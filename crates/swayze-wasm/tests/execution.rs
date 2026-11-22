@@ -550,6 +550,12 @@ fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
         6,
         ErrorKind::TrailingBodyBytes,
     );
+    // A second balance-preserving operation cannot continue past the first end.
+    bad_body(
+        &[0, 0x41, 40, 0x41, 2, 0x6a, 0x0b, 0x41, 1, 0x6b, 0x0b],
+        7,
+        ErrorKind::TrailingBodyBytes,
+    );
     for (id, payload) in SECTIONS {
         let trailing = [payload, &[0]].concat();
         bad_payload(

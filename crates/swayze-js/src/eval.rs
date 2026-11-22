@@ -9,6 +9,11 @@ use crate::{
 const MAX_INSTRUCTIONS: usize = 4096;
 
 /// A result or intermediate value in the supported JavaScript subset.
+///
+/// The derived [`PartialEq`] compares Rust enum variants and their payloads.
+/// For Numbers, `+0.0` and `-0.0` compare equal and NaN never compares equal,
+/// even to itself. This is a host-side convenience, not a definition of
+/// JavaScript equality. This subset has no guest equality operators.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     /// A JavaScript Number (binary64), including signed zeros, infinities, and NaN.

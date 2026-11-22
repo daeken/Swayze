@@ -1,5 +1,6 @@
 use crate::parser::Instruction::{
-    self, Add, Divide, Multiply, Negate, Number, Positive, Remainder, Subtract,
+    self, Add, Divide, InitConst, LoadConst, Multiply, Negate, Number, Positive, Remainder,
+    Subtract,
 };
 use crate::{ErrorKind, Limit, Limits, Span, parse_script, parse_script_with_limits};
 
@@ -100,7 +101,7 @@ fn entire_input_is_required() {
     assert_error("1; 2", Unsupported, 3, 4);
     assert_error("1;;", Unsupported, 2, 3);
     assert_error("1;\u{00A0}🚧", Unsupported, 4, 8);
-    assert_error("1; let x", Unsupported, 3, 4);
+    assert_error("1; let x", Unsupported, 3, 6);
     assert_error("1; // comment", Unsupported, 3, 5);
     assert_error("1;\0", Unsupported, 2, 3);
     assert_error("1 23", Malformed, 2, 4);
@@ -113,6 +114,192 @@ fn entire_input_is_required() {
     assert_error("1\n++2", Unsupported, 2, 4);
     assert_error("1\n--2", Unsupported, 2, 4);
     assert_error("1;\n/2/", Unsupported, 3, 4);
+}
+
+#[test]
+fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
+    assert_postfix(
+        "const x = 2; const y = x * 5; y + 1;",
+        &[
+            Number(2.),
+            InitConst,
+            LoadConst(0),
+            Number(5.),
+            Multiply,
+            InitConst,
+            LoadConst(1),
+            Number(1.),
+            Add,
+        ],
+        2,
+    );
+    assert_postfix(
+        "const constx=1; const const0=constx; const const_=const0; const const$=const_; const$",
+        &[
+            Number(1.),
+            InitConst,
+            LoadConst(0),
+            InitConst,
+            LoadConst(1),
+            InitConst,
+            LoadConst(2),
+            InitConst,
+            LoadConst(3),
+        ],
+        1,
+    );
+    assert_postfix(
+        "const\u{00A0}$a0 = 2\n+ 1; const _B=$a0; _B",
+        &[
+            Number(2.),
+            Number(1.),
+            Add,
+            InitConst,
+            LoadConst(0),
+            InitConst,
+            LoadConst(1),
+        ],
+        2,
+    );
+}
+
+#[test]
+fn consts_decline_reserved_and_non_subset_names_without_splitting() {
+    use ErrorKind::Unsupported;
+    for name in [
+        "const",
+        "let",
+        "var",
+        "for",
+        "return",
+        "class",
+        "true",
+        "enum",
+        "await",
+        "yield",
+        "implements",
+        "static",
+        "using",
+        "eval",
+        "arguments",
+        "NaN",
+        "undefined",
+    ] {
+        let source = format!("const {name}=1; 2");
+        assert_error(&source, Unsupported, 6, 6 + name.len());
+    }
+    for (source, start, end) in [
+        ("constx=1; x", 0, 6),
+        ("Const x=1; x", 0, 5),
+        ("consté x=1; x", 5, 7),
+        ("const\\u0078=1; x", 5, 6),
+        ("const é=1; 1", 6, 8),
+        ("const xé=1; 1", 7, 9),
+        ("const x\\u0061=1; 1", 7, 8),
+        ("const x=1; x\u{200D}", 12, 15),
+        ("const x==1; x", 7, 9),
+        ("const x===1; x", 7, 10),
+        ("const x=>1; x", 7, 9),
+        ("const x=1; x!==1", 12, 13),
+    ] {
+        assert_error(source, Unsupported, start, end);
+    }
+}
+
+#[test]
+fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, start, end) in [
+        ("const", Malformed, 5, 5),
+        ("const x; x", Malformed, 7, 8),
+        ("const x=; x", Malformed, 8, 9),
+        ("const x=1", Unsupported, 9, 9),
+        ("const x=1;", Unsupported, 10, 10),
+        ("const x=1\nx", Unsupported, 10, 11),
+        ("const x=1\nconst y=2; x", Unsupported, 10, 15),
+        ("const x=1,y=2; x", Unsupported, 9, 10),
+        ("const [x]=1; x", Unsupported, 6, 7),
+        ("const {x}=1; x", Unsupported, 6, 7),
+        ("const x=(1;); x", Malformed, 10, 11),
+        ("const x=1;; x", Unsupported, 10, 11),
+        ("const x=1; x; x", Unsupported, 14, 15),
+        ("const x=1; x; const y=1; y", Unsupported, 14, 19),
+        ("const x=1; x=2", Unsupported, 12, 13),
+        ("const x=1; x += 2", Unsupported, 13, 15),
+        ("const x=1; x(2)", Unsupported, 12, 13),
+        ("const x=1; x.y", Unsupported, 12, 13),
+        ("const x=1; x//comment", Unsupported, 12, 14),
+        ("(const x=1; x)", Unsupported, 1, 6),
+    ] {
+        assert_error(source, kind, start, end);
+    }
+}
+
+#[test]
+fn duplicate_declarations_are_early_errors_and_unavailable_reads_are_unsupported() {
+    use ErrorKind::{Malformed, Unsupported};
+    let duplicate = "const x=1; const y=x; const x=2; y";
+    assert_error(duplicate, Malformed, 28, 29);
+    assert_eq!(
+        parse_script(duplicate).unwrap_err().message(),
+        "duplicate const declaration"
+    );
+    for (source, start, end) in [
+        ("x", 0, 1),
+        ("const x=x; x", 8, 9),
+        ("const x=y; const y=1; x", 8, 9),
+        ("const x=1; const y=y+x; y", 19, 20),
+        ("const x=1; X", 11, 12), // case-sensitive
+    ] {
+        assert_error(source, Unsupported, start, end);
+        assert!(
+            parse_script(source)
+                .unwrap_err()
+                .message()
+                .contains("earlier const declaration")
+        );
+    }
+}
+
+#[test]
+fn consts_charge_parsing_and_resolution_to_existing_budgets() {
+    let source = "const x=0;x";
+    let limits = Limits {
+        max_tokens: 6,
+        max_work: 17,
+        ..Limits::default()
+    };
+    assert!(parse_script_with_limits(source, limits).is_ok());
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 5,
+            ..limits
+        },
+        Limit::Tokens,
+        10,
+        11,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: 15,
+            ..limits
+        },
+        Limit::Work,
+        10,
+        11,
+    );
+    assert_limit(
+        "const x=(0);x",
+        Limits {
+            max_nesting_depth: 0,
+            ..Limits::default()
+        },
+        Limit::NestingDepth,
+        8,
+        9,
+    );
 }
 
 #[test]

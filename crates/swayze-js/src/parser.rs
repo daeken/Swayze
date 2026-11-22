@@ -57,7 +57,7 @@ pub enum Limit {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
-    /// The recognized syntax cannot be completed here.
+    /// Recognized syntax is incomplete or violates a static rule of the subset.
     Malformed,
     /// Parsing would require syntax outside the slice. This is not a validity claim.
     Unsupported,
@@ -140,10 +140,11 @@ impl std::error::Error for Error {}
 pub struct Script {
     instructions: Vec<Instruction>,
     max_stack_depth: usize,
+    const_slots: usize,
 }
 
 impl Script {
-    /// The number of literals and operators in the expression.
+    /// The number of literal, operator, binding read and binding initialization instructions.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
@@ -156,6 +157,10 @@ impl Script {
     pub(crate) fn instructions(&self) -> &[Instruction] {
         &self.instructions
     }
+
+    pub(crate) fn const_slots(&self) -> usize {
+        self.const_slots
+    }
 }
 
 impl fmt::Debug for Script {
@@ -163,6 +168,7 @@ impl fmt::Debug for Script {
         f.debug_struct("Script")
             .field("instruction_count", &self.instruction_count())
             .field("max_stack_depth", &self.max_stack_depth())
+            .field("const_slots", &self.const_slots)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +176,8 @@ impl fmt::Debug for Script {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
+    LoadConst(usize),
+    InitConst,
     Add,
     Subtract,
     Multiply,
@@ -208,6 +216,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         max_nesting_depth: limits.max_nesting_depth,
         pending: Vec::new(),
         postfix: Vec::new(),
+        bindings: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
     }
@@ -250,6 +259,9 @@ impl Operator {
 #[derive(Clone, Copy)]
 enum TokenKind {
     Number(f64),
+    Identifier,
+    Const,
+    Equals,
     Operator(Operator),
     Open,
     Close,
@@ -281,6 +293,27 @@ fn is_trivia_space(c: char) -> bool {
             '\t' | '\u{000B}' | '\u{000C}' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
                 ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
         )
+}
+
+fn is_identifier_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, '_' | '$')
+}
+
+fn is_excluded_name(name: &str) -> bool {
+    matches!(
+        name,
+        // Keywords, reserved literals, future/strict reserved words, and `await`.
+        "break" | "case" | "catch" | "class" | "continue" | "debugger" | "default"
+            | "delete" | "do" | "else" | "enum" | "export" | "extends" | "false"
+            | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
+            | "new" | "null" | "return" | "super" | "switch" | "this" | "throw" | "true"
+            | "try" | "typeof" | "var" | "void" | "while" | "with" | "await" | "yield"
+            | "implements" | "interface" | "let" | "package" | "private" | "protected"
+            | "public" | "static"
+            // Contextual syntax, strict-mode restricted names, and selected globals.
+            | "as" | "async" | "from" | "get" | "of" | "set" | "using" | "eval"
+            | "arguments" | "undefined" | "Infinity" | "NaN" | "globalThis"
+    )
 }
 
 impl Lexer<'_> {
@@ -340,6 +373,8 @@ impl Lexer<'_> {
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
+            _ if is_identifier_start(c) => self.identifier(start)?,
+            '=' => self.equals(start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             ';' => TokenKind::Semicolon,
@@ -359,6 +394,57 @@ impl Lexer<'_> {
             },
             after_line_break,
         }))
+    }
+
+    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
+        while let Some(c) = self
+            .peek()
+            .filter(|&c| is_identifier_start(c) || c.is_ascii_digit())
+        {
+            self.consume(c)?;
+        }
+        // Don't mistake the ASCII prefix of a Unicode or escaped name for a keyword.
+        if let Some(c) = self
+            .peek()
+            .filter(|&c| c == '\\' || (!c.is_ascii() && !is_trivia_space(c)))
+        {
+            let span = self.consume(c)?;
+            return Err(Error::unsupported(
+                span,
+                "Unicode and escaped identifiers are outside the subset",
+            ));
+        }
+        let name = &self.source[start..self.offset];
+        if name == "const" {
+            Ok(TokenKind::Const)
+        } else if is_excluded_name(name) {
+            Err(Error::unsupported(
+                Span {
+                    start,
+                    end: self.offset,
+                },
+                "reserved or excluded name is outside the subset",
+            ))
+        } else {
+            Ok(TokenKind::Identifier)
+        }
+    }
+
+    fn equals(&mut self, start: usize) -> Result<TokenKind, Error> {
+        if let Some(next @ ('=' | '>')) = self.peek() {
+            self.consume(next)?;
+            if next == '=' && self.peek() == Some('=') {
+                self.consume('=')?;
+            }
+            return Err(Error::unsupported(
+                Span {
+                    start,
+                    end: self.offset,
+                },
+                "longer punctuator is outside the arithmetic subset",
+            ));
+        }
+        Ok(TokenKind::Equals)
     }
 
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
@@ -488,31 +574,160 @@ struct Parser<'s> {
     max_nesting_depth: usize,
     pending: Vec<Pending>,
     postfix: Vec<Instruction>,
+    // Parse-only declaration spans in slot order; never retained by Script.
+    bindings: Vec<Span>,
     stack_depth: usize,
     max_stack_depth: usize,
 }
 
 impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
+        let mut next = self.lexer.next()?;
+        while matches!(
+            next,
+            Some(Token {
+                kind: TokenKind::Const,
+                ..
+            })
+        ) {
+            self.parse_const()?;
+            next = self.lexer.next()?;
+        }
+        let first = next.ok_or_else(|| {
+            let eof = Span::at(self.lexer.offset);
+            Error::unsupported(
+                eof,
+                if self.bindings.is_empty() {
+                    "empty scripts are outside the arithmetic subset"
+                } else {
+                    "a final expression is required after const declarations"
+                },
+            )
+        })?;
+        self.parse_expression(first, false)?;
+        if let Some(token) = self.lexer.next()? {
+            return Err(Error::unsupported(
+                token.span,
+                "no additional statements are supported after the final expression",
+            ));
+        }
+        Ok(Script {
+            instructions: self.postfix,
+            max_stack_depth: self.max_stack_depth,
+            const_slots: self.bindings.len(),
+        })
+    }
+
+    fn require_token(&mut self, message: &'static str) -> Result<Token, Error> {
+        self.lexer
+            .next()?
+            .ok_or_else(|| Error::malformed(Span::at(self.lexer.offset), message))
+    }
+
+    fn parse_const(&mut self) -> Result<(), Error> {
+        let name = self.require_token("expected a const binding name")?;
+        match name.kind {
+            TokenKind::Identifier => {}
+            TokenKind::Const => {
+                return Err(Error::unsupported(name.span, "const is a reserved name"));
+            }
+            _ => return Err(Error::malformed(name.span, "expected a const binding name")),
+        }
+        if self.lookup_binding(name.span)?.is_some() {
+            return Err(Error::malformed(name.span, "duplicate const declaration"));
+        }
+        let equals = self.require_token("expected '=' after the const name")?;
+        if !matches!(equals.kind, TokenKind::Equals) {
+            return Err(Error::malformed(
+                equals.span,
+                "expected '=' after the const name",
+            ));
+        }
+        let first = self.require_token("expected a const initializer")?;
+        let end = self.parse_expression(first, true)?;
+        self.emit(Instruction::InitConst, end)?;
+        try_push(&mut self.bindings, name.span, name.span)
+    }
+
+    fn lookup_binding(&mut self, span: Span) -> Result<Option<usize>, Error> {
+        let source = self.lexer.source;
+        let name = &source[span.start..span.end];
+        for (slot, binding) in self.bindings.iter().enumerate() {
+            let candidate = &source[binding.start..binding.end];
+            self.lexer.charge(1, span)?;
+            if name.len() == candidate.len() {
+                self.lexer.charge(name.len(), span)?;
+                if name == candidate {
+                    return Ok(Some(slot));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_expression(&mut self, first: Token, initializer: bool) -> Result<Span, Error> {
         let mut nesting = 0;
         let mut needs_operand = true;
         let mut seen_token = false;
-        let mut terminated = false;
-        while let Some(token) = self.lexer.next()? {
+        let mut next = Some(first);
+        let end = loop {
+            let Some(token) = next else {
+                let eof = Span::at(self.lexer.offset);
+                if needs_operand {
+                    return Err(Error::malformed(
+                        eof,
+                        "expected an operand before end of source",
+                    ));
+                }
+                if nesting != 0 {
+                    return Err(Error::malformed(
+                        eof,
+                        "expected a closing parenthesis before end of source",
+                    ));
+                }
+                if initializer {
+                    return Err(Error::unsupported(
+                        eof,
+                        "const declarations require explicit semicolons",
+                    ));
+                }
+                break eof;
+            };
             let Token {
                 kind,
                 span,
                 after_line_break,
             } = token;
-            if terminated {
-                return Err(Error::unsupported(
-                    span,
-                    "only one expression statement is supported",
-                ));
-            }
             match (needs_operand, kind) {
+                (_, TokenKind::Equals) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "assignments are outside the subset",
+                    ));
+                }
+                (false, TokenKind::Const | TokenKind::Number(_) | TokenKind::Identifier)
+                    if initializer && nesting == 0 && after_line_break =>
+                {
+                    return Err(Error::unsupported(
+                        span,
+                        "const declarations require explicit semicolons",
+                    ));
+                }
+                (_, TokenKind::Const) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "const declarations can only precede the final expression",
+                    ));
+                }
                 (true, TokenKind::Number(value)) => {
                     self.emit(Instruction::Number(value), span)?;
+                    needs_operand = false;
+                }
+                (true, TokenKind::Identifier) => {
+                    let slot = self.lookup_binding(span)?.ok_or_else(|| {
+                        Error::unsupported(span, "read requires an earlier const declaration; self, forward and unbound reads are outside the subset")
+                    })?;
+                    self.emit(Instruction::LoadConst(slot), span)?;
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {
@@ -538,7 +753,7 @@ impl Parser<'_> {
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Some(prefix), span)?;
                 }
-                (true, TokenKind::Semicolon) if !seen_token => {
+                (true, TokenKind::Semicolon) if !initializer && !seen_token => {
                     return Err(Error::unsupported(
                         span,
                         "empty statements are outside the arithmetic subset",
@@ -589,16 +804,18 @@ impl Parser<'_> {
                         "call expressions are outside the arithmetic subset",
                     ));
                 }
-                (false, TokenKind::Number(_)) if nesting == 0 && after_line_break => {
+                (false, TokenKind::Number(_) | TokenKind::Identifier)
+                    if nesting == 0 && after_line_break =>
+                {
                     return Err(Error::unsupported(
                         span,
                         "only one expression statement is supported",
                     ));
                 }
-                (false, TokenKind::Number(_)) => {
+                (false, TokenKind::Number(_) | TokenKind::Identifier) => {
                     return Err(Error::malformed(span, "expected a binary operator"));
                 }
-                (false, TokenKind::Semicolon) if nesting == 0 => terminated = true,
+                (false, TokenKind::Semicolon) if nesting == 0 => break span,
                 (false, TokenKind::Semicolon) => {
                     return Err(Error::malformed(
                         span,
@@ -607,41 +824,19 @@ impl Parser<'_> {
                 }
             }
             seen_token = true;
-        }
-
-        let eof = Span::at(self.lexer.offset);
-        if !seen_token {
-            return Err(Error::unsupported(
-                eof,
-                "empty scripts are outside the arithmetic subset",
-            ));
-        }
-        if needs_operand {
-            return Err(Error::malformed(
-                eof,
-                "expected an operand before end of source",
-            ));
-        }
-        if nesting != 0 {
-            return Err(Error::malformed(
-                eof,
-                "expected a closing parenthesis before end of source",
-            ));
-        }
+            next = self.lexer.next()?;
+        };
         while let Some((op, at)) = self.pending.pop() {
             let op = op.ok_or_else(|| Error::malformed(at, "unmatched opening parenthesis"))?;
             self.emit(op.instruction(), at)?;
         }
         if self.stack_depth != 1 {
             return Err(Error::malformed(
-                eof,
+                end,
                 "expected exactly one complete expression",
             ));
         }
-        Ok(Script {
-            instructions: self.postfix,
-            max_stack_depth: self.max_stack_depth,
-        })
+        Ok(end)
     }
 
     fn push_pending(&mut self, op: Option<Operator>, span: Span) -> Result<(), Error> {
@@ -651,23 +846,24 @@ impl Parser<'_> {
 
     fn emit(&mut self, instruction: Instruction, span: Span) -> Result<(), Error> {
         self.lexer.charge(1, span)?;
-        let operands = match instruction {
+        let (operands, results) = match instruction {
             Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
-            Instruction::Number(_) => 0,
-            Instruction::Positive | Instruction::Negate => 1,
+            Instruction::Number(_) | Instruction::LoadConst(_) => (0, 1),
+            Instruction::InitConst => (1, 0),
+            Instruction::Positive | Instruction::Negate => (1, 1),
             Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply
             | Instruction::Divide
-            | Instruction::Remainder => 2,
+            | Instruction::Remainder => (2, 1),
         };
         self.stack_depth = self
             .stack_depth
             .checked_sub(operands)
             .ok_or_else(|| Error::malformed(span, "operation is missing an operand"))?
-            .checked_add(1)
+            .checked_add(results)
             .ok_or_else(|| Error::limit(span, Limit::Allocation))?;
         self.max_stack_depth = self.max_stack_depth.max(self.stack_depth);
         try_push(&mut self.postfix, instruction, span)

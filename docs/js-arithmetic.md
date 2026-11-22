@@ -33,3 +33,8 @@ precedence, operand order, associativity, binary64 rounding, and signed zero.
 Evaluator unit tests also check malformed postfix, the work budget, overflow,
 and NaN. These are focused implementation tests, not a proof of correctness or
 ECMAScript conformance. They do not run Test262, and there is no JIT in this path.
+
+With Node.js installed, `sh tools/check-js-reference.sh` independently compares
+synthetic arithmetic fixtures in debug and release, using exact binary64 bits
+except for NaN payloads. It does not execute Test262 or user-supplied code and is
+not required by the normal merge gate.

@@ -1,5 +1,5 @@
 use swayze_wasm::{
-    Error, ErrorKind, IntegerField, InvokeError, LengthField, Limit, Module, validate_module,
+    Error, ErrorKind, IntegerField, InvokeError, LengthField, Limit, Module, Trap, validate_module,
 };
 
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
@@ -471,9 +471,97 @@ fn wraps_all_three_arithmetic_operations() {
 }
 
 #[test]
+fn executes_signed_and_unsigned_division_and_remainder() {
+    for (opcode, cases) in [
+        (
+            0x6d,
+            &[(-7, 3, -2), (7, -3, -2), (i32::MIN, 1, i32::MIN)][..],
+        ), // div_s
+        (
+            0x6e,
+            &[
+                (-1, 2, i32::MAX),
+                (-1, 1, -1),
+                (-1, i32::MIN, 1),
+                (1, -1, 0),
+            ],
+        ), // div_u
+        (0x6f, &[(-7, 3, -1), (7, -3, 1), (i32::MIN, -1, 0)]), // rem_s
+        (
+            0x70,
+            &[
+                (-1, 2, 1),
+                (-1, i32::MIN, i32::MAX),
+                (i32::MIN, -1, i32::MIN),
+            ],
+        ), // rem_u
+    ] {
+        let code = code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]);
+        let validated = exported_function(&i32_type(2), &code);
+        let instance = validated.instantiate();
+        for &(lhs, rhs, expected) in cases {
+            assert_eq!(
+                instance.invoke_i32_with_args("answer", &[lhs, rhs]),
+                Ok(expected),
+                "opcode {opcode:#x} with ({lhs}, {rhs})",
+            );
+        }
+    }
+}
+
+#[test]
+fn division_and_remainder_by_zero_validate_but_trap_on_invocation() {
+    for opcode in 0x6d..=0x70 {
+        let code = code_body(&[0, 0x41, 0, 0x41, 0, opcode, 0x0b]);
+        let validated = exported_function(TYPE, &code);
+        let instance = validated.instantiate();
+        assert_eq!(
+            instance.invoke_i32("answer"),
+            Err(InvokeError::Trap(Trap::IntegerDivideByZero)),
+            "opcode {opcode:#x}",
+        );
+        assert_eq!(
+            instance.invoke_i32_with_args("answer", &[0]),
+            Err(InvokeError::ArityMismatch {
+                expected: 0,
+                actual: 1
+            }),
+        );
+        assert_eq!(
+            instance.invoke_i32_with_args("Answer", &[0]),
+            Err(InvokeError::ExportNotFound),
+        );
+    }
+}
+
+#[test]
+fn stops_at_first_guest_trap_and_can_reuse_the_instance() {
+    let code = code_body(&[
+        1, 1, 0x7f, // Declare local 3.
+        0x20, 3, 0x41, 1, 0x6a, 0x21, 3, // Increment local 3 before a possible trap.
+        0x20, 0, 0x20, 1, 0x6d, // First possible trap: div_s(p0, p1).
+        0x41, 5, 0x20, 2, 0x70, // Later possible trap: rem_u(5, p2).
+        0x6a, 0x20, 3, 0x6a, 0x0b, // Sum the results and the local.
+    ]);
+    let validated = exported_function(&i32_type(3), &code);
+    let instance = validated.instantiate();
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[i32::MIN, -1, 0]),
+        Err(InvokeError::Trap(Trap::IntegerOverflow)),
+    );
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[8, 2, 0]),
+        Err(InvokeError::Trap(Trap::IntegerDivideByZero)),
+    );
+    for _ in 0..2 {
+        assert_eq!(instance.invoke_i32_with_args("answer", &[8, 2, 3]), Ok(7));
+    }
+}
+
+#[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x0b, 0x20, 0x21, 0x22, 0x41, 0x6a, 0x6b, 0x6c].contains(&opcode) {
+        if ![0x0b, 0x20, 0x21, 0x22, 0x41].contains(&opcode) && !(0x6a..=0x70).contains(&opcode) {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],
                 3,
@@ -501,7 +589,7 @@ fn set_pops_and_tee_preserves_an_operand_but_both_require_one() {
 
 #[test]
 fn requires_two_operands_for_each_binary_op_and_one_result_at_end() {
-    for opcode in [0x6a, 0x6b, 0x6c] {
+    for opcode in 0x6a..=0x70 {
         bad_body(
             &[0, opcode, 0x0b],
             1,
@@ -525,6 +613,18 @@ fn requires_two_operands_for_each_binary_op_and_one_result_at_end() {
         5,
         ErrorKind::InvalidResultDepth { depth: 2 },
     );
+}
+
+#[test]
+fn does_not_skip_result_depth_validation_for_a_trapping_body() {
+    for opcode in 0x6d..=0x70 {
+        // Executing this operation would trap, but validation must still check `end`.
+        bad_body(
+            &[0, 0x41, 8, 0x41, 1, 0x41, 0, opcode, 0x0b],
+            8,
+            ErrorKind::InvalidResultDepth { depth: 2 },
+        );
+    }
 }
 
 #[test]
@@ -576,27 +676,30 @@ fn bounds_instruction_count_inclusively() {
 fn bounds_operand_depth_inclusively() {
     let limit = Limit::OperandStackDepth;
     let ty = i32_type(1);
-    let body_at_depth = |depth: usize| {
+    let body_at_depth = |depth: usize, opcode| {
         let mut body = vec![0];
         for _ in 0..depth {
             body.extend([0x20, 0]);
         }
         body.extend([0x22, 0]); // A tee is valid at full depth; it doesn't push.
-        body.extend(std::iter::repeat_n(0x6a, depth - 1));
+        body.push(opcode); // Reduce the top two operands at full depth.
+        body.extend(std::iter::repeat_n(0x6a, depth - 2));
         body.push(0x0b);
         body
     };
-    let validated = exported_function(&ty, &code_body(&body_at_depth(limit.maximum())));
-    assert_eq!(
-        validated.instantiate().invoke_i32_with_args("answer", &[1]),
-        Ok(limit.maximum() as i32)
-    );
-    bad_typed_body(
-        &ty,
-        &body_at_depth(limit.maximum() + 1),
-        1 + 2 * limit.maximum(),
-        ErrorKind::LimitExceeded { limit },
-    );
+    for (opcode, reduced) in [(0x6a, 2), (0x6d, 1), (0x6e, 1), (0x6f, 0), (0x70, 0)] {
+        let validated = exported_function(&ty, &code_body(&body_at_depth(limit.maximum(), opcode)));
+        assert_eq!(
+            validated.instantiate().invoke_i32_with_args("answer", &[1]),
+            Ok(limit.maximum() as i32 - 2 + reduced),
+        );
+        bad_typed_body(
+            &ty,
+            &body_at_depth(limit.maximum() + 1, opcode),
+            1 + 2 * limit.maximum(),
+            ErrorKind::LimitExceeded { limit },
+        );
+    }
 }
 
 fn code_immediate(leb: &[u8]) -> Vec<u8> {

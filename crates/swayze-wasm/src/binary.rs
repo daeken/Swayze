@@ -1,4 +1,4 @@
-use crate::{Function, InvokeError, Module};
+use crate::{Function, InvokeError, Module, Trap};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -360,6 +360,34 @@ enum BinaryOp {
     Add,
     Sub,
     Mul,
+    DivS,
+    DivU,
+    RemS,
+    RemU,
+}
+
+impl BinaryOp {
+    fn apply(self, lhs: i32, rhs: i32) -> Result<i32, Trap> {
+        match self {
+            Self::Add => Ok(lhs.wrapping_add(rhs)),
+            Self::Sub => Ok(lhs.wrapping_sub(rhs)),
+            Self::Mul => Ok(lhs.wrapping_mul(rhs)),
+            Self::DivS if rhs == 0 => Err(Trap::IntegerDivideByZero),
+            Self::DivS => lhs.checked_div(rhs).ok_or(Trap::IntegerOverflow),
+            // Same-width casts reinterpret the operands and preserve the result bits.
+            Self::DivU => (lhs as u32)
+                .checked_div(rhs as u32)
+                .map(|value| value as i32)
+                .ok_or(Trap::IntegerDivideByZero),
+            // Wasm remainder by -1 is zero even for i32::MIN, unlike checked_rem.
+            Self::RemS if rhs == -1 => Ok(0),
+            Self::RemS => lhs.checked_rem(rhs).ok_or(Trap::IntegerDivideByZero),
+            Self::RemU => (lhs as u32)
+                .checked_rem(rhs as u32)
+                .map(|value| value as i32)
+                .ok_or(Trap::IntegerDivideByZero),
+        }
+    }
 }
 
 /// Only the decoder below constructs this, after checking local indices, every
@@ -383,7 +411,7 @@ impl ValidatedCode {
         locals[..self.parameter_count].copy_from_slice(args);
         let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
         let mut depth = 0;
-        // Each stored instruction runs once, for at most BodyInstructions steps.
+        // Each stored instruction runs at most once; a trap terminates execution.
         // Validation proves each local index is below the total slot count,
         // every stack access fits, and depth is one on completion.
         for &instruction in &self.instructions {
@@ -406,11 +434,7 @@ impl ValidatedCode {
                 Instruction::Binary(op) => {
                     let rhs = operands[depth - 1];
                     let lhs = &mut operands[depth - 2];
-                    *lhs = match op {
-                        BinaryOp::Add => lhs.wrapping_add(rhs),
-                        BinaryOp::Sub => lhs.wrapping_sub(rhs),
-                        BinaryOp::Mul => lhs.wrapping_mul(rhs),
-                    };
+                    *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
                     depth -= 1;
                 }
             }
@@ -486,6 +510,10 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
             0x6a => Instruction::Binary(BinaryOp::Add),
             0x6b => Instruction::Binary(BinaryOp::Sub),
             0x6c => Instruction::Binary(BinaryOp::Mul),
+            0x6d => Instruction::Binary(BinaryOp::DivS),
+            0x6e => Instruction::Binary(BinaryOp::DivU),
+            0x6f => Instruction::Binary(BinaryOp::RemS),
+            0x70 => Instruction::Binary(BinaryOp::RemU),
             _ => {
                 return Err(Error {
                     offset,

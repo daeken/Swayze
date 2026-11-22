@@ -18,8 +18,9 @@
 //! Validation starts with an empty operand stack and checks each stack effect:
 //! `i32.const` pushes one i32, and the binary operators consume two and push
 //! one. `end` must be the final byte of the body frame and leave exactly one
-//! result. Each body is limited to 256 bytes including the locals vector and
-//! `end`, 127 instructions excluding `end`, and 32 live i32 operands.
+//! result. The inclusive limits are 256 body bytes (including the locals vector
+//! and `end`), 127 arithmetic and constant instructions (excluding `end`), and
+//! 32 live i32 operands.
 //!
 //! Validation checks the entire input before returning an owned [`Module`] with
 //! private decoded instructions and an optional bounded export name. A separate
@@ -41,8 +42,11 @@
 //! function/type/code and export relationships, bounded LEB32 decoding, stack
 //! underflow and final depth, acceptance at and rejection beyond each body
 //! budget, and ordered, wrapping arithmetic after discarding the input. Parsing
-//! uses bounded borrowed frames and fallible reservations for decoded instructions
-//! and the export name. There is no unsafe code, recursion, or external dependency.
+//! uses bounded borrowed frames and decodes into a fixed-size scratch array.
+//! Only after checking `end` and the complete body frame does it call
+//! `Vec::try_reserve_exact` for the decoded instruction count and copy those
+//! instructions. The export name is also reserved fallibly. There is no unsafe
+//! code, recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!

@@ -186,6 +186,32 @@ fn reads_four_parameters_in_declared_order_on_each_invocation() {
 }
 
 #[test]
+fn zeroes_declared_locals_on_every_invocation_of_the_same_instance() {
+    // Increment the local before returning it. A retained local would return 2
+    // on the second call.
+    assert_body_result(&[1, 1, 0x7f, 0x20, 0, 0x41, 1, 0x6a, 0x22, 0, 0x0b], 1);
+}
+
+#[test]
+fn reads_and_assigns_parameters_before_grouped_declared_locals() {
+    let code = code_body(&[
+        3, 2, 0x7f, 0, 0x7f, 1, 0x7f, // Local indices 2, 3, 4.
+        0x20, 0, 0x21, 2, // Save the first argument (a) in local 2.
+        0x20, 1, 0x22, 0, // Store the second argument (b) in parameter 0.
+        0x41, 3, 0x6c, 0x21, 1, // Multiply the tee result; parameter 1 = 3*b.
+        0x20, 0, 0x20, 2, 0x6b, 0x21, 4, // Local 4 = b - a.
+        0x20, 1, 0x20, 4, 0x6b, 0x20, 3, 0x6a, // 3*b - (b - a) + 0.
+        0x0b,
+    ]);
+    let validated = exported_function(&i32_type(2), &code);
+    let instance = validated.instantiate();
+    let args = [9, 4];
+    assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(17));
+    assert_eq!(args, [9, 4]);
+    assert_eq!(instance.invoke_i32_with_args("answer", &[-1, 7]), Ok(13));
+}
+
+#[test]
 fn checks_export_name_then_exact_declared_arity_even_for_unused_parameters() {
     let validated = exported_function(&i32_type(2), CODE);
     let instance = validated.instantiate();
@@ -244,51 +270,152 @@ fn parameter_arithmetic_wraps() {
 }
 
 #[test]
-fn accepts_a_maximally_padded_local_index() {
-    let code = code_body(&[0, 0x20, 0x82, 0x80, 0x80, 0x80, 0, 0x0b]);
-    let validated = exported_function(&i32_type(3), &code);
-    assert_eq!(
-        validated
-            .instantiate()
-            .invoke_i32_with_args("answer", &[9, 4, -13]),
-        Ok(-13)
+fn accepts_maximally_padded_local_counts_and_indices() {
+    assert_body_result(
+        &[
+            0x81, 0x80, 0x80, 0x80, 0, // One group.
+            0x82, 0x80, 0x80, 0x80, 0, 0x7f, // Two i32 locals.
+            0x41, 9, // Push 9.
+            0x21, 0x81, 0x80, 0x80, 0x80, 0, // Set local 1.
+            0x20, 0x81, 0x80, 0x80, 0x80, 0, // Get local 1.
+            0x22, 0x80, 0x80, 0x80, 0x80, 0, // Tee into local 0.
+            0x20, 0, 0x6a, 0x0b, // 9 + local 0.
+        ],
+        18,
     );
 }
 
 #[test]
-fn rejects_local_indices_outside_the_parameter_range() {
-    for (parameter_count, leb, index) in [
-        (0, &[0][..], 0),
-        (1, &[1], 1),
-        (4, &[4], 4),
-        (4, &[0x7f], 127),
-        (4, &[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX),
-    ] {
-        let body = [&[0, 0x20][..], leb, &[0x0b]].concat();
-        bad_typed_body(
-            &i32_type(parameter_count),
-            &body,
-            2,
-            ErrorKind::InvalidIndex {
-                field: IntegerField::LocalIndex,
-                index,
+fn bounds_total_declared_locals_independently_of_parameters() {
+    let ty = i32_type(4);
+    let body = [2, 7, 0x7f, 9, 0x7f, 0x20, 3, 0x21, 19, 0x20, 19, 0x0b];
+    let validated = exported_function(&ty, &code_body(&body));
+    assert_eq!(
+        validated
+            .instantiate()
+            .invoke_i32_with_args("answer", &[1, 2, 3, 4]),
+        Ok(4)
+    );
+    let mut too_many = body;
+    too_many[3] = 10;
+    bad_typed_body(
+        &ty,
+        &too_many,
+        3,
+        ErrorKind::UnsupportedCount {
+            field: IntegerField::LocalCount,
+            count: 10,
+        },
+    );
+    // A full u32 is decodable but far above the budget, even after just one local.
+    // A naive u32 sum of these counts would wrap to zero.
+    bad_body(
+        &[
+            2, 1, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x7f, 0x41, 1, 0x0b,
+        ],
+        3,
+        ErrorKind::UnsupportedCount {
+            field: IntegerField::LocalCount,
+            count: u32::MAX,
+        },
+    );
+}
+
+#[test]
+fn zero_count_groups_use_body_bytes_but_not_local_slots() {
+    let mut body = vec![126];
+    for _ in 0..126 {
+        body.extend([0, 0x7f]);
+    }
+    body.extend([0x41, 9, 0x0b]);
+    assert_eq!(body.len(), Limit::CodeBodyBytes.maximum());
+    assert_body_result(&body, 9);
+}
+
+#[test]
+fn validates_all_local_group_types_even_for_zero_counts() {
+    for count in [0, 1] {
+        bad_body(
+            &[2, 1, 0x7f, count, 0x7e, 0x41, 1, 0x0b],
+            4,
+            ErrorKind::UnexpectedByte {
+                expected: 0x7f,
+                found: 0x7e,
             },
         );
     }
 }
 
 #[test]
+fn validates_local_count_leb_values_within_the_body_frame() {
+    use IntegerField::{LocalCount, LocalGroupCount};
+    for (prefix, field) in [(&[][..], LocalGroupCount), (&[2, 1, 0x7f], LocalCount)] {
+        for count in 0..=4 {
+            let body = [prefix, &[0x80; 4][..count]].concat();
+            let mut code = code_body(&body);
+            let boundary = code.len();
+            code.extend([0, 0x7f, 0x41, 1, 0x0b]);
+            bad_code(&code, boundary, ErrorKind::TruncatedInteger { field });
+        }
+        for fifth in [0x10, 0x7f, 0x80] {
+            let body = [prefix, &[0x80, 0x80, 0x80, 0x80, fifth, 0]].concat();
+            bad_body(
+                &body,
+                prefix.len() + 4,
+                ErrorKind::IntegerOverflow { field },
+            );
+        }
+    }
+    // A huge but decodable group vector cannot read beyond its first missing entry.
+    bad_body(
+        &[0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0x7f],
+        7,
+        ErrorKind::TruncatedInteger { field: LocalCount },
+    );
+    let mut code = code_body(&[1, 1]);
+    let boundary = code.len();
+    code.extend([0x7f, 0x41, 1, 0x0b]);
+    bad_code(&code, boundary, ErrorKind::TruncatedByte { expected: 0x7f });
+}
+
+#[test]
+fn rejects_local_indices_outside_the_combined_index_space() {
+    for (parameter_count, locals, leb, index) in [
+        (0, &[0][..], &[0][..], 0),
+        (1, &[1, 0, 0x7f], &[1], 1),
+        (4, &[2, 8, 0x7f, 8, 0x7f], &[20], 20),
+        (4, &[1, 2, 0x7f], &[0x7f], 127),
+        (4, &[1, 2, 0x7f], &[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX),
+    ] {
+        for opcode in [0x20, 0x21, 0x22] {
+            let body = [locals, &[0x41, 1, opcode], leb, &[0x0b]].concat();
+            bad_typed_body(
+                &i32_type(parameter_count),
+                &body,
+                locals.len() + 3,
+                ErrorKind::InvalidIndex {
+                    field: IntegerField::LocalIndex,
+                    index,
+                },
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_local_index_leb_overflow() {
-    for fifth in [0x10, 0x7f, 0x80] {
-        let body = [0, 0x20, 0x80, 0x80, 0x80, 0x80, fifth, 0, 0x0b];
-        bad_typed_body(
-            &i32_type(1),
-            &body,
-            6,
-            ErrorKind::IntegerOverflow {
-                field: IntegerField::LocalIndex,
-            },
-        );
+    for opcode in [0x20, 0x21, 0x22] {
+        for fifth in [0x10, 0x7f, 0x80] {
+            let body = [0, 0x41, 1, opcode, 0x80, 0x80, 0x80, 0x80, fifth, 0, 0x0b];
+            bad_typed_body(
+                &i32_type(1),
+                &body,
+                8,
+                ErrorKind::IntegerOverflow {
+                    field: IntegerField::LocalIndex,
+                },
+            );
+        }
     }
 }
 
@@ -346,7 +473,7 @@ fn wraps_all_three_arithmetic_operations() {
 #[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x0b, 0x20, 0x41, 0x6a, 0x6b, 0x6c].contains(&opcode) {
+        if ![0x0b, 0x20, 0x21, 0x22, 0x41, 0x6a, 0x6b, 0x6c].contains(&opcode) {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],
                 3,
@@ -354,6 +481,22 @@ fn rejects_every_opcode_outside_the_slice() {
             );
         }
     }
+}
+
+#[test]
+fn set_pops_and_tee_preserves_an_operand_but_both_require_one() {
+    for opcode in [0x21, 0x22] {
+        bad_body(
+            &[1, 1, 0x7f, opcode, 0, 0x0b],
+            3,
+            ErrorKind::StackUnderflow { depth: 0 },
+        );
+    }
+    let set = [1, 1, 0x7f, 0x41, 7, 0x21, 0, 0x0b];
+    bad_body(&set, 7, ErrorKind::InvalidResultDepth { depth: 0 });
+    let mut tee = set;
+    tee[5] = 0x22;
+    assert_body_result(&tee, 7);
 }
 
 #[test]
@@ -423,10 +566,9 @@ fn bounds_instruction_count_inclusively() {
         Ok(pairs as i32)
     );
 
-    // A balanced program needs an odd number of non-end instructions. A further
-    // pair would preserve that shape but exceeds the budget at its first opcode.
+    // A tee preserves the final depth but exceeds the instruction budget by one.
     let extra = body.len() - 1;
-    body.splice(extra..extra, [0x20, 0, 0x6a]);
+    body.splice(extra..extra, [0x22, 0]);
     bad_typed_body(&ty, &body, extra, ErrorKind::LimitExceeded { limit });
 }
 
@@ -439,6 +581,7 @@ fn bounds_operand_depth_inclusively() {
         for _ in 0..depth {
             body.extend([0x20, 0]);
         }
+        body.extend([0x22, 0]); // A tee is valid at full depth; it doesn't push.
         body.extend(std::iter::repeat_n(0x6a, depth - 1));
         body.push(0x0b);
         body
@@ -587,13 +730,9 @@ fn requires_singleton_type_function_code_and_at_most_one_export() {
         (3, &[], FunctionCount, &[0, 2]),
         (7, &[], ExportCount, &[2]),
         (10, &[], CodeCount, &[0, 2]),
-        (10, &[1, 3], LocalGroupCount, &[1]),
     ] {
         for &count in bad_counts {
-            let mut payload = [prefix, &[count]].concat();
-            if field == LocalGroupCount {
-                payload.extend([0, 0x7f]); // Even a declared zero-count local group is outside the slice.
-            }
+            let payload = [prefix, &[count]].concat();
             bad_payload(
                 id,
                 &payload,
@@ -720,7 +859,12 @@ fn rejects_every_proper_prefix_of_the_demo_except_the_valid_empty_module() {
 #[test]
 fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
     use IntegerField::*;
-    for (opcode, field) in [(0x41, I32Const), (0x20, LocalIndex)] {
+    for (opcode, field) in [
+        (0x41, I32Const),
+        (0x20, LocalIndex),
+        (0x21, LocalIndex),
+        (0x22, LocalIndex),
+    ] {
         for count in 0..=4 {
             let body = [&[0, opcode][..], &[0x80; 4][..count]].concat();
             let mut code = code_body(&body);

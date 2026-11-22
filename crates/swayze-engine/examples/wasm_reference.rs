@@ -34,7 +34,7 @@ fn sleb32(mut value: i32, min_width: usize) -> Vec<u8> {
     }
 }
 
-fn singleton_module(parameter_count: u8, expression: &[u8]) -> Vec<u8> {
+fn singleton_module(parameter_count: u8, locals: &[u8], expression: &[u8]) -> Vec<u8> {
     let mut module = b"\0asm\x01\0\0\0".to_vec();
     module.extend([1, 5 + parameter_count, 1, 0x60, parameter_count]);
     module.extend(std::iter::repeat_n(0x7f, usize::from(parameter_count)));
@@ -45,9 +45,10 @@ fn singleton_module(parameter_count: u8, expression: &[u8]) -> Vec<u8> {
     module.extend([0, 0]); // Function export, index 0.
 
     // These tiny bodies fit single-byte section and body lengths.
-    assert!(expression.len() + 4 < 128);
-    let body_len = expression.len() as u8 + 2;
-    module.extend([10, body_len + 2, 1, body_len, 0]); // One body, no locals.
+    assert!(expression.len() + locals.len() + 3 < 128);
+    let body_len = (expression.len() + locals.len() + 1) as u8;
+    module.extend([10, body_len + 2, 1, body_len]);
+    module.extend_from_slice(locals);
     module.extend_from_slice(expression);
     module.push(0x0b); // end
     module
@@ -61,9 +62,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(expected: i32, args: &[i32], expression: &[u8]) -> Self {
+        Self::with_locals(expected, args, &[0], expression)
+    }
+
+    fn with_locals(expected: i32, args: &[i32], locals: &[u8], expression: &[u8]) -> Self {
         Self {
             expected,
-            bytes: singleton_module(u8::try_from(args.len()).unwrap(), expression),
+            bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression),
             args: args.to_vec(),
         }
     }
@@ -125,6 +130,15 @@ fn fixtures() -> Vec<Fixture> {
         42,
         &[4, 8, 15, 42],
         &[0x20, 0x83, 0x80, 0x80, 0x80, 0], // Padded local index 3.
+    ));
+    // A local is initially zero; parameter writes affect only this call.
+    cases.push(Fixture::with_locals(0, &[99], &[1, 1, 0x7f], &[0x20, 1]));
+    cases.push(Fixture::new(42, &[99], &[0x41, 42, 0x21, 0, 0x20, 0]));
+    cases.push(Fixture::with_locals(
+        42,
+        &[],
+        &[2, 3, 0x7f, 13, 0x7f],
+        &[0x41, 21, 0x22, 15, 0x20, 15, 0x6a],
     ));
     cases
 }

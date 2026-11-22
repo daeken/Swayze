@@ -13,6 +13,10 @@ if [ "$expected" != "$actual" ]; then
     echo "Test262 revision mismatch: superproject $expected, checkout $actual" >&2
     exit 1
 fi
+if ! git -C vendor/test262 diff --quiet --no-ext-diff --no-textconv HEAD --; then
+    echo 'Test262 tracked files differ from the pin or cannot be read' >&2
+    exit 1
+fi
 for file in LICENSE harness/assert.js harness/sta.js test/language/expressions/addition/S11.6.1_A1.js; do
     if [ ! -f "vendor/test262/$file" ]; then
         echo "Missing Test262 file: $file" >&2

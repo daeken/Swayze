@@ -15,9 +15,10 @@ corpus code:
 sh tools/check-test262.sh
 ```
 
-The check compares the submodule HEAD with the committed superproject gitlink and
-checks file presence, not file contents or local modifications. Use
-`git -C vendor/test262 status --short` to inspect local changes. This is a corpus
+The check compares the submodule HEAD with the committed superproject gitlink,
+checks representative paths, and rejects tracked changes. It does not inventory
+untracked files. Use a fresh checkout for CI; a future runner should discover
+cases from the pinned Git tree rather than a filesystem glob. This is a corpus
 smoke check, not a Test262 runner or a conformance/pass claim. Normal Cargo builds
 do not initialize, download, or execute the corpus.
 

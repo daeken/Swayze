@@ -1,10 +1,12 @@
-//! Bounded parser for a small JavaScript Script subset. See the [slice notes](#slice-notes).
+//! Bounded parser and evaluator for a small JavaScript Script subset. See the [slice notes](#slice-notes).
 //!
 //! # Slice notes
 #![doc = include_str!("../README.md")]
 
+mod eval;
 mod parser;
 
+pub use eval::EvalError;
 pub use parser::{
     Error, ErrorKind, Limit, Limits, Script, Span, parse_script, parse_script_with_limits,
 };
@@ -27,7 +29,7 @@ impl fmt::Display for Unsupported {
 impl std::error::Error for Unsupported {}
 
 /// Compatibility shim: always returns [`Unsupported`] without reading the source.
-/// Use [`parse_script`] for standalone parsing.
+/// Use [`parse_script`] and [`Script::evaluate`] for the arithmetic subset.
 pub fn prepare(_source: &str) -> Result<Infallible, Unsupported> {
     Err(Unsupported)
 }

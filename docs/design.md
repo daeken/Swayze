@@ -1,6 +1,6 @@
 # Swayze engine design — bootstrap draft
 
-**Status:** requirements for implementation, not a statement of guarantees the scaffold already provides. The first deliverable is a standalone interpreter library; its first deployment model of interest is *inside an untrusted browser renderer*. There is no executable guest language yet.
+**Status:** requirements for implementation, not a statement of guarantees the scaffold already provides. The first deliverable is a standalone interpreter library; its first deployment model of interest is *inside an untrusted browser renderer*. The working slices are standalone only; see the [README](../README.md) for current coverage.
 
 Decision order: **security, then performance, then breadth of standards coverage**. A feature we cannot bound or isolate stays off the untrusted-input path. A fast but observably wrong implementation does not count as supporting the feature.
 
@@ -8,7 +8,7 @@ Decision order: **security, then performance, then breadth of standards coverage
 
 Build the smallest working slice first. A parser does not need a completed GC design; a working interpreter does not need a proof of the JIT. Keep the seam that lets us replace a prototype (e.g. opaque handles instead of addresses, a specified reference semantics instead of “whatever this backend does”). The invariants below are targets for their respective features, not prerequisites for writing the first line of code.
 
-For each implemented slice, keep a short, versioned note next to the feature or in its feature matrix: **what works and where it may run; what evidence we have; what remains unproven or known wrong**. Update it when behavior or evidence changes. For example, today `prepare_js` and `prepare_wasm` reject all inputs; debug/release tests cover representative inputs; no parsing, isolation or memory-safety theorem has been established. A test pass, an audit and a proof are different claims. Exercise prototypes in standalone tests or an isolated fuzz harness, not on live pages. A prototype with open safety obligations can land without being enabled in Keanu.
+For each implemented slice, keep a short, versioned note next to the feature or in its feature matrix: **what works and where it may run; what evidence we have; what remains unproven or known wrong**. Update it when behavior or evidence changes. For example, see the [JS arithmetic evaluator notes](js-arithmetic.md) for what executes, what the tests show, and what is still missing. A test pass, an audit and a proof are different claims. Exercise prototypes in standalone tests or an isolated fuzz harness, not on live pages. A prototype with open safety obligations can land without being enabled in Keanu.
 
 ## System boundary
 

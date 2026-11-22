@@ -6,15 +6,16 @@ Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 produces `14.0`.
 
 This path evaluates an expression over supported integer literals with binary
-`+`, `-`, and `*`, including parenthesized grouping. The parser determines
-precedence and associativity. There are no variables, calls, coercions or other
+`+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
+The parser determines precedence and associativity. There are no variables, calls, coercions or other
 language execution facilities in this evaluator.
 
 The evaluator sees only the private postfix instructions, not the original
 source. Before allocating, it checks an execution ceiling of 4,096 instructions
 (one per literal or operator), independent of custom parse limits. It visits each
 instruction at most once. Each literal adds one operand and each binary
-operation consumes two operands and leaves one. The evaluator reserves storage
+operation consumes two operands and leaves one. A unary operation replaces the
+top operand. The evaluator reserves storage
 for the peak stack depth calculated by the parser, after checking that it is
 at most `ceil(n/2)` `f64` operands for `n` instructions. It rejects any
 attempt to exceed the reserved depth, missing operands, or anything other

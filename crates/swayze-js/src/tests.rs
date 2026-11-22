@@ -1,5 +1,6 @@
+use crate::parser::BindingKind;
 use crate::parser::Instruction::{
-    self, Add, Divide, InitConst, LoadConst, Multiply, Negate, Number, Positive, Remainder,
+    self, Add, Divide, InitBinding, LoadBinding, Multiply, Negate, Number, Positive, Remainder,
     Subtract,
 };
 use crate::{ErrorKind, Limit, Limits, Span, parse_script, parse_script_with_limits};
@@ -122,12 +123,12 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
         "const x = 2; const y = x * 5; y + 1;",
         &[
             Number(2.),
-            InitConst,
-            LoadConst(0),
+            InitBinding(BindingKind::Const),
+            LoadBinding(0),
             Number(5.),
             Multiply,
-            InitConst,
-            LoadConst(1),
+            InitBinding(BindingKind::Const),
+            LoadBinding(1),
             Number(1.),
             Add,
         ],
@@ -137,14 +138,14 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
         "const constx=1; const const0=constx; const const_=const0; const const$=const_; const$",
         &[
             Number(1.),
-            InitConst,
-            LoadConst(0),
-            InitConst,
-            LoadConst(1),
-            InitConst,
-            LoadConst(2),
-            InitConst,
-            LoadConst(3),
+            InitBinding(BindingKind::Const),
+            LoadBinding(0),
+            InitBinding(BindingKind::Const),
+            LoadBinding(1),
+            InitBinding(BindingKind::Const),
+            LoadBinding(2),
+            InitBinding(BindingKind::Const),
+            LoadBinding(3),
         ],
         1,
     );
@@ -154,10 +155,10 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
             Number(2.),
             Number(1.),
             Add,
-            InitConst,
-            LoadConst(0),
-            InitConst,
-            LoadConst(1),
+            InitBinding(BindingKind::Const),
+            LoadBinding(0),
+            InitBinding(BindingKind::Const),
+            LoadBinding(1),
         ],
         2,
     );
@@ -241,7 +242,7 @@ fn duplicate_declarations_are_early_errors_and_unavailable_reads_are_unsupported
     assert_error(duplicate, Malformed, 28, 29);
     assert_eq!(
         parse_script(duplicate).unwrap_err().message(),
-        "duplicate const declaration"
+        "duplicate binding declaration"
     );
     for (source, start, end) in [
         ("x", 0, 1),
@@ -255,7 +256,7 @@ fn duplicate_declarations_are_early_errors_and_unavailable_reads_are_unsupported
             parse_script(source)
                 .unwrap_err()
                 .message()
-                .contains("earlier const declaration")
+                .contains("earlier declaration")
         );
     }
 }
@@ -296,6 +297,151 @@ fn consts_charge_parsing_and_resolution_to_existing_budgets() {
             ..Limits::default()
         },
         Limit::NestingDepth,
+        8,
+        9,
+    );
+}
+
+#[test]
+fn lets_and_assignments_compile_to_ordered_slot_operations() {
+    use Instruction::StoreBinding;
+    assert_postfix(
+        "let x = 2; const step = 5; x = x * step; x + 1;",
+        &[
+            Number(2.),
+            InitBinding(BindingKind::Let),
+            Number(5.),
+            InitBinding(BindingKind::Const),
+            LoadBinding(0),
+            LoadBinding(1),
+            Multiply,
+            StoreBinding(0),
+            LoadBinding(0),
+            Number(1.),
+            Add,
+        ],
+        2,
+    );
+    assert_postfix(
+        "let/**/let0=1; let let_=let0; let let$=let_; let Let=let$; Let",
+        &[
+            Number(1.),
+            InitBinding(BindingKind::Let),
+            LoadBinding(0),
+            InitBinding(BindingKind::Let),
+            LoadBinding(1),
+            InitBinding(BindingKind::Let),
+            LoadBinding(2),
+            InitBinding(BindingKind::Let),
+            LoadBinding(3),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn mutable_binding_gaps_and_duplicate_declarations() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, start, end) in [
+        ("let let=1; 2", Unsupported, 4, 7),
+        ("let const=1; 2", Unsupported, 4, 9),
+        ("let eval=1; 2", Unsupported, 4, 8),
+        ("leté=1; 2", Unsupported, 3, 5),
+        ("let\\u0078=1; 2", Unsupported, 3, 4),
+        ("let x; x", Malformed, 5, 6),
+        ("let x=; x", Malformed, 6, 7),
+        ("let x=x; x", Unsupported, 6, 7),
+        ("let x=y; let y=1; x", Unsupported, 6, 7),
+        ("let x=1; x=y; let y=0; x", Unsupported, 11, 12),
+        ("let x=1; x=y; x", Unsupported, 11, 12),
+        ("x=1; let x=2; x", Unsupported, 0, 1),
+        ("x=1; 2", Unsupported, 0, 1),
+        ("const x=1; x=2; x", Unsupported, 12, 13),
+        ("let x=1; let x=2; x", Malformed, 13, 14),
+        ("let x=1; const x=2; x", Malformed, 15, 16),
+        ("const x=1; let x=2; x", Malformed, 15, 16),
+        ("let x=1; x=0; let x=2; x", Malformed, 18, 19),
+        ("{let x=1;} x", Unsupported, 0, 1),
+    ] {
+        assert_error(source, kind, start, end);
+    }
+}
+
+#[test]
+fn only_explicit_simple_assignments_before_the_final_expression() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, start, end) in [
+        ("let x=1; x=2", Unsupported, 12, 12),
+        ("let x=1; x=2;", Unsupported, 13, 13),
+        ("let x=1; x=; x", Malformed, 11, 12),
+        ("let x=1; x=", Malformed, 11, 11),
+        ("let x=1; x=2\nx", Unsupported, 13, 14),
+        ("let x=1; x=2/*\u{2028}*/x", Unsupported, 19, 20),
+        ("let x=1\nx=2; x", Unsupported, 8, 9),
+        ("let x=1; (x)=2; x", Unsupported, 12, 13),
+        ("let x=1; (x=2)", Unsupported, 11, 12),
+        ("let x=1; x + (x=2)", Unsupported, 15, 16),
+        ("let x=1; let y=(x=2); y", Unsupported, 17, 18),
+        ("let x=1; x=x=2; x", Unsupported, 12, 13),
+        ("let x=1; x+=2; x", Unsupported, 10, 12),
+        ("let x=1; x**=2; x", Unsupported, 10, 13),
+        ("let x=1; x==2; x", Unsupported, 10, 12),
+        ("let x=1; x=>2; x", Unsupported, 10, 12),
+        ("let x=1; x; x=2; x", Unsupported, 12, 13),
+        ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),
+        ("let x=1; x/*🚧", Malformed, 10, 16),
+        ("let x=1; x/*🚧*/2", Malformed, 18, 19),
+        ("let x=1; x/*\u{2028}*/2", Unsupported, 17, 18),
+    ] {
+        assert_error(source, kind, start, end);
+    }
+}
+
+#[test]
+fn assignment_lookahead_and_resolution_respect_inclusive_budgets() {
+    let source = "let x=0;x/*α*/=x+1;x/*\u{2028}*/+x; //β";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 15,
+        // Two decimal conversions, two pending operators, nine emissions,
+        // and four name resolutions at two units each.
+        max_work: source.len() + 21,
+        max_nesting_depth: 0,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.evaluate(), Ok(2.0));
+    let semicolon = source.rfind(';').unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 14,
+            ..limits
+        },
+        Limit::Tokens,
+        semicolon,
+        semicolon + 1,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        source.len() - 'β'.len_utf8(),
+        source.len(),
+    );
+    assert_limit("let x=0;x=(1);x", limits, Limit::NestingDepth, 10, 11);
+
+    // Stop within the assignment target lookup: eight scanned bytes,
+    // one conversion, two emitted ops, and two scanned lookahead bytes.
+    assert_limit(
+        "let x=0;x=1;x",
+        Limits {
+            max_work: 14,
+            ..limits
+        },
+        Limit::Work,
         8,
         9,
     );

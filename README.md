@@ -1,6 +1,6 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript can evaluate decimal arithmetic with per-script `const` bindings. WebAssembly can validate empty and custom-only modules and invoke a single import-free function by export name. It supports up to four `i32` arguments, 16 mutable `i32` locals and straight-line arithmetic. There is no JIT or browser sandbox here.
+Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript can evaluate decimal arithmetic with per-script `const` and `let` bindings and simple reassignment. WebAssembly can validate empty and custom-only modules and invoke a single import-free function by export name. It supports up to four `i32` arguments, 16 mutable `i32` locals and straight-line arithmetic. There is no JIT or browser sandbox here.
 
 Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current implementation makes no security-proof claim.
 
@@ -17,7 +17,7 @@ Start with the **[engine design](docs/design.md)** for the threat model, languag
 cargo run --frozen -p swayze-engine --example first_slice
 ```
 
-This prints `JavaScript result: 11` for `const x = 2; const y = x * 5; y + 1;` and `WebAssembly result: 42` for an exported Wasm function called with `45` and `3` that subtracts its arguments. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
+This prints `JavaScript result: 11` for `let x = 2; const step = 5; x = x * step; x + 1;` and `WebAssembly result: 42` for an exported Wasm function called with `45` and `3` that subtracts its arguments. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
 
 ## Check a checkout
 

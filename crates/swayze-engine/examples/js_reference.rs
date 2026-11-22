@@ -94,6 +94,12 @@ fn fixtures() -> Vec<String> {
             "8 / // divisor follows\n 2",
             "2 /****/+ 3",
             "2 /* /* nested opener ignored */ + 3",
+            "let x = 2; const step = 5; x = x * step; x + 1;",
+            "let x = .5; x = -x; let y = x; x = 4; y - x",
+            "let x = 2; x /* assignment */ = x + 5; x",
+            "let x = -0; x = x * 2; 1 / x",
+            "let x = 1; x = 0 / 0; x",
+            "let x = 3; let y = x * 2; x = y - x; y = y / x; x - y",
         ]
         .map(str::to_owned),
     );

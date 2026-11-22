@@ -140,11 +140,11 @@ impl std::error::Error for Error {}
 pub struct Script {
     instructions: Vec<Instruction>,
     max_stack_depth: usize,
-    const_slots: usize,
+    binding_slots: usize,
 }
 
 impl Script {
-    /// The number of literal, operator, binding read and binding initialization instructions.
+    /// The number of literal, operator, binding read, initialization and assignment instructions.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
@@ -158,8 +158,8 @@ impl Script {
         &self.instructions
     }
 
-    pub(crate) fn const_slots(&self) -> usize {
-        self.const_slots
+    pub(crate) fn binding_slots(&self) -> usize {
+        self.binding_slots
     }
 }
 
@@ -168,16 +168,23 @@ impl fmt::Debug for Script {
         f.debug_struct("Script")
             .field("instruction_count", &self.instruction_count())
             .field("max_stack_depth", &self.max_stack_depth())
-            .field("const_slots", &self.const_slots)
+            .field("binding_slots", &self.binding_slots)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BindingKind {
+    Const,
+    Let,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
-    LoadConst(usize),
-    InitConst,
+    LoadBinding(usize),
+    InitBinding(BindingKind),
+    StoreBinding(usize),
     Add,
     Subtract,
     Multiply,
@@ -213,6 +220,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
             tokens_left: limits.max_tokens,
             work_left: limits.max_work,
         },
+        lookahead: None,
         max_nesting_depth: limits.max_nesting_depth,
         pending: Vec::new(),
         postfix: Vec::new(),
@@ -260,7 +268,7 @@ impl Operator {
 enum TokenKind {
     Number(f64),
     Identifier,
-    Const,
+    Declaration(BindingKind),
     Equals,
     Operator(Operator),
     Open,
@@ -308,7 +316,7 @@ fn is_excluded_name(name: &str) -> bool {
             | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
             | "new" | "null" | "return" | "super" | "switch" | "this" | "throw" | "true"
             | "try" | "typeof" | "var" | "void" | "while" | "with" | "await" | "yield"
-            | "implements" | "interface" | "let" | "package" | "private" | "protected"
+            | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
             // Contextual syntax, strict-mode restricted names, and selected globals.
             | "as" | "async" | "from" | "get" | "of" | "set" | "using" | "eval"
@@ -450,18 +458,17 @@ impl Lexer<'_> {
             ));
         }
         let name = &self.source[start..self.offset];
-        if name == "const" {
-            Ok(TokenKind::Const)
-        } else if is_excluded_name(name) {
-            Err(Error::unsupported(
+        match name {
+            "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
+            "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
+            _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
                     end: self.offset,
                 },
                 "reserved or excluded name is outside the subset",
-            ))
-        } else {
-            Ok(TokenKind::Identifier)
+            )),
+            _ => Ok(TokenKind::Identifier),
         }
     }
 
@@ -594,43 +601,62 @@ impl Lexer<'_> {
 // `None` is a delimiter; otherwise this is a pending prefix or binary operator.
 type Pending = (Option<Operator>, Span);
 
+struct Binding {
+    name: Span,
+    kind: BindingKind,
+}
+
 struct Parser<'s> {
     lexer: Lexer<'s>,
+    // A top-level name may start an assignment or the final expression. Cache
+    // the next lexer result (including EOF) so the latter path never re-lexes it.
+    lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     pending: Vec<Pending>,
     postfix: Vec<Instruction>,
-    // Parse-only declaration spans in slot order; never retained by Script.
-    bindings: Vec<Span>,
+    // Parse-only declarations in slot order; never retained by Script.
+    bindings: Vec<Binding>,
     stack_depth: usize,
     max_stack_depth: usize,
 }
 
 impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
-        let mut next = self.lexer.next()?;
-        while matches!(
-            next,
-            Some(Token {
-                kind: TokenKind::Const,
-                ..
-            })
-        ) {
-            self.parse_const()?;
-            next = self.lexer.next()?;
+        loop {
+            let first = self.next_token()?.ok_or_else(|| {
+                Error::unsupported(
+                    Span::at(self.lexer.offset),
+                    if self.bindings.is_empty() {
+                        "empty scripts are outside the arithmetic subset"
+                    } else {
+                        "a final expression is required after binding statements"
+                    },
+                )
+            })?;
+            match first.kind {
+                TokenKind::Declaration(kind) => {
+                    self.parse_declaration(kind)?;
+                    continue;
+                }
+                TokenKind::Identifier => {
+                    let next = self.next_token()?;
+                    if let Some(Token {
+                        kind: TokenKind::Equals,
+                        span,
+                        ..
+                    }) = next
+                    {
+                        self.parse_assignment(first.span, span)?;
+                        continue;
+                    }
+                    self.lookahead = Some(next);
+                }
+                _ => {}
+            }
+            self.parse_expression(first, None)?;
+            break;
         }
-        let first = next.ok_or_else(|| {
-            let eof = Span::at(self.lexer.offset);
-            Error::unsupported(
-                eof,
-                if self.bindings.is_empty() {
-                    "empty scripts are outside the arithmetic subset"
-                } else {
-                    "a final expression is required after const declarations"
-                },
-            )
-        })?;
-        self.parse_expression(first, false)?;
-        if let Some(token) = self.lexer.next()? {
+        if let Some(token) = self.next_token()? {
             return Err(Error::unsupported(
                 token.span,
                 "no additional statements are supported after the final expression",
@@ -639,46 +665,80 @@ impl Parser<'_> {
         Ok(Script {
             instructions: self.postfix,
             max_stack_depth: self.max_stack_depth,
-            const_slots: self.bindings.len(),
+            binding_slots: self.bindings.len(),
         })
     }
 
+    fn next_token(&mut self) -> Result<Option<Token>, Error> {
+        match self.lookahead.take() {
+            Some(next) => Ok(next),
+            None => self.lexer.next(),
+        }
+    }
+
     fn require_token(&mut self, message: &'static str) -> Result<Token, Error> {
-        self.lexer
-            .next()?
+        self.next_token()?
             .ok_or_else(|| Error::malformed(Span::at(self.lexer.offset), message))
     }
 
-    fn parse_const(&mut self) -> Result<(), Error> {
-        let name = self.require_token("expected a const binding name")?;
+    fn parse_declaration(&mut self, kind: BindingKind) -> Result<(), Error> {
+        let name = self.require_token("expected a binding name")?;
         match name.kind {
             TokenKind::Identifier => {}
-            TokenKind::Const => {
-                return Err(Error::unsupported(name.span, "const is a reserved name"));
+            TokenKind::Declaration(_) => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "const and let are reserved names",
+                ));
             }
-            _ => return Err(Error::malformed(name.span, "expected a const binding name")),
+            _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         if self.lookup_binding(name.span)?.is_some() {
-            return Err(Error::malformed(name.span, "duplicate const declaration"));
+            return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
-        let equals = self.require_token("expected '=' after the const name")?;
+        let equals = self.require_token("expected '=' after the binding name")?;
         if !matches!(equals.kind, TokenKind::Equals) {
             return Err(Error::malformed(
                 equals.span,
-                "expected '=' after the const name",
+                "expected '=' after the binding name",
             ));
         }
-        let first = self.require_token("expected a const initializer")?;
-        let end = self.parse_expression(first, true)?;
-        self.emit(Instruction::InitConst, end)?;
-        try_push(&mut self.bindings, name.span, name.span)
+        let first = self.require_token("expected a binding initializer")?;
+        let missing_semicolon = match kind {
+            BindingKind::Const => "const declarations require explicit semicolons",
+            BindingKind::Let => "let declarations require explicit semicolons",
+        };
+        let end = self.parse_expression(first, Some(missing_semicolon))?;
+        self.emit(Instruction::InitBinding(kind), end)?;
+        // Expose the name only after its initializer: self and forward access
+        // cannot resolve to a slot.
+        let binding = Binding {
+            name: name.span,
+            kind,
+        };
+        try_push(&mut self.bindings, binding, name.span)
+    }
+
+    fn parse_assignment(&mut self, name: Span, equals: Span) -> Result<(), Error> {
+        let slot = self.lookup_binding(name)?.ok_or_else(|| {
+            Error::unsupported(name, "assignment requires an earlier let declaration")
+        })?;
+        if self.bindings[slot].kind != BindingKind::Let {
+            return Err(Error::unsupported(
+                equals,
+                "assignment to const is outside the subset",
+            ));
+        }
+        let first = self.require_token("expected an assignment value")?;
+        let end = self.parse_expression(first, Some("assignments require explicit semicolons"))?;
+        self.emit(Instruction::StoreBinding(slot), end)
     }
 
     fn lookup_binding(&mut self, span: Span) -> Result<Option<usize>, Error> {
         let source = self.lexer.source;
         let name = &source[span.start..span.end];
         for (slot, binding) in self.bindings.iter().enumerate() {
-            let candidate = &source[binding.start..binding.end];
+            let candidate = &source[binding.name.start..binding.name.end];
             self.lexer.charge(1, span)?;
             if name.len() == candidate.len() {
                 self.lexer.charge(name.len(), span)?;
@@ -690,7 +750,11 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    fn parse_expression(&mut self, first: Token, initializer: bool) -> Result<Span, Error> {
+    fn parse_expression(
+        &mut self,
+        first: Token,
+        missing_semicolon: Option<&'static str>,
+    ) -> Result<Span, Error> {
         let mut nesting = 0;
         let mut needs_operand = true;
         let mut seen_token = false;
@@ -710,11 +774,8 @@ impl Parser<'_> {
                         "expected a closing parenthesis before end of source",
                     ));
                 }
-                if initializer {
-                    return Err(Error::unsupported(
-                        eof,
-                        "const declarations require explicit semicolons",
-                    ));
+                if let Some(message) = missing_semicolon {
+                    return Err(Error::unsupported(eof, message));
                 }
                 break eof;
             };
@@ -727,21 +788,20 @@ impl Parser<'_> {
                 (_, TokenKind::Equals) => {
                     return Err(Error::unsupported(
                         span,
-                        "assignments are outside the subset",
+                        "assignment expressions are outside the subset",
                     ));
                 }
-                (false, TokenKind::Const | TokenKind::Number(_) | TokenKind::Identifier)
-                    if initializer && nesting == 0 && after_line_break =>
-                {
+                (_, TokenKind::Declaration(_)) => {
+                    if !needs_operand
+                        && nesting == 0
+                        && after_line_break
+                        && let Some(message) = missing_semicolon
+                    {
+                        return Err(Error::unsupported(span, message));
+                    }
                     return Err(Error::unsupported(
                         span,
-                        "const declarations require explicit semicolons",
-                    ));
-                }
-                (_, TokenKind::Const) => {
-                    return Err(Error::unsupported(
-                        span,
-                        "const declarations can only precede the final expression",
+                        "declarations are only allowed as top-level statements before the final expression",
                     ));
                 }
                 (true, TokenKind::Number(value)) => {
@@ -750,9 +810,9 @@ impl Parser<'_> {
                 }
                 (true, TokenKind::Identifier) => {
                     let slot = self.lookup_binding(span)?.ok_or_else(|| {
-                        Error::unsupported(span, "read requires an earlier const declaration; self, forward and unbound reads are outside the subset")
+                        Error::unsupported(span, "read requires an earlier declaration; self, forward and unbound reads are outside the subset")
                     })?;
-                    self.emit(Instruction::LoadConst(slot), span)?;
+                    self.emit(Instruction::LoadBinding(slot), span)?;
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {
@@ -778,7 +838,7 @@ impl Parser<'_> {
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Some(prefix), span)?;
                 }
-                (true, TokenKind::Semicolon) if !initializer && !seen_token => {
+                (true, TokenKind::Semicolon) if missing_semicolon.is_none() && !seen_token => {
                     return Err(Error::unsupported(
                         span,
                         "empty statements are outside the arithmetic subset",
@@ -834,7 +894,7 @@ impl Parser<'_> {
                 {
                     return Err(Error::unsupported(
                         span,
-                        "only one expression statement is supported",
+                        missing_semicolon.unwrap_or("only one expression statement is supported"),
                     ));
                 }
                 (false, TokenKind::Number(_) | TokenKind::Identifier) => {
@@ -849,7 +909,7 @@ impl Parser<'_> {
                 }
             }
             seen_token = true;
-            next = self.lexer.next()?;
+            next = self.next_token()?;
         };
         while let Some((op, at)) = self.pending.pop() {
             let op = op.ok_or_else(|| Error::malformed(at, "unmatched opening parenthesis"))?;
@@ -875,8 +935,8 @@ impl Parser<'_> {
             Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
-            Instruction::Number(_) | Instruction::LoadConst(_) => (0, 1),
-            Instruction::InitConst => (1, 0),
+            Instruction::Number(_) | Instruction::LoadBinding(_) => (0, 1),
+            Instruction::InitBinding(_) | Instruction::StoreBinding(_) => (1, 0),
             Instruction::Positive | Instruction::Negate => (1, 1),
             Instruction::Add
             | Instruction::Subtract

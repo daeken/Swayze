@@ -1,4 +1,4 @@
-use swayze_js::{ErrorKind, EvalError, Limits, parse_script, parse_script_with_limits};
+use swayze_js::{ErrorKind, EvalError, Limits, Value, parse_script, parse_script_with_limits};
 
 #[test]
 fn numeric_toboolean_and_selected_number() {
@@ -73,7 +73,7 @@ fn both_arms_are_parsed_but_remain_expression_only() {
         "const x = 0 ? x : 1; x",
         "let x = 1; 0 ? (x = 2) : x",
         "let x = 1; x = 1 ? 2 : x = 3; x",
-        "1 ? 2 : true",
+        "true ? 2 : null",
     ] {
         assert_eq!(
             parse_script(source).unwrap_err().kind(),
@@ -90,11 +90,13 @@ fn skipped_instructions_count_toward_evaluation_ceiling() {
         max_tokens: 4097,
         ..Limits::default()
     };
-    let at_cap = parse_script_with_limits(&format!("1?7:{body}0"), limits).unwrap();
+    let at_cap = parse_script_with_limits(&format!("true?false:{body}0"), limits).unwrap();
     assert_eq!(at_cap.instruction_count(), 4096);
-    assert_eq!(at_cap.evaluate(), Ok(7.0));
+    assert_eq!(at_cap.evaluate_value(), Ok(Value::Boolean(false)));
+    assert_eq!(at_cap.evaluate(), Err(EvalError::NonNumericResult));
 
-    let over_cap = parse_script_with_limits(&format!("1?7:{body}-0"), limits).unwrap();
+    let over_cap = parse_script_with_limits(&format!("true?false:{body}-0"), limits).unwrap();
     assert_eq!(over_cap.instruction_count(), 4097);
+    assert_eq!(over_cap.evaluate_value(), Err(EvalError::LimitExceeded));
     assert_eq!(over_cap.evaluate(), Err(EvalError::LimitExceeded));
 }

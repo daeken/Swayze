@@ -25,6 +25,93 @@ fn assert_limit(source: &str, limits: Limits, limit: Limit, start: usize, end: u
 }
 
 #[test]
+fn booleans_are_whole_tokens_not_names_or_prefixes_of_names() {
+    use ErrorKind::{Malformed, Unsupported};
+    use Instruction::Boolean;
+
+    assert_postfix("true", &[Boolean(true)], 1);
+    assert_postfix("(/*comment*/false\u{00A0});", &[Boolean(false)], 1);
+    for literal in ["true", "false"] {
+        for suffix in ["x", "0", "_", "$"] {
+            let name = format!("{literal}{suffix}");
+            assert_error(&name, Unsupported, 0, name.len());
+            assert_postfix(
+                &format!("let {name}=true;{name}"),
+                &[Boolean(true), InitBinding(BindingKind::Let), LoadBinding(0)],
+                1,
+            );
+        }
+        for suffix in ["é", "\u{200D}", "\\u0061"] {
+            assert_error(
+                &format!("{literal}{suffix}"),
+                Unsupported,
+                literal.len(),
+                literal.len() + suffix.chars().next().unwrap().len_utf8(),
+            );
+        }
+        for declaration in ["const", "let"] {
+            let start = declaration.len() + 1;
+            assert_error(
+                &format!("{declaration} {literal}=1; 2"),
+                Unsupported,
+                start,
+                start + literal.len(),
+            );
+        }
+    }
+    assert_postfix(
+        "const True=false; True",
+        &[
+            Boolean(false),
+            InitBinding(BindingKind::Const),
+            LoadBinding(0),
+        ],
+        1,
+    );
+    assert_error("true=1; false", Unsupported, 4, 5);
+    assert_error("1true", Unsupported, 1, 2);
+    assert_error("false true", Malformed, 6, 10);
+    assert_error("false\ntrue", Unsupported, 6, 10);
+    assert_error("true;false", Unsupported, 5, 10);
+}
+
+#[test]
+fn boolean_literals_share_token_and_emission_budgets_without_decimal_conversion() {
+    let source = "true?false:0";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 5,
+        max_nesting_depth: 1,
+        // Source bytes, one decimal conversion byte, five emissions, two pending pushes.
+        max_work: source.len() + 8,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 5);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate_value(), Ok(crate::Value::Boolean(false)));
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 4,
+            ..limits
+        },
+        Limit::Tokens,
+        11,
+        12,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        11,
+        12,
+    );
+}
+
+#[test]
 fn precedence_associativity_and_grouping() {
     assert_postfix(
         "1 + 2 * (3-4);",
@@ -299,7 +386,6 @@ fn consts_decline_reserved_and_non_subset_names_without_splitting() {
         "for",
         "return",
         "class",
-        "true",
         "enum",
         "await",
         "yield",

@@ -6,7 +6,7 @@
 mod eval;
 mod parser;
 
-pub use eval::EvalError;
+pub use eval::{EvalError, Value};
 pub use parser::{
     Error, ErrorKind, Limit, Limits, Script, Span, parse_script, parse_script_with_limits,
 };
@@ -29,7 +29,7 @@ impl fmt::Display for Unsupported {
 impl std::error::Error for Unsupported {}
 
 /// Compatibility shim: always returns [`Unsupported`] without reading the source.
-/// Use [`parse_script`] and [`Script::evaluate`] for the arithmetic subset.
+/// Use [`parse_script`] and [`Script::evaluate_value`] for the supported subset.
 pub fn prepare(_source: &str) -> Result<Infallible, Unsupported> {
     Err(Unsupported)
 }

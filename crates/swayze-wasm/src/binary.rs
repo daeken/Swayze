@@ -1,4 +1,4 @@
-use crate::{Function, InvokeError, Module, Trap};
+use crate::{Export, InvokeError, Module, Trap};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -36,6 +36,7 @@ pub enum ErrorKind {
     TruncatedBody { declared: usize, available: usize },
     TruncatedName { declared: usize, available: usize },
     InvalidUtf8Name,
+    DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
     TruncatedByte { expected: u8 },
@@ -157,6 +158,7 @@ impl fmt::Display for Error {
                 "name declares {declared} bytes but only {available} remain in its section"
             ),
             InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
+            DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
             TruncatedByte { expected } => write!(f, "missing expected byte {expected:#04x}"),
@@ -193,9 +195,10 @@ impl std::error::Error for Error {}
 /// Validate the crate's [supported slice](crate#supported-slice) of WebAssembly Core 1.0.
 ///
 /// Success checks the complete input and returns an owned module without
-/// executing it. Work is at most linear in the input length. Allocations retain
-/// only validated instructions and an optional export name, with sizes bounded by
-/// [`Limit::BodyInstructions`] and [`Limit::ExportNameBytes`].
+/// executing it. Work is at most linear in the input length under the fixed
+/// section and vector caps. Allocations retain up to eight bodies bounded by
+/// [`Limit::BodyInstructions`] and eight export entries with names bounded by
+/// [`Limit::ExportNameBytes`].
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -205,6 +208,9 @@ impl std::error::Error for Error {}
 /// of the invalid or incomplete sequence.
 /// A local group's count that exceeds the remaining declared-local budget is
 /// reported as [`ErrorKind::UnsupportedCount`] with [`IntegerField::LocalCount`].
+/// A code count differing from the function count is reported as
+/// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
+/// A repeated export name is reported at the start of its length field.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -221,9 +227,9 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
 
     let mut last_standard = 0;
     let mut parameter_count = None;
-    let mut has_function = false;
-    let mut export = None;
-    let mut code = None;
+    let mut function_count = None;
+    let mut functions = Vec::new();
+    let mut exports = Vec::new();
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -258,15 +264,18 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         match id {
             1 => parameter_count = Some(validate_type(&mut section)?),
             3 => {
-                section.count(IntegerField::FunctionCount, 1..=1)?;
-                section.index(IntegerField::TypeIndex, 1)?;
-                has_function = true;
+                let count = section.count(IntegerField::FunctionCount, 1..=MAX_FUNCTIONS)?;
+                for _ in 0..count {
+                    section.index(IntegerField::TypeIndex, 1)?;
+                }
+                function_count = Some(count);
             }
-            7 => export = validate_export(&mut section)?,
+            7 => exports = validate_exports(&mut section, function_count)?,
             10 => {
-                // With no type section there are no indices to permit, and the
-                // required-section check below will reject any such module.
-                code = Some(validate_code(&mut section, parameter_count.unwrap_or(0))?);
+                // Decode even without the type section, so framing and ordering
+                // errors still take precedence. The final presence check rejects it.
+                functions =
+                    validate_code(&mut section, function_count, parameter_count.unwrap_or(0))?;
             }
             _ => {
                 return Err(Error {
@@ -282,31 +291,19 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
     }
     if last_standard != 0 {
-        // The exact counts, zero indices, and presence of all three sections
-        // together establish the type/function/code and export relationships.
+        // The presence of all three sections makes the count and index checks
+        // above sufficient to associate each export with a validated body.
         for (id, present) in [
             (1, parameter_count.is_some()),
-            (3, has_function),
-            (10, code.is_some()),
+            (3, function_count.is_some()),
+            (10, !functions.is_empty()),
         ] {
             if !present {
                 return Err(module.error(ErrorKind::MissingSection { id }));
             }
         }
     }
-    let export = if let Some(name) = export {
-        let mut owned = String::new();
-        owned
-            .try_reserve_exact(name.len())
-            .map_err(|_| module.error(ErrorKind::AllocationFailed))?;
-        owned.push_str(name);
-        Some(owned)
-    } else {
-        None
-    };
-    Ok(Module {
-        function: code.map(|code| Function { code, export }),
-    })
+    Ok(Module { functions, exports })
 }
 
 fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
@@ -340,6 +337,8 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+const MAX_FUNCTIONS: u32 = 8;
+const MAX_EXPORTS: u32 = 8;
 const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
@@ -357,14 +356,45 @@ fn validate_type(section: &mut Reader<'_>) -> Result<u32, Error> {
     Ok(parameter_count)
 }
 
-fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Error> {
-    if section.count(IntegerField::ExportCount, 0..=1)? == 0 {
-        return Ok(None);
+fn validate_exports(
+    section: &mut Reader<'_>,
+    function_count: Option<u32>,
+) -> Result<Vec<Export>, Error> {
+    let allocation_error = section.error(ErrorKind::AllocationFailed);
+    let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
+    let mut exports: Vec<Export> = Vec::new();
+    exports
+        .try_reserve_exact(count as usize)
+        .map_err(|_| allocation_error)?;
+    for _ in 0..count {
+        let offset = section.position();
+        let name = section.name(LengthField::ExportNameSize)?;
+        if exports.iter().any(|export| export.name == name) {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::DuplicateExportName,
+            });
+        }
+        section.expect_byte(0x00)?; // function export descriptor
+        let index = if let Some(bound) = function_count {
+            section.index(IntegerField::FunctionIndex, bound)?
+        } else {
+            // No valid target without a function section. Preserve framing and
+            // order checks before the final required-section check rejects it.
+            section.integer(IntegerField::FunctionIndex)?
+        };
+        let mut owned = String::new();
+        owned.try_reserve_exact(name.len()).map_err(|_| Error {
+            offset,
+            kind: ErrorKind::AllocationFailed,
+        })?;
+        owned.push_str(name);
+        exports.push(Export {
+            name: owned,
+            function_index: index as usize,
+        });
     }
-    let name = section.name(LengthField::ExportNameSize)?;
-    section.expect_byte(0x00)?; // function export descriptor
-    section.index(IntegerField::FunctionIndex, 1)?;
-    Ok(Some(name))
+    Ok(exports)
 }
 
 const IF: u8 = 0x04;
@@ -580,8 +610,25 @@ fn decode_plain(
     })
 }
 
-fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
-    section.count(IntegerField::CodeCount, 1..=1)?;
+fn validate_code(
+    section: &mut Reader<'_>,
+    function_count: Option<u32>,
+    parameter_count: u32,
+) -> Result<Vec<ValidatedCode>, Error> {
+    let allocation_error = section.error(ErrorKind::AllocationFailed);
+    let allowed_counts = function_count.map_or(1..=MAX_FUNCTIONS, |count| count..=count);
+    let count = section.count(IntegerField::CodeCount, allowed_counts)?;
+    let mut functions = Vec::new();
+    functions
+        .try_reserve_exact(count as usize)
+        .map_err(|_| allocation_error)?;
+    for _ in 0..count {
+        functions.push(validate_body(section, parameter_count)?);
+    }
+    Ok(functions)
+}
+
+fn validate_body(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
     let mut body = section.frame(declared).ok_or(Error {

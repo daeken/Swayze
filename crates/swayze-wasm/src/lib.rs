@@ -3,12 +3,13 @@
 //! # Supported slice
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
-//! custom sections within [`Limit`], and either no standard sections or exactly
-//! one type, one function, and one code body in their respective sections. The
-//! type must have zero to four `i32` parameters and exactly one `i32` result.
-//! The function must reference type zero. Its body may declare up to 16 `i32`
-//! locals in total. The number of groups and each group's local count are
-//! unsigned LEB32; zero-count groups are allowed but must still specify `i32`.
+//! custom sections within [`Limit`], and either no standard sections or one
+//! type, one to eight function declarations, and exactly as many code bodies,
+//! in that section order. The singleton type must have zero to four `i32`
+//! parameters and exactly one `i32` result. Every function references type
+//! zero. Each body may declare up to 16 `i32` locals in total. The number of
+//! groups and each group's local count are unsigned LEB32; zero-count groups
+//! are allowed but must still specify `i32`.
 //! Supported instructions are `local.get`, `local.set`, `local.tee` (each with
 //! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
 //! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
@@ -19,8 +20,11 @@
 //! Both can be assigned. `if` can nest, takes no block parameters, and requires
 //! both arms. There are no calls, `block`, `loop`, `br`, `return`, `unreachable`,
 //! or other control instructions.
-//! An optional export section between function and code may contain zero or one
-//! export, which must refer to function zero. Both kinds of names must be UTF-8.
+//! An optional export section between function and code may contain zero to
+//! eight function exports. Name matching is exact (no Unicode normalization),
+//! and duplicate export names are rejected. Each export refers to a defined
+//! function by its zero-based declaration index. Distinct names may refer to
+//! the same function. Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import, memory, and start) are
 //! rejected, even when empty.
@@ -41,11 +45,12 @@
 //! instructions (including `if` and `else` across both arms, excluding `end`),
 //! 32 live i32 operands including those below arm floors, and 16 nested `if`s.
 //!
-//! Validation checks the entire input before returning an owned [`Module`] with
-//! private decoded instructions and an optional bounded export name. A separate
-//! [`Module::instantiate`] step creates an [`Instance`]. Its typed
-//! [`Instance::invoke_i32_with_args`] method looks up the exact export name,
-//! checks the argument count, and executes without allocating or recursing.
+//! Validation checks the entire input, including every body even if unexported,
+//! before returning an immutable, owned [`Module`] with private decoded bodies
+//! and named export entries. A separate [`Module::instantiate`] step creates an
+//! [`Instance`]. Its typed [`Instance::invoke_i32_with_args`] method scans at
+//! most eight export names for an exact match, then checks the argument count
+//! and executes only the selected body without allocating or recursing.
 //! Zero selects the else arm; every nonzero i32 selects the then arm. Validation
 //! uses a fixed stack of control frames and backpatches private jump targets at
 //! matching delimiters. Each target is a strictly later decoded instruction
@@ -82,6 +87,10 @@
 //! successive calls, wrapping arithmetic after discarding the input, signed and
 //! unsigned division and remainder edge cases, name and arity checks before
 //! execution, and stopping at the first guest trap and reusing the instance.
+//! Multi-function tests check dispatch by declaration index, exact UTF-8 names
+//! and aliases, shared arity, traps and fresh local state across dispatches,
+//! duplicate names, invalid indices, count agreement and caps, and validation
+//! of later unexported bodies and their frame boundaries.
 //! Comparison tests cover exact 0/1 results, equal operands and signed versus
 //! unsigned boundary values, unary and binary underflows at the function and
 //! arm floors, conditional selection, and comparisons at the instruction and
@@ -95,8 +104,11 @@
 //! expanding groups. It uses bounded borrowed frames and decodes instructions
 //! into a fixed-size scratch array. After checking `end` and the complete body
 //! frame, it calls `Vec::try_reserve_exact` for the decoded instruction count and
-//! copies those instructions. The export name is also reserved fallibly. There
-//! is no unsafe code, recursion, or external dependency.
+//! copies those instructions. The body and export vectors are reserved fallibly
+//! after checking their counts, and each name is reserved fallibly after checking
+//! its length. The count caps bound aggregate decoding to eight body budgets and
+//! duplicate checks to at most 28 comparisons of bounded names. There is no
+//! unsafe code, recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!
@@ -112,17 +124,18 @@ use std::{convert::Infallible, fmt};
 ///
 /// ```compile_fail
 /// use swayze_wasm::Module;
-/// let forged = Module { function: None };
+/// let forged = Module { functions: Vec::new(), exports: Vec::new() };
 /// ```
 #[derive(Debug)]
 pub struct Module {
-    function: Option<Function>,
+    functions: Vec<binary::ValidatedCode>,
+    exports: Vec<Export>,
 }
 
 #[derive(Debug)]
-struct Function {
-    code: binary::ValidatedCode,
-    export: Option<String>,
+struct Export {
+    name: String,
+    function_index: usize,
 }
 
 impl Module {
@@ -165,12 +178,14 @@ impl Instance<'_> {
     /// locals are initialized to zero on each invocation. A guest trap stops
     /// execution and returns [`InvokeError::Trap`] without affecting later calls.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
-        match &self.module.function {
-            Some(function) if function.export.as_deref() == Some(name) => {
-                function.code.execute(args)
-            }
-            _ => Err(InvokeError::ExportNotFound),
-        }
+        let export = self
+            .module
+            .exports
+            .iter()
+            .find(|export| export.name == name)
+            .ok_or(InvokeError::ExportNotFound)?;
+        // Validation checks the index against the exact number of decoded bodies.
+        self.module.functions[export.function_index].execute(args)
     }
 }
 

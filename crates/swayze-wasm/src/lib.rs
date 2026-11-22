@@ -14,12 +14,14 @@
 //! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
 //! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
-//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, and
+//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `call`, and
 //! `if (result i32) ... else ... end` (block type byte `0x7f`). Local indices
 //! start at zero and address parameters first, then locals in declaration order.
-//! Both can be assigned. `if` can nest, takes no block parameters, and requires
-//! both arms. There are no calls, `block`, `loop`, `br`, `return`, `unreachable`,
-//! or other control instructions.
+//! Both can be assigned. `call` takes an unsigned LEB32 index into the exact
+//! function declarations, including forward and self references. `if` can nest,
+//! takes no block parameters, and requires both arms. There are no indirect
+//! calls, `block`, `loop`, `br`, `return`, `unreachable`, or other control
+//! instructions.
 //! An optional export section between function and code may contain zero to
 //! eight function exports. Name matching is exact (no Unicode normalization),
 //! and duplicate export names are rejected. Each export refers to a defined
@@ -33,9 +35,11 @@
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
 //! `local.set` pops one, `local.tee` requires and leaves the top operand,
 //! `i32.eqz` consumes one and pushes one, and the binary operators consume two
-//! and push one. `if` consumes an i32 condition from above the enclosing
-//! frame's operand floor and saves the remaining depth as the floor for both
-//! arms. Every operand access in an arm must stay above that floor. `else`
+//! and push one. `call` consumes as many i32s as the shared type has parameters
+//! (the top operand is the last parameter) and pushes one result. `if` consumes
+//! an i32 condition from above the enclosing frame's operand floor and saves
+//! the remaining depth as the floor for both arms. Every operand access in an
+//! arm must stay above that floor. `else`
 //! checks for exactly one new result and resets validation to the saved depth,
 //! and the matching `end` checks that the else arm also leaves exactly one new
 //! result. Both arms are checked regardless of the condition.
@@ -50,15 +54,17 @@
 //! and named export entries. A separate [`Module::instantiate`] step creates an
 //! [`Instance`]. Its typed [`Instance::invoke_i32_with_args`] method scans at
 //! most eight export names for an exact match, then checks the argument count
-//! and executes only the selected body without allocating or recursing.
-//! Zero selects the else arm; every nonzero i32 selects the then arm. Validation
-//! uses a fixed stack of control frames and backpatches private jump targets at
-//! matching delimiters. Each target is a strictly later decoded instruction
-//! index or the one-past-last index. Execution visits each decoded instruction
-//! at most once, and never executes an untaken arm.
-//! Each invocation has a fixed operand stack and fixed local storage:
-//! parameters are copied from the supplied arguments, and declared locals start
-//! at zero on every call. [`Instance::invoke_i32`] is equivalent to passing an
+//! and begins execution at the selected body without allocating or recursing
+//! in Rust. Zero selects the else arm; every nonzero i32 selects the then arm.
+//! Validation uses a fixed stack of control frames and backpatches private jump
+//! targets at matching delimiters. Each jump target is a strictly later decoded
+//! instruction index or the one-past-last index in the same body. Execution
+//! never visits an untaken arm.
+//! Each active call frame has its own fixed operand stack and local storage.
+//! Parameters are copied from the supplied arguments or caller's operands, and
+//! declared locals start at zero for every frame. A callee starts with no
+//! operands. Its single result is pushed onto the caller's remaining operands
+//! before execution resumes. [`Instance::invoke_i32`] is equivalent to passing an
 //! empty argument slice. The top operand is the right-hand side of each binary
 //! operation. `i32.eqz` tests for zero, and `i32.eq` and `i32.ne` compare the
 //! operand bits for equality or inequality. Ordering comparisons interpret the
@@ -73,8 +79,16 @@
 //! `i32::MIN / -1` traps for signed division; signed remainder for those operands
 //! returns zero. These are runtime outcomes, not validation errors.
 //! [`InvokeError::Trap`] reports the first guest trap and skips all remaining
-//! instructions. The same instance can be invoked again with fresh call-local
-//! state. Empty, custom-only, and unexported modules have no callable exports.
+//! instructions, including in callers. Host resource limits are separate:
+//! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
+//! exceed either 16 live frames (including the exported function) or 1024 total
+//! instruction dispatches. Every executed decoded instruction costs one dispatch,
+//! including a `call`, `if` test, or an executed `else` jump. Untaken instructions,
+//! `end` delimiters and returning from frames cost nothing. An invocation can
+//! return just after its last allowed dispatch. If the next instruction would
+//! exceed the dispatch budget, that limit takes precedence over executing it.
+//! The same instance can be invoked again with fresh call-local state and budgets.
+//! Empty, custom-only, and unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -91,6 +105,11 @@
 //! and aliases, shared arity, traps and fresh local state across dispatches,
 //! duplicate names, invalid indices, count agreement and caps, and validation
 //! of later unexported bodies and their frame boundaries.
+//! Direct-call tests cover nested and repeated calls, forward and self targets,
+//! zero and four parameters, frame isolation, bounded index decoding and stack
+//! effects at arm floors, and propagation and reuse after traps or execution
+//! limits. Budget tests exercise the last allowed frame and dispatch, the next
+//! attempted frame and dispatch, and budget sharing across completed callees.
 //! Comparison tests cover exact 0/1 results, equal operands and signed versus
 //! unsigned boundary values, unary and binary underflows at the function and
 //! arm floors, conditional selection, and comparisons at the instruction and
@@ -108,7 +127,7 @@
 //! after checking their counts, and each name is reserved fallibly after checking
 //! its length. The count caps bound aggregate decoding to eight body budgets and
 //! duplicate checks to at most 28 comparisons of bounded names. There is no
-//! unsafe code, recursion, or external dependency.
+//! unsafe code, Rust recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!
@@ -124,10 +143,11 @@ use std::{convert::Infallible, fmt};
 ///
 /// ```compile_fail
 /// use swayze_wasm::Module;
-/// let forged = Module { functions: Vec::new(), exports: Vec::new() };
+/// let forged = Module { parameter_count: 0, functions: Vec::new(), exports: Vec::new() };
 /// ```
 #[derive(Debug)]
 pub struct Module {
+    parameter_count: usize,
     functions: Vec<binary::ValidatedCode>,
     exports: Vec<Export>,
 }
@@ -155,7 +175,8 @@ pub struct Instance<'module> {
 impl Instance<'_> {
     /// Invoke the exact named export as a `() -> i32` function.
     /// A matching export with parameters returns [`InvokeError::ArityMismatch`].
-    /// A guest trap returns [`InvokeError::Trap`].
+    /// A guest trap returns [`InvokeError::Trap`]; exceeding a host execution
+    /// limit returns [`InvokeError::LimitExceeded`] instead.
     ///
     /// ```
     /// use swayze_wasm::validate_module;
@@ -176,7 +197,8 @@ impl Instance<'_> {
     /// or this returns [`InvokeError::ArityMismatch`] without executing code.
     /// Assignments to parameters do not affect the supplied slice, and declared
     /// locals are initialized to zero on each invocation. A guest trap stops
-    /// execution and returns [`InvokeError::Trap`] without affecting later calls.
+    /// execution and returns [`InvokeError::Trap`]; exceeding a host execution
+    /// limit returns [`InvokeError::LimitExceeded`]. Neither affects later calls.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         let export = self
             .module
@@ -184,12 +206,12 @@ impl Instance<'_> {
             .iter()
             .find(|export| export.name == name)
             .ok_or(InvokeError::ExportNotFound)?;
-        // Validation checks the index against the exact number of decoded bodies.
-        self.module.functions[export.function_index].execute(args)
+        binary::execute(self.module, export.function_index, args)
     }
 }
 
-/// Why invoking a typed export failed: host-side lookup or arity, or a guest trap.
+/// Why invoking a typed export failed: host-side lookup, arity or resource
+/// limit, or a guest trap.
 /// Module validation failures are reported separately as [`Error`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvokeError {
@@ -199,6 +221,8 @@ pub enum InvokeError {
     ArityMismatch { expected: usize, actual: usize },
     /// Guest execution stopped before returning a value.
     Trap(Trap),
+    /// The invocation would exceed a host resource bound, not a Core trap.
+    LimitExceeded { limit: ExecutionLimit },
 }
 
 impl fmt::Display for InvokeError {
@@ -212,6 +236,11 @@ impl fmt::Display for InvokeError {
                 )
             }
             Self::Trap(trap) => write!(f, "WebAssembly trapped: {trap}"),
+            Self::LimitExceeded { limit } => write!(
+                f,
+                "WebAssembly execution {limit:?} limit exceeded (maximum {})",
+                limit.maximum()
+            ),
         }
     }
 }
@@ -220,7 +249,26 @@ impl std::error::Error for InvokeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Trap(trap) => Some(trap),
-            Self::ExportNotFound | Self::ArityMismatch { .. } => None,
+            Self::ExportNotFound | Self::ArityMismatch { .. } | Self::LimitExceeded { .. } => None,
+        }
+    }
+}
+
+/// Fixed host resource bounds for one invocation. These are not Wasm traps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionLimit {
+    /// Simultaneously live function frames, including the exported function.
+    CallDepth,
+    /// Total executed decoded instructions across all frames in the invocation.
+    InstructionDispatches,
+}
+
+impl ExecutionLimit {
+    /// The inclusive maximum for this resource.
+    pub const fn maximum(self) -> usize {
+        match self {
+            Self::CallDepth => 16,
+            Self::InstructionDispatches => 1024,
         }
     }
 }

@@ -231,6 +231,24 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![arg],
         });
     }
+    // A forward call to an unexported function doubles the argument.
+    let forward = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\
+                    \x03\x03\x02\0\0\x07\x0a\x01\x06answer\0\0\
+                    \x0a\x10\x02\x06\0\x20\0\x10\x01\x0b\x07\0\x20\0\x41\x02\x6c\x0b";
+    cases.push(Fixture {
+        expected: Ok(42),
+        bytes: forward.to_vec(),
+        export: EXPORT,
+        args: vec![21],
+    });
+    // Count down on the way in and add one per return. All calls terminate
+    // well within Swayze's budgets; the host limits aren't compared to Node.
+    let recursive = [
+        0x20, 0, 0x04, 0x7f, 0x20, 0, 0x41, 1, 0x6b, 0x10, 0, 0x41, 1, 0x6a, 0x05, 0x41, 0, 0x0b,
+    ];
+    for input in [0, 1, 7] {
+        cases.push(Fixture::new(input, &[input], &recursive));
+    }
     cases
 }
 

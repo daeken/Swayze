@@ -1,4 +1,4 @@
-use crate::{Function, Module};
+use crate::{Function, InvokeError, Module};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -66,6 +66,7 @@ pub enum IntegerField {
     LocalGroupCount,
     TypeIndex,
     FunctionIndex,
+    LocalIndex,
     I32Const,
 }
 
@@ -80,7 +81,7 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded `i32.const`, `i32.add`, `i32.sub`, and `i32.mul` operations; excludes `end`.
+    /// Decoded `local.get` and i32 operations; excludes `end`.
     BodyInstructions,
     /// Peak number of live i32 operands in the code body.
     OperandStackDepth,
@@ -194,7 +195,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     read_header(&mut module)?;
 
     let mut last_standard = 0;
-    let mut has_type = false;
+    let mut parameter_count = None;
     let mut has_function = false;
     let mut export = None;
     let mut code = None;
@@ -230,17 +231,18 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             });
         }
         match id {
-            1 => {
-                validate_type(&mut section)?;
-                has_type = true;
-            }
+            1 => parameter_count = Some(validate_type(&mut section)?),
             3 => {
                 section.count(IntegerField::FunctionCount, 1..=1)?;
-                section.zero_index(IntegerField::TypeIndex)?;
+                section.index(IntegerField::TypeIndex, 1)?;
                 has_function = true;
             }
             7 => export = validate_export(&mut section)?,
-            10 => code = Some(validate_code(&mut section)?),
+            10 => {
+                // With no type section there are no indices to permit, and the
+                // required-section check below will reject any such module.
+                code = Some(validate_code(&mut section, parameter_count.unwrap_or(0))?);
+            }
             _ => {
                 return Err(Error {
                     offset: id_offset,
@@ -257,7 +259,11 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     if last_standard != 0 {
         // The exact counts, zero indices, and presence of all three sections
         // together establish the type/function/code and export relationships.
-        for (id, present) in [(1, has_type), (3, has_function), (10, code.is_some())] {
+        for (id, present) in [
+            (1, parameter_count.is_some()),
+            (3, has_function),
+            (10, code.is_some()),
+        ] {
             if !present {
                 return Err(module.error(ErrorKind::MissingSection { id }));
             }
@@ -309,12 +315,19 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_type(section: &mut Reader<'_>) -> Result<(), Error> {
+const MAX_PARAMETERS: u32 = 4;
+const I32: u8 = 0x7f;
+
+fn validate_type(section: &mut Reader<'_>) -> Result<u32, Error> {
     section.count(IntegerField::TypeCount, 1..=1)?;
     section.expect_byte(0x60)?; // functype
-    section.count(IntegerField::ParameterCount, 0..=0)?;
+    let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
+    for _ in 0..parameter_count {
+        section.expect_byte(I32)?;
+    }
     section.count(IntegerField::ResultCount, 1..=1)?;
-    section.expect_byte(0x7f) // i32
+    section.expect_byte(I32)?;
+    Ok(parameter_count)
 }
 
 fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Error> {
@@ -323,7 +336,7 @@ fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Erro
     }
     let name = section.name(LengthField::ExportNameSize)?;
     section.expect_byte(0x00)?; // function export descriptor
-    section.zero_index(IntegerField::FunctionIndex)?;
+    section.index(IntegerField::FunctionIndex, 1)?;
     Ok(Some(name))
 }
 
@@ -332,6 +345,7 @@ const END: u8 = 0x0b;
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
     Const(i32),
+    LocalGet(u32),
     Binary(BinaryOp),
 }
 
@@ -342,24 +356,36 @@ enum BinaryOp {
     Mul,
 }
 
-/// Only the decoder below constructs this, after checking every stack effect
-/// and the complete body frame. There is no way to mutate it after validation.
+/// Only the decoder below constructs this, after checking local indices, every
+/// stack effect, and the complete body frame. It cannot be mutated after validation.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
+    parameter_count: usize,
     instructions: Vec<Instruction>,
 }
 
 impl ValidatedCode {
-    pub(super) fn execute(&self) -> i32 {
+    pub(super) fn execute(&self, args: &[i32]) -> Result<i32, InvokeError> {
+        if args.len() != self.parameter_count {
+            return Err(InvokeError::ArityMismatch {
+                expected: self.parameter_count,
+                actual: args.len(),
+            });
+        }
         let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
         let mut depth = 0;
         // Each stored instruction runs once, for at most BodyInstructions steps.
-        // Validation starts at the same depth, proves every index fits, and
+        // Validation proves each local index is below parameter_count. It starts
+        // at the same operand depth, proves every stack access fits, and
         // establishes that depth is one on completion.
         for &instruction in &self.instructions {
             match instruction {
                 Instruction::Const(value) => {
                     operands[depth] = value;
+                    depth += 1;
+                }
+                Instruction::LocalGet(index) => {
+                    operands[depth] = args[index as usize];
                     depth += 1;
                 }
                 Instruction::Binary(op) => {
@@ -374,11 +400,11 @@ impl ValidatedCode {
                 }
             }
         }
-        operands[0]
+        Ok(operands[0])
     }
 }
 
-fn validate_code(section: &mut Reader<'_>) -> Result<ValidatedCode, Error> {
+fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
     section.count(IntegerField::CodeCount, 1..=1)?;
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -412,7 +438,10 @@ fn validate_code(section: &mut Reader<'_>) -> Result<ValidatedCode, Error> {
                 kind: ErrorKind::AllocationFailed,
             })?;
             instructions.extend_from_slice(&decoded[..count]);
-            return Ok(ValidatedCode { instructions });
+            return Ok(ValidatedCode {
+                parameter_count: parameter_count as usize,
+                instructions,
+            });
         }
         let slot = decoded.get_mut(count).ok_or(Error {
             offset,
@@ -421,6 +450,7 @@ fn validate_code(section: &mut Reader<'_>) -> Result<ValidatedCode, Error> {
             },
         })?;
         let instruction = match opcode {
+            0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, parameter_count)?),
             0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
             0x6a => Instruction::Binary(BinaryOp::Add),
             0x6b => Instruction::Binary(BinaryOp::Sub),
@@ -433,7 +463,7 @@ fn validate_code(section: &mut Reader<'_>) -> Result<ValidatedCode, Error> {
             }
         };
         depth = match instruction {
-            Instruction::Const(_) => depth
+            Instruction::Const(_) | Instruction::LocalGet(_) => depth
                 .checked_add(1)
                 .filter(|&next| next <= Limit::OperandStackDepth.maximum())
                 .ok_or(Error {
@@ -567,11 +597,11 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn zero_index(&mut self, field: IntegerField) -> Result<(), Error> {
+    fn index(&mut self, field: IntegerField, bound: u32) -> Result<u32, Error> {
         let offset = self.position();
         let index = self.integer(field)?;
-        if index == 0 {
-            Ok(())
+        if index < bound {
+            Ok(index)
         } else {
             Err(Error {
                 offset,

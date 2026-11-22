@@ -184,14 +184,87 @@ fn whitespace_and_utf8_spans() {
 fn non_slice_numeric_lexemes_are_not_split() {
     use ErrorKind::Unsupported;
     for input in [
-        "00", "08", "0x10", "0o10", "0b10", "1.0", "1.", "1e2", "1E+2", "1n", "1_000", "1foo",
-        "1$foo", "1\\u0061",
+        "00",
+        "08",
+        "01.5",
+        "08e2",
+        "077.toString()",
+        "0x10",
+        "0o10",
+        "0b10",
+        "1n",
+        "1_000",
+        "1foo",
+        "1$foo",
+        "1\\u0061",
     ] {
         assert_error(input, Unsupported, 1, 2);
     }
-    assert_error(".5", Unsupported, 0, 1);
-    assert_error("10n", Unsupported, 2, 3);
-    assert_error("1é", Unsupported, 1, 3);
+    for (source, start, end) in [
+        (".", 0, 1),
+        ("...5", 0, 1),
+        (".５", 0, 1),
+        ("(1).toString()", 3, 4),
+        ("1 .toString()", 2, 3),
+        ("1..toString()", 2, 3),
+        ("1.toString()", 2, 3),
+        ("1.5.toString()", 3, 4),
+        ("1e3.toString()", 3, 4),
+        ("1...2", 2, 3),
+        ("1.2.3", 3, 4),
+        ("1else", 2, 3),
+        ("1.evil", 3, 4),
+        ("1e2tail", 3, 4),
+        ("1e2e3", 3, 4),
+        ("1é", 1, 3),
+        (".5é", 2, 4),
+        ("1e2\\u0061", 3, 4),
+        ("10n", 2, 3),
+        (".5n", 2, 3),
+        ("1.e2n", 4, 5),
+        ("1._5", 2, 3),
+        ("1.5_0", 3, 4),
+        ("1e_2", 2, 3),
+        ("1e+_2", 3, 4),
+        ("1e2_0", 3, 4),
+    ] {
+        assert_error(source, Unsupported, start, end);
+    }
+}
+
+#[test]
+fn decimal_literal_forms_and_token_boundaries() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, expected) in [
+        (".5", 0.5),
+        ("1.", 1.0),
+        ("1.25", 1.25),
+        ("0.05", 0.05),
+        ("1e3", 1000.0),
+        ("1E-3", 0.001),
+        ("1e+003", 1000.0),
+        ("1.e3", 1000.0),
+        (".5e1", 5.0),
+        ("1.25e+1", 12.5),
+    ] {
+        assert_postfix(source, &[Number(expected)], 1);
+    }
+    assert_postfix("1e-2- .5", &[Number(0.01), Number(0.5), Subtract], 2);
+    assert_postfix(".5\u{2028}+1.", &[Number(0.5), Number(1.0), Add], 2);
+    for (source, offset) in [
+        ("1e", 2),
+        ("1e-", 3),
+        ("1e+;", 3),
+        ("1.e 2", 3),
+        (".5e\u{00A0}2", 3),
+    ] {
+        assert_error(source, Malformed, offset, offset);
+    }
+    assert_error("1 .5", Malformed, 2, 4);
+    assert_error("1.\n.5", Unsupported, 3, 5);
+    assert_error(".5; 1e0", Unsupported, 4, 7);
+    assert_error("1./*comment*/", Unsupported, 2, 4);
+    assert_error(".5e-1//comment", Unsupported, 5, 7);
 }
 
 #[test]
@@ -218,6 +291,72 @@ fn decimal_precision_and_overflow() {
     let above = format!("1{}", "0".repeat(309));
     assert_postfix(&above, &[Number(f64::INFINITY)], 1);
     assert_error(&format!("{above}n"), ErrorKind::Unsupported, 310, 311);
+}
+
+#[test]
+fn fractional_and_exponential_literals_round_once() {
+    for (source, expected) in [
+        (
+            "1.00000000000000011102230246251565404236316680908203125",
+            1.0,
+        ),
+        (
+            "1.00000000000000011102230246251565404236316680908203126",
+            f64::from_bits(1.0_f64.to_bits() + 1),
+        ),
+        ("9007199254740993e0", 9_007_199_254_740_992.0),
+        ("1.7976931348623157e308", f64::MAX),
+        ("1e309", f64::INFINITY),
+        ("2.4703282292062327e-324", 0.0),
+        ("2.4703282292062328e-324", f64::from_bits(1)),
+    ] {
+        assert_postfix(source, &[Number(expected)], 1);
+    }
+    let zeros = "0".repeat(400);
+    assert_postfix(&format!("125{zeros}e-402"), &[Number(1.25)], 1);
+    assert_postfix(&format!("125{zeros}.0e-402"), &[Number(1.25)], 1);
+    assert_postfix(&format!("0.{zeros}125e401"), &[Number(1.25)], 1);
+    let huge_exponent = "9".repeat(400);
+    assert_postfix(&format!("1e{huge_exponent}"), &[Number(f64::INFINITY)], 1);
+    assert_postfix(&format!("1e-{huge_exponent}"), &[Number(0.0)], 1);
+    assert_postfix(&format!("0e{huge_exponent}"), &[Number(0.0)], 1);
+}
+
+#[test]
+fn decimal_conversion_cap_and_work_budget() {
+    let defaults = Limits::default();
+    for (prefix, tail, value) in [(".", "5", 0.0), ("1e+", "1", 10.0)] {
+        let at_cap = format!("{prefix}{}{tail}", "0".repeat(4095 - prefix.len()));
+        let above_cap = format!("{at_cap}0");
+        assert_postfix(&at_cap, &[Number(value)], 1);
+        assert_limit(&above_cap, defaults, Limit::DecimalLiteralBytes, 0, 4097);
+    }
+    let limits = Limits {
+        max_tokens: 1,
+        max_work: 13,
+        ..defaults
+    };
+    assert!(parse_script_with_limits(".5E+01", limits).is_ok());
+    assert_limit(
+        ".5E+01",
+        Limits {
+            max_work: 5,
+            ..limits
+        },
+        Limit::Work,
+        5,
+        6,
+    );
+    assert_limit(
+        ".5E+01",
+        Limits {
+            max_work: 11,
+            ..limits
+        },
+        Limit::Work,
+        0,
+        6,
+    );
 }
 
 #[test]

@@ -8,10 +8,11 @@ const REFERENCE: &str = r#"
 if (process.versions.node.split('.')[0] !== '22') {
     throw new Error(`expected Node.js v22, got ${process.version}`);
 }
-const [name, ...fixtures] = process.argv.slice(1);
+const fixtures = process.argv.slice(1);
 console.log(process.version);
 for (const fixture of fixtures) {
-    const [hex, ...args] = fixture.split(':');
+    const [hex, nameBytes, ...args] = fixture.split(':');
+    const name = Buffer.from(nameBytes, 'hex').toString('utf8');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
     const invoke = new WebAssembly.Instance(module).exports[name];
     try {
@@ -63,6 +64,7 @@ fn singleton_module(parameter_count: u8, locals: &[u8], expression: &[u8]) -> Ve
 struct Fixture {
     expected: Result<i32, WasmTrap>,
     bytes: Vec<u8>,
+    export: &'static str,
     args: Vec<i32>,
 }
 
@@ -84,13 +86,14 @@ impl Fixture {
         Self {
             expected,
             bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression),
+            export: EXPORT,
             args: args.to_vec(),
         }
     }
 
     fn encode(&self) -> String {
         use std::fmt::Write;
-        let mut encoded = hex(&self.bytes);
+        let mut encoded = format!("{}:{}", hex(&self.bytes), hex(self.export.as_bytes()));
         for arg in &self.args {
             write!(&mut encoded, ":{arg}").unwrap();
         }
@@ -215,6 +218,19 @@ fn fixtures() -> Vec<Fixture> {
             ],
         ));
     }
+    // Body 0 returns its argument; body 1 increments it. Exports reference
+    // function indices out of order and include a non-ASCII alias for body 1.
+    let multi = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\
+                  \x03\x03\x02\0\0\x07\x0e\x03\x01x\0\x01\x01y\0\0\x02\xcf\x80\0\x01\
+                  \x0a\x0e\x02\x04\0\x20\0\x0b\x07\0\x20\0\x41\x01\x6a\x0b";
+    for (export, arg, expected) in [("x", 41, 42), ("y", 41, 41), ("π", i32::MAX, i32::MIN)] {
+        cases.push(Fixture {
+            expected: Ok(expected),
+            bytes: multi.to_vec(),
+            export,
+            args: vec![arg],
+        });
+    }
     cases
 }
 
@@ -230,7 +246,7 @@ fn hex(bytes: &[u8]) -> String {
 fn evaluate(fixture: &Fixture) -> Result<Result<i32, WasmTrap>, Box<dyn Error>> {
     match validate_module(&fixture.bytes)?
         .instantiate()
-        .invoke_i32_with_args(EXPORT, &fixture.args)
+        .invoke_i32_with_args(fixture.export, &fixture.args)
     {
         Ok(value) => Ok(Ok(value)),
         Err(WasmInvokeError::Trap(trap)) => Ok(Err(trap)),
@@ -244,7 +260,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Only generated modules reach the fixed driver, never files or user inputs.
     let output = Command::new("node")
         .env_remove("NODE_OPTIONS")
-        .args(["-e", REFERENCE, "--", EXPORT])
+        .args(["-e", REFERENCE, "--"])
         .args(&encoded)
         .output()?;
     if !output.status.success() {

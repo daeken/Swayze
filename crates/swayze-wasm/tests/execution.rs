@@ -5,6 +5,7 @@ use swayze_wasm::{
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const TYPE: &[u8] = &[1, 0x60, 0, 1, 0x7f];
 const FUNCTION: &[u8] = &[1, 0];
+const TWO_FUNCTIONS: &[u8] = &[2, 0, 0];
 const EXPORT: &[u8] = b"\x01\x06answer\0\0";
 const CODE: &[u8] = &[1, 4, 0, 0x41, 42, 0x0b];
 const SECTIONS: [(u8, &[u8]); 4] = [(1, TYPE), (3, FUNCTION), (7, EXPORT), (10, CODE)];
@@ -93,10 +94,7 @@ fn validates_export_name_utf8_and_its_inclusive_limit() {
         "\0é𝄞".to_owned(),
         "x".repeat(limit.maximum()),
     ] {
-        let mut export = vec![1];
-        push_u32(&mut export, name.len());
-        export.extend_from_slice(name.as_bytes());
-        export.extend([0, 0]);
+        let export = function_exports(&[(name.as_bytes(), 0)]);
         let bytes = module(&[(1, TYPE), (3, FUNCTION), (7, &export), (10, CODE)]);
         assert_eq!(
             validate_module(&bytes)
@@ -110,6 +108,11 @@ fn validates_export_name_utf8_and_its_inclusive_limit() {
     push_u32(&mut too_long, limit.maximum() + 1);
     bad_payload(7, &too_long, 1, ErrorKind::LimitExceeded { limit });
     bad_payload(7, b"\x01\x03x\xe2\x82\xac\0", 3, ErrorKind::InvalidUtf8Name);
+    let mut bytes = module(&[(1, TYPE), (3, FUNCTION)]);
+    let exports = function_exports(&[(b"valid", 0), (b"x\xff", 0)]);
+    let start = push_section(&mut bytes, 7, &exports);
+    let invalid_byte = function_exports(&[(b"valid", 0)]).len() + 2;
+    expect_error(&bytes, start + invalid_byte, ErrorKind::InvalidUtf8Name);
     bad_payload(
         7,
         b"\x01\x03x",
@@ -121,11 +124,30 @@ fn validates_export_name_utf8_and_its_inclusive_limit() {
     );
 }
 
-fn code_body(body: &[u8]) -> Vec<u8> {
-    let mut code = vec![1];
-    push_u32(&mut code, body.len());
-    code.extend_from_slice(body);
+fn code_bodies(bodies: &[&[u8]]) -> Vec<u8> {
+    let mut code = Vec::new();
+    push_u32(&mut code, bodies.len());
+    for body in bodies {
+        push_u32(&mut code, body.len());
+        code.extend_from_slice(body);
+    }
     code
+}
+
+fn code_body(body: &[u8]) -> Vec<u8> {
+    code_bodies(&[body])
+}
+
+fn function_exports(entries: &[(&[u8], usize)]) -> Vec<u8> {
+    let mut exports = Vec::new();
+    push_u32(&mut exports, entries.len());
+    for &(name, index) in entries {
+        push_u32(&mut exports, name.len());
+        exports.extend_from_slice(name);
+        exports.push(0);
+        push_u32(&mut exports, index);
+    }
+    exports
 }
 
 fn i32_type(parameter_count: u8) -> Vec<u8> {
@@ -165,6 +187,208 @@ fn bad_typed_body(ty: &[u8], body: &[u8], offset: usize, kind: ErrorKind) {
 
 fn bad_body(body: &[u8], offset: usize, kind: ErrorKind) {
     bad_typed_body(TYPE, body, offset, kind);
+}
+
+#[test]
+fn dispatches_multiple_bodies_by_exact_owned_names_and_aliases() {
+    let validated = {
+        let exports = function_exports(&[
+            (b"", 1),
+            ("é".as_bytes(), 0),
+            ("e\u{301}".as_bytes(), 1),
+            ("\0é".as_bytes(), 1),
+            (b"alias", 0),
+        ]);
+        let code = code_bodies(&[&[0, 0x41, 19, 0x0b], &[0, 0x41, 42, 0x0b]]);
+        let bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS), (7, &exports), (10, &code)]);
+        validate_module(&bytes).unwrap()
+    };
+    let instance = validated.instantiate();
+    for (name, expected) in [
+        ("", 42),
+        ("é", 19),
+        ("e\u{301}", 42),
+        ("\0é", 42),
+        ("alias", 19),
+    ] {
+        assert_eq!(instance.invoke_i32(name), Ok(expected));
+    }
+    for name in ["É", "e", "é\0", "alia", "Alias"] {
+        assert_eq!(instance.invoke_i32(name), Err(InvokeError::ExportNotFound));
+    }
+}
+
+#[test]
+fn shares_arity_and_keeps_traps_and_locals_call_local_across_exports() {
+    let exports = function_exports(&[(b"accumulate", 0), (b"divide", 1)]);
+    let code = code_bodies(&[
+        // Add the parameter to a zero-initialized local and write back the result.
+        &[1, 1, 0x7f, 0x20, 1, 0x20, 0, 0x6a, 0x22, 1, 0x0b],
+        // Store 12 in the same local index, then divide by the parameter.
+        &[1, 1, 0x7f, 0x41, 12, 0x22, 1, 0x20, 0, 0x6d, 0x0b],
+    ]);
+    let bytes = module(&[
+        (1, &i32_type(1)),
+        (3, TWO_FUNCTIONS),
+        (7, &exports),
+        (10, &code),
+    ]);
+    let validated = validate_module(&bytes).unwrap();
+    let instance = validated.instantiate();
+    for name in ["accumulate", "divide"] {
+        assert_eq!(
+            instance.invoke_i32(name),
+            Err(InvokeError::ArityMismatch {
+                expected: 1,
+                actual: 0
+            })
+        );
+    }
+    assert_eq!(instance.invoke_i32_with_args("accumulate", &[3]), Ok(3));
+    assert_eq!(
+        instance.invoke_i32_with_args("divide", &[0]),
+        Err(InvokeError::Trap(Trap::IntegerDivideByZero))
+    );
+    assert_eq!(instance.invoke_i32_with_args("accumulate", &[5]), Ok(5));
+    assert_eq!(instance.invoke_i32_with_args("divide", &[2]), Ok(6));
+    assert_eq!(instance.invoke_i32_with_args("accumulate", &[1]), Ok(1));
+}
+
+#[test]
+fn admits_eight_functions_and_eight_exports_with_independent_body_budgets() {
+    let functions = [8, 0, 0, 0, 0, 0, 0, 0, 0];
+    let names = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"];
+    let entries: Vec<_> = names
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, name)| (name.as_slice(), i))
+        .collect();
+    let exports = function_exports(&entries);
+    // 127 decoded instructions per body, not per module.
+    assert_eq!(Limit::BodyInstructions.maximum(), 127);
+    let bodies: Vec<_> = (0..8)
+        .map(|i| {
+            let mut body = vec![0, 0x41, i];
+            for _ in 0..63 {
+                body.extend([0x41, 0, 0x6a]);
+            }
+            body.push(0x0b);
+            body
+        })
+        .collect();
+    let code = code_bodies(&bodies.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let validated = validate_module(&module(&[
+        (1, TYPE),
+        (3, &functions),
+        (7, &exports),
+        (10, &code),
+    ]))
+    .unwrap();
+    let instance = validated.instantiate();
+    for (i, name) in ["a", "b", "c", "d", "e", "f", "g", "h"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(instance.invoke_i32(name), Ok(i as i32));
+    }
+}
+
+#[test]
+fn rejects_duplicate_names_regardless_of_target_or_empty_name() {
+    for (name, second_index) in [("é".as_bytes(), 1), (b"".as_slice(), 0)] {
+        let export = function_exports(&[(name, 0), (b"other", 0), (name, second_index)]);
+        let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
+        let start = push_section(&mut bytes, 7, &export);
+        push_section(&mut bytes, 10, &code_bodies(&[&CODE[2..]; 2]));
+        let duplicate_offset = function_exports(&[(name, 0), (b"other", 0)]).len();
+        expect_error(
+            &bytes,
+            start + duplicate_offset,
+            ErrorKind::DuplicateExportName,
+        );
+    }
+}
+
+#[test]
+fn checks_every_declaration_and_export_index_against_its_actual_space() {
+    for (id, prefix, payload, index, field) in [
+        (
+            3,
+            &[(1, TYPE)][..],
+            &[2, 0, 1][..],
+            1,
+            IntegerField::TypeIndex,
+        ),
+        (
+            7,
+            &[(1, TYPE), (3, TWO_FUNCTIONS)],
+            b"\x02\x01a\0\x01\x01b\0\x02",
+            2,
+            IntegerField::FunctionIndex,
+        ),
+    ] {
+        let mut bytes = module(prefix);
+        let start = push_section(&mut bytes, id, payload);
+        expect_error(
+            &bytes,
+            start + payload.len() - 1,
+            ErrorKind::InvalidIndex { field, index },
+        );
+    }
+}
+
+#[test]
+fn requires_exact_function_and_code_count_agreement() {
+    for bodies in [1, 3] {
+        let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
+        let start = push_section(&mut bytes, 10, &code_bodies(&vec![&CODE[2..]; bodies]));
+        expect_error(
+            &bytes,
+            start,
+            ErrorKind::UnsupportedCount {
+                field: IntegerField::CodeCount,
+                count: bodies as u32,
+            },
+        );
+    }
+}
+
+#[test]
+fn validates_later_unexported_bodies_with_their_own_local_space_and_frames() {
+    let first = &[1, 1, 0x7f, 0x20, 0, 0x0b];
+    let limit = Limit::CodeBodyBytes;
+    let oversized = vec![0; limit.maximum() + 1];
+    for (second, offset, kind) in [
+        (
+            &[0, 0x20, 0, 0x0b][..],
+            3,
+            ErrorKind::InvalidIndex {
+                field: IntegerField::LocalIndex,
+                index: 0,
+            },
+        ),
+        (
+            &[0, 0x10, 0, 0x0b],
+            2,
+            ErrorKind::UnsupportedOpcode { opcode: 0x10 },
+        ),
+        (
+            &[0, 0x41, 0x80],
+            4,
+            ErrorKind::TruncatedInteger {
+                field: IntegerField::I32Const,
+            },
+        ),
+        (&[0, 0x41, 42, 0x0b, 0x0b], 5, ErrorKind::TrailingBodyBytes),
+        (&oversized, 0, ErrorKind::LimitExceeded { limit }),
+    ] {
+        let mut bytes = module(&[(1, TYPE), (3, &[3, 0, 0, 0]), (7, EXPORT)]);
+        let start = push_section(&mut bytes, 10, &code_bodies(&[first, second, &CODE[2..]]));
+        // The next valid body's frame cannot supply the missing immediate byte.
+        let second_size = code_body(first).len();
+        expect_error(&bytes, start + second_size + offset, kind);
+    }
 }
 
 #[test]
@@ -1159,7 +1383,7 @@ fn rejects_signed_leb_overflow_and_continuation_in_the_fifth_byte() {
 }
 
 #[test]
-fn rejects_unsigned_leb_overflow_and_large_in_range_indices() {
+fn rejects_unsigned_leb_overflow_and_max_u32_indices() {
     for fifth in [0x10, 0x7f, 0x80] {
         let leb = [0x80, 0x80, 0x80, 0x80, fifth, 0];
         let index = [&[1][..], &leb].concat();
@@ -1188,27 +1412,29 @@ fn rejects_unsigned_leb_overflow_and_large_in_range_indices() {
             index: u32::MAX,
         },
     );
-    bad_payload(
-        7,
-        &[1, 0, 0, 1],
-        3,
+    let mut bytes = module(&[(1, TYPE), (3, FUNCTION)]);
+    let exports = function_exports(&[(b"", u32::MAX as usize)]);
+    let start = push_section(&mut bytes, 7, &exports);
+    expect_error(
+        &bytes,
+        start + 3,
         ErrorKind::InvalidIndex {
             field: IntegerField::FunctionIndex,
-            index: 1,
+            index: u32::MAX,
         },
     );
 }
 
 #[test]
-fn requires_singleton_type_function_code_and_at_most_one_export() {
+fn bounds_type_function_code_and_export_counts() {
     use IntegerField::*;
     for (id, prefix, field, bad_counts) in [
         (1, &[][..], TypeCount, &[0, 2][..]),
         (1, &[1, 0x60], ParameterCount, &[5]),
         (1, &[1, 0x60, 0], ResultCount, &[0, 2]),
-        (3, &[], FunctionCount, &[0, 2]),
-        (7, &[], ExportCount, &[2]),
-        (10, &[], CodeCount, &[0, 2]),
+        (3, &[], FunctionCount, &[0, 9]),
+        (7, &[], ExportCount, &[9]),
+        (10, &[], CodeCount, &[0, 9]),
     ] {
         for &count in bad_counts {
             let payload = [prefix, &[count]].concat();

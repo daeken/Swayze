@@ -249,6 +249,19 @@ fn fixtures() -> Vec<Fixture> {
     for input in [0, 1, 7] {
         cases.push(Fixture::new(input, &[input], &recursive));
     }
+    // A no-argument export calls a two-argument function, also exported.
+    let mixed = b"\0asm\x01\0\0\0\x01\x0b\x02\x60\0\x01\x7f\x60\x02\x7f\x7f\x01\x7f\
+                  \x03\x03\x02\0\x01\x07\x09\x02\x01x\0\0\x01y\0\x01\
+                  \x0a\x12\x02\x08\0\x41\x2d\x41\x03\x10\x01\x0b\
+                  \x07\0\x20\0\x20\x01\x6b\x0b";
+    for (export, args, expected) in [("x", vec![], 42), ("y", vec![45, 3], 42)] {
+        cases.push(Fixture {
+            expected: Ok(expected),
+            bytes: mixed.to_vec(),
+            export,
+            args,
+        });
+    }
     cases
 }
 

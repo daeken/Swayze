@@ -226,7 +226,9 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     read_header(&mut module)?;
 
     let mut last_standard = 0;
-    let mut parameter_count = None;
+    let mut type_arities = [0; MAX_TYPES as usize];
+    let mut type_count = None;
+    let mut function_arities = [0; MAX_FUNCTIONS as usize];
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
@@ -262,20 +264,23 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             });
         }
         match id {
-            1 => parameter_count = Some(validate_type(&mut section)?),
+            1 => type_count = Some(validate_types(&mut section, &mut type_arities)?),
             3 => {
                 let count = section.count(IntegerField::FunctionCount, 1..=MAX_FUNCTIONS)?;
-                for _ in 0..count {
-                    section.index(IntegerField::TypeIndex, 1)?;
+                // Without a type section, use a placeholder zero-arg type at
+                // index zero while checking framing and order. Reject its absence
+                // in the final required-section check.
+                let bound = type_count.unwrap_or(1);
+                for arity in &mut function_arities[..count as usize] {
+                    let index = section.index(IntegerField::TypeIndex, bound)?;
+                    *arity = type_arities[index as usize];
                 }
                 function_count = Some(count);
             }
             7 => exports = validate_exports(&mut section, function_count)?,
             10 => {
-                // Decode even without the type section, so framing and ordering
-                // errors still take precedence. The final presence check rejects it.
-                functions =
-                    validate_code(&mut section, function_count, parameter_count.unwrap_or(0))?;
+                let declarations = function_count.map(|count| &function_arities[..count as usize]);
+                functions = validate_code(&mut section, declarations, type_arities[0])?;
             }
             _ => {
                 return Err(Error {
@@ -294,7 +299,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         // The presence of all three sections makes the count and index checks
         // above sufficient to associate each export and call with a validated body.
         for (id, present) in [
-            (1, parameter_count.is_some()),
+            (1, type_count.is_some()),
             (3, function_count.is_some()),
             (10, !functions.is_empty()),
         ] {
@@ -303,11 +308,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
         }
     }
-    Ok(Module {
-        parameter_count: parameter_count.unwrap_or(0) as usize,
-        functions,
-        exports,
-    })
+    Ok(Module { functions, exports })
 }
 
 fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
@@ -341,6 +342,7 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+const MAX_TYPES: u32 = 8;
 const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
 const MAX_PARAMETERS: u32 = 4;
@@ -348,16 +350,22 @@ const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 
-fn validate_type(section: &mut Reader<'_>) -> Result<u32, Error> {
-    section.count(IntegerField::TypeCount, 1..=1)?;
-    section.expect_byte(0x60)?; // functype
-    let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
-    for _ in 0..parameter_count {
+fn validate_types(
+    section: &mut Reader<'_>,
+    arities: &mut [u32; MAX_TYPES as usize],
+) -> Result<u32, Error> {
+    let count = section.count(IntegerField::TypeCount, 1..=MAX_TYPES)?;
+    for arity in &mut arities[..count as usize] {
+        section.expect_byte(0x60)?; // functype
+        let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
+        for _ in 0..parameter_count {
+            section.expect_byte(I32)?;
+        }
+        section.count(IntegerField::ResultCount, 1..=1)?;
         section.expect_byte(I32)?;
+        *arity = parameter_count;
     }
-    section.count(IntegerField::ResultCount, 1..=1)?;
-    section.expect_byte(I32)?;
-    Ok(parameter_count)
+    Ok(count)
 }
 
 fn validate_exports(
@@ -478,6 +486,7 @@ impl BinaryOp {
 /// strictly forward decoded instruction indices, or the one-past-last index.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
+    parameter_count: usize,
     instructions: Vec<Instruction>,
 }
 
@@ -523,7 +532,7 @@ pub(super) fn execute(
     function_index: usize,
     args: &[i32],
 ) -> Result<i32, InvokeError> {
-    let parameter_count = module.parameter_count;
+    let parameter_count = module.functions[function_index].parameter_count;
     if args.len() != parameter_count {
         return Err(InvokeError::ArityMismatch {
             expected: parameter_count,
@@ -573,9 +582,10 @@ pub(super) fn execute(
                 }
                 // Keep the caller's prefix; the argument suffix is already in
                 // parameter order. Reset reused frame storage before entering.
+                let index = index as usize;
                 let end = frame.depth;
-                frame.depth -= parameter_count;
-                let callee = CallFrame::new(index as usize, &frame.operands[frame.depth..end]);
+                frame.depth -= module.functions[index].parameter_count;
+                let callee = CallFrame::new(index, &frame.operands[frame.depth..end]);
                 active += 1;
                 frames[active] = callee;
             }
@@ -677,22 +687,28 @@ fn decode_plain(
 
 fn validate_code(
     section: &mut Reader<'_>,
-    function_count: Option<u32>,
-    parameter_count: u32,
+    declarations: Option<&[u32]>,
+    first_type_arity: u32,
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
-    let allowed_counts = function_count.map_or(1..=MAX_FUNCTIONS, |count| count..=count);
+    let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |arities| {
+        let count = arities.len() as u32;
+        count..=count
+    });
     let count = section.count(IntegerField::CodeCount, allowed_counts)?;
     let mut functions = Vec::new();
     functions
         .try_reserve_exact(count as usize)
         .map_err(|_| allocation_error)?;
-    for _ in 0..count {
-        functions.push(validate_body(
-            section,
-            parameter_count,
-            function_count.unwrap_or(0),
-        )?);
+    for index in 0..count {
+        let (parameter_count, function_arities) = match declarations {
+            Some(arities) => (arities[index as usize], arities),
+            // Preserve framing and ordering diagnostics for incomplete modules:
+            // without declarations there are no call targets, and the first type
+            // gives the placeholder arity until the final required-section check.
+            None => (first_type_arity, &[][..]),
+        };
+        functions.push(validate_body(section, parameter_count, function_arities)?);
     }
     Ok(functions)
 }
@@ -700,7 +716,7 @@ fn validate_code(
 fn validate_body(
     section: &mut Reader<'_>,
     parameter_count: u32,
-    function_bound: u32,
+    function_arities: &[u32],
 ) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -808,11 +824,18 @@ fn validate_body(
                 depth = base;
             }
             _ => {
-                let instruction =
-                    decode_plain(&mut body, opcode, offset, local_bound, function_bound)?;
+                let instruction = decode_plain(
+                    &mut body,
+                    opcode,
+                    offset,
+                    local_bound,
+                    function_arities.len() as u32,
+                )?;
                 depth = match instruction {
                     Instruction::Const(_) | Instruction::LocalGet(_) => depth + 1,
-                    Instruction::Call(_) => consume(parameter_count as usize)? + 1,
+                    Instruction::Call(index) => {
+                        consume(function_arities[index as usize] as usize)? + 1
+                    }
                     Instruction::LocalSet(_) => consume(1)?,
                     Instruction::LocalTee(_) | Instruction::Eqz => consume(1)? + 1,
                     Instruction::Binary(_) => consume(2)? + 1,
@@ -838,7 +861,10 @@ fn validate_body(
         kind: ErrorKind::AllocationFailed,
     })?;
     instructions.extend_from_slice(&decoded[..count]);
-    Ok(ValidatedCode { instructions })
+    Ok(ValidatedCode {
+        parameter_count: parameter_count as usize,
+        instructions,
+    })
 }
 
 struct Reader<'a> {

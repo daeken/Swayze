@@ -3,13 +3,14 @@
 //! # Supported slice
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
-//! custom sections within [`Limit`], and either no standard sections or one
-//! type, one to eight function declarations, and exactly as many code bodies,
-//! in that section order. The singleton type must have zero to four `i32`
-//! parameters and exactly one `i32` result. Every function references type
-//! zero. Each body may declare up to 16 `i32` locals in total. The number of
-//! groups and each group's local count are unsigned LEB32; zero-count groups
-//! are allowed but must still specify `i32`.
+//! custom sections within [`Limit`], and either no standard sections or one to
+//! eight types, one to eight function declarations, and exactly as many code
+//! bodies as function declarations, in that section order. Each type must have
+//! zero to four `i32` parameters and exactly one `i32` result, even if unused.
+//! Every function declares its own zero-based index into the type table; types
+//! may be shared. Each body may declare up to 16 `i32` locals in total. The
+//! number of groups and each group's local count are unsigned LEB32; zero-count
+//! groups are allowed but must still specify `i32`.
 //! Supported instructions are `local.get`, `local.set`, `local.tee` (each with
 //! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
 //! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
@@ -35,12 +36,12 @@
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
 //! `local.set` pops one, `local.tee` requires and leaves the top operand,
 //! `i32.eqz` consumes one and pushes one, and the binary operators consume two
-//! and push one. `call` consumes as many i32s as the shared type has parameters
-//! (the top operand is the last parameter) and pushes one result. `if` consumes
-//! an i32 condition from above the enclosing frame's operand floor and saves
-//! the remaining depth as the floor for both arms. Every operand access in an
-//! arm must stay above that floor. `else`
-//! checks for exactly one new result and resets validation to the saved depth,
+//! and push one. `call` consumes as many i32s as the target function's type has
+//! parameters (the top operand is the last parameter) and pushes one result.
+//! `if` consumes an i32 condition from above the enclosing frame's operand floor
+//! and saves the remaining depth as the floor for both arms. Every operand
+//! access in an arm must stay above that floor. `else` checks for exactly one
+//! new result and resets validation to the saved depth,
 //! and the matching `end` checks that the else arm also leaves exactly one new
 //! result. Both arms are checked regardless of the condition.
 //! The function has a floor of zero; its own `end` must be the final byte of
@@ -49,12 +50,13 @@
 //! instructions (including `if` and `else` across both arms, excluding `end`),
 //! 32 live i32 operands including those below arm floors, and 16 nested `if`s.
 //!
-//! Validation checks the entire input, including every body even if unexported,
-//! before returning an immutable, owned [`Module`] with private decoded bodies
-//! and named export entries. A separate [`Module::instantiate`] step creates an
-//! [`Instance`]. Its typed [`Instance::invoke_i32_with_args`] method scans at
-//! most eight export names for an exact match, then checks the argument count
-//! and begins execution at the selected body without allocating or recursing
+//! Validation resolves every function's type index before decoding any body,
+//! and checks the entire input, including every body even if unexported. It
+//! returns an immutable, owned [`Module`] with private decoded bodies, their
+//! arities, and named export entries. A separate [`Module::instantiate`] step
+//! creates an [`Instance`]. Its typed [`Instance::invoke_i32_with_args`] method
+//! scans at most eight export names for an exact match, then checks the selected
+//! function's arity and begins execution without allocating or recursing
 //! in Rust. Zero selects the else arm; every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames and backpatches private jump
 //! targets at matching delimiters. Each jump target is a strictly later decoded
@@ -102,13 +104,14 @@
 //! unsigned division and remainder edge cases, name and arity checks before
 //! execution, and stopping at the first guest trap and reusing the instance.
 //! Multi-function tests check dispatch by declaration index, exact UTF-8 names
-//! and aliases, shared arity, traps and fresh local state across dispatches,
-//! duplicate names, invalid indices, count agreement and caps, and validation
-//! of later unexported bodies and their frame boundaries.
+//! and aliases, shared and mixed arities, traps and fresh locals across dispatches,
+//! duplicate names, exact type and function index bounds, independent count caps,
+//! malformed unused types, and later unexported bodies and their frame boundaries.
 //! Direct-call tests cover nested and repeated calls, forward and self targets,
-//! zero and four parameters, frame isolation, bounded index decoding and stack
-//! effects at arm floors, and propagation and reuse after traps or execution
-//! limits. Budget tests exercise the last allowed frame and dispatch, the next
+//! calls between different signatures, argument order, frame isolation, bounded
+//! index decoding, underflow at both arm floors, zero-argument calls at the
+//! operand cap, and propagation and reuse after traps or execution limits.
+//! Budget tests exercise the last allowed frame and dispatch, the next
 //! attempted frame and dispatch, and budget sharing across completed callees.
 //! Comparison tests cover exact 0/1 results, equal operands and signed versus
 //! unsigned boundary values, unary and binary underflows at the function and
@@ -119,10 +122,11 @@
 //! traps, rejection of untaken invalid code, arm result counts and floor
 //! violations (even when depth would later recover), delimiter errors, and
 //! control, instruction and operand bounds.
-//! Parsing checks declaration counts against the remaining local budget without
-//! expanding groups. It uses bounded borrowed frames and decodes instructions
-//! into a fixed-size scratch array. After checking `end` and the complete body
-//! frame, it calls `Vec::try_reserve_exact` for the decoded instruction count and
+//! Parsing uses fixed scratch tables for up to eight type arities and eight
+//! resolved function arities. It checks local group counts against the remaining
+//! local budget without expanding groups, uses bounded borrowed frames, and
+//! decodes instructions into a fixed-size scratch array. After checking `end`
+//! and the complete body frame, it calls `Vec::try_reserve_exact` for the count and
 //! copies those instructions. The body and export vectors are reserved fallibly
 //! after checking their counts, and each name is reserved fallibly after checking
 //! its length. The count caps bound aggregate decoding to eight body budgets and
@@ -143,11 +147,10 @@ use std::{convert::Infallible, fmt};
 ///
 /// ```compile_fail
 /// use swayze_wasm::Module;
-/// let forged = Module { parameter_count: 0, functions: Vec::new(), exports: Vec::new() };
+/// let forged = Module { functions: Vec::new(), exports: Vec::new() };
 /// ```
 #[derive(Debug)]
 pub struct Module {
-    parameter_count: usize,
     functions: Vec<binary::ValidatedCode>,
     exports: Vec<Export>,
 }

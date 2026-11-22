@@ -151,11 +151,18 @@ fn function_exports(entries: &[(&[u8], usize)]) -> Vec<u8> {
     exports
 }
 
-fn i32_type(parameter_count: u8) -> Vec<u8> {
-    let mut ty = vec![1, 0x60, parameter_count];
-    ty.extend(std::iter::repeat_n(0x7f, usize::from(parameter_count)));
-    ty.extend([1, 0x7f]);
-    ty
+fn i32_types(arities: &[u8]) -> Vec<u8> {
+    let mut types = vec![u8::try_from(arities.len()).unwrap()];
+    for &arity in arities {
+        types.extend([0x60, arity]);
+        types.extend(std::iter::repeat_n(0x7f, usize::from(arity)));
+        types.extend([1, 0x7f]);
+    }
+    types
+}
+
+fn i32_type(arity: u8) -> Vec<u8> {
+    i32_types(&[arity])
 }
 
 fn exported_function(ty: &[u8], code: &[u8]) -> Module {
@@ -164,10 +171,19 @@ fn exported_function(ty: &[u8], code: &[u8]) -> Module {
 }
 
 fn exported_functions(arity: u8, exports: &[(&[u8], usize)], bodies: &[&[u8]]) -> Module {
-    let mut declarations = vec![0; bodies.len() + 1];
-    declarations[0] = u8::try_from(bodies.len()).unwrap();
+    exported_typed_functions(&[arity], &vec![0; bodies.len()], exports, bodies)
+}
+
+fn exported_typed_functions(
+    arities: &[u8],
+    type_indices: &[u8],
+    exports: &[(&[u8], usize)],
+    bodies: &[&[u8]],
+) -> Module {
+    let mut declarations = vec![u8::try_from(type_indices.len()).unwrap()];
+    declarations.extend_from_slice(type_indices);
     validate_module(&module(&[
-        (1, &i32_type(arity)),
+        (1, &i32_types(arities)),
         (3, &declarations),
         (7, &function_exports(exports)),
         (10, &code_bodies(bodies)),
@@ -268,8 +284,10 @@ fn shares_arity_and_keeps_traps_and_locals_call_local_across_exports() {
 }
 
 #[test]
-fn admits_eight_functions_and_eight_exports_with_independent_body_budgets() {
-    let functions = [8, 0, 0, 0, 0, 0, 0, 0, 0];
+fn admits_eight_types_functions_and_exports_with_independent_body_budgets() {
+    // Identical signatures are valid as separate type table entries.
+    let types = i32_types(&[0; 8]);
+    let functions = [8, 7, 6, 5, 4, 3, 2, 1, 0];
     let names = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"];
     let entries: Vec<_> = names
         .iter()
@@ -292,7 +310,7 @@ fn admits_eight_functions_and_eight_exports_with_independent_body_budgets() {
         .collect();
     let code = code_bodies(&bodies.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let validated = validate_module(&module(&[
-        (1, TYPE),
+        (1, &types),
         (3, &functions),
         (7, &exports),
         (10, &code),
@@ -304,6 +322,92 @@ fn admits_eight_functions_and_eight_exports_with_independent_body_budgets() {
         .enumerate()
     {
         assert_eq!(instance.invoke_i32(name), Ok(i as i32));
+    }
+}
+
+#[test]
+fn admits_eight_types_with_one_function_referencing_the_last_type() {
+    let types = i32_types(&[0, 1, 2, 3, 4, 0, 1, 3]);
+    // One function declares type index 7 (with unsigned LEB32 padding).
+    let declarations = [1, 0x87, 0x80, 0x80, 0x80, 0];
+    let code = code_body(b"\0\x20\x02\x0b");
+    let validated = validate_module(&module(&[
+        (1, &types),
+        (3, &declarations),
+        (7, EXPORT),
+        (10, &code),
+    ]))
+    .unwrap();
+    assert_eq!(
+        validated
+            .instantiate()
+            .invoke_i32_with_args("answer", &[11, 22, 33]),
+        Ok(33)
+    );
+}
+
+#[test]
+fn rejects_malformed_type_entries_even_if_no_function_references_them() {
+    use ErrorKind::*;
+    use IntegerField::*;
+    for (second, offset, kind) in [
+        (
+            &[0x61][..],
+            0,
+            UnexpectedByte {
+                expected: 0x60,
+                found: 0x61,
+            },
+        ),
+        (
+            &[0x60, 5],
+            1,
+            UnsupportedCount {
+                field: ParameterCount,
+                count: 5,
+            },
+        ),
+        (
+            &[0x60, 1, 0x7e],
+            2,
+            UnexpectedByte {
+                expected: 0x7f,
+                found: 0x7e,
+            },
+        ),
+        (
+            &[0x60, 0, 0],
+            2,
+            UnsupportedCount {
+                field: ResultCount,
+                count: 0,
+            },
+        ),
+        (
+            &[0x60, 0, 2],
+            2,
+            UnsupportedCount {
+                field: ResultCount,
+                count: 2,
+            },
+        ),
+        (
+            &[0x60, 0, 1, 0x7e],
+            3,
+            UnexpectedByte {
+                expected: 0x7f,
+                found: 0x7e,
+            },
+        ),
+        (&[0x60, 0, 1], 3, TruncatedByte { expected: 0x7f }),
+    ] {
+        let types = [&[2][..], &TYPE[1..], second].concat();
+        let mut bytes = HEADER.to_vec();
+        let start = push_section(&mut bytes, 1, &types);
+        for (id, payload) in SECTIONS.into_iter().skip(1) {
+            push_section(&mut bytes, id, payload);
+        }
+        expect_error(&bytes, start + TYPE.len() + offset, kind);
     }
 }
 
@@ -325,12 +429,13 @@ fn rejects_duplicate_names_regardless_of_target_or_empty_name() {
 
 #[test]
 fn checks_every_declaration_and_export_index_against_its_actual_space() {
+    let types = i32_types(&[1, 0]);
     for (id, prefix, payload, index, field) in [
         (
             3,
-            &[(1, TYPE)][..],
-            &[2, 0, 1][..],
-            1,
+            &[(1, types.as_slice())][..],
+            &[3, 1, 0, 2][..],
+            2,
             IntegerField::TypeIndex,
         ),
         (
@@ -372,13 +477,14 @@ fn composes_nested_and_repeated_zero_arg_calls_to_forward_and_earlier_targets() 
 }
 
 #[test]
-fn passes_four_arguments_in_order_above_the_caller_arm_floor() {
-    let validated = exported_functions(
-        4,
-        &[(b"answer", 0)],
+fn uses_each_export_arity_and_passes_four_arguments_above_the_caller_arm_floor() {
+    let validated = exported_typed_functions(
+        &[4, 2],
+        &[1, 0],
+        &[(b"answer", 0), (b"pack", 1)],
         &[
-            // Keep 30 below the arm floor and pass the four inputs as a suffix.
-            b"\0\x41\x1e\x41\x01\x04\x7f\x20\0\x20\x01\x20\x02\x20\x03\x10\x01\
+            // Keep 30 below the arm floor and call pack(a, b, 3, 4).
+            b"\0\x41\x1e\x41\x01\x04\x7f\x20\0\x20\x01\x41\x03\x41\x04\x10\x01\
               \x05\x41\0\x0b\x6a\x0b",
             // (((a * 10) + b) * 10 + c) * 10 + d
             b"\0\x20\0\x41\x0a\x6c\x20\x01\x6a\x41\x0a\x6c\x20\x02\x6a\
@@ -386,32 +492,55 @@ fn passes_four_arguments_in_order_above_the_caller_arm_floor() {
         ],
     );
     let instance = validated.instantiate();
+    assert_eq!(instance.invoke_i32_with_args("answer", &[1, 2]), Ok(1264));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[4, 3]), Ok(4364));
     assert_eq!(
-        instance.invoke_i32_with_args("answer", &[1, 2, 3, 4]),
-        Ok(1264)
+        instance.invoke_i32_with_args("pack", &[4, 3, 2, 1]),
+        Ok(4321)
     );
     assert_eq!(
         instance.invoke_i32_with_args("answer", &[4, 3, 2, 1]),
-        Ok(4351)
+        Err(InvokeError::ArityMismatch {
+            expected: 2,
+            actual: 4
+        })
+    );
+    assert_eq!(
+        instance.invoke_i32_with_args("pack", &[1, 2]),
+        Err(InvokeError::ArityMismatch {
+            expected: 4,
+            actual: 2
+        })
     );
 }
 
 #[test]
 fn keeps_caller_locals_and_operands_and_resets_reused_callee_storage() {
-    let validated = exported_functions(
-        1,
-        &[(b"answer", 0)],
+    let validated = exported_typed_functions(
+        &[1, 0],
+        &[0, 0, 1],
+        &[(b"answer", 0), (b"zero", 2)],
         &[
-            // local1 = 9; return 50 + f1(arg) + f1(arg) + arg + local1
-            b"\x01\x01\x7f\x41\x09\x21\x01\x41\x32\x20\0\x10\x01\x20\0\x10\x01\
-              \x6a\x6a\x20\0\x6a\x20\x01\x6a\x0b",
+            // local1 = 9; return 50 + (f1(arg) + f2()) + f1(arg) + arg + local1
+            b"\x01\x01\x7f\x41\x09\x21\x01\x41\x32\x20\0\x10\x01\x10\x02\x6a\
+              \x20\0\x10\x01\x6a\x6a\x20\0\x6a\x20\x01\x6a\x0b",
             // Return the initial local plus the arg, but mutate both slots.
             b"\x01\x01\x7f\x20\x01\x20\0\x22\x01\x6a\x41\x03\x21\0\x0b",
+            // Both previous slots (including the parameter) are now fresh locals.
+            b"\x01\x02\x7f\x20\0\x20\x01\x6a\x0b",
         ],
     );
     let instance = validated.instantiate();
     assert_eq!(instance.invoke_i32_with_args("answer", &[7]), Ok(80));
     assert_eq!(instance.invoke_i32_with_args("answer", &[-2]), Ok(53));
+    assert_eq!(instance.invoke_i32("zero"), Ok(0));
+    assert_eq!(
+        instance.invoke_i32_with_args("zero", &[7]),
+        Err(InvokeError::ArityMismatch {
+            expected: 0,
+            actual: 1
+        })
+    );
 }
 
 #[test]
@@ -469,6 +598,42 @@ fn validates_call_stack_effect_at_the_active_floor_including_untaken_arms() {
 }
 
 #[test]
+fn mixed_arity_call_cannot_pop_past_the_function_or_either_arm_floor() {
+    let types = i32_types(&[1, 2]);
+    let declarations = [2, 0, 1];
+    let invalid_call = [0x41, 1, 0x10, 1]; // Supply one, but f1 requires two.
+    let check_caller = |caller: &[u8], call_offset| {
+        let mut bytes = module(&[(1, &types), (3, &declarations)]);
+        let start = push_section(&mut bytes, 10, &code_bodies(&[caller, &CODE[2..]]));
+        let caller_start = code_body(caller).len() - caller.len();
+        expect_error(
+            &bytes,
+            start + caller_start + call_offset,
+            ErrorKind::StackUnderflow { depth: 1 },
+        );
+    };
+    check_caller(b"\0\x41\x01\x10\x01\x0b", 3);
+    for invalid_then in [true, false] {
+        // Keep an operand below the floor. The invalid arm is always untaken.
+        let mut caller = vec![0, 0x41, 9, 0x41, u8::from(!invalid_then), 0x04, 0x7f];
+        let mut call_offset = 0;
+        for then_arm in [true, false] {
+            if !then_arm {
+                caller.push(0x05);
+            }
+            if then_arm == invalid_then {
+                call_offset = caller.len() + 2;
+                caller.extend(invalid_call);
+            } else {
+                caller.extend([0x41, 42]);
+            }
+        }
+        caller.extend([0x0b, 0x6a, 0x0b]);
+        check_caller(&caller, call_offset);
+    }
+}
+
+#[test]
 fn zero_arg_result_obeys_the_operand_cap_without_sharing_caller_stack_space() {
     let limit = Limit::OperandStackDepth;
     let peak = limit.maximum();
@@ -488,12 +653,20 @@ fn zero_arg_result_obeys_the_operand_cap_without_sharing_caller_stack_space() {
     }
     callee.extend(std::iter::repeat_n(0x6a, peak - 1));
     callee.push(0x0b);
-    let validated = exported_functions(0, &[(b"answer", 0)], &[&caller(peak - 1), &callee]);
-    assert_eq!(validated.instantiate().invoke_i32("answer"), Ok(63));
+    let validated = exported_typed_functions(
+        &[1, 0],
+        &[0, 1],
+        &[(b"answer", 0)],
+        &[&caller(peak - 1), &callee],
+    );
+    assert_eq!(
+        validated.instantiate().invoke_i32_with_args("answer", &[7]),
+        Ok(63)
+    );
 
     let too_deep = caller(peak);
     let code = code_bodies(&[&too_deep, &callee]);
-    let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
+    let mut bytes = module(&[(1, &i32_types(&[1, 0])), (3, &[2, 0, 1])]);
     let start = push_section(&mut bytes, 10, &code);
     let caller_start = code_body(&too_deep).len() - too_deep.len();
     expect_error(
@@ -505,14 +678,15 @@ fn zero_arg_result_obeys_the_operand_cap_without_sharing_caller_stack_space() {
 
 #[test]
 fn propagates_the_first_nested_trap_and_reuses_the_instance() {
-    let validated = exported_functions(
-        1,
+    let validated = exported_typed_functions(
+        &[2, 1, 3],
+        &[1, 0, 2],
         &[(b"answer", 0)],
         &[
-            // f1(arg) / (arg + 1) -- would divide by zero for -1 if reached.
-            b"\0\x20\0\x10\x01\x20\0\x41\x01\x6a\x6d\x0b",
-            b"\0\x20\0\x10\x02\x0b",                     // f2(arg)
-            b"\0\x41\x80\x80\x80\x80\x78\x20\0\x6d\x0b", // MIN / arg
+            // f1(arg, MIN) / (arg + 1) -- would divide by zero for -1 if reached.
+            b"\0\x20\0\x41\x80\x80\x80\x80\x78\x10\x01\x20\0\x41\x01\x6a\x6d\x0b",
+            b"\0\x20\x01\x20\0\x41\x01\x10\x02\x0b", // f2(b, a, 1)
+            b"\0\x20\0\x20\x01\x20\x02\x6c\x6d\x0b", // a / (b * c)
         ],
     );
     let instance = validated.instantiate();
@@ -620,8 +794,9 @@ fn dispatch_limit_is_checked_before_attempting_a_call_at_maximum_depth() {
 
 #[test]
 fn requires_exact_function_and_code_count_agreement() {
+    let types = i32_types(&[2, 0, 1]);
     for bodies in [1, 3] {
-        let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
+        let mut bytes = module(&[(1, &types), (3, &[2, 1, 0])]);
         let start = push_section(&mut bytes, 10, &code_bodies(&vec![&CODE[2..]; bodies]));
         expect_error(
             &bytes,
@@ -636,7 +811,7 @@ fn requires_exact_function_and_code_count_agreement() {
 
 #[test]
 fn validates_later_unexported_bodies_with_their_own_local_space_and_frames() {
-    let first = &[1, 1, 0x7f, 0x20, 0, 0x0b];
+    let first = &[1, 1, 0x7f, 0x20, 4, 0x0b];
     let limit = Limit::CodeBodyBytes;
     let oversized = vec![0; limit.maximum() + 1];
     for (second, offset, kind) in [
@@ -670,7 +845,7 @@ fn validates_later_unexported_bodies_with_their_own_local_space_and_frames() {
         (&[0, 0x41, 42, 0x0b, 0x0b], 5, ErrorKind::TrailingBodyBytes),
         (&oversized, 0, ErrorKind::LimitExceeded { limit }),
     ] {
-        let mut bytes = module(&[(1, TYPE), (3, &[3, 0, 0, 0]), (7, EXPORT)]);
+        let mut bytes = module(&[(1, &i32_types(&[4, 0])), (3, &[3, 0, 1, 1]), (7, EXPORT)]);
         let start = push_section(&mut bytes, 10, &code_bodies(&[first, second, &CODE[2..]]));
         // The next valid body's frame cannot supply the missing immediate byte.
         let second_size = code_body(first).len();
@@ -1716,7 +1891,7 @@ fn rejects_unsigned_leb_overflow_and_max_u32_indices() {
 fn bounds_type_function_code_and_export_counts() {
     use IntegerField::*;
     for (id, prefix, field, bad_counts) in [
-        (1, &[][..], TypeCount, &[0, 2][..]),
+        (1, &[][..], TypeCount, &[0, 9][..]),
         (1, &[1, 0x60], ParameterCount, &[5]),
         (1, &[1, 0x60, 0], ResultCount, &[0, 2]),
         (3, &[], FunctionCount, &[0, 9]),

@@ -10,8 +10,10 @@
 //! locals in total. The number of groups and each group's local count are
 //! unsigned LEB32; zero-count groups are allowed but must still specify `i32`.
 //! Supported instructions are `local.get`, `local.set`, `local.tee` (each with
-//! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.add`, `i32.sub`,
-//! `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, and
+//! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
+//! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
+//! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
+//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, and
 //! `if (result i32) ... else ... end` (block type byte `0x7f`). Local indices
 //! start at zero and address parameters first, then locals in declaration order.
 //! Both can be assigned. `if` can nest, takes no block parameters, and requires
@@ -25,13 +27,14 @@
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
-//! `local.set` pops one, `local.tee` requires and leaves the top operand, and
-//! the binary operators consume two and push one. `if` consumes an i32 condition
-//! from above the enclosing frame's operand floor and saves the remaining depth
-//! as the floor for both arms. Every operand access in an arm must stay above
-//! that floor. `else` checks for exactly one new result and resets validation to
-//! the saved depth, and the matching `end` checks that the else arm also leaves
-//! exactly one new result. Both arms are checked regardless of the condition.
+//! `local.set` pops one, `local.tee` requires and leaves the top operand,
+//! `i32.eqz` consumes one and pushes one, and the binary operators consume two
+//! and push one. `if` consumes an i32 condition from above the enclosing
+//! frame's operand floor and saves the remaining depth as the floor for both
+//! arms. Every operand access in an arm must stay above that floor. `else`
+//! checks for exactly one new result and resets validation to the saved depth,
+//! and the matching `end` checks that the else arm also leaves exactly one new
+//! result. Both arms are checked regardless of the condition.
 //! The function has a floor of zero; its own `end` must be the final byte of
 //! the body frame and leave exactly one result. The inclusive limits are 256
 //! body bytes (including the locals vector and all `end` bytes), 127 decoded
@@ -52,7 +55,11 @@
 //! parameters are copied from the supplied arguments, and declared locals start
 //! at zero on every call. [`Instance::invoke_i32`] is equivalent to passing an
 //! empty argument slice. The top operand is the right-hand side of each binary
-//! operation. Addition, subtraction, and multiplication wrap modulo 2³². Signed
+//! operation. `i32.eqz` tests for zero, and `i32.eq` and `i32.ne` compare the
+//! operand bits for equality or inequality. Ordering comparisons interpret the
+//! bits as signed `i32` for `_s` and unsigned `u32` for `_u`. These tests and
+//! comparisons do not trap and return exactly `1` if true or `0` if false.
+//! Addition, subtraction, and multiplication wrap modulo 2³². Signed
 //! division truncates toward zero, and a nonzero signed remainder has the sign
 //! of the dividend. Unsigned division and remainder interpret the operand bits
 //! as `u32` and preserve the result bits in the returned `i32` value.
@@ -75,6 +82,10 @@
 //! successive calls, wrapping arithmetic after discarding the input, signed and
 //! unsigned division and remainder edge cases, name and arity checks before
 //! execution, and stopping at the first guest trap and reusing the instance.
+//! Comparison tests cover exact 0/1 results, equal operands and signed versus
+//! unsigned boundary values, unary and binary underflows at the function and
+//! arm floors, conditional selection, and comparisons at the instruction and
+//! operand limits.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor

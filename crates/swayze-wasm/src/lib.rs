@@ -6,11 +6,14 @@
 //! custom sections within [`Limit`], and either no standard sections or exactly
 //! one type, one function, and one code body in their respective sections. The
 //! type must have zero to four `i32` parameters and exactly one `i32` result.
-//! The function must reference type zero, and its body must have an empty locals
-//! declaration vector. The only instructions before a single final `end` are
-//! `local.get <unsigned LEB32>`, `i32.const <signed LEB32>`, `i32.add`, `i32.sub`,
-//! and `i32.mul`. `local.get` addresses only parameters, in declaration order
-//! starting at zero. There are no calls, branches, or other control instructions.
+//! The function must reference type zero. Its body may declare up to 16 `i32`
+//! locals in total. The number of groups and each group's local count are
+//! unsigned LEB32; zero-count groups are allowed but must still specify `i32`.
+//! The only instructions before a single final `end` are `local.get`, `local.set`,
+//! `local.tee` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
+//! `i32.add`, `i32.sub`, and `i32.mul`. Local indices start at zero and address
+//! parameters first, then locals in declaration order. Both can be assigned.
+//! There are no calls, branches, or other control instructions.
 //! An optional export section between function and code may contain zero or one
 //! export, which must refer to function zero. Both kinds of names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
@@ -19,7 +22,8 @@
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
-//! and the binary operators consume two and push one. `end` must be the final
+//! `local.set` pops one, `local.tee` requires and leaves the top operand, and
+//! the binary operators consume two and push one. `end` must be the final
 //! byte of the body frame and leave exactly one result. The inclusive limits are
 //! 256 body bytes (including the locals vector and `end`), 127 instructions
 //! (excluding `end`), and 32 live i32 operands.
@@ -28,8 +32,10 @@
 //! private decoded instructions and an optional bounded export name. A separate
 //! [`Module::instantiate`] step creates an [`Instance`]. Its typed
 //! [`Instance::invoke_i32_with_args`] method looks up the exact export name,
-//! checks the argument count, and executes each stored instruction once on a
-//! fixed stack without allocating. [`Instance::invoke_i32`] is equivalent to
+//! checks the argument count, and executes each stored instruction once without
+//! allocating. Each invocation has a fixed operand stack and fixed local storage:
+//! parameters are copied from the supplied arguments, and declared locals start
+//! at zero on every call. [`Instance::invoke_i32`] is equivalent to
 //! passing an empty argument slice. Arithmetic wraps modulo 2³²; subtraction
 //! uses the top operand as the right-hand side. Empty, custom-only, and
 //! unexported modules have no callable exports. [`prepare`] remains a stub.
@@ -38,14 +44,16 @@
 //!
 //! Local tests exercise framing, UTF-8, size limits, section order and contents,
 //! function/type/code and export relationships, parameter types and counts,
-//! exact invocation arity, bounded LEB32 decoding (including local indices),
-//! stack underflow and final depth, each body budget, and ordered parameter reads
-//! and wrapping arithmetic after discarding the input. Parsing uses bounded
-//! borrowed frames and decodes into a fixed-size scratch array. Only after
-//! checking `end` and the complete body frame does it call `Vec::try_reserve_exact`
-//! for the decoded instruction count and copy those instructions. The export
-//! name is also reserved fallibly. There is no unsafe code, recursion, or
-//! external dependency.
+//! exact invocation arity, bounded LEB32 decoding (including local counts and
+//! indices), local declaration types and limits, each stack effect and body
+//! budget, reads and writes in the combined local index space, fresh locals on
+//! successive calls, and wrapping arithmetic after discarding the input.
+//! Parsing checks declaration counts against the remaining local budget without
+//! expanding groups. It uses bounded borrowed frames and decodes instructions
+//! into a fixed-size scratch array. After checking `end` and the complete body
+//! frame, it calls `Vec::try_reserve_exact` for the decoded instruction count and
+//! copies those instructions. The export name is also reserved fallibly. There
+//! is no unsafe code, recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!
@@ -109,6 +117,8 @@ impl Instance<'_> {
     /// An unknown name returns [`InvokeError::ExportNotFound`]. If the name
     /// matches, the number of arguments must equal the declared parameter count
     /// or this returns [`InvokeError::ArityMismatch`] without executing code.
+    /// Assignments to parameters do not affect the supplied slice, and declared
+    /// locals are initialized to zero on each invocation.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         match &self.module.function {
             Some(function) if function.export.as_deref() == Some(name) => {

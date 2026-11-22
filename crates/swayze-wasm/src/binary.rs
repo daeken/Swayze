@@ -68,6 +68,8 @@ pub enum IntegerField {
     FunctionIndex,
     LocalIndex,
     I32Const,
+    /// Number of declared locals in one group.
+    LocalCount,
 }
 
 /// Fixed resource bounds for [`validate_module`]. All maxima are inclusive.
@@ -81,7 +83,7 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded `local.get` and i32 operations; excludes `end`.
+    /// Decoded local and i32 operations; excludes `end`.
     BodyInstructions,
     /// Peak number of live i32 operands in the code body.
     OperandStackDepth,
@@ -153,9 +155,7 @@ impl fmt::Display for Error {
             TrailingSectionBytes { id } => write!(f, "trailing bytes in section ID {id}"),
             TrailingBodyBytes => f.write_str("trailing bytes after code body end"),
             UnsupportedOpcode { opcode } => write!(f, "unsupported opcode {opcode:#04x}"),
-            StackUnderflow { depth } => {
-                write!(f, "binary operator needs two operands, found {depth}")
-            }
+            StackUnderflow { depth } => write!(f, "not enough operands, found {depth}"),
             InvalidResultDepth { depth } => write!(f, "expected one result at end, found {depth}"),
             AllocationFailed => f.write_str("could not reserve validated module storage"),
             LimitExceeded { limit } => {
@@ -180,6 +180,8 @@ impl std::error::Error for Error {}
 /// rejected before reading the size. Decodable sizes are checked against
 /// their limit before checking availability. Bad UTF-8 is reported at the start
 /// of the invalid or incomplete sequence.
+/// A local group's count that exceeds the remaining declared-local budget is
+/// reported as [`ErrorKind::UnsupportedCount`] with [`IntegerField::LocalCount`].
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -316,6 +318,8 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
 }
 
 const MAX_PARAMETERS: u32 = 4;
+const MAX_DECLARED_LOCALS: u32 = 16;
+const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 
 fn validate_type(section: &mut Reader<'_>) -> Result<u32, Error> {
@@ -346,6 +350,8 @@ const END: u8 = 0x0b;
 enum Instruction {
     Const(i32),
     LocalGet(u32),
+    LocalSet(u32),
+    LocalTee(u32),
     Binary(BinaryOp),
 }
 
@@ -372,12 +378,14 @@ impl ValidatedCode {
                 actual: args.len(),
             });
         }
+        // Only the parameter prefix is overwritten; declared locals start at zero.
+        let mut locals = [0i32; MAX_LOCAL_SLOTS];
+        locals[..self.parameter_count].copy_from_slice(args);
         let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
         let mut depth = 0;
         // Each stored instruction runs once, for at most BodyInstructions steps.
-        // Validation proves each local index is below parameter_count. It starts
-        // at the same operand depth, proves every stack access fits, and
-        // establishes that depth is one on completion.
+        // Validation proves each local index is below the total slot count,
+        // every stack access fits, and depth is one on completion.
         for &instruction in &self.instructions {
             match instruction {
                 Instruction::Const(value) => {
@@ -385,8 +393,15 @@ impl ValidatedCode {
                     depth += 1;
                 }
                 Instruction::LocalGet(index) => {
-                    operands[depth] = args[index as usize];
+                    operands[depth] = locals[index as usize];
                     depth += 1;
+                }
+                Instruction::LocalSet(index) => {
+                    depth -= 1;
+                    locals[index as usize] = operands[depth];
+                }
+                Instruction::LocalTee(index) => {
+                    locals[index as usize] = operands[depth - 1];
                 }
                 Instruction::Binary(op) => {
                     let rhs = operands[depth - 1];
@@ -404,6 +419,20 @@ impl ValidatedCode {
     }
 }
 
+fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
+    let groups = body.integer(IntegerField::LocalGroupCount)?;
+    let mut remaining = MAX_DECLARED_LOCALS;
+    // Every group consumes at least two bytes of the bounded body, even if its
+    // count is zero. No declarations are expanded or allocated here.
+    for _ in 0..groups {
+        let count = body.count(IntegerField::LocalCount, 0..=remaining)?;
+        body.expect_byte(I32)?;
+        // Count was checked against the remaining budget before subtraction.
+        remaining -= count;
+    }
+    Ok(MAX_DECLARED_LOCALS - remaining)
+}
+
 fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
     section.count(IntegerField::CodeCount, 1..=1)?;
     let declared = section.length(LengthField::CodeBodySize)?;
@@ -415,7 +444,7 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
             available,
         },
     })?;
-    body.count(IntegerField::LocalGroupCount, 0..=0)?;
+    let local_bound = parameter_count + validate_locals(&mut body)?;
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
     let mut count = 0;
     let mut depth = 0usize;
@@ -450,7 +479,9 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
             },
         })?;
         let instruction = match opcode {
-            0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, parameter_count)?),
+            0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
+            0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
+            0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
             0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
             0x6a => Instruction::Binary(BinaryOp::Add),
             0x6b => Instruction::Binary(BinaryOp::Sub),
@@ -462,6 +493,12 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
                 });
             }
         };
+        let consume = |operands| {
+            depth.checked_sub(operands).ok_or(Error {
+                offset,
+                kind: ErrorKind::StackUnderflow { depth },
+            })
+        };
         depth = match instruction {
             Instruction::Const(_) | Instruction::LocalGet(_) => depth
                 .checked_add(1)
@@ -472,14 +509,9 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
                         limit: Limit::OperandStackDepth,
                     },
                 })?,
-            Instruction::Binary(_) => {
-                // Consume both operands before accounting for the single result.
-                let remaining = depth.checked_sub(2).ok_or(Error {
-                    offset,
-                    kind: ErrorKind::StackUnderflow { depth },
-                })?;
-                remaining + 1
-            }
+            Instruction::LocalSet(_) => consume(1)?,
+            Instruction::LocalTee(_) => consume(1)? + 1,
+            Instruction::Binary(_) => consume(2)? + 1,
         };
         *slot = instruction;
         count += 1;

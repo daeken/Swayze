@@ -102,7 +102,7 @@ fn entire_input_is_required() {
     assert_error("1;;", Unsupported, 2, 3);
     assert_error("1;\u{00A0}🚧", Unsupported, 4, 8);
     assert_error("1; let x", Unsupported, 3, 6);
-    assert_error("1; // comment", Unsupported, 3, 5);
+    assert_postfix("1; // comment", &[Number(1.)], 1);
     assert_error("1;\0", Unsupported, 2, 3);
     assert_error("1 23", Malformed, 2, 4);
     assert_error("1\n2", Unsupported, 2, 3);
@@ -228,7 +228,6 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const x=1; x += 2", Unsupported, 13, 15),
         ("const x=1; x(2)", Unsupported, 12, 13),
         ("const x=1; x.y", Unsupported, 12, 13),
-        ("const x=1; x//comment", Unsupported, 12, 14),
         ("(const x=1; x)", Unsupported, 1, 6),
     ] {
         assert_error(source, kind, start, end);
@@ -322,7 +321,7 @@ fn malformed_subset_and_unsupported_constructs() {
     assert_error("1%", Malformed, 2, 2);
     assert_error("1%%2", Malformed, 2, 3);
     assert_error("() => 1", Unsupported, 3, 5);
-    assert_error("(()/*comment*/=>1)", Unsupported, 3, 5);
+    assert_error("(()/*comment*/=>1)", Unsupported, 14, 16);
 }
 
 #[test]
@@ -337,10 +336,9 @@ fn operator_lexical_boundaries_are_conservative() {
     assert_error("-1**2", Unsupported, 2, 4);
     assert_error("(-1)**2", Unsupported, 4, 6);
     assert_error("1\n**2", Unsupported, 2, 4);
-    assert_error("1/*comment*/+2", Unsupported, 1, 3);
-    assert_error("1//2", Unsupported, 1, 3);
-    assert_error("1\n//2", Unsupported, 2, 4);
-    assert_error("-/*comment*/1", Unsupported, 1, 3);
+    assert_postfix("1/*comment*/+2", &[Number(1.), Number(2.), Add], 2);
+    assert_postfix("1//2", &[Number(1.)], 1);
+    assert_postfix("-/*comment*/1", &[Number(1.), Negate], 1);
     assert_error("/2/", Unsupported, 0, 1);
     assert_error("8 / /2/", Unsupported, 4, 5);
     assert_error("+ /2/", Unsupported, 2, 3);
@@ -450,8 +448,8 @@ fn decimal_literal_forms_and_token_boundaries() {
     assert_error("1 .5", Malformed, 2, 4);
     assert_error("1.\n.5", Unsupported, 3, 5);
     assert_error(".5; 1e0", Unsupported, 4, 7);
-    assert_error("1./*comment*/", Unsupported, 2, 4);
-    assert_error(".5e-1//comment", Unsupported, 5, 7);
+    assert_postfix("1./*comment*/", &[Number(1.)], 1);
+    assert_postfix(".5e-1//comment", &[Number(0.05)], 1);
 }
 
 #[test]

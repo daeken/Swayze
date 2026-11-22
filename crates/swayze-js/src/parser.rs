@@ -24,7 +24,7 @@ impl Span {
 pub struct Limits {
     /// Maximum UTF-8 source length, checked before scanning.
     pub max_source_bytes: usize,
-    /// Maximum number of non-whitespace tokens, including punctuation.
+    /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
     /// Maximum number of simultaneously open parentheses.
     pub max_nesting_depth: usize,
@@ -345,17 +345,52 @@ impl Lexer<'_> {
         Ok(span)
     }
 
-    fn skip_whitespace(&mut self) -> Result<bool, Error> {
+    fn skip_trivia(&mut self) -> Result<bool, Error> {
         let mut line_break = false;
-        while let Some(c) = self.peek().filter(|&c| is_trivia_space(c)) {
-            line_break |= is_line_terminator(c);
-            self.consume(c)?;
+        while let Some(c) = self.peek() {
+            if is_trivia_space(c) {
+                line_break |= is_line_terminator(c);
+                self.consume(c)?;
+            } else if c == '/' && self.rest().starts_with("//") {
+                self.consume('/')?;
+                self.consume('/')?;
+                // Leave the line terminator for the next trivia iteration.
+                while let Some(c) = self.peek().filter(|&c| !is_line_terminator(c)) {
+                    self.consume(c)?;
+                }
+            } else if c == '/' && self.rest().starts_with("/*") {
+                line_break |= self.skip_block_comment()?;
+            } else {
+                break;
+            }
         }
         Ok(line_break)
     }
 
+    fn skip_block_comment(&mut self) -> Result<bool, Error> {
+        let start = self.offset;
+        self.consume('/')?;
+        self.consume('*')?;
+        let mut line_break = false;
+        while let Some(c) = self.peek() {
+            self.consume(c)?;
+            if c == '*' && self.peek() == Some('/') {
+                self.consume('/')?;
+                return Ok(line_break);
+            }
+            line_break |= is_line_terminator(c);
+        }
+        Err(Error::malformed(
+            Span {
+                start,
+                end: self.offset,
+            },
+            "unterminated block comment",
+        ))
+    }
+
     fn next(&mut self) -> Result<Option<Token>, Error> {
-        let after_line_break = self.skip_whitespace()?;
+        let after_line_break = self.skip_trivia()?;
         let Some(c) = self.peek() else {
             return Ok(None);
         };
@@ -448,30 +483,20 @@ impl Lexer<'_> {
     }
 
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
-        if let Some(next) = self.peek() {
-            if c == '/' && matches!(next, '/' | '*') {
-                self.consume(next)?;
-                return Err(Error::unsupported(
-                    Span {
-                        start,
-                        end: self.offset,
-                    },
-                    "comments are outside the arithmetic subset",
-                ));
+        if let Some(next) = self.peek()
+            && (next == '=' || (next == c && matches!(c, '+' | '-' | '*')))
+        {
+            self.consume(next)?;
+            if c == '*' && next == '*' && self.rest().starts_with('=') {
+                self.consume('=')?;
             }
-            if next == '=' || (next == c && matches!(c, '+' | '-' | '*')) {
-                self.consume(next)?;
-                if c == '*' && next == '*' && self.rest().starts_with('=') {
-                    self.consume('=')?;
-                }
-                return Err(Error::unsupported(
-                    Span {
-                        start,
-                        end: self.offset,
-                    },
-                    "longer punctuator is outside the arithmetic subset",
-                ));
-            }
+            return Err(Error::unsupported(
+                Span {
+                    start,
+                    end: self.offset,
+                },
+                "longer punctuator is outside the arithmetic subset",
+            ));
         }
         Ok(TokenKind::Operator(match c {
             '+' => Operator::Add,
@@ -761,9 +786,9 @@ impl Parser<'_> {
                 }
                 (true, TokenKind::Close) if matches!(self.pending.last(), Some((None, _))) => {
                     // Empty parens can start an arrow function; don't misreport that as malformed.
-                    self.lexer.skip_whitespace()?;
+                    self.lexer.skip_trivia()?;
                     let rest = self.lexer.rest();
-                    if let Some(prefix) = ["=>", "/*", "//", "<!--", "-->"]
+                    if let Some(prefix) = ["=>", "<!--", "-->"]
                         .into_iter()
                         .find(|p| rest.starts_with(p))
                     {
@@ -773,7 +798,7 @@ impl Parser<'_> {
                                 start,
                                 end: start + prefix.len(),
                             },
-                            "arrow syntax or comments are outside the arithmetic subset",
+                            "arrow syntax or HTML comments are outside the arithmetic subset",
                         ));
                     }
                     return Err(Error::malformed(span, "empty parenthesized expression"));

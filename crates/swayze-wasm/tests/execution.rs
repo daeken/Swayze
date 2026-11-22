@@ -510,6 +510,44 @@ fn executes_signed_and_unsigned_division_and_remainder() {
 }
 
 #[test]
+fn eqz_returns_exactly_one_for_zero_and_zero_otherwise() {
+    let code = code_body(&[0, 0x20, 0, 0x45, 0x0b]);
+    let module = exported_function(&i32_type(1), &code);
+    let instance = module.instantiate();
+    for (arg, expected) in [(0, 1), (1, 0), (-1, 0), (i32::MIN, 0), (i32::MAX, 0)] {
+        assert_eq!(
+            instance.invoke_i32_with_args("answer", &[arg]),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn compares_signed_and_unsigned_operands_in_stack_order() {
+    // Expected results in opcode order: eq, ne, lt_s/u, gt_s/u, le_s/u, ge_s/u.
+    let cases = [
+        ([-1, 0], [0, 1, 1, 0, 0, 1, 1, 0, 0, 1]),
+        ([0, -1], [0, 1, 0, 1, 1, 0, 0, 1, 1, 0]),
+        ([i32::MIN, i32::MAX], [0, 1, 1, 0, 0, 1, 1, 0, 0, 1]),
+        ([i32::MAX, i32::MIN], [0, 1, 0, 1, 1, 0, 0, 1, 1, 0]),
+        ([i32::MIN, -1], [0, 1, 1, 1, 0, 0, 1, 1, 0, 0]),
+        ([i32::MIN, i32::MIN], [1, 0, 0, 0, 0, 0, 1, 1, 1, 1]),
+    ];
+    for (index, opcode) in (0x46..=0x4f).enumerate() {
+        let code = code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]);
+        let module = exported_function(&i32_type(2), &code);
+        let instance = module.instantiate();
+        for (args, expected) in cases {
+            assert_eq!(
+                instance.invoke_i32_with_args("answer", &args),
+                Ok(expected[index]),
+                "opcode {opcode:#x} with {args:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn division_and_remainder_by_zero_validate_but_trap_on_invocation() {
     for opcode in 0x6d..=0x70 {
         let code = code_body(&[0, 0x41, 0, 0x41, 0, opcode, 0x0b]);
@@ -623,6 +661,29 @@ fn joins_nested_arms_at_the_enclosing_else_or_function_exit() {
 }
 
 #[test]
+fn zero_test_and_ordering_comparisons_select_conditional_arms() {
+    let code = code_body(&[
+        0, 0x41, 40, // Preserve 40 below each arm's operand floor.
+        0x20, 0, 0x45, 0x04, 0x7f, // if eqz(p0)
+        0x20, 1, 0x20, 2, 0x48, // then: p1 <_s p2
+        0x04, 0x7f, 0x41, 1, 0x05, 0x41, 2, 0x0b, // selects 1 or 2
+        0x05, 0x20, 1, 0x20, 2, 0x49, // else: p1 <_u p2
+        0x04, 0x7f, 0x41, 3, 0x05, 0x41, 4, 0x0b, // selects 3 or 4
+        0x0b, 0x6a, 0x0b,
+    ]);
+    let module = exported_function(&i32_type(3), &code);
+    let instance = module.instantiate();
+    for (args, expected) in [
+        ([0, -1, 0], 41),
+        ([0, 0, -1], 42),
+        ([1, 0, -1], 43),
+        ([1, -1, 0], 44),
+    ] {
+        assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
+    }
+}
+
+#[test]
 fn rejects_bad_if_block_type_and_missing_condition() {
     for found in [0x40, 0x7e, 0, 0xff] {
         bad_body(
@@ -699,6 +760,39 @@ fn cannot_use_operands_below_the_arm_floor_even_if_restored() {
                 arm_start + bad_op,
                 ErrorKind::StackUnderflow { depth },
             );
+        }
+    }
+}
+
+#[test]
+fn comparisons_require_their_operands_above_the_active_floor() {
+    let push = [0x41, 1];
+    for opcode in 0x45..=0x4f {
+        let arity = if opcode == 0x45 { 1 } else { 2 };
+        for depth in 0..arity {
+            let operands = push.repeat(depth);
+            let underflow = ErrorKind::StackUnderflow { depth };
+            let body = [&[0][..], &operands, &[opcode, 0x0b]].concat();
+            bad_body(&body, 1 + operands.len(), underflow);
+
+            // The function has two frozen operands. If a comparison illegally
+            // used one or both, the rest of the arm would restore its depth.
+            let restore = push.repeat(arity - depth);
+            let bad = [&operands[..], &[opcode], &restore].concat();
+            for (condition, then, otherwise, arm_start) in
+                [(0, &bad[..], &push[..], 9), (1, &push[..], &bad[..], 12)]
+            {
+                // The invalid arm is always untaken.
+                let body = [
+                    &[0, 0x41, 10, 0x41, 20, 0x41, condition, 0x04, 0x7f][..],
+                    then,
+                    &[0x05],
+                    otherwise,
+                    &[0x0b, 0x6a, 0x6a, 0x0b],
+                ]
+                .concat();
+                bad_body(&body, arm_start + operands.len(), underflow);
+            }
         }
     }
 }
@@ -799,20 +893,20 @@ fn conditional_body_byte_budget_includes_both_ends() {
 fn counts_control_ops_and_both_arms_together_in_the_instruction_budget() {
     let limit = Limit::BodyInstructions;
     let ty = i32_type(1);
-    let mut body = vec![0, 0x20, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 6];
+    let mut body = vec![0, 0x20, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 1];
     let pairs = (limit.maximum() - 5) / 2;
     assert_eq!(5 + 2 * pairs, limit.maximum());
     for _ in 0..pairs {
-        body.extend([0x41, 0, 0x6a]);
+        body.extend([0x41, 1, 0x46]); // Check equality with 1, leaving 1.
     }
     body.extend([0x0b, 0x0b]);
     let module = exported_function(&ty, &code_body(&body));
     let instance = module.instantiate();
     assert_eq!(instance.invoke_i32_with_args("answer", &[1]), Ok(7));
-    assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(6));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(1));
 
     let extra = body.len() - 2;
-    body.splice(extra..extra, [0x22, 0]);
+    body.insert(extra, 0x45);
     bad_typed_body(&ty, &body, extra, ErrorKind::LimitExceeded { limit });
 }
 
@@ -826,10 +920,11 @@ fn arm_operand_limit_includes_values_below_its_floor() {
     }
     body.extend([0x41, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 1, 0x41, 2]);
     let at_limit = body.len();
-    body.extend([0x6a, 0x0b]);
+    // eqz replaces the top operand at full depth, then lt_s consumes two.
+    body.extend([0x45, 0x48, 0x0b]);
     body.extend(std::iter::repeat_n(0x6a, base));
     body.push(0x0b);
-    assert_body_result(&body, base as i32 + 3);
+    assert_body_result(&body, base as i32);
     // The else arm exceeds the limit even though the condition now selects then.
     body[2 + 2 * base] = 1;
     body.splice(at_limit..at_limit, [0x41, 3, 0x6a]);
@@ -840,6 +935,7 @@ fn arm_operand_limit_includes_values_below_its_floor() {
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![0x04, 0x05, 0x0b, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
+            && !(0x45..=0x4f).contains(&opcode)
             && !(0x6a..=0x70).contains(&opcode)
         {
             bad_body(

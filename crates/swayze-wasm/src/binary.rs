@@ -377,6 +377,7 @@ enum Instruction {
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
+    Eqz,
     Binary(BinaryOp),
     JumpIfZero { target: usize },
     Jump { target: usize },
@@ -384,6 +385,16 @@ enum Instruction {
 
 #[derive(Clone, Copy, Debug)]
 enum BinaryOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
     Add,
     Sub,
     Mul,
@@ -396,6 +407,16 @@ enum BinaryOp {
 impl BinaryOp {
     fn apply(self, lhs: i32, rhs: i32) -> Result<i32, Trap> {
         match self {
+            Self::Eq => Ok(i32::from(lhs == rhs)),
+            Self::Ne => Ok(i32::from(lhs != rhs)),
+            Self::LtS => Ok(i32::from(lhs < rhs)),
+            Self::LtU => Ok(i32::from((lhs as u32) < (rhs as u32))),
+            Self::GtS => Ok(i32::from(lhs > rhs)),
+            Self::GtU => Ok(i32::from((lhs as u32) > (rhs as u32))),
+            Self::LeS => Ok(i32::from(lhs <= rhs)),
+            Self::LeU => Ok(i32::from((lhs as u32) <= (rhs as u32))),
+            Self::GeS => Ok(i32::from(lhs >= rhs)),
+            Self::GeU => Ok(i32::from((lhs as u32) >= (rhs as u32))),
             Self::Add => Ok(lhs.wrapping_add(rhs)),
             Self::Sub => Ok(lhs.wrapping_sub(rhs)),
             Self::Mul => Ok(lhs.wrapping_mul(rhs)),
@@ -460,6 +481,10 @@ impl ValidatedCode {
                 }
                 Instruction::LocalTee(index) => {
                     locals[index as usize] = operands[depth - 1];
+                }
+                Instruction::Eqz => {
+                    let top = &mut operands[depth - 1];
+                    *top = i32::from(*top == 0);
                 }
                 Instruction::Binary(op) => {
                     let rhs = operands[depth - 1];
@@ -528,6 +553,17 @@ fn decode_plain(
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
         0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
+        0x45 => Instruction::Eqz,
+        0x46 => Instruction::Binary(BinaryOp::Eq),
+        0x47 => Instruction::Binary(BinaryOp::Ne),
+        0x48 => Instruction::Binary(BinaryOp::LtS),
+        0x49 => Instruction::Binary(BinaryOp::LtU),
+        0x4a => Instruction::Binary(BinaryOp::GtS),
+        0x4b => Instruction::Binary(BinaryOp::GtU),
+        0x4c => Instruction::Binary(BinaryOp::LeS),
+        0x4d => Instruction::Binary(BinaryOp::LeU),
+        0x4e => Instruction::Binary(BinaryOp::GeS),
+        0x4f => Instruction::Binary(BinaryOp::GeU),
         0x6a => Instruction::Binary(BinaryOp::Add),
         0x6b => Instruction::Binary(BinaryOp::Sub),
         0x6c => Instruction::Binary(BinaryOp::Mul),
@@ -666,7 +702,7 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
                         depth + 1
                     }
                     Instruction::LocalSet(_) => consume(1)?,
-                    Instruction::LocalTee(_) => consume(1)? + 1,
+                    Instruction::LocalTee(_) | Instruction::Eqz => consume(1)? + 1,
                     Instruction::Binary(_) => consume(2)? + 1,
                     Instruction::JumpIfZero { .. } | Instruction::Jump { .. } => {
                         unreachable!("only control delimiters create jumps")

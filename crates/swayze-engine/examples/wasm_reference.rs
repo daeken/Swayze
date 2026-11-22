@@ -194,6 +194,27 @@ fn fixtures() -> Vec<Fixture> {
     ] {
         cases.push(Fixture::with_outcome(outcome, &args, &[0], &nested));
     }
+    for (arg, expected) in [(0, 1), (i32::MIN, 0)] {
+        cases.push(Fixture::new(expected, &[arg], &[0x20, 0, 0x45]));
+    }
+    for (args, expected) in [
+        ([-1, 1], [0, 1, 1, 0, 0, 1, 1, 0, 0, 1]),
+        ([1, -1], [0, 1, 0, 1, 1, 0, 0, 1, 1, 0]),
+        ([i32::MIN; 2], [1, 0, 0, 0, 0, 0, 1, 1, 1, 1]),
+    ] {
+        for (opcode, result) in (0x46..=0x4f).zip(expected) {
+            cases.push(Fixture::new(result, &args, &[0x20, 0, 0x20, 1, opcode]));
+        }
+    }
+    for (opcode, expected) in [(0x48, 42), (0x49, 7)] {
+        cases.push(Fixture::new(
+            expected,
+            &[-1, 1],
+            &[
+                0x20, 0, 0x20, 1, opcode, 0x04, 0x7f, 0x41, 42, 0x05, 0x41, 7, 0x0b,
+            ],
+        ));
+    }
     cases
 }
 

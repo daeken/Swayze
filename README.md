@@ -1,13 +1,13 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: design and build scaffold.** It does not parse, validate or execute guest programs yet. There is no JIT or browser sandbox here.
+Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** The first WebAssembly slice validates empty modules and custom sections; no Wasm code executes. JavaScript is not wired up yet. There is no JIT or browser sandbox here.
 
 Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current scaffold makes no security-proof claim.
 
 | Path | Responsibility today |
 | --- | --- |
-| `crates/swayze-engine` | Rust embedder-facing facade; `prepare_js` and `prepare_wasm` return typed `Unsupported` errors for all inputs. |
-| `crates/swayze-js`, `crates/swayze-wasm` | Separate frontend boundaries, with no external crates. Neither accepts a program as valid. |
+| `crates/swayze-engine` | Rust embedder-facing facade; `validate_module` exposes the first Wasm validator. |
+| `crates/swayze-js`, `crates/swayze-wasm` | Separate frontend boundaries, with no external crates. The Wasm slice is documented in [`swayze-wasm`](crates/swayze-wasm/src/lib.rs). |
 | `vendor/test262` | Official TC39 corpus, pinned as a Git submodule. Test data only; not a build dependency. |
 | `docs/`, `tools/` | Design, corpus maintenance notes and non-executing corpus check. |
 
@@ -23,7 +23,7 @@ cargo clippy --workspace --all-targets --frozen -- -D warnings
 cargo test --workspace --frozen
 ```
 
-The first toolchain installation needs network access. Cargo itself needs no registry packages for this scaffold. First-party crates inherit `forbid(unsafe_code)`; the release profile keeps overflow checks enabled. The tests assert that even a valid script or empty Wasm module is reported as **unsupported**, not as a successful parse or a syntax error.
+The first toolchain installation needs network access. Cargo itself needs no registry packages for this scaffold. First-party crates inherit `forbid(unsafe_code)`; the release profile keeps overflow checks enabled. Tests cover the supported Wasm subset, framing errors, and rejection of unsupported sections. This is not a Wasm conformance or security proof.
 
 To populate and verify Test262 separately:
 

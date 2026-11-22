@@ -1,4 +1,9 @@
-//! Host-facing Swayze scaffold. No frontend validates or runs guest code yet.
+//! Host-facing Swayze API. Only the documented language subsets are supported.
+
+pub use swayze_wasm::{
+    Error as WasmValidationError, ErrorKind as WasmErrorKind, Limit as WasmLimit,
+    Module as WasmModule, validate_module,
+};
 
 use std::{convert::Infallible, fmt};
 

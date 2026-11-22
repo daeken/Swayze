@@ -153,6 +153,119 @@ fn precedence_associativity_and_grouping() {
 }
 
 #[test]
+fn equal_precedence_logical_operators_associate_left() {
+    use Instruction::ShortCircuit;
+    for (symbol, when_truthy) in [("&&", false), ("||", true)] {
+        assert_postfix(
+            &format!("1{symbol}2{symbol}3"),
+            &[
+                Number(1.),
+                ShortCircuit {
+                    target: 3,
+                    when_truthy,
+                },
+                Number(2.),
+                ShortCircuit {
+                    target: 5,
+                    when_truthy,
+                },
+                Number(3.),
+            ],
+            1,
+        );
+        assert_postfix(
+            &format!("1{symbol}(2{symbol}3)"),
+            &[
+                Number(1.),
+                ShortCircuit {
+                    target: 5,
+                    when_truthy,
+                },
+                Number(2.),
+                ShortCircuit {
+                    target: 5,
+                    when_truthy,
+                },
+                Number(3.),
+            ],
+            1,
+        );
+    }
+}
+
+#[test]
+fn logical_punctuators_use_maximal_munch_without_crossing_trivia() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, start, end) in [
+        ("!===1", Malformed, 0, 3), // `!==` followed by `=`, not `!` followed by `===`
+        ("!=1", Unsupported, 0, 2),
+        ("1&2", Unsupported, 1, 2),
+        ("1|2", Unsupported, 1, 2),
+        ("1&=2", Unsupported, 1, 3),
+        ("1|=2", Unsupported, 1, 3),
+        ("1&&=2", Unsupported, 1, 4),
+        ("1||=2", Unsupported, 1, 4),
+        ("1&&&2", Unsupported, 3, 4),
+        ("1||||2", Malformed, 3, 5),
+        ("1&/**/&2", Unsupported, 1, 2),
+        ("1|\n|2", Unsupported, 1, 2),
+        ("1|| =2", Unsupported, 4, 5),
+        ("1!", Unsupported, 1, 2),
+        ("1||2++", Unsupported, 4, 6),
+        ("1&&2?.x", Unsupported, 4, 6),
+        ("1||2??3", Unsupported, 4, 6),
+        ("1&&2??=3", Unsupported, 4, 7),
+    ] {
+        assert_error(source, kind, start, end);
+    }
+}
+
+#[test]
+fn logical_operators_charge_work_and_tokens_without_using_nesting_depth() {
+    let source = "!true&&false";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 4,
+        max_nesting_depth: 0,
+        // Source bytes, two pending pushes, and four emissions.
+        max_work: source.len() + 6,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 4);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        7,
+        12,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 3,
+            ..limits
+        },
+        Limit::Tokens,
+        7,
+        8,
+    );
+    assert_limit(
+        "true&&(false||true)",
+        Limits {
+            max_nesting_depth: 0,
+            ..Limits::default()
+        },
+        Limit::NestingDepth,
+        6,
+        7,
+    );
+}
+
+#[test]
 fn conditionals_compile_to_forward_jumps_and_join_at_the_same_stack_depth() {
     use Instruction::{Jump, JumpIfFalse};
     assert_postfix(

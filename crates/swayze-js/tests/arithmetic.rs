@@ -21,6 +21,14 @@ fn arithmetic_respects_precedence_and_operand_order() {
 }
 
 #[test]
+fn fractional_and_exponential_literals_evaluate_as_numbers() {
+    assert_eq!(evaluate("(.5 + 1.) * 1e+1 - 1.25E-1;"), 14.875);
+    assert_eq!(evaluate("-1e-325").to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(evaluate("-.0").to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(evaluate("-1e309"), f64::NEG_INFINITY);
+}
+
+#[test]
 fn subtraction_associates_to_the_left_unless_grouped() {
     assert_eq!(evaluate("10 - 3 - 2"), 5.0);
     assert_eq!(evaluate("10 - (3 - 2)"), 9.0);

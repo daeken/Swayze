@@ -5,7 +5,8 @@ Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 `Script`. For example, `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?`
 produces `14.0`.
 
-This path evaluates an expression over supported integer literals with binary
+This path evaluates an expression over decimal literals (including fractions and
+signed exponents) with binary
 `+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. There are no variables, calls, coercions or other
 language execution facilities in this evaluator.

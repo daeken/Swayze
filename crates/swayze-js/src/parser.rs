@@ -1,5 +1,8 @@
 use std::fmt;
 
+// Fixed ceiling for decimal literals with a point or exponent.
+const MAX_DECIMAL_LITERAL_BYTES: usize = 4096;
+
 /// A half-open UTF-8 byte range in the original source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
@@ -47,6 +50,8 @@ pub enum Limit {
     Tokens,
     NestingDepth,
     Work,
+    /// Fixed byte ceiling for a decimal literal with a point or exponent.
+    DecimalLiteralBytes,
     Allocation,
 }
 
@@ -56,7 +61,7 @@ pub enum ErrorKind {
     Malformed,
     /// Parsing would require syntax outside the slice. This is not a validity claim.
     Unsupported,
-    /// A configured ceiling or available allocation was exhausted.
+    /// A resource ceiling or available allocation was exhausted.
     LimitExceeded(Limit),
 }
 
@@ -103,6 +108,7 @@ impl Error {
             Limit::Tokens => "token ceiling exceeded",
             Limit::NestingDepth => "parenthesis nesting ceiling exceeded",
             Limit::Work => "parse work ceiling exceeded",
+            Limit::DecimalLiteralBytes => "decimal literal byte ceiling exceeded",
             Limit::Allocation => "unable to allocate parser storage",
         };
         Self {
@@ -263,10 +269,28 @@ struct Lexer<'s> {
     work_left: usize,
 }
 
+fn is_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+fn is_trivia_space(c: char) -> bool {
+    // ECMA-262 WhiteSpace and LineTerminator (not Rust's `char::is_whitespace`).
+    is_line_terminator(c)
+        || matches!(
+            c,
+            '\t' | '\u{000B}' | '\u{000C}' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
+        )
+}
+
 impl Lexer<'_> {
     fn rest(&self) -> &str {
         // `offset` starts at zero and only advances by complete UTF-8 scalars.
         &self.source[self.offset..]
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.rest().chars().next()
     }
 
     fn charge(&mut self, units: usize, span: Span) -> Result<(), Error> {
@@ -290,23 +314,8 @@ impl Lexer<'_> {
 
     fn skip_whitespace(&mut self) -> Result<bool, Error> {
         let mut line_break = false;
-        while let Some(c) = self.rest().chars().next() {
-            match c {
-                '\n' | '\r' | '\u{2028}' | '\u{2029}' => line_break = true,
-                // ECMA-262 WhiteSpace (not Rust's `char::is_whitespace`).
-                '\t'
-                | '\u{000B}'
-                | '\u{000C}'
-                | ' '
-                | '\u{00A0}'
-                | '\u{1680}'
-                | '\u{2000}'..='\u{200A}'
-                | '\u{202F}'
-                | '\u{205F}'
-                | '\u{3000}'
-                | '\u{FEFF}' => {}
-                _ => break,
-            }
+        while let Some(c) = self.peek().filter(|&c| is_trivia_space(c)) {
+            line_break |= is_line_terminator(c);
             self.consume(c)?;
         }
         Ok(line_break)
@@ -314,7 +323,7 @@ impl Lexer<'_> {
 
     fn next(&mut self) -> Result<Option<Token>, Error> {
         let after_line_break = self.skip_whitespace()?;
-        let Some(c) = self.rest().chars().next() else {
+        let Some(c) = self.peek() else {
             return Ok(None);
         };
         let start = self.offset;
@@ -330,6 +339,7 @@ impl Lexer<'_> {
 
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
+            '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             ';' => TokenKind::Semicolon,
@@ -352,7 +362,7 @@ impl Lexer<'_> {
     }
 
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
-        if let Some(next) = self.rest().chars().next() {
+        if let Some(next) = self.peek() {
             if c == '/' && matches!(next, '/' | '*') {
                 self.consume(next)?;
                 return Err(Error::unsupported(
@@ -387,18 +397,19 @@ impl Lexer<'_> {
         }))
     }
 
-    fn number(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
-        while let Some(c @ '0'..='9') = self.rest().chars().next() {
-            let span = self.consume(c)?;
-            if first == '0' {
-                return Err(Error::unsupported(
-                    span,
-                    "leading-zero numeric syntax is outside the subset",
-                ));
-            }
+    fn decimal_digits(&mut self) -> Result<(), Error> {
+        while let Some(c @ '0'..='9') = self.peek() {
+            self.consume(c)?;
         }
-        if let Some(c) = self.rest().chars().next()
-            && (c.is_ascii_alphabetic() || matches!(c, '.' | '_' | '$' | '\\'))
+        Ok(())
+    }
+
+    fn reject_numeric_suffix(&mut self) -> Result<(), Error> {
+        // Decline adjacent non-ASCII non-whitespace without classifying Unicode identifiers.
+        if let Some(c) = self.peek()
+            && (c.is_ascii_alphabetic()
+                || matches!(c, '.' | '_' | '$' | '\\')
+                || (!c.is_ascii() && !is_trivia_space(c)))
         {
             let span = self.consume(c)?;
             return Err(Error::unsupported(
@@ -406,17 +417,61 @@ impl Lexer<'_> {
                 "adjacent characters require non-subset numeric or identifier lexing",
             ));
         }
+        Ok(())
+    }
+
+    fn number(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        if first == '0' {
+            if let Some(c @ '0'..='9') = self.peek() {
+                let span = self.consume(c)?;
+                return Err(Error::unsupported(
+                    span,
+                    "leading-zero numeric syntax is outside the subset",
+                ));
+            }
+        } else {
+            self.decimal_digits()?;
+        }
+
+        let mut integer_only = first != '.';
+        if integer_only && self.peek() == Some('.') {
+            self.consume('.')?;
+            self.decimal_digits()?;
+            integer_only = false;
+        }
+        if let Some(marker @ ('e' | 'E')) = self.peek() {
+            self.consume(marker)?;
+            if let Some(sign @ ('+' | '-')) = self.peek() {
+                self.consume(sign)?;
+            }
+            let digits_start = self.offset;
+            self.decimal_digits()?;
+            if self.offset == digits_start {
+                // An adjacent identifier or separator is still unsupported, not
+                // necessarily an attempt to write an exponent in this grammar.
+                self.reject_numeric_suffix()?;
+                return Err(Error::malformed(
+                    Span::at(self.offset),
+                    "expected a decimal exponent digit",
+                ));
+            }
+            integer_only = false;
+        }
+        self.reject_numeric_suffix()?;
 
         let span = Span {
             start,
             end: self.offset,
         };
-        let digits = span.end - span.start;
-        let value = if digits > 309 {
-            // A canonical decimal with 310+ digits is at least 10^309.
+        let bytes = span.end - span.start;
+        let value = if integer_only && bytes > 309 {
+            // A canonical integer with 310+ digits is at least 10^309.
             f64::INFINITY
         } else {
-            self.charge(digits, span)?;
+            if bytes > MAX_DECIMAL_LITERAL_BYTES {
+                return Err(Error::limit(span, Limit::DecimalLiteralBytes));
+            }
+            self.charge(bytes, span)?;
             self.source[start..self.offset]
                 .parse::<f64>()
                 .map_err(|_| Error::malformed(span, "could not convert decimal literal"))?

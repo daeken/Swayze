@@ -591,6 +591,34 @@ fn spends_one_dispatch_budget_across_sequential_calls_and_final_returns_are_free
 }
 
 #[test]
+fn dispatch_limit_is_checked_before_attempting_a_call_at_maximum_depth() {
+    let recur = |zero_tests| {
+        let mut body = vec![1, 1, 0x7f, 0x41, 0]; // One local; i32.const 0.
+        body.extend(std::iter::repeat_n(0x45, zero_tests));
+        body.extend([0x21, 0, 0x10, 1, 0x0b]); // local.set 0; call 1; end.
+        body
+    };
+    let module = exported_functions(0, &[(b"both", 0), (b"depth", 1)], &[&recur(62), &recur(61)]);
+    let instance = module.instantiate();
+    // Each frame spends 64 dispatches through its call. At depth 16 the
+    // attempted push on dispatch 1024 is within budget but exceeds depth.
+    assert_eq!(
+        instance.invoke_i32("depth"),
+        Err(InvokeError::LimitExceeded {
+            limit: ExecutionLimit::CallDepth,
+        })
+    );
+    // The extra instruction in frame 0 uses up the budget just before that
+    // same attempted push, so the call is never dispatched.
+    assert_eq!(
+        instance.invoke_i32("both"),
+        Err(InvokeError::LimitExceeded {
+            limit: ExecutionLimit::InstructionDispatches,
+        })
+    );
+}
+
+#[test]
 fn requires_exact_function_and_code_count_agreement() {
     for bodies in [1, 3] {
         let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);

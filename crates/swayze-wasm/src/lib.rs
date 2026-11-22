@@ -255,6 +255,10 @@ impl std::error::Error for InvokeError {
 }
 
 /// Fixed host resource bounds for one invocation. These are not Wasm traps.
+///
+/// Dispatch is budgeted before executing an instruction. If no dispatches
+/// remain when a call would also exceed the frame limit, the dispatch limit
+/// is reported instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionLimit {
     /// Simultaneously live function frames, including the exported function.

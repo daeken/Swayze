@@ -1,7 +1,7 @@
 //! Opt-in differential Wasm i32 smoke check: run tools/check-wasm-reference.sh.
 
 use std::{error::Error, process::Command};
-use swayze_engine::validate_module;
+use swayze_engine::{WasmInvokeError, WasmTrap, validate_module};
 
 const EXPORT: &str = "answer";
 const REFERENCE: &str = r#"
@@ -13,9 +13,15 @@ console.log(process.version);
 for (const fixture of fixtures) {
     const [hex, ...args] = fixture.split(':');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
-    const value = new WebAssembly.Instance(module).exports[name](...args.map(Number));
-    if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
-    console.log(value);
+    const invoke = new WebAssembly.Instance(module).exports[name];
+    try {
+        const value = invoke(...args.map(Number));
+        if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
+        console.log(value);
+    } catch (error) {
+        if (!(error instanceof WebAssembly.RuntimeError)) throw error;
+        console.log('trap');
+    }
 }
 "#;
 
@@ -55,7 +61,7 @@ fn singleton_module(parameter_count: u8, locals: &[u8], expression: &[u8]) -> Ve
 }
 
 struct Fixture {
-    expected: i32,
+    expected: Result<i32, WasmTrap>,
     bytes: Vec<u8>,
     args: Vec<i32>,
 }
@@ -66,6 +72,15 @@ impl Fixture {
     }
 
     fn with_locals(expected: i32, args: &[i32], locals: &[u8], expression: &[u8]) -> Self {
+        Self::with_outcome(Ok(expected), args, locals, expression)
+    }
+
+    fn with_outcome(
+        expected: Result<i32, WasmTrap>,
+        args: &[i32],
+        locals: &[u8],
+        expression: &[u8],
+    ) -> Self {
         Self {
             expected,
             bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression),
@@ -140,6 +155,32 @@ fn fixtures() -> Vec<Fixture> {
         &[2, 3, 0x7f, 13, 0x7f],
         &[0x41, 21, 0x22, 15, 0x20, 15, 0x6a],
     ));
+    use WasmTrap::{IntegerDivideByZero, IntegerOverflow};
+    for (opcode, args, outcome) in [
+        (0x6d, [-11, 3], Ok(-3)),
+        (0x6d, [i32::MIN, -1], Err(IntegerOverflow)),
+        (0x6e, [-1, 2], Ok(i32::MAX)),
+        (0x6e, [-1, 1], Ok(-1)),
+        (0x6f, [-11, 3], Ok(-2)),
+        (0x6f, [i32::MIN, -1], Ok(0)),
+        (0x70, [-1, 2], Ok(1)),
+        (0x70, [1, -1], Ok(1)),
+    ] {
+        cases.push(Fixture::with_outcome(
+            outcome,
+            &args,
+            &[0],
+            &[0x20, 0, 0x20, 1, opcode],
+        ));
+    }
+    for opcode in 0x6d..=0x70 {
+        cases.push(Fixture::with_outcome(
+            Err(IntegerDivideByZero),
+            &[i32::MIN, 0],
+            &[0],
+            &[0x20, 0, 0x20, 1, opcode],
+        ));
+    }
     cases
 }
 
@@ -152,10 +193,15 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn evaluate(fixture: &Fixture) -> Result<i32, Box<dyn Error>> {
-    Ok(validate_module(&fixture.bytes)?
+fn evaluate(fixture: &Fixture) -> Result<Result<i32, WasmTrap>, Box<dyn Error>> {
+    match validate_module(&fixture.bytes)?
         .instantiate()
-        .invoke_i32_with_args(EXPORT, &fixture.args)?)
+        .invoke_i32_with_args(EXPORT, &fixture.args)
+    {
+        Ok(value) => Ok(Ok(value)),
+        Err(WasmInvokeError::Trap(trap)) => Ok(Err(trap)),
+        Err(host_error) => Err(host_error.into()),
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -185,13 +231,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     for ((fixture, encoded), reference) in cases.iter().zip(encoded).zip(lines) {
         let expected = fixture.expected;
         let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
-        if reference.parse::<i32>()? != actual || actual != expected {
+        let agrees = match actual {
+            Ok(value) => reference.parse::<i32>().ok() == Some(value),
+            Err(_) => reference == "trap",
+        };
+        if !agrees || actual != expected {
             return Err(format!(
-                "fixture {encoded}: expected {expected}, Swayze {actual}, Node {version} {reference}"
+                "fixture {encoded}: expected {expected:?}, Swayze {actual:?}, Node {version} {reference}"
             )
             .into());
         }
     }
-    println!("Matched all {count} fixtures against Node {version} (signed i32)");
+    println!("Matched all {count} fixtures against Node {version} (i32 results or runtime traps)");
     Ok(())
 }

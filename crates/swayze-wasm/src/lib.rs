@@ -11,8 +11,9 @@
 //! unsigned LEB32; zero-count groups are allowed but must still specify `i32`.
 //! The only instructions before a single final `end` are `local.get`, `local.set`,
 //! `local.tee` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
-//! `i32.add`, `i32.sub`, and `i32.mul`. Local indices start at zero and address
-//! parameters first, then locals in declaration order. Both can be assigned.
+//! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, and
+//! `i32.rem_u`. Local indices start at zero and address parameters first, then
+//! locals in declaration order. Both can be assigned.
 //! There are no calls, branches, or other control instructions.
 //! An optional export section between function and code may contain zero or one
 //! export, which must refer to function zero. Both kinds of names must be UTF-8.
@@ -32,13 +33,23 @@
 //! private decoded instructions and an optional bounded export name. A separate
 //! [`Module::instantiate`] step creates an [`Instance`]. Its typed
 //! [`Instance::invoke_i32_with_args`] method looks up the exact export name,
-//! checks the argument count, and executes each stored instruction once without
+//! checks the argument count, and executes the stored instructions in order without
 //! allocating. Each invocation has a fixed operand stack and fixed local storage:
 //! parameters are copied from the supplied arguments, and declared locals start
-//! at zero on every call. [`Instance::invoke_i32`] is equivalent to
-//! passing an empty argument slice. Arithmetic wraps modulo 2³²; subtraction
-//! uses the top operand as the right-hand side. Empty, custom-only, and
-//! unexported modules have no callable exports. [`prepare`] remains a stub.
+//! at zero on every call. [`Instance::invoke_i32`] is equivalent to passing an
+//! empty argument slice. The top operand is the right-hand side of each binary
+//! operation. Addition, subtraction, and multiplication wrap modulo 2³². Signed
+//! division truncates toward zero, and a nonzero signed remainder has the sign
+//! of the dividend. Unsigned division and remainder interpret the operand bits
+//! as `u32` and preserve the result bits in the returned `i32` value.
+//!
+//! A zero right operand traps for all four division and remainder instructions.
+//! `i32::MIN / -1` traps for signed division; signed remainder for those operands
+//! returns zero. These are runtime outcomes, not validation errors.
+//! [`InvokeError::Trap`] reports the first guest trap and skips all remaining
+//! instructions. The same instance can be invoked again with fresh call-local
+//! state. Empty, custom-only, and unexported modules have no callable exports.
+//! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
 //!
@@ -47,7 +58,9 @@
 //! exact invocation arity, bounded LEB32 decoding (including local counts and
 //! indices), local declaration types and limits, each stack effect and body
 //! budget, reads and writes in the combined local index space, fresh locals on
-//! successive calls, and wrapping arithmetic after discarding the input.
+//! successive calls, wrapping arithmetic after discarding the input, signed and
+//! unsigned division and remainder edge cases, name and arity checks before
+//! execution, and stopping at the first guest trap and reusing the instance.
 //! Parsing checks declaration counts against the remaining local budget without
 //! expanding groups. It uses bounded borrowed frames and decodes instructions
 //! into a fixed-size scratch array. After checking `end` and the complete body
@@ -99,6 +112,7 @@ pub struct Instance<'module> {
 impl Instance<'_> {
     /// Invoke the exact named export as a `() -> i32` function.
     /// A matching export with parameters returns [`InvokeError::ArityMismatch`].
+    /// A guest trap returns [`InvokeError::Trap`].
     ///
     /// ```
     /// use swayze_wasm::validate_module;
@@ -118,7 +132,8 @@ impl Instance<'_> {
     /// matches, the number of arguments must equal the declared parameter count
     /// or this returns [`InvokeError::ArityMismatch`] without executing code.
     /// Assignments to parameters do not affect the supplied slice, and declared
-    /// locals are initialized to zero on each invocation.
+    /// locals are initialized to zero on each invocation. A guest trap stops
+    /// execution and returns [`InvokeError::Trap`] without affecting later calls.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         match &self.module.function {
             Some(function) if function.export.as_deref() == Some(name) => {
@@ -129,13 +144,16 @@ impl Instance<'_> {
     }
 }
 
-/// Why invoking a typed export failed.
+/// Why invoking a typed export failed: host-side lookup or arity, or a guest trap.
+/// Module validation failures are reported separately as [`Error`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvokeError {
     /// This module has no export with the requested name.
     ExportNotFound,
     /// The export exists but the supplied argument count does not match its type.
     ArityMismatch { expected: usize, actual: usize },
+    /// Guest execution stopped before returning a value.
+    Trap(Trap),
 }
 
 impl fmt::Display for InvokeError {
@@ -148,11 +166,39 @@ impl fmt::Display for InvokeError {
                     "WebAssembly export expects {expected} arguments, got {actual}"
                 )
             }
+            Self::Trap(trap) => write!(f, "WebAssembly trapped: {trap}"),
         }
     }
 }
 
-impl std::error::Error for InvokeError {}
+impl std::error::Error for InvokeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Trap(trap) => Some(trap),
+            Self::ExportNotFound | Self::ArityMismatch { .. } => None,
+        }
+    }
+}
+
+/// The reason a validated guest instruction trapped at runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Trap {
+    /// An integer division or remainder instruction had a zero divisor.
+    IntegerDivideByZero,
+    /// Signed integer division could not represent its quotient.
+    IntegerOverflow,
+}
+
+impl fmt::Display for Trap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IntegerDivideByZero => f.write_str("integer divide by zero"),
+            Self::IntegerOverflow => f.write_str("integer overflow"),
+        }
+    }
+}
+
+impl std::error::Error for Trap {}
 
 /// The WebAssembly frontend is not implemented; this says nothing about input validity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

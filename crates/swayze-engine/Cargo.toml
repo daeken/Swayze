@@ -1,0 +1,13 @@
+[package]
+name = "swayze-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+swayze-js = { path = "../swayze-js" }
+swayze-wasm = { path = "../swayze-wasm" }
+
+[lints]
+workspace = true

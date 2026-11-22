@@ -1,14 +1,5 @@
-use std::{fmt, str};
-
-/// Marker returned only after this crate's bounded validator accepts the input.
-/// It contains no executable code or retained input.
-///
-/// ```compile_fail
-/// use swayze_wasm::Module;
-/// let forged = Module(());
-/// ```
-#[derive(Debug)]
-pub struct Module(());
+use crate::{ConstantFunction, Module};
+use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,19 +20,49 @@ pub enum ErrorKind {
     UnsupportedVersion { version: u32 },
     UnknownSectionId { id: u8 },
     UnsupportedSection { id: u8 },
+    SectionOutOfOrder { id: u8 },
+    MissingSection { id: u8 },
     TruncatedLength { field: LengthField },
     LengthOverflow { field: LengthField },
+    TruncatedInteger { field: IntegerField },
+    IntegerOverflow { field: IntegerField },
     TruncatedSection { declared: usize, available: usize },
+    TruncatedBody { declared: usize, available: usize },
     TruncatedName { declared: usize, available: usize },
     InvalidUtf8Name,
+    UnsupportedCount { field: IntegerField, count: u32 },
+    InvalidIndex { field: IntegerField, index: u32 },
+    TruncatedByte { expected: u8 },
+    UnexpectedByte { expected: u8, found: u8 },
+    TrailingSectionBytes { id: u8 },
+    TrailingBodyBytes,
     LimitExceeded { limit: Limit },
 }
 
 /// The field whose unsigned LEB128 length could not be decoded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum LengthField {
     SectionSize,
     CustomNameSize,
+    ExportNameSize,
+    CodeBodySize,
+}
+
+/// A count, index, or immediate encoded as a LEB32 integer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IntegerField {
+    TypeCount,
+    ParameterCount,
+    ResultCount,
+    FunctionCount,
+    ExportCount,
+    CodeCount,
+    LocalGroupCount,
+    TypeIndex,
+    FunctionIndex,
+    I32Const,
 }
 
 /// Fixed resource bounds for [`validate_module`]. All maxima are inclusive.
@@ -51,10 +72,12 @@ pub enum Limit {
     ModuleBytes,
     /// Number of sections, including custom sections with empty names or bodies.
     SectionCount,
-    /// Declared payload bytes in one section, excluding its ID and size field.
+    /// Declared payload bytes in one section or nested code body, excluding framing.
     SectionBytes,
     /// Name bytes in one custom section, excluding its length field.
     CustomNameBytes,
+    /// Name bytes in one export, excluding its length field.
+    ExportNameBytes,
 }
 
 impl Limit {
@@ -64,7 +87,7 @@ impl Limit {
             Self::ModuleBytes => 1024 * 1024,
             Self::SectionCount => 1024,
             Self::SectionBytes => 256 * 1024,
-            Self::CustomNameBytes => 4 * 1024,
+            Self::CustomNameBytes | Self::ExportNameBytes => 4 * 1024,
         }
     }
 }
@@ -79,8 +102,12 @@ impl fmt::Display for Error {
             UnsupportedVersion { version } => write!(f, "unsupported binary version {version}"),
             UnknownSectionId { id } => write!(f, "unknown section ID {id}"),
             UnsupportedSection { id } => write!(f, "unsupported section ID {id}"),
+            SectionOutOfOrder { id } => write!(f, "duplicate or out-of-order section ID {id}"),
+            MissingSection { id } => write!(f, "missing required section ID {id}"),
             TruncatedLength { field } => write!(f, "truncated LEB32 for {field:?}"),
             LengthOverflow { field } => write!(f, "LEB32 overflow for {field:?}"),
+            TruncatedInteger { field } => write!(f, "truncated LEB32 for {field:?}"),
+            IntegerOverflow { field } => write!(f, "LEB32 overflow for {field:?}"),
             TruncatedSection {
                 declared,
                 available,
@@ -88,14 +115,29 @@ impl fmt::Display for Error {
                 f,
                 "section declares {declared} bytes but only {available} remain"
             ),
+            TruncatedBody {
+                declared,
+                available,
+            } => write!(
+                f,
+                "code body declares {declared} bytes but only {available} remain in its section"
+            ),
             TruncatedName {
                 declared,
                 available,
             } => write!(
                 f,
-                "custom name declares {declared} bytes but only {available} remain in its section"
+                "name declares {declared} bytes but only {available} remain in its section"
             ),
-            InvalidUtf8Name => f.write_str("invalid UTF-8 in custom section name"),
+            InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
+            UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
+            InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
+            TruncatedByte { expected } => write!(f, "missing expected byte {expected:#04x}"),
+            UnexpectedByte { expected, found } => {
+                write!(f, "expected byte {expected:#04x}, found {found:#04x}")
+            }
+            TrailingSectionBytes { id } => write!(f, "trailing bytes in section ID {id}"),
+            TrailingBodyBytes => f.write_str("trailing bytes after code body end"),
             LimitExceeded { limit } => {
                 write!(f, "{limit:?} limit exceeded (maximum {})", limit.maximum())
             }
@@ -105,20 +147,18 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Validate a WebAssembly Core 1.0 module containing only custom sections.
+/// Validate the crate's [supported slice](crate#supported-slice) of WebAssembly Core 1.0.
 ///
-/// This checks the complete input on success. Work is linear in input length,
-/// uses constant additional space, and is bounded by [`Limit`]. The validator
-/// does not instantiate anything or interpret the contents of custom sections
-/// beyond the names.
+/// Success checks the complete input and returns an owned module without
+/// executing it. Work is at most linear in the input length; the only allocation
+/// is for a retained export name, bounded by [`Limit::ExportNameBytes`].
 ///
-/// The module-byte limit is checked before decoding, and section count before
-/// reading the next section. Section IDs 1 through 11 (Core 1.0), 12 (data count),
-/// and 13 (tag) are recognized but unsupported. They are rejected after checking
-/// the section size and that its payload fits, without validating the payload
-/// or any later sections. Unknown IDs are rejected before reading the size.
-/// Decodable sizes are checked against their limit before checking availability.
-/// Bad UTF-8 is reported at the start of the invalid or incomplete sequence.
+/// The module-byte limit is checked before decoding, and the section-count
+/// limit before reading the next section. Unsupported known IDs are rejected
+/// after checking the section frame but not its contents; unknown IDs are
+/// rejected before reading the size. Decodable sizes are checked against
+/// their limit before checking availability. Bad UTF-8 is reported at the start
+/// of the invalid or incomplete sequence.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -133,6 +173,11 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     };
     read_header(&mut module)?;
 
+    let mut last_standard = 0;
+    let mut has_type = false;
+    let mut has_function = false;
+    let mut export = None;
+    let mut value = None;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -147,28 +192,63 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         let declared = module.length(LengthField::SectionSize)?;
         let available = module.remaining.len();
-        let payload = module.take(declared).ok_or(Error {
+        let mut section = module.frame(declared).ok_or(Error {
             offset: module.end,
             kind: ErrorKind::TruncatedSection {
                 declared,
                 available,
             },
         })?;
-        if id != 0 {
+        if id == 0 {
+            section.name(LengthField::CustomNameSize)?;
+            continue; // The rest of a custom section is opaque.
+        }
+        if id <= last_standard && matches!(id, 1 | 3 | 7 | 10) {
             return Err(Error {
                 offset: id_offset,
-                kind: ErrorKind::UnsupportedSection { id },
+                kind: ErrorKind::SectionOutOfOrder { id },
             });
         }
-        validate_custom(Reader {
-            remaining: payload,
-            end: module.position(),
-        })?;
+        match id {
+            1 => {
+                validate_type(&mut section)?;
+                has_type = true;
+            }
+            3 => {
+                section.count(IntegerField::FunctionCount, 1..=1)?;
+                section.zero_index(IntegerField::TypeIndex)?;
+                has_function = true;
+            }
+            7 => export = validate_export(&mut section)?,
+            10 => value = Some(validate_code(&mut section)?),
+            _ => {
+                return Err(Error {
+                    offset: id_offset,
+                    kind: ErrorKind::UnsupportedSection { id },
+                });
+            }
+        }
+        section.finish(ErrorKind::TrailingSectionBytes { id })?;
+        last_standard = id;
     }
     if !module.remaining.is_empty() {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
     }
-    Ok(Module(()))
+    if last_standard != 0 {
+        // The exact counts, zero indices, and presence of all three sections
+        // together establish the type/function/code and export relationships.
+        for (id, present) in [(1, has_type), (3, has_function), (10, value.is_some())] {
+            if !present {
+                return Err(module.error(ErrorKind::MissingSection { id }));
+            }
+        }
+    }
+    Ok(Module {
+        function: value.map(|value| ConstantFunction {
+            value,
+            export: export.map(Box::from),
+        }),
+    })
 }
 
 fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
@@ -202,23 +282,41 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_custom(mut custom: Reader<'_>) -> Result<(), Error> {
-    let declared = custom.length(LengthField::CustomNameSize)?;
-    let name_offset = custom.position();
-    let available = custom.remaining.len();
-    let name = custom.take(declared).ok_or(Error {
-        offset: custom.end,
-        kind: ErrorKind::TruncatedName {
+fn validate_type(section: &mut Reader<'_>) -> Result<(), Error> {
+    section.count(IntegerField::TypeCount, 1..=1)?;
+    section.expect_byte(0x60)?; // functype
+    section.count(IntegerField::ParameterCount, 0..=0)?;
+    section.count(IntegerField::ResultCount, 1..=1)?;
+    section.expect_byte(0x7f) // i32
+}
+
+fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Error> {
+    if section.count(IntegerField::ExportCount, 0..=1)? == 0 {
+        return Ok(None);
+    }
+    let name = section.name(LengthField::ExportNameSize)?;
+    section.expect_byte(0x00)?; // function export descriptor
+    section.zero_index(IntegerField::FunctionIndex)?;
+    Ok(Some(name))
+}
+
+fn validate_code(section: &mut Reader<'_>) -> Result<i32, Error> {
+    section.count(IntegerField::CodeCount, 1..=1)?;
+    let declared = section.length(LengthField::CodeBodySize)?;
+    let available = section.remaining.len();
+    let mut body = section.frame(declared).ok_or(Error {
+        offset: section.end,
+        kind: ErrorKind::TruncatedBody {
             declared,
             available,
         },
     })?;
-    str::from_utf8(name).map_err(|err| Error {
-        // valid_up_to() is bounded by name.len(), and the whole name fits.
-        offset: name_offset + err.valid_up_to(),
-        kind: ErrorKind::InvalidUtf8Name,
-    })?;
-    Ok(())
+    body.count(IntegerField::LocalGroupCount, 0..=0)?;
+    body.expect_byte(0x41)?; // i32.const
+    let value = body.integer(IntegerField::I32Const)? as i32;
+    body.expect_byte(0x0b)?; // end
+    body.finish(ErrorKind::TrailingBodyBytes)?;
+    Ok(value)
 }
 
 struct Reader<'a> {
@@ -252,33 +350,62 @@ impl<'a> Reader<'a> {
         Some(bytes)
     }
 
+    fn frame(&mut self, length: usize) -> Option<Reader<'a>> {
+        let remaining = self.take(length)?;
+        Some(Reader {
+            remaining,
+            end: self.position(),
+        })
+    }
+
+    fn finish(&self, trailing: ErrorKind) -> Result<(), Error> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(self.error(trailing))
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), Error> {
+        let offset = self.position();
+        match self.byte() {
+            Some(found) if found == expected => Ok(()),
+            Some(found) => Err(Error {
+                offset,
+                kind: ErrorKind::UnexpectedByte { expected, found },
+            }),
+            None => Err(self.error(ErrorKind::TruncatedByte { expected })),
+        }
+    }
+
+    fn name(&mut self, field: LengthField) -> Result<&'a str, Error> {
+        let declared = self.length(field)?;
+        let name_offset = self.position();
+        let available = self.remaining.len();
+        let name = self.take(declared).ok_or(Error {
+            offset: self.end,
+            kind: ErrorKind::TruncatedName {
+                declared,
+                available,
+            },
+        })?;
+        str::from_utf8(name).map_err(|err| Error {
+            offset: name_offset + err.valid_up_to(),
+            kind: ErrorKind::InvalidUtf8Name,
+        })
+    }
+
     fn length(&mut self, field: LengthField) -> Result<usize, Error> {
         let start = self.position();
-        let mut value = 0u32;
-        let mut shift = 0;
-        loop {
-            let offset = self.position();
-            let byte = self
-                .byte()
-                .ok_or_else(|| self.error(ErrorKind::TruncatedLength { field }))?;
-            // At most five bytes; the fifth can carry only four value bits
-            // and must terminate. Non-minimal encodings within this width are legal.
-            if shift == 28 && byte > 0x0f {
-                return Err(Error {
-                    offset,
-                    kind: ErrorKind::LengthOverflow { field },
-                });
-            }
-            value |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-
+        let value = self.leb32(
+            false,
+            ErrorKind::TruncatedLength { field },
+            ErrorKind::LengthOverflow { field },
+        )?;
         let limit = match field {
-            LengthField::SectionSize => Limit::SectionBytes,
+            LengthField::SectionSize | LengthField::CodeBodySize => Limit::SectionBytes,
             LengthField::CustomNameSize => Limit::CustomNameBytes,
+            LengthField::ExportNameSize => Limit::ExportNameBytes,
         };
         match usize::try_from(value) {
             Ok(length) if length <= limit.maximum() => Ok(length),
@@ -286,6 +413,78 @@ impl<'a> Reader<'a> {
                 offset: start,
                 kind: ErrorKind::LimitExceeded { limit },
             }),
+        }
+    }
+
+    fn count(&mut self, field: IntegerField, allowed: RangeInclusive<u32>) -> Result<u32, Error> {
+        let offset = self.position();
+        let count = self.integer(field)?;
+        if allowed.contains(&count) {
+            Ok(count)
+        } else {
+            Err(Error {
+                offset,
+                kind: ErrorKind::UnsupportedCount { field, count },
+            })
+        }
+    }
+
+    fn zero_index(&mut self, field: IntegerField) -> Result<(), Error> {
+        let offset = self.position();
+        let index = self.integer(field)?;
+        if index == 0 {
+            Ok(())
+        } else {
+            Err(Error {
+                offset,
+                kind: ErrorKind::InvalidIndex { field, index },
+            })
+        }
+    }
+
+    fn integer(&mut self, field: IntegerField) -> Result<u32, Error> {
+        self.leb32(
+            field == IntegerField::I32Const,
+            ErrorKind::TruncatedInteger { field },
+            ErrorKind::IntegerOverflow { field },
+        )
+    }
+
+    // For signed input the returned bits represent the two's-complement i32.
+    fn leb32(
+        &mut self,
+        signed: bool,
+        truncated: ErrorKind,
+        overflow: ErrorKind,
+    ) -> Result<u32, Error> {
+        let mut value = 0u32;
+        let mut shift = 0;
+        loop {
+            let offset = self.position();
+            let byte = self.byte().ok_or_else(|| self.error(truncated))?;
+            if shift == 28 {
+                // The fifth byte must terminate; only four value bits remain.
+                // Signed unused bits must agree with the true sign (bit 3).
+                let fits = if signed {
+                    byte <= 0x07 || (0x78..=0x7f).contains(&byte)
+                } else {
+                    byte <= 0x0f
+                };
+                if !fits {
+                    return Err(Error {
+                        offset,
+                        kind: overflow,
+                    });
+                }
+            }
+            value |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                if signed && shift < 28 && byte & 0x40 != 0 {
+                    value |= u32::MAX << (shift + 7);
+                }
+                return Ok(value);
+            }
+            shift += 7;
         }
     }
 }

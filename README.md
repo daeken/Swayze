@@ -1,12 +1,12 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** The first WebAssembly slice validates empty modules and custom sections; no Wasm code executes. JavaScript can parse and evaluate one arithmetic expression. There is no JIT or browser sandbox here.
+Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript can parse and evaluate one arithmetic expression. WebAssembly can validate empty and custom-only modules and invoke a single import-free `i32.const` function by export name. There is no JIT or browser sandbox here.
 
 Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current implementation makes no security-proof claim.
 
 | Path | Responsibility today |
 | --- | --- |
-| `crates/swayze-engine` | Rust embedder-facing facade; `parse_script` returns a script that can be evaluated; `validate_module` checks the first Wasm subset. |
+| `crates/swayze-engine` | Rust embedder-facing facade; `parse_script` returns a script that can be evaluated; `validate_module` returns a Wasm module that can be instantiated. |
 | `crates/swayze-js`, `crates/swayze-wasm` | Separate frontend boundaries, with no external crates. Supported subsets, limits and gaps are documented in [`swayze-js`](crates/swayze-js/README.md) and [`swayze-wasm`](crates/swayze-wasm/src/lib.rs). |
 | `vendor/test262` | Official TC39 corpus, pinned as a Git submodule. Test data only; not a build dependency. |
 | `docs/`, `tools/` | Design, corpus maintenance notes and non-executing corpus check. |
@@ -17,7 +17,7 @@ Start with the **[engine design](docs/design.md)** for the threat model, languag
 cargo run --frozen -p swayze-engine --example first_slice
 ```
 
-This prints `JavaScript result: 20` for `(2 + 3) * 4` and validates an empty Wasm module. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
+This prints `JavaScript result: 20` for `(2 + 3) * 4` and `WebAssembly result: 42` for a module exporting `answer`. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
 
 ## Check a checkout
 

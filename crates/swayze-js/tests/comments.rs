@@ -103,7 +103,12 @@ fn eof_ends_line_comments_but_not_block_comments() {
         (
             "const x=1; /* no final expression */",
             ErrorKind::Unsupported,
-            "a final expression is required after const declarations",
+            "a final expression is required after binding statements",
+        ),
+        (
+            "let x=1; x=2// no semicolon",
+            ErrorKind::Unsupported,
+            "assignments require explicit semicolons",
         ),
     ] {
         let error = parse_script(source).unwrap_err();

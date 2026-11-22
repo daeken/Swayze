@@ -10,9 +10,10 @@ if (process.versions.node.split('.')[0] !== '22') {
 }
 const [name, ...fixtures] = process.argv.slice(1);
 console.log(process.version);
-for (const hex of fixtures) {
+for (const fixture of fixtures) {
+    const [hex, ...args] = fixture.split(':');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
-    const value = new WebAssembly.Instance(module).exports[name]();
+    const value = new WebAssembly.Instance(module).exports[name](...args.map(Number));
     if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
     console.log(value);
 }
@@ -33,8 +34,11 @@ fn sleb32(mut value: i32, min_width: usize) -> Vec<u8> {
     }
 }
 
-fn singleton_module(expression: &[u8]) -> Vec<u8> {
-    let mut module = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0".to_vec();
+fn singleton_module(parameter_count: u8, expression: &[u8]) -> Vec<u8> {
+    let mut module = b"\0asm\x01\0\0\0".to_vec();
+    module.extend([1, 5 + parameter_count, 1, 0x60, parameter_count]);
+    module.extend(std::iter::repeat_n(0x7f, usize::from(parameter_count)));
+    module.extend([1, 0x7f, 3, 2, 1, 0]); // One i32 result; one function of type 0.
     let name_len = EXPORT.len() as u8;
     module.extend([7, name_len + 4, 1, name_len]); // Export section, one name.
     module.extend(EXPORT.bytes());
@@ -49,7 +53,32 @@ fn singleton_module(expression: &[u8]) -> Vec<u8> {
     module
 }
 
-fn fixtures() -> Vec<(i32, Vec<u8>)> {
+struct Fixture {
+    expected: i32,
+    bytes: Vec<u8>,
+    args: Vec<i32>,
+}
+
+impl Fixture {
+    fn new(expected: i32, args: &[i32], expression: &[u8]) -> Self {
+        Self {
+            expected,
+            bytes: singleton_module(u8::try_from(args.len()).unwrap(), expression),
+            args: args.to_vec(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        use std::fmt::Write;
+        let mut encoded = hex(&self.bytes);
+        for arg in &self.args {
+            write!(&mut encoded, ":{arg}").unwrap();
+        }
+        encoded
+    }
+}
+
+fn fixtures() -> Vec<Fixture> {
     let mut values = vec![i32::MIN, i32::MAX, -1, 0, 1];
     // Straddle the negative and positive limits of each short signed encoding.
     for bits in [6, 13, 20, 27] {
@@ -62,7 +91,7 @@ fn fixtures() -> Vec<(i32, Vec<u8>)> {
         for width in canonical_width..=5 {
             let mut expression = vec![0x41]; // i32.const
             expression.extend(sleb32(value, width));
-            cases.push((value, singleton_module(&expression)));
+            cases.push(Fixture::new(value, &[], &expression));
         }
     }
     // Exercise operand ordering and overflow, with a third live operand.
@@ -83,9 +112,20 @@ fn fixtures() -> Vec<(i32, Vec<u8>)> {
                 expression.extend(sleb32(value, 1));
             }
             expression.extend([opcode, 0x6b]);
-            cases.push((a.wrapping_sub(op(b, c)), singleton_module(&expression)));
+            cases.push(Fixture::new(a.wrapping_sub(op(b, c)), &[], &expression));
+            cases.push(Fixture::new(
+                a.wrapping_sub(op(b, c)),
+                &[a, b, c],
+                &[0x20, 0, 0x20, 1, 0x20, 2, opcode, 0x6b],
+            ));
         }
     }
+    cases.push(Fixture::new(i32::MIN, &[i32::MIN], &[0x20, 0]));
+    cases.push(Fixture::new(
+        42,
+        &[4, 8, 15, 42],
+        &[0x20, 0x83, 0x80, 0x80, 0x80, 0], // Padded local index 3.
+    ));
     cases
 }
 
@@ -98,13 +138,15 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn evaluate(bytes: &[u8]) -> Result<i32, Box<dyn Error>> {
-    Ok(validate_module(bytes)?.instantiate().invoke_i32(EXPORT)?)
+fn evaluate(fixture: &Fixture) -> Result<i32, Box<dyn Error>> {
+    Ok(validate_module(&fixture.bytes)?
+        .instantiate()
+        .invoke_i32_with_args(EXPORT, &fixture.args)?)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cases = fixtures();
-    let encoded: Vec<_> = cases.iter().map(|(_, bytes)| hex(bytes)).collect();
+    let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
     let output = Command::new("node")
         .env_remove("NODE_OPTIONS")
@@ -126,11 +168,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if count != cases.len() {
         return Err(format!("Node returned {count} results for {} fixtures", cases.len()).into());
     }
-    for (((expected, bytes), hex), reference) in cases.iter().zip(encoded).zip(lines) {
-        let actual = evaluate(bytes).map_err(|error| format!("module {hex}: {error}"))?;
-        if reference.parse::<i32>()? != actual || actual != *expected {
+    for ((fixture, encoded), reference) in cases.iter().zip(encoded).zip(lines) {
+        let expected = fixture.expected;
+        let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
+        if reference.parse::<i32>()? != actual || actual != expected {
             return Err(format!(
-                "module {hex}: expected {expected}, Swayze {actual}, Node {version} {reference}"
+                "fixture {encoded}: expected {expected}, Swayze {actual}, Node {version} {reference}"
             )
             .into());
         }

@@ -1,6 +1,6 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript can parse and evaluate one arithmetic expression. WebAssembly can validate empty and custom-only modules and invoke a single import-free function with straight-line `i32` arithmetic by export name. There is no JIT or browser sandbox here.
+Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript can parse and evaluate one arithmetic expression. WebAssembly can validate empty and custom-only modules and invoke a single import-free function with up to four `i32` arguments and straight-line arithmetic by export name. There is no JIT or browser sandbox here.
 
 Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current implementation makes no security-proof claim.
 
@@ -17,7 +17,7 @@ Start with the **[engine design](docs/design.md)** for the threat model, languag
 cargo run --frozen -p swayze-engine --example first_slice
 ```
 
-This prints `JavaScript result: 20` for `(2 + 3) * 4` and `WebAssembly result: 42` for an exported Wasm function that adds 40 and 2. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
+This prints `JavaScript result: 20` for `(2 + 3) * 4` and `WebAssembly result: 42` for an exported Wasm function called with `45` and `3` that subtracts its arguments. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
 
 ## Check a checkout
 

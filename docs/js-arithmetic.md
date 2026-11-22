@@ -16,9 +16,14 @@ and writes to `const` are rejected as unsupported rather than modeling global
 lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
 calls, objects or nonnumeric coercions.
 
-The evaluator sees only the private postfix instructions, not the original
-source. Before allocating, it checks an execution ceiling of 4,096 instructions
-(including reads, initializations and writes), independent of custom parse limits. It visits each
+Conditional expressions (`test ? consequent : alternate`) evaluate only the
+selected arm. For numeric tests, either signed zero and NaN are false; other
+numbers are true. Conditionals are right-associative and bind less tightly than
+arithmetic. Both arms are parsed and must use supported syntax and bindings.
+
+The evaluator sees only private instructions, not the original source. Before
+allocating, it checks a ceiling of 4,096 instructions, counting both arms and
+their forward jumps, independent of custom parse limits. It visits each
 instruction at most once. Each literal adds one operand and each binary
 operation consumes two operands and leaves one. A unary operation replaces the
 top operand. Initialization consumes a value and appends a slot; a read pushes

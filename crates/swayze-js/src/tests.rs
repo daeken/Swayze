@@ -66,6 +66,131 @@ fn precedence_associativity_and_grouping() {
 }
 
 #[test]
+fn conditionals_compile_to_forward_jumps_and_join_at_the_same_stack_depth() {
+    use Instruction::{Jump, JumpIfFalse};
+    assert_postfix(
+        "9+(0?2*3:4?5:6)",
+        &[
+            Number(9.),
+            Number(0.),
+            JumpIfFalse(7),
+            Number(2.),
+            Number(3.),
+            Multiply,
+            Jump(12),
+            Number(4.),
+            JumpIfFalse(11),
+            Number(5.),
+            Jump(12),
+            Number(6.),
+            Add,
+        ],
+        3,
+    );
+    assert_postfix(
+        "1?0?2:3:4",
+        &[
+            Number(1.),
+            JumpIfFalse(8),
+            Number(0.),
+            JumpIfFalse(6),
+            Number(2.),
+            Jump(7),
+            Number(3.),
+            Jump(9),
+            Number(4.),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn malformed_conditional_delimiters_and_longer_punctuators() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, start, end) in [
+        ("?1:2", 0, 1),
+        ("1?", 2, 2),
+        ("1:?2", 1, 2),
+        ("1?:2", 2, 3),
+        ("1?2", 3, 3),
+        ("1?2:", 4, 4),
+        ("1?2:;", 4, 5),
+        ("1?2:3:4", 5, 6),
+        ("(1?2):3", 4, 5),
+        ("1?(2:3)", 4, 5),
+        ("1?2+ :3", 5, 6),
+        ("1 + ?2:3", 4, 5),
+        ("const x=1?2; x", 11, 12),
+        ("let x=1; x=1?2", 14, 14),
+    ] {
+        assert_error(source, Malformed, start, end);
+    }
+    for (source, end) in [("1??2", 3), ("1??=2", 4), ("1?.x", 3), ("1?.(2)", 3)] {
+        assert_error(source, Unsupported, 1, end);
+    }
+    assert_error("1?2:3\n4", Unsupported, 6, 7);
+}
+
+#[test]
+fn conditional_syntax_jumps_and_pending_frames_are_metered() {
+    let limits = Limits {
+        max_tokens: 5,
+        max_work: 15, // 5 scanned bytes, 3 conversions, 5 emissions, 2 pending pushes
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_script_with_limits("0?1:2", limits)
+            .unwrap()
+            .evaluate(),
+        Ok(2.0)
+    );
+    assert_limit(
+        "0?1:2",
+        Limits {
+            max_tokens: 4,
+            ..limits
+        },
+        Limit::Tokens,
+        4,
+        5,
+    );
+    assert_limit(
+        "0?1:2",
+        Limits {
+            max_work: 14,
+            ..limits
+        },
+        Limit::Work,
+        4,
+        5,
+    );
+
+    let limits = Limits {
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    assert_limit("(1?2:3)", limits, Limit::NestingDepth, 2, 3);
+    assert_limit("1?2:3?4:5", limits, Limit::NestingDepth, 5, 6);
+    assert_limit("1?2?3:4:5", limits, Limit::NestingDepth, 3, 4);
+    assert!(parse_script_with_limits("(1)?2:3", limits).is_ok());
+
+    let count = 10_000;
+    let source = "0?1:".repeat(count) + "2";
+    let script = parse_script_with_limits(
+        &source,
+        Limits {
+            max_tokens: 4 * count + 1,
+            max_nesting_depth: count,
+            ..limits
+        },
+    )
+    .unwrap();
+    assert_eq!(script.instruction_count(), 4 * count + 1);
+    assert_eq!(script.max_stack_depth(), 1);
+}
+
+#[test]
 fn postfix_orders_prefix_and_multiplicative_operators() {
     assert_postfix(
         "- + -(1+2)/-4%+5*6",

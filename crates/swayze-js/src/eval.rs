@@ -14,7 +14,7 @@ const MAX_INSTRUCTIONS: usize = 4096;
 pub enum EvalError {
     /// The instruction sequence exceeds the evaluator's operation budget.
     LimitExceeded,
-    /// The instruction sequence has invalid operand or binding-slot usage.
+    /// The instruction sequence has invalid control flow, operands, or binding-slot usage.
     InvalidScript,
     /// The evaluator could not allocate bounded operand or binding storage.
     AllocationFailed,
@@ -40,9 +40,10 @@ impl Script {
     /// results, not evaluation errors. This runs no host callbacks and does not
     /// read source text. Initializations and assignments run in source order,
     /// with fresh immutable `const` and mutable `let` slots for each call. The
-    /// final expression determines the result. The evaluation ceiling is 4,096
-    /// instructions (one per literal, operator, binding read, initialization or
-    /// assignment), regardless of the parse limits used.
+    /// final expression determines the result. A conditional evaluates its test
+    /// and only the selected arm; zero (of either sign) and NaN select the false arm.
+    /// The evaluation ceiling is 4,096 total instructions, including both arms
+    /// and their jumps, regardless of the parse limits used.
     ///
     /// # Errors
     ///
@@ -70,10 +71,9 @@ fn evaluate(
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
-    // Within any expression, each push after the first requires a binary
-    // operation before that expression can yield one value. Each binding also
-    // needs at least a push and an initializer instruction, and the final
-    // expression needs at least one instruction of its own.
+    // On a path that reaches the peak, that many pushes and at least one less
+    // pop are needed to finish with one value. Each binding also needs at least
+    // a push and an initializer, and the final expression needs an instruction.
     if max_operands == 0
         || max_operands > ops.len().div_ceil(2)
         || binding_slots > ops.len().saturating_sub(1) / 2
@@ -93,8 +93,12 @@ fn evaluate(
         .try_reserve_exact(binding_slots)
         .map_err(|_| EvalError::AllocationFailed)?;
 
-    for op in ops {
-        match *op {
+    // Each step advances the instruction pointer, so the total instruction
+    // ceiling bounds execution even with jumps. `ops.len()` denotes exit.
+    let mut ip = 0;
+    while let Some(&op) = ops.get(ip) {
+        ip += 1;
+        match op {
             Instruction::Number(value) => push_operand(&mut stack, max_operands, value)?,
             Instruction::LoadBinding(slot) => {
                 let (Slot::Const(value) | Slot::Let(value)) =
@@ -128,12 +132,28 @@ fn evaluate(
             Instruction::Remainder => apply_binary(&mut stack, |lhs, rhs| lhs % rhs)?,
             Instruction::Positive => apply_unary(&mut stack, |value| value)?,
             Instruction::Negate => apply_unary(&mut stack, |value| -value)?,
+            Instruction::JumpIfFalse(target) => {
+                let target = check_target(ip, target, ops.len())?;
+                let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
+                if condition == 0.0 || condition.is_nan() {
+                    ip = target;
+                }
+            }
+            Instruction::Jump(target) => ip = check_target(ip, target, ops.len())?,
         }
     }
 
     match stack.as_slice() {
         [value] if bindings.len() == binding_slots => Ok(*value),
         _ => Err(EvalError::InvalidScript),
+    }
+}
+
+fn check_target(next: usize, target: usize, exit: usize) -> Result<usize, EvalError> {
+    if (next..=exit).contains(&target) {
+        Ok(target)
+    } else {
+        Err(EvalError::InvalidScript)
     }
 }
 
@@ -184,6 +204,51 @@ mod tests {
             (&[one, one, Instruction::Add][..], 1),
         ] {
             assert_eq!(evaluate(ops, peak, 0), Err(EvalError::InvalidScript));
+        }
+    }
+
+    #[test]
+    fn checks_forward_jump_targets_and_allows_one_past_end() {
+        use Instruction::{Jump, JumpIfFalse, Number};
+        let one = Number(1.0);
+        let zero = Number(0.0);
+        for ops in [
+            &[one, Jump(0)][..], // backward
+            &[one, Jump(1)][..], // self
+            &[one, Jump(3)][..], // past exit
+            &[one, Jump(usize::MAX)][..],
+            &[zero, JumpIfFalse(1), one][..],
+            &[one, JumpIfFalse(4), one][..], // invalid even if not taken
+            &[JumpIfFalse(2), one][..],      // missing test operand
+            &[zero, JumpIfFalse(3), one][..], // taken to exit without a result
+        ] {
+            assert_eq!(
+                evaluate(ops, 1, 0),
+                Err(EvalError::InvalidScript),
+                "{ops:?}"
+            );
+        }
+        assert_eq!(evaluate(&[one, Jump(2)], 1, 0), Ok(1.0));
+    }
+
+    #[test]
+    fn executes_only_the_selected_arm() {
+        use Instruction::{Jump, JumpIfFalse, LoadBinding, Number};
+        // A bad slot is observable if executed, unlike ordinary arithmetic in
+        // the subset. The parser would never emit this load.
+        let bad = LoadBinding(0);
+        let answer = Number(42.0);
+        for (test, consequent, alternate) in [(1.0, answer, bad), (0.0, bad, answer)] {
+            let ops = [Number(test), JumpIfFalse(4), consequent, Jump(5), alternate];
+            assert_eq!(evaluate(&ops, 1, 0), Ok(42.0));
+            let flipped = [
+                Number(1.0 - test),
+                JumpIfFalse(4),
+                consequent,
+                Jump(5),
+                alternate,
+            ];
+            assert_eq!(evaluate(&flipped, 1, 0), Err(EvalError::InvalidScript));
         }
     }
 

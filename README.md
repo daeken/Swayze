@@ -1,8 +1,8 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in a security-first browser. **Status: design and build scaffold.** It does not parse, validate or execute guest programs yet. There is no JIT or browser sandbox here.
+Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: design and build scaffold.** It does not parse, validate or execute guest programs yet. There is no JIT or browser sandbox here.
 
-Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary, JIT admission criteria and delivery gates. Security takes precedence over speed or feature coverage.
+Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current scaffold makes no security-proof claim.
 
 | Path | Responsibility today |
 | --- | --- |

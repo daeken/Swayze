@@ -181,6 +181,19 @@ fn fixtures() -> Vec<Fixture> {
             &[0x20, 0, 0x20, 1, opcode],
         ));
     }
+    // If the first parameter is zero, the nested condition selects 2 or 3.
+    // Otherwise only the then arm runs and attempts signed division by zero.
+    let nested = [
+        0x20, 0, 0x04, 0x7f, 0x41, 1, 0x41, 0, 0x6d, 0x05, 0x20, 1, 0x04, 0x7f, 0x41, 2, 0x05,
+        0x41, 3, 0x0b, 0x0b,
+    ];
+    for (args, outcome) in [
+        ([0, 0], Ok(3)),
+        ([0, -1], Ok(2)),
+        ([-1, 0], Err(IntegerDivideByZero)),
+    ] {
+        cases.push(Fixture::with_outcome(outcome, &args, &[0], &nested));
+    }
     cases
 }
 

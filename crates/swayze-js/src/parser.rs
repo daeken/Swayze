@@ -137,7 +137,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// The number of literals and binary operators in the expression.
+    /// The number of literals and operators in the expression.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
@@ -167,6 +167,10 @@ pub(crate) enum Instruction {
     Add,
     Subtract,
     Multiply,
+    Divide,
+    Remainder,
+    Positive,
+    Negate,
 }
 
 /// Parse a complete Script in the arithmetic subset with default [`Limits`].
@@ -205,17 +209,22 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Binary {
+enum Operator {
     Add,
     Subtract,
     Multiply,
+    Divide,
+    Remainder,
+    Positive,
+    Negate,
 }
 
-impl Binary {
+impl Operator {
     fn precedence(self) -> u8 {
         match self {
             Self::Add | Self::Subtract => 1,
-            Self::Multiply => 2,
+            Self::Multiply | Self::Divide | Self::Remainder => 2,
+            Self::Positive | Self::Negate => 3,
         }
     }
 
@@ -224,6 +233,10 @@ impl Binary {
             Self::Add => Instruction::Add,
             Self::Subtract => Instruction::Subtract,
             Self::Multiply => Instruction::Multiply,
+            Self::Divide => Instruction::Divide,
+            Self::Remainder => Instruction::Remainder,
+            Self::Positive => Instruction::Positive,
+            Self::Negate => Instruction::Negate,
         }
     }
 }
@@ -231,7 +244,7 @@ impl Binary {
 #[derive(Clone, Copy)]
 enum TokenKind {
     Number(f64),
-    Binary(Binary),
+    Operator(Operator),
     Open,
     Close,
     Semicolon,
@@ -320,30 +333,7 @@ impl Lexer<'_> {
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             ';' => TokenKind::Semicolon,
-            '+' | '-' | '*' => {
-                if let Some(next) = self.rest().chars().next()
-                    && (next == c || next == '=')
-                {
-                    self.consume(next)?;
-                    if c == '*' && next == '*' && self.rest().starts_with('=') {
-                        self.consume('=')?;
-                    }
-                    let span = Span {
-                        start,
-                        end: self.offset,
-                    };
-                    return Err(Error::unsupported(
-                        span,
-                        "longer punctuator is outside the arithmetic subset",
-                    ));
-                }
-                let op = match c {
-                    '+' => Binary::Add,
-                    '-' => Binary::Subtract,
-                    _ => Binary::Multiply,
-                };
-                TokenKind::Binary(op)
-            }
+            '+' | '-' | '*' | '/' | '%' => self.operator(c, start)?,
             _ => {
                 return Err(Error::unsupported(
                     first,
@@ -358,6 +348,42 @@ impl Lexer<'_> {
                 end: self.offset,
             },
             after_line_break,
+        }))
+    }
+
+    fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
+        if let Some(next) = self.rest().chars().next() {
+            if c == '/' && matches!(next, '/' | '*') {
+                self.consume(next)?;
+                return Err(Error::unsupported(
+                    Span {
+                        start,
+                        end: self.offset,
+                    },
+                    "comments are outside the arithmetic subset",
+                ));
+            }
+            if next == '=' || (next == c && matches!(c, '+' | '-' | '*')) {
+                self.consume(next)?;
+                if c == '*' && next == '*' && self.rest().starts_with('=') {
+                    self.consume('=')?;
+                }
+                return Err(Error::unsupported(
+                    Span {
+                        start,
+                        end: self.offset,
+                    },
+                    "longer punctuator is outside the arithmetic subset",
+                ));
+            }
+        }
+        Ok(TokenKind::Operator(match c {
+            '+' => Operator::Add,
+            '-' => Operator::Subtract,
+            '*' => Operator::Multiply,
+            '/' => Operator::Divide,
+            '%' => Operator::Remainder,
+            _ => unreachable!("not an arithmetic operator"),
         }))
     }
 
@@ -399,8 +425,8 @@ impl Lexer<'_> {
     }
 }
 
-// `None` is a delimiter; otherwise this is a pending binary operator.
-type Pending = (Option<Binary>, Span);
+// `None` is a delimiter; otherwise this is a pending prefix or binary operator.
+type Pending = (Option<Operator>, Span);
 
 struct Parser<'s> {
     lexer: Lexer<'s>,
@@ -441,11 +467,21 @@ impl Parser<'_> {
                     nesting += 1;
                     self.push_pending(None, span)?;
                 }
-                (true, TokenKind::Binary(Binary::Add | Binary::Subtract)) => {
-                    return Err(Error::unsupported(
-                        span,
-                        "unary operators are outside the arithmetic subset",
-                    ));
+                (true, TokenKind::Operator(op)) => {
+                    let prefix = match op {
+                        Operator::Add => Operator::Positive,
+                        Operator::Subtract => Operator::Negate,
+                        Operator::Divide => {
+                            // In operand position a slash could begin a regexp, not division.
+                            return Err(Error::unsupported(
+                                span,
+                                "regular expression literals are outside the arithmetic subset",
+                            ));
+                        }
+                        _ => return Err(Error::malformed(span, "expected an operand")),
+                    };
+                    // Don't pop pending operators: another prefix applies before this one.
+                    self.push_pending(Some(prefix), span)?;
                 }
                 (true, TokenKind::Semicolon) if !seen_token => {
                     return Err(Error::unsupported(
@@ -473,7 +509,7 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "empty parenthesized expression"));
                 }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
-                (false, TokenKind::Binary(op)) => {
+                (false, TokenKind::Operator(op)) => {
                     while let Some(&(Some(prev), at)) = self.pending.last() {
                         if prev.precedence() < op.precedence() {
                             break;
@@ -553,30 +589,32 @@ impl Parser<'_> {
         })
     }
 
-    fn push_pending(&mut self, op: Option<Binary>, span: Span) -> Result<(), Error> {
+    fn push_pending(&mut self, op: Option<Operator>, span: Span) -> Result<(), Error> {
         self.lexer.charge(1, span)?;
         try_push(&mut self.pending, (op, span), span)
     }
 
     fn emit(&mut self, instruction: Instruction, span: Span) -> Result<(), Error> {
         self.lexer.charge(1, span)?;
-        match instruction {
-            Instruction::Number(value) if !value.is_sign_negative() && !value.is_nan() => {
-                // Each push corresponds to a distinct nonempty literal in `source`.
-                self.stack_depth += 1;
-                self.max_stack_depth = self.max_stack_depth.max(self.stack_depth);
-            }
-            Instruction::Number(_) => {
+        let operands = match instruction {
+            Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
-            _ if self.stack_depth >= 2 => self.stack_depth -= 1,
-            _ => {
-                return Err(Error::malformed(
-                    span,
-                    "binary operation is missing an operand",
-                ));
-            }
-        }
+            Instruction::Number(_) => 0,
+            Instruction::Positive | Instruction::Negate => 1,
+            Instruction::Add
+            | Instruction::Subtract
+            | Instruction::Multiply
+            | Instruction::Divide
+            | Instruction::Remainder => 2,
+        };
+        self.stack_depth = self
+            .stack_depth
+            .checked_sub(operands)
+            .ok_or_else(|| Error::malformed(span, "operation is missing an operand"))?
+            .checked_add(1)
+            .ok_or_else(|| Error::limit(span, Limit::Allocation))?;
+        self.max_stack_depth = self.max_stack_depth.max(self.stack_depth);
         try_push(&mut self.postfix, instruction, span)
     }
 }

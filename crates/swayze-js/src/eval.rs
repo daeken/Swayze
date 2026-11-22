@@ -32,9 +32,10 @@ impl std::error::Error for EvalError {}
 impl Script {
     /// Evaluate this prepared arithmetic expression using JavaScript Number (binary64).
     ///
-    /// Each binary `+`, `-`, or `*` operates on numbers in the order chosen by
-    /// the parser. Signed zeros, infinities, and NaN are numeric results, not
-    /// evaluation errors. This runs no host callbacks and does not read source text.
+    /// Each operator works on numbers in the order chosen by the parser, rounding
+    /// each operation to binary64. Signed zeros, infinities, and NaN are numeric
+    /// results, not evaluation errors. This runs no host callbacks and does not
+    /// read source text.
     /// The evaluation ceiling is 4,096 instructions (one per literal or operator),
     /// regardless of the parse limits used.
     ///
@@ -51,10 +52,11 @@ fn evaluate(ops: &[Instruction], max_operands: usize) -> Result<f64, EvalError> 
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
-    // A valid sequence with n instructions has (n+1)/2 literals: each
-    // binary operation reduces the stack depth by one, leaving one result.
-    // Bound the parser's peak stack depth before using it to reserve storage.
-    if ops.len().is_multiple_of(2) || max_operands == 0 || max_operands > ops.len().div_ceil(2) {
+    // Each literal beyond the first requires a binary operation to combine it
+    // with the rest. Unary operations do not change the depth. So a valid
+    // sequence has at most ceil(n / 2) literals for n instructions, bounding
+    // peak stack depth (and therefore the reservation) even with unary operators.
+    if max_operands == 0 || max_operands > ops.len().div_ceil(2) {
         return Err(EvalError::InvalidScript);
     }
 
@@ -74,6 +76,11 @@ fn evaluate(ops: &[Instruction], max_operands: usize) -> Result<f64, EvalError> 
             Instruction::Add => apply_binary(&mut stack, |lhs, rhs| lhs + rhs)?,
             Instruction::Subtract => apply_binary(&mut stack, |lhs, rhs| lhs - rhs)?,
             Instruction::Multiply => apply_binary(&mut stack, |lhs, rhs| lhs * rhs)?,
+            Instruction::Divide => apply_binary(&mut stack, |lhs, rhs| lhs / rhs)?,
+            // Floating-point `%` uses a quotient truncated toward zero, as in JS.
+            Instruction::Remainder => apply_binary(&mut stack, |lhs, rhs| lhs % rhs)?,
+            Instruction::Positive => apply_unary(&mut stack, |value| value)?,
+            Instruction::Negate => apply_unary(&mut stack, |value| -value)?,
         }
     }
 
@@ -81,6 +88,12 @@ fn evaluate(ops: &[Instruction], max_operands: usize) -> Result<f64, EvalError> 
         [value] => Ok(*value),
         _ => Err(EvalError::InvalidScript),
     }
+}
+
+fn apply_unary(stack: &mut [f64], op: impl FnOnce(f64) -> f64) -> Result<(), EvalError> {
+    let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
+    *value = op(*value);
+    Ok(())
 }
 
 fn apply_binary(stack: &mut Vec<f64>, op: impl FnOnce(f64, f64) -> f64) -> Result<(), EvalError> {
@@ -101,6 +114,10 @@ mod tests {
             (&[][..], 0),
             (&[one, one][..], 2),
             (&[Instruction::Subtract][..], 1),
+            (&[Instruction::Positive, one][..], 1),
+            (&[Instruction::Negate, one][..], 1),
+            (&[one, Instruction::Divide][..], 1),
+            (&[one, Instruction::Remainder][..], 1),
             (&[one, Instruction::Subtract, one][..], 1),
             (&[one, one, one][..], 2),
             (&[one, one, one, Instruction::Add, one][..], 3),
@@ -123,6 +140,8 @@ mod tests {
         let operands = MAX_INSTRUCTIONS.div_ceil(2);
         let mut ops = vec![Instruction::Number(1.0); operands];
         ops.extend(std::iter::repeat_n(Instruction::Add, operands - 1));
+        ops.push(Instruction::Positive);
+        assert_eq!(ops.len(), MAX_INSTRUCTIONS);
         assert_eq!(evaluate(&ops, operands), Ok(operands as f64));
     }
 

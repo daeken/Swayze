@@ -1,4 +1,6 @@
-use crate::parser::Instruction::{self, Add, Multiply, Number, Subtract};
+use crate::parser::Instruction::{
+    self, Add, Divide, Multiply, Negate, Number, Positive, Remainder, Subtract,
+};
 use crate::{ErrorKind, Limit, Limits, Span, parse_script, parse_script_with_limits};
 
 fn assert_postfix(source: &str, expected: &[Instruction], depth: usize) {
@@ -62,13 +64,44 @@ fn precedence_associativity_and_grouping() {
 }
 
 #[test]
+fn postfix_orders_prefix_and_multiplicative_operators() {
+    assert_postfix(
+        "- + -(1+2)/-4%+5*6",
+        &[
+            Number(1.),
+            Number(2.),
+            Add,
+            Negate,
+            Positive,
+            Negate,
+            Number(4.),
+            Negate,
+            Divide,
+            Number(5.),
+            Positive,
+            Remainder,
+            Number(6.),
+            Multiply,
+        ],
+        2,
+    );
+    assert_postfix(
+        "8/-(-2)",
+        &[Number(8.), Number(2.), Negate, Negate, Divide],
+        2,
+    );
+    assert_postfix("1+ +2", &[Number(1.), Number(2.), Positive, Add], 2);
+    assert_postfix("1- -2", &[Number(1.), Number(2.), Negate, Subtract], 2);
+}
+
+#[test]
 fn entire_input_is_required() {
     use ErrorKind::{Malformed, Unsupported};
     assert_error("1; 2", Unsupported, 3, 4);
     assert_error("1;;", Unsupported, 2, 3);
     assert_error("1;\u{00A0}🚧", Unsupported, 4, 8);
     assert_error("1; let x", Unsupported, 3, 4);
-    assert_error("1; // comment", Unsupported, 3, 4);
+    assert_error("1; // comment", Unsupported, 3, 5);
     assert_error("1;\0", Unsupported, 2, 3);
     assert_error("1 23", Malformed, 2, 4);
     assert_error("1\n2", Unsupported, 2, 3);
@@ -76,6 +109,10 @@ fn entire_input_is_required() {
     assert_error("1(2)", Unsupported, 1, 2);
     assert_error("(1)2", Malformed, 3, 4);
     assert_postfix("1\n-2\n;\t  ", &[Number(1.), Number(2.), Subtract], 2);
+    assert_postfix("8\n/\n2", &[Number(8.), Number(2.), Divide], 2);
+    assert_error("1\n++2", Unsupported, 2, 4);
+    assert_error("1\n--2", Unsupported, 2, 4);
+    assert_error("1;\n/2/", Unsupported, 3, 4);
 }
 
 #[test]
@@ -92,17 +129,34 @@ fn malformed_subset_and_unsupported_constructs() {
     assert_error("(1\n2)", Malformed, 3, 4);
     assert_error("", Unsupported, 0, 0);
     assert_error(";", Unsupported, 0, 1);
-    assert_error("-1", Unsupported, 0, 1);
-    assert_error("1+ +2", Unsupported, 3, 4);
-    assert_error("1--2", Unsupported, 1, 3);
-    assert_error("1++2", Unsupported, 1, 3);
-    assert_error("1**2", Unsupported, 1, 3);
-    assert_error("1**=2", Unsupported, 1, 4);
-    assert_error("1-=2", Unsupported, 1, 3);
-    assert_error("1/2", Unsupported, 1, 2);
-    assert_error("1/*comment*/+2", Unsupported, 1, 2);
+    assert_error("-", Malformed, 1, 1);
+    assert_error("(+)", Malformed, 2, 3);
+    assert_error("1/", Malformed, 2, 2);
+    assert_error("1%", Malformed, 2, 2);
+    assert_error("1%%2", Malformed, 2, 3);
     assert_error("() => 1", Unsupported, 3, 5);
     assert_error("(()/*comment*/=>1)", Unsupported, 3, 5);
+}
+
+#[test]
+fn operator_lexical_boundaries_are_conservative() {
+    use ErrorKind::Unsupported;
+    for source in ["1--2", "1++2", "1**2", "1-=2", "1/=2", "1%=2"] {
+        assert_error(source, Unsupported, 1, 3);
+    }
+    assert_error("++2", Unsupported, 0, 2);
+    assert_error("--2", Unsupported, 0, 2);
+    assert_error("1**=2", Unsupported, 1, 4);
+    assert_error("-1**2", Unsupported, 2, 4);
+    assert_error("(-1)**2", Unsupported, 4, 6);
+    assert_error("1\n**2", Unsupported, 2, 4);
+    assert_error("1/*comment*/+2", Unsupported, 1, 3);
+    assert_error("1//2", Unsupported, 1, 3);
+    assert_error("1\n//2", Unsupported, 2, 4);
+    assert_error("-/*comment*/1", Unsupported, 1, 3);
+    assert_error("/2/", Unsupported, 0, 1);
+    assert_error("8 / /2/", Unsupported, 4, 5);
+    assert_error("+ /2/", Unsupported, 2, 3);
 }
 
 #[test]
@@ -269,6 +323,67 @@ fn individual_limits_are_inclusive() {
         1,
         4,
     ); // trailing trivia
+}
+
+#[test]
+fn mixed_operators_charge_token_and_work_budgets() {
+    let source = "-(1)/+2%3";
+    let limits = Limits {
+        max_tokens: 9,
+        max_work: 24,
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 7);
+    assert_eq!(script.max_stack_depth(), 2);
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 8,
+            ..limits
+        },
+        Limit::Tokens,
+        8,
+        9,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: 23,
+            ..limits
+        },
+        Limit::Work,
+        7,
+        8,
+    );
+}
+
+#[test]
+fn long_prefix_chains_are_iterative_without_using_nesting_budget() {
+    let count = 10_000;
+    let source = "- ".repeat(count) + "0";
+    let limits = Limits {
+        max_nesting_depth: 0,
+        ..Limits::default()
+    };
+    assert_limit(
+        &source,
+        limits,
+        Limit::Tokens,
+        2 * limits.max_tokens,
+        2 * limits.max_tokens + 1,
+    );
+    let script = parse_script_with_limits(
+        &source,
+        Limits {
+            max_tokens: count + 1,
+            ..limits
+        },
+    )
+    .unwrap();
+    assert_eq!(script.instruction_count(), count + 1);
+    assert_eq!(script.max_stack_depth(), 1);
 }
 
 #[test]

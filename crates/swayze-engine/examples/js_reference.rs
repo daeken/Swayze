@@ -75,6 +75,16 @@ fn fixtures() -> Vec<String> {
             "1.7976931348623159e308",
             "9007199254740993.0",
             "0e99999999999999999999999999",
+            "const x = 2; const y = x * 5; y + 1;",
+            "const x = 1; const X = 4; x - X",
+            "const const0 = .5; const $x = const0 * 1e2; $x / const0;",
+            "const x = -0; const y = x * 2; 1 / y",
+            "const x = 1 / 0; const y = x - x; y",
+            "const x = 9007199254740992; const y = x + 1; y - x",
+            "const x\n=\n3; const y = x + 2; y * (x - 1)",
+            "const x = 6; const unused = x / 0; x",
+            "const x = 2; x",
+            "const x = 3; x",
         ]
         .map(str::to_owned),
     );

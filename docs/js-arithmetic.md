@@ -8,20 +8,22 @@ produces `14.0`.
 This path evaluates an expression over decimal literals (including fractions and
 signed exponents) with binary
 `+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
-The parser determines precedence and associativity. There are no variables, calls, coercions or other
-language execution facilities in this evaluator.
+The parser determines precedence and associativity. Optional `const` declarations
+initialize numeric slots in source order before the final expression. Reads must
+refer to earlier declarations; global lookup and temporal dead zone behavior are
+not implemented. There are no calls, objects or nonnumeric coercions.
 
 The evaluator sees only the private postfix instructions, not the original
 source. Before allocating, it checks an execution ceiling of 4,096 instructions
-(one per literal or operator), independent of custom parse limits. It visits each
+(including reads and initializations), independent of custom parse limits. It visits each
 instruction at most once. Each literal adds one operand and each binary
 operation consumes two operands and leaves one. A unary operation replaces the
-top operand. The evaluator reserves storage
-for the peak stack depth calculated by the parser, after checking that it is
-at most `ceil(n/2)` `f64` operands for `n` instructions. It rejects any
-attempt to exceed the reserved depth, missing operands, or anything other
-than a single final result. Evaluation uses no recursion, host callbacks, dynamic code generation,
-external dependencies, or unsafe code.
+top operand. Initialization consumes a value and appends a slot; a read pushes
+that slot's value. The evaluator checks bounds before reserving at most 2,048
+operand slots and 2,047 binding slots. Reads of uninitialized slots, missing
+operands and invalid final stack depth are rejected. Every evaluation uses
+fresh slots; there is no shared global state. There is no recursion, host
+callback, dynamic code generation, third-party dependency, or unsafe code.
 
 Each operation is a separate binary64 (`f64`) operation, not host integer
 arithmetic. Signed zero is preserved; overflow to infinity and arithmetic that

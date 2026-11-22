@@ -3,7 +3,7 @@
 use swayze_engine::{parse_script, validate_module};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let script = parse_script("(2 + 3) * 4;")?;
+    let script = parse_script("const x = 2; const y = x * 5; y + 1;")?;
     println!("JavaScript result: {}", script.evaluate()?);
 
     // `answer: (i32, i32) -> i32` with body `local.get 0; local.get 1; i32.sub`.

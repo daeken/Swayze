@@ -10,7 +10,11 @@ const MAX_INSTRUCTIONS: usize = 4096;
 
 /// A result or intermediate value in the supported JavaScript subset.
 ///
-/// Rust `PartialEq` compares tagged host values; it is not a guest equality operation.
+/// The derived Rust [`PartialEq`] compares enum variants and their payloads.
+/// For Numbers, it uses `f64` equality: signed zeros compare equal and NaN is
+/// unequal to itself. Guest `===` and `!==` are evaluated separately according
+/// to JavaScript's strict equality rules, not by calling this trait. They agree
+/// with Rust `==` and `!=` for the supported Number and Boolean values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     /// A JavaScript Number (binary64), including signed zeros, infinities, and NaN.

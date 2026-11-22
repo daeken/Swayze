@@ -2,6 +2,8 @@
 
 `parse_script` parses a JavaScript Script with zero or more initialized `const` or `let` declarations and simple assignments in source order, followed by one expression. Call `Script::evaluate_value` for the final expression's `Value::Number(f64)` or `Value::Boolean(bool)`. For example, `let x = 1; x = x >= true; x === true;` returns `Value::Boolean(true)`. The compatibility method `Script::evaluate` returns a Number as `f64` and reports `EvalError::NonNumericResult` for a Boolean without converting it. `prepare` is still an unsupported compatibility shim.
 
+`Value`'s derived Rust `PartialEq` compares enum variants and their payloads; `f64` equality treats signed zeros as equal and NaN as unequal to itself. For the supported Number and Boolean values, Rust `==` and `!=` agree with guest `===` and `!==`, respectively. The guest operators implement JavaScript's strict equality rules separately rather than using Rust `PartialEq`.
+
 ```text
 Script   ::= (Decl | Assign)* Expr ';'? EOF
 Decl     ::= ('const' | 'let') Name '=' Expr ';'

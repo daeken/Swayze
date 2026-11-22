@@ -193,6 +193,12 @@ pub(crate) enum Instruction {
     Remainder,
     Positive,
     Negate,
+    StrictEqual,
+    StrictNotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
     JumpIfFalse(usize),
     Jump(usize),
 }
@@ -237,6 +243,12 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
 
 #[derive(Clone, Copy, Debug)]
 enum Operator {
+    StrictEqual,
+    StrictNotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
     Add,
     Subtract,
     Multiply,
@@ -249,14 +261,25 @@ enum Operator {
 impl Operator {
     fn precedence(self) -> u8 {
         match self {
-            Self::Add | Self::Subtract => 1,
-            Self::Multiply | Self::Divide | Self::Remainder => 2,
-            Self::Positive | Self::Negate => 3,
+            Self::StrictEqual | Self::StrictNotEqual => 1,
+            Self::LessThan
+            | Self::LessThanOrEqual
+            | Self::GreaterThan
+            | Self::GreaterThanOrEqual => 2,
+            Self::Add | Self::Subtract => 3,
+            Self::Multiply | Self::Divide | Self::Remainder => 4,
+            Self::Positive | Self::Negate => 5,
         }
     }
 
     fn instruction(self) -> Instruction {
         match self {
+            Self::StrictEqual => Instruction::StrictEqual,
+            Self::StrictNotEqual => Instruction::StrictNotEqual,
+            Self::LessThan => Instruction::LessThan,
+            Self::LessThanOrEqual => Instruction::LessThanOrEqual,
+            Self::GreaterThan => Instruction::GreaterThan,
+            Self::GreaterThanOrEqual => Instruction::GreaterThanOrEqual,
             Self::Add => Instruction::Add,
             Self::Subtract => Instruction::Subtract,
             Self::Multiply => Instruction::Multiply,
@@ -424,7 +447,15 @@ impl Lexer<'_> {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             _ if is_identifier_start(c) => self.identifier(start)?,
-            '=' => self.equals(start)?,
+            '=' | '!' => self.equality_or_assignment(c, start)?,
+            // Annex B HTML-like comments remain outside the subset.
+            '<' if self.rest().starts_with("!--") => {
+                return Err(Error::unsupported(
+                    first,
+                    "HTML comments are outside the subset",
+                ));
+            }
+            '<' | '>' => self.relational(c, start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             '?' => self.question(start)?,
@@ -483,10 +514,40 @@ impl Lexer<'_> {
         }
     }
 
-    fn equals(&mut self, start: usize) -> Result<TokenKind, Error> {
-        if let Some(next @ ('=' | '>')) = self.peek() {
-            self.consume(next)?;
-            if next == '=' && self.peek() == Some('=') {
+    fn equality_or_assignment(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        if self.peek() == Some('=') {
+            self.consume('=')?;
+            if self.peek() == Some('=') {
+                self.consume('=')?;
+                return Ok(TokenKind::Operator(if first == '=' {
+                    Operator::StrictEqual
+                } else {
+                    Operator::StrictNotEqual
+                }));
+            }
+        } else if first == '=' {
+            if self.peek() != Some('>') {
+                return Ok(TokenKind::Equals);
+            }
+            self.consume('>')?;
+        }
+        Err(Error::unsupported(
+            Span {
+                start,
+                end: self.offset,
+            },
+            "punctuator is outside the subset",
+        ))
+    }
+
+    fn relational(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        if self.peek() == Some(first) {
+            // Recognize the whole shift punctuator, with optional third '>' and '='.
+            self.consume(first)?;
+            if first == '>' && self.peek() == Some('>') {
+                self.consume('>')?;
+            }
+            if self.peek() == Some('=') {
                 self.consume('=')?;
             }
             return Err(Error::unsupported(
@@ -494,10 +555,20 @@ impl Lexer<'_> {
                     start,
                     end: self.offset,
                 },
-                "longer punctuator is outside the arithmetic subset",
+                "shift operators are outside the subset",
             ));
         }
-        Ok(TokenKind::Equals)
+        let inclusive = self.peek() == Some('=');
+        if inclusive {
+            self.consume('=')?;
+        }
+        Ok(TokenKind::Operator(match (first, inclusive) {
+            ('<', false) => Operator::LessThan,
+            ('<', true) => Operator::LessThanOrEqual,
+            ('>', false) => Operator::GreaterThan,
+            ('>', true) => Operator::GreaterThanOrEqual,
+            _ => unreachable!("not a relational operator"),
+        }))
     }
 
     fn question(&mut self, start: usize) -> Result<TokenKind, Error> {
@@ -634,7 +705,7 @@ impl Lexer<'_> {
 
 #[derive(Clone, Copy)]
 enum Pending {
-    Arithmetic(Operator),
+    Op(Operator),
     Group,
     Consequent { branch: usize, base_depth: usize },
     Alternate { jump: usize, join_depth: usize },
@@ -877,7 +948,7 @@ impl Parser<'_> {
                         _ => return Err(Error::malformed(span, "expected an operand")),
                     };
                     // Don't pop pending operators: another prefix applies before this one.
-                    self.push_pending(Pending::Arithmetic(prefix), span)?;
+                    self.push_pending(Pending::Op(prefix), span)?;
                 }
                 (true, TokenKind::Semicolon) if missing_semicolon.is_none() && !seen_token => {
                     return Err(Error::unsupported(
@@ -908,14 +979,14 @@ impl Parser<'_> {
                 }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
                 (false, TokenKind::Operator(op)) => {
-                    self.reduce_arithmetic(op.precedence())?;
-                    self.push_pending(Pending::Arithmetic(op), span)?;
+                    self.reduce_operators(op.precedence())?;
+                    self.push_pending(Pending::Op(op), span)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Question) => {
-                    // Lower precedence than arithmetic, but do not close an enclosing
-                    // conditional: this question starts a conditional within that arm.
-                    self.reduce_arithmetic(0)?;
+                    // Lower precedence than every operator here, but do not close an
+                    // enclosing conditional: this one starts within that arm.
+                    self.reduce_operators(0)?;
                     let branch = self.instructions.len();
                     self.emit(Instruction::JumpIfFalse(UNPATCHED), span)?;
                     self.open_pending(
@@ -1002,8 +1073,8 @@ impl Parser<'_> {
         try_push(&mut self.pending, (entry, span), span)
     }
 
-    fn reduce_arithmetic(&mut self, min_precedence: u8) -> Result<(), Error> {
-        while let Some(&(Pending::Arithmetic(op), span)) = self.pending.last() {
+    fn reduce_operators(&mut self, min_precedence: u8) -> Result<(), Error> {
+        while let Some(&(Pending::Op(op), span)) = self.pending.last() {
             if op.precedence() < min_precedence {
                 break;
             }
@@ -1015,10 +1086,10 @@ impl Parser<'_> {
 
     // At an expression delimiter, reduce through completed conditionals but stop
     // at an opening parenthesis or a conditional whose ':' has not been seen.
-    // '?' drained arithmetic at its level, so there are no arithmetic entries
+    // '?' drained operators at its level, so there are no operator entries
     // underneath the alternate markers until after the next delimiter.
     fn reduce_expression(&mut self) -> Result<(), Error> {
-        self.reduce_arithmetic(0)?;
+        self.reduce_operators(0)?;
         while let Some(&(Pending::Alternate { jump, join_depth }, span)) = self.pending.last() {
             if self.stack_depth != join_depth {
                 return Err(Error::malformed(
@@ -1087,7 +1158,13 @@ impl Parser<'_> {
             | Instruction::Subtract
             | Instruction::Multiply
             | Instruction::Divide
-            | Instruction::Remainder => (2, 1),
+            | Instruction::Remainder
+            | Instruction::StrictEqual
+            | Instruction::StrictNotEqual
+            | Instruction::LessThan
+            | Instruction::LessThanOrEqual
+            | Instruction::GreaterThan
+            | Instruction::GreaterThanOrEqual => (2, 1),
         };
         self.stack_depth = self
             .stack_depth

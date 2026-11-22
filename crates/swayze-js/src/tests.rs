@@ -410,9 +410,7 @@ fn consts_decline_reserved_and_non_subset_names_without_splitting() {
         ("const x\\u0061=1; 1", 7, 8),
         ("const x=1; x\u{200D}", 12, 15),
         ("const x==1; x", 7, 9),
-        ("const x===1; x", 7, 10),
         ("const x=>1; x", 7, 9),
-        ("const x=1; x!==1", 12, 13),
     ] {
         assert_error(source, Unsupported, start, end);
     }
@@ -425,6 +423,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const", Malformed, 5, 5),
         ("const x; x", Malformed, 7, 8),
         ("const x=; x", Malformed, 8, 9),
+        ("const x===1; x", Malformed, 7, 10),
         ("const x=1", Unsupported, 9, 9),
         ("const x=1;", Unsupported, 10, 10),
         ("const x=1\nx", Unsupported, 10, 11),

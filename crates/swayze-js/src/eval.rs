@@ -36,6 +36,15 @@ impl Value {
             Self::Boolean(value) => value,
         }
     }
+
+    fn strictly_equals(self, other: Self) -> bool {
+        match (self, other) {
+            // Binary64 equality equates signed zeros and never equates NaN.
+            (Self::Number(lhs), Self::Number(rhs)) => lhs == rhs,
+            (Self::Boolean(lhs), Self::Boolean(rhs)) => lhs == rhs,
+            _ => false,
+        }
+    }
 }
 
 /// Failure to evaluate a prepared script or obtain a Number result from it.
@@ -83,10 +92,15 @@ impl Script {
 
     /// Evaluate the Script and return the final expression's Number or Boolean value.
     ///
-    /// Arithmetic converts Boolean operands to `1` for `true` and `+0` for
-    /// `false`, then computes a binary64 Number. A conditional evaluates its
-    /// test and only the selected arm, preserving the arm's value and type.
-    /// `false`, either signed zero, and NaN select the false arm.
+    /// Arithmetic and relational operators convert Boolean operands to `1` for
+    /// `true` and `+0` for `false`. Arithmetic returns a Number; relational
+    /// operators return a Boolean, always `false` if either operand is NaN.
+    /// Strict equality and inequality compare tags and values without coercion
+    /// and return a Boolean.
+    ///
+    /// A conditional evaluates its test and only the selected arm, preserving
+    /// the arm's value and type. `false`, either signed zero, and NaN select the
+    /// false arm.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments run in source order with fresh immutable `const` and
@@ -178,12 +192,23 @@ fn evaluate(
                 }
                 *value = stack.pop().ok_or(EvalError::InvalidScript)?;
             }
-            Instruction::Add => apply_binary(&mut stack, |lhs, rhs| lhs + rhs)?,
-            Instruction::Subtract => apply_binary(&mut stack, |lhs, rhs| lhs - rhs)?,
-            Instruction::Multiply => apply_binary(&mut stack, |lhs, rhs| lhs * rhs)?,
-            Instruction::Divide => apply_binary(&mut stack, |lhs, rhs| lhs / rhs)?,
+            Instruction::Add => apply_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
+            Instruction::Subtract => apply_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
+            Instruction::Multiply => apply_arithmetic(&mut stack, |lhs, rhs| lhs * rhs)?,
+            Instruction::Divide => apply_arithmetic(&mut stack, |lhs, rhs| lhs / rhs)?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
-            Instruction::Remainder => apply_binary(&mut stack, |lhs, rhs| lhs % rhs)?,
+            Instruction::Remainder => apply_arithmetic(&mut stack, |lhs, rhs| lhs % rhs)?,
+            Instruction::StrictEqual => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Boolean(lhs.strictly_equals(rhs))
+            })?,
+            Instruction::StrictNotEqual => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Boolean(!lhs.strictly_equals(rhs))
+            })?,
+            // Direct binary64 comparisons all return false for unordered operands.
+            Instruction::LessThan => apply_relational(&mut stack, |lhs, rhs| lhs < rhs)?,
+            Instruction::LessThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs <= rhs)?,
+            Instruction::GreaterThan => apply_relational(&mut stack, |lhs, rhs| lhs > rhs)?,
+            Instruction::GreaterThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs >= rhs)?,
             Instruction::Positive => apply_unary(&mut stack, |value| value)?,
             Instruction::Negate => apply_unary(&mut stack, |value| -value)?,
             Instruction::JumpIfFalse(target) => {
@@ -229,11 +254,32 @@ fn apply_unary(stack: &mut [Value], op: impl FnOnce(f64) -> f64) -> Result<(), E
     Ok(())
 }
 
-fn apply_binary(stack: &mut Vec<Value>, op: impl FnOnce(f64, f64) -> f64) -> Result<(), EvalError> {
+fn apply_binary(
+    stack: &mut Vec<Value>,
+    op: impl FnOnce(Value, Value) -> Value,
+) -> Result<(), EvalError> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
     let lhs = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *lhs = Value::Number(op(lhs.to_number(), rhs.to_number()));
+    *lhs = op(*lhs, rhs);
     Ok(())
+}
+
+fn apply_arithmetic(
+    stack: &mut Vec<Value>,
+    op: impl FnOnce(f64, f64) -> f64,
+) -> Result<(), EvalError> {
+    apply_binary(stack, |lhs, rhs| {
+        Value::Number(op(lhs.to_number(), rhs.to_number()))
+    })
+}
+
+fn apply_relational(
+    stack: &mut Vec<Value>,
+    op: impl FnOnce(f64, f64) -> bool,
+) -> Result<(), EvalError> {
+    apply_binary(stack, |lhs, rhs| {
+        Value::Boolean(op(lhs.to_number(), rhs.to_number()))
+    })
 }
 
 #[cfg(test)]
@@ -254,6 +300,8 @@ mod tests {
             (&[Instruction::Negate, one][..], 1),
             (&[one, Instruction::Divide][..], 1),
             (&[one, Instruction::Remainder][..], 1),
+            (&[Instruction::StrictEqual][..], 1),
+            (&[one, Instruction::LessThanOrEqual][..], 1),
             (&[one, Instruction::Subtract, one][..], 1),
             (&[one, one, one][..], 2),
             (&[one, one, one, Instruction::Add, one][..], 3),
@@ -306,6 +354,28 @@ mod tests {
                 assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
             }
         }
+    }
+
+    #[test]
+    fn comparison_results_branch_without_running_the_other_arm() {
+        use Instruction::{Boolean, Jump, JumpIfFalse, LessThan, LoadBinding, Number};
+        // A load of a nonexistent slot fails if executed. Comparisons drive
+        // both paths, and the selected value retains its tag.
+        let mut ops = [
+            Boolean(false),
+            Number(1.0),
+            LessThan,
+            JumpIfFalse(6),
+            Boolean(true),
+            Jump(7),
+            LoadBinding(0),
+        ];
+        assert_eq!(evaluate(&ops, 2, 0), Ok(Value::Boolean(true)));
+        ops[0] = Boolean(true);
+        assert_eq!(evaluate(&ops, 2, 0), Err(EvalError::InvalidScript));
+        ops[4] = LoadBinding(0);
+        ops[6] = Number(17.0);
+        assert_eq!(evaluate(&ops, 2, 0), Ok(Value::Number(17.0)));
     }
 
     #[test]

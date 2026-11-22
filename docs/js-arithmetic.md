@@ -15,13 +15,21 @@ The parser determines precedence and associativity. `const` and initialized
 statements update earlier `let` slots. All statements require an explicit
 semicolon; the final expression's semicolon is optional. Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global
-lookup, temporal dead zone behavior or a runtime `TypeError`. For arithmetic,
-`true` converts to `1` and `false` to `+0`. There are no calls or objects.
+lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
+calls or objects.
+
+Arithmetic and relational comparisons (`<`, `<=`, `>`, `>=`) convert `true`
+to `1` and `false` to `+0`. Every relational comparison involving NaN is
+false. Strict equality (`===`, `!==`) compares types without coercion: signed
+zeros compare equal, while NaN is unequal to itself. Comparisons return
+Booleans. Arithmetic binds more tightly than relational comparisons, which
+bind more tightly than equality.
 
 Conditional expressions (`test ? consequent : alternate`) evaluate only the
 selected arm, preserving its value type. Boolean tests use their own value.
-For numeric tests, either signed zero and NaN are false; other numbers are true. Conditionals are right-associative and bind less tightly than
-arithmetic. Both arms are parsed and must use supported syntax and bindings.
+For numeric tests, either signed zero and NaN are false; other numbers are
+true. Conditionals are right-associative and bind less tightly than equality.
+Both arms are parsed and must use supported syntax and bindings.
 
 The evaluator sees only private instructions, not the original source. Before
 allocating, it checks a ceiling of 4,096 instructions, counting both arms and

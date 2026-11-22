@@ -85,6 +85,15 @@ fn fixtures() -> Vec<String> {
             "const x = 6; const unused = x / 0; x",
             "const x = 2; x",
             "const x = 3; x",
+            "/* before */ const x/* binding */=2; x/**/+3; // trailing",
+            "1 // line comment\r\n + 2",
+            "1 // unicode\u{2028} * 3",
+            "1 // unicode\u{2029} - 3",
+            "1 + /* \n 👋 */ 2",
+            "8 / /* divisor */ 2",
+            "8 / // divisor follows\n 2",
+            "2 /****/+ 3",
+            "2 /* /* nested opener ignored */ + 3",
         ]
         .map(str::to_owned),
     );

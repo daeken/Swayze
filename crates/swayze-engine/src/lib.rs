@@ -1,8 +1,12 @@
 //! Host-facing Swayze API. Only the documented language subsets are supported.
 
+pub use swayze_js::{
+    Error as JsParseError, ErrorKind as JsErrorKind, Limit as JsLimit, Limits as JsLimits, Script,
+    Span as JsSpan, parse_script, parse_script_with_limits,
+};
 pub use swayze_wasm::{
-    Error as WasmValidationError, ErrorKind as WasmErrorKind, Limit as WasmLimit,
-    Module as WasmModule, validate_module,
+    Error as WasmValidationError, ErrorKind as WasmErrorKind, LengthField as WasmLengthField,
+    Limit as WasmLimit, Module as WasmModule, validate_module,
 };
 
 use std::{convert::Infallible, fmt};

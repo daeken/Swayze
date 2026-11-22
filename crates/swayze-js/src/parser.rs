@@ -26,7 +26,7 @@ pub struct Limits {
     pub max_source_bytes: usize,
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
-    /// Maximum number of simultaneously open parentheses.
+    /// Maximum combined depth of open parentheses and pending conditional expressions.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
     pub max_work: usize,
@@ -106,7 +106,7 @@ impl Error {
         let message = match limit {
             Limit::SourceBytes => "source byte ceiling exceeded",
             Limit::Tokens => "token ceiling exceeded",
-            Limit::NestingDepth => "parenthesis nesting ceiling exceeded",
+            Limit::NestingDepth => "expression nesting ceiling exceeded",
             Limit::Work => "parse work ceiling exceeded",
             Limit::DecimalLiteralBytes => "decimal literal byte ceiling exceeded",
             Limit::Allocation => "unable to allocate parser storage",
@@ -136,7 +136,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A validated Script in the arithmetic subset. Only the parser constructs it.
+/// A validated Script in the numeric expression subset. Only the parser constructs it.
 pub struct Script {
     instructions: Vec<Instruction>,
     max_stack_depth: usize,
@@ -144,12 +144,12 @@ pub struct Script {
 }
 
 impl Script {
-    /// The number of literal, operator, binding read, initialization and assignment instructions.
+    /// The total number of instructions, including jumps and both arms of every conditional.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
 
-    /// The peak operand stack size required by the validated postfix order.
+    /// The peak operand stack size required across all control-flow paths.
     pub fn max_stack_depth(&self) -> usize {
         self.max_stack_depth
     }
@@ -192,14 +192,16 @@ pub(crate) enum Instruction {
     Remainder,
     Positive,
     Negate,
+    JumpIfFalse(usize),
+    Jump(usize),
 }
 
-/// Parse a complete Script in the arithmetic subset with default [`Limits`].
+/// Parse a complete Script in the numeric expression subset with default [`Limits`].
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
 
-/// Parse a complete Script in the arithmetic subset with caller-supplied limits.
+/// Parse a complete Script in the numeric expression subset with caller-supplied limits.
 pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, Error> {
     if source.len() > limits.max_source_bytes {
         // Starting within the source, back up at most three continuation bytes.
@@ -222,8 +224,9 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         },
         lookahead: None,
         max_nesting_depth: limits.max_nesting_depth,
+        nesting_depth: 0,
         pending: Vec::new(),
-        postfix: Vec::new(),
+        instructions: Vec::new(),
         bindings: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
@@ -273,6 +276,8 @@ enum TokenKind {
     Operator(Operator),
     Open,
     Close,
+    Question,
+    Colon,
     Semicolon,
 }
 
@@ -420,6 +425,8 @@ impl Lexer<'_> {
             '=' => self.equals(start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
+            '?' => self.question(start)?,
+            ':' => TokenKind::Colon,
             ';' => TokenKind::Semicolon,
             '+' | '-' | '*' | '/' | '%' => self.operator(c, start)?,
             _ => {
@@ -487,6 +494,29 @@ impl Lexer<'_> {
             ));
         }
         Ok(TokenKind::Equals)
+    }
+
+    fn question(&mut self, start: usize) -> Result<TokenKind, Error> {
+        if self.peek() == Some('?') {
+            self.consume('?')?;
+            if self.peek() == Some('=') {
+                self.consume('=')?;
+            }
+        } else if self.rest().strip_prefix('.').is_some_and(|rest| {
+            // `?.` is not optional chaining when followed by a decimal digit.
+            !matches!(rest.as_bytes().first(), Some(b'0'..=b'9'))
+        }) {
+            self.consume('.')?;
+        } else {
+            return Ok(TokenKind::Question);
+        }
+        Err(Error::unsupported(
+            Span {
+                start,
+                end: self.offset,
+            },
+            "longer punctuator is outside the arithmetic subset",
+        ))
     }
 
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
@@ -598,8 +628,16 @@ impl Lexer<'_> {
     }
 }
 
-// `None` is a delimiter; otherwise this is a pending prefix or binary operator.
-type Pending = (Option<Operator>, Span);
+#[derive(Clone, Copy)]
+enum Pending {
+    Arithmetic(Operator),
+    Group,
+    Consequent { branch: usize, base_depth: usize },
+    Alternate { jump: usize, join_depth: usize },
+}
+
+// Only used while emitting a conditional; every jump is patched before a Script is returned.
+const UNPATCHED: usize = usize::MAX;
 
 struct Binding {
     name: Span,
@@ -612,8 +650,9 @@ struct Parser<'s> {
     // the next lexer result (including EOF) so the latter path never re-lexes it.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
-    pending: Vec<Pending>,
-    postfix: Vec<Instruction>,
+    nesting_depth: usize,
+    pending: Vec<(Pending, Span)>,
+    instructions: Vec<Instruction>,
     // Parse-only declarations in slot order; never retained by Script.
     bindings: Vec<Binding>,
     stack_depth: usize,
@@ -663,7 +702,7 @@ impl Parser<'_> {
             ));
         }
         Ok(Script {
-            instructions: self.postfix,
+            instructions: self.instructions,
             max_stack_depth: self.max_stack_depth,
             binding_slots: self.bindings.len(),
         })
@@ -755,11 +794,10 @@ impl Parser<'_> {
         first: Token,
         missing_semicolon: Option<&'static str>,
     ) -> Result<Span, Error> {
-        let mut nesting = 0;
         let mut needs_operand = true;
         let mut seen_token = false;
         let mut next = Some(first);
-        let end = loop {
+        let (end, at_eof) = loop {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
                 if needs_operand {
@@ -768,16 +806,7 @@ impl Parser<'_> {
                         "expected an operand before end of source",
                     ));
                 }
-                if nesting != 0 {
-                    return Err(Error::malformed(
-                        eof,
-                        "expected a closing parenthesis before end of source",
-                    ));
-                }
-                if let Some(message) = missing_semicolon {
-                    return Err(Error::unsupported(eof, message));
-                }
-                break eof;
+                break (eof, true);
             };
             let Token {
                 kind,
@@ -793,11 +822,13 @@ impl Parser<'_> {
                 }
                 (_, TokenKind::Declaration(_)) => {
                     if !needs_operand
-                        && nesting == 0
                         && after_line_break
                         && let Some(message) = missing_semicolon
                     {
-                        return Err(Error::unsupported(span, message));
+                        self.reduce_expression()?;
+                        if self.pending.is_empty() {
+                            return Err(Error::unsupported(span, message));
+                        }
                     }
                     return Err(Error::unsupported(
                         span,
@@ -816,11 +847,7 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {
-                    if nesting == self.max_nesting_depth {
-                        return Err(Error::limit(span, Limit::NestingDepth));
-                    }
-                    nesting += 1;
-                    self.push_pending(None, span)?;
+                    self.open_pending(Pending::Group, span)?;
                 }
                 (true, TokenKind::Operator(op)) => {
                     let prefix = match op {
@@ -836,7 +863,7 @@ impl Parser<'_> {
                         _ => return Err(Error::malformed(span, "expected an operand")),
                     };
                     // Don't pop pending operators: another prefix applies before this one.
-                    self.push_pending(Some(prefix), span)?;
+                    self.push_pending(Pending::Arithmetic(prefix), span)?;
                 }
                 (true, TokenKind::Semicolon) if missing_semicolon.is_none() && !seen_token => {
                     return Err(Error::unsupported(
@@ -844,7 +871,9 @@ impl Parser<'_> {
                         "empty statements are outside the arithmetic subset",
                     ));
                 }
-                (true, TokenKind::Close) if matches!(self.pending.last(), Some((None, _))) => {
+                (true, TokenKind::Close)
+                    if matches!(self.pending.last(), Some((Pending::Group, _))) =>
+                {
                     // Empty parens can start an arrow function; don't misreport that as malformed.
                     self.lexer.skip_trivia()?;
                     let rest = self.lexer.rest();
@@ -865,22 +894,40 @@ impl Parser<'_> {
                 }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
                 (false, TokenKind::Operator(op)) => {
-                    while let Some(&(Some(prev), at)) = self.pending.last() {
-                        if prev.precedence() < op.precedence() {
-                            break;
-                        }
-                        self.pending.pop();
-                        self.emit(prev.instruction(), at)?;
-                    }
-                    self.push_pending(Some(op), span)?;
+                    self.reduce_arithmetic(op.precedence())?;
+                    self.push_pending(Pending::Arithmetic(op), span)?;
+                    needs_operand = true;
+                }
+                (false, TokenKind::Question) => {
+                    // Lower precedence than arithmetic, but do not close an enclosing
+                    // conditional: this question starts a conditional within that arm.
+                    self.reduce_arithmetic(0)?;
+                    let branch = self.instructions.len();
+                    self.emit(Instruction::JumpIfFalse(UNPATCHED), span)?;
+                    self.open_pending(
+                        Pending::Consequent {
+                            branch,
+                            base_depth: self.stack_depth,
+                        },
+                        span,
+                    )?;
+                    needs_operand = true;
+                }
+                (false, TokenKind::Colon) => {
+                    self.start_alternate(span)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Close) => {
-                    nesting = nesting
-                        .checked_sub(1)
-                        .ok_or_else(|| Error::malformed(span, "unmatched closing parenthesis"))?;
-                    while let Some((Some(op), at)) = self.pending.pop() {
-                        self.emit(op.instruction(), at)?;
+                    self.reduce_expression()?;
+                    match self.pending.pop() {
+                        Some((Pending::Group, _)) => self.nesting_depth -= 1,
+                        Some((Pending::Consequent { .. }, _)) => {
+                            return Err(Error::malformed(
+                                span,
+                                "expected ':' before closing parenthesis",
+                            ));
+                        }
+                        _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
                 }
                 (false, TokenKind::Open) => {
@@ -889,31 +936,35 @@ impl Parser<'_> {
                         "call expressions are outside the arithmetic subset",
                     ));
                 }
-                (false, TokenKind::Number(_) | TokenKind::Identifier)
-                    if nesting == 0 && after_line_break =>
-                {
-                    return Err(Error::unsupported(
-                        span,
-                        missing_semicolon.unwrap_or("only one expression statement is supported"),
-                    ));
-                }
                 (false, TokenKind::Number(_) | TokenKind::Identifier) => {
+                    if after_line_break {
+                        self.reduce_expression()?;
+                        if self.pending.is_empty() {
+                            return Err(Error::unsupported(
+                                span,
+                                missing_semicolon
+                                    .unwrap_or("only one expression statement is supported"),
+                            ));
+                        }
+                    }
                     return Err(Error::malformed(span, "expected a binary operator"));
                 }
-                (false, TokenKind::Semicolon) if nesting == 0 => break span,
-                (false, TokenKind::Semicolon) => {
-                    return Err(Error::malformed(
-                        span,
-                        "semicolon inside a parenthesized expression",
-                    ));
-                }
+                (false, TokenKind::Semicolon) => break (span, false),
             }
             seen_token = true;
             next = self.next_token()?;
         };
-        while let Some((op, at)) = self.pending.pop() {
-            let op = op.ok_or_else(|| Error::malformed(at, "unmatched opening parenthesis"))?;
-            self.emit(op.instruction(), at)?;
+        self.reduce_expression()?;
+        if let Some((pending, _)) = self.pending.last() {
+            let message = match pending {
+                Pending::Group if at_eof => "expected a closing parenthesis before end of source",
+                Pending::Group => "semicolon inside a parenthesized expression",
+                _ => "expected ':' to complete conditional expression",
+            };
+            return Err(Error::malformed(end, message));
+        }
+        if at_eof && let Some(message) = missing_semicolon {
+            return Err(Error::unsupported(end, message));
         }
         if self.stack_depth != 1 {
             return Err(Error::malformed(
@@ -924,9 +975,84 @@ impl Parser<'_> {
         Ok(end)
     }
 
-    fn push_pending(&mut self, op: Option<Operator>, span: Span) -> Result<(), Error> {
+    fn open_pending(&mut self, marker: Pending, span: Span) -> Result<(), Error> {
+        if self.nesting_depth == self.max_nesting_depth {
+            return Err(Error::limit(span, Limit::NestingDepth));
+        }
+        self.nesting_depth += 1;
+        self.push_pending(marker, span)
+    }
+
+    fn push_pending(&mut self, entry: Pending, span: Span) -> Result<(), Error> {
         self.lexer.charge(1, span)?;
-        try_push(&mut self.pending, (op, span), span)
+        try_push(&mut self.pending, (entry, span), span)
+    }
+
+    fn reduce_arithmetic(&mut self, min_precedence: u8) -> Result<(), Error> {
+        while let Some(&(Pending::Arithmetic(op), span)) = self.pending.last() {
+            if op.precedence() < min_precedence {
+                break;
+            }
+            self.pending.pop();
+            self.emit(op.instruction(), span)?;
+        }
+        Ok(())
+    }
+
+    // At an expression delimiter, reduce through completed conditionals but stop
+    // at an opening parenthesis or a conditional whose ':' has not been seen.
+    // '?' drained arithmetic at its level, so there are no arithmetic entries
+    // underneath the alternate markers until after the next delimiter.
+    fn reduce_expression(&mut self) -> Result<(), Error> {
+        self.reduce_arithmetic(0)?;
+        while let Some(&(Pending::Alternate { jump, join_depth }, span)) = self.pending.last() {
+            if self.stack_depth != join_depth {
+                return Err(Error::malformed(
+                    span,
+                    "conditional branches must each leave one result",
+                ));
+            }
+            self.patch_jump(jump, span)?;
+            self.pending.pop();
+            self.nesting_depth -= 1;
+        }
+        Ok(())
+    }
+
+    fn start_alternate(&mut self, span: Span) -> Result<(), Error> {
+        self.reduce_expression()?;
+        let Some((Pending::Consequent { branch, base_depth }, _)) = self.pending.pop() else {
+            return Err(Error::malformed(span, "':' without a matching '?'"));
+        };
+        let join_depth = self.stack_depth;
+        if join_depth.checked_sub(1) != Some(base_depth) {
+            return Err(Error::malformed(
+                span,
+                "conditional branches must each leave one result",
+            ));
+        }
+        let jump = self.instructions.len();
+        self.emit(Instruction::Jump(UNPATCHED), span)?;
+        self.patch_jump(branch, span)?;
+        self.stack_depth = base_depth;
+        self.push_pending(Pending::Alternate { jump, join_depth }, span)
+    }
+
+    fn patch_jump(&mut self, at: usize, span: Span) -> Result<(), Error> {
+        // Target the current emission frontier. It becomes the next instruction
+        // (possibly another jump), or the one-past-end exit of the final Script.
+        // Since `at` must index an already emitted jump, the target is forward.
+        let target = self.instructions.len();
+        let slot = match self.instructions.get_mut(at) {
+            Some(Instruction::JumpIfFalse(slot) | Instruction::Jump(slot))
+                if *slot == UNPATCHED =>
+            {
+                slot
+            }
+            _ => return Err(Error::malformed(span, "invalid conditional jump")),
+        };
+        *slot = target;
+        Ok(())
     }
 
     fn emit(&mut self, instruction: Instruction, span: Span) -> Result<(), Error> {
@@ -936,7 +1062,10 @@ impl Parser<'_> {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
             Instruction::Number(_) | Instruction::LoadBinding(_) => (0, 1),
-            Instruction::InitBinding(_) | Instruction::StoreBinding(_) => (1, 0),
+            Instruction::InitBinding(_)
+            | Instruction::StoreBinding(_)
+            | Instruction::JumpIfFalse(_) => (1, 0),
+            Instruction::Jump(_) => (0, 0),
             Instruction::Positive | Instruction::Negate => (1, 1),
             Instruction::Add
             | Instruction::Subtract
@@ -951,7 +1080,7 @@ impl Parser<'_> {
             .checked_add(results)
             .ok_or_else(|| Error::limit(span, Limit::Allocation))?;
         self.max_stack_depth = self.max_stack_depth.max(self.stack_depth);
-        try_push(&mut self.postfix, instruction, span)
+        try_push(&mut self.instructions, instruction, span)
     }
 }
 

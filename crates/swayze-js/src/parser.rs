@@ -310,10 +310,14 @@ enum TokenKind {
     Boolean(bool),
     Identifier,
     Declaration(BindingKind),
+    If,
+    Else,
     Equals,
     Operator(Operator),
     Open,
     Close,
+    OpenBrace,
+    CloseBrace,
     Question,
     Colon,
     Semicolon,
@@ -355,8 +359,8 @@ fn is_excluded_name(name: &str) -> bool {
         name,
         // Other keywords, reserved literals, future/strict reserved words, and `await`.
         "break" | "case" | "catch" | "class" | "continue" | "debugger" | "default"
-            | "delete" | "do" | "else" | "enum" | "export" | "extends"
-            | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
+            | "delete" | "do" | "enum" | "export" | "extends"
+            | "finally" | "for" | "function" | "import" | "in" | "instanceof"
             | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
             | "try" | "typeof" | "var" | "void" | "while" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
@@ -472,6 +476,8 @@ impl Lexer<'_> {
             '<' | '>' => self.relational(c, start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
+            '{' => TokenKind::OpenBrace,
+            '}' => TokenKind::CloseBrace,
             '?' => self.question(start)?,
             ':' => TokenKind::Colon,
             ';' => TokenKind::Semicolon,
@@ -515,6 +521,8 @@ impl Lexer<'_> {
         match name {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
             "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
+            "if" => Ok(TokenKind::If),
+            "else" => Ok(TokenKind::Else),
             "true" => Ok(TokenKind::Boolean(true)),
             "false" => Ok(TokenKind::Boolean(false)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
@@ -769,10 +777,16 @@ struct Binding {
     kind: BindingKind,
 }
 
+enum ExpressionEnd {
+    Script,
+    Semicolon(&'static str),
+    IfTest,
+}
+
 struct Parser<'s> {
     lexer: Lexer<'s>,
-    // A top-level name may start an assignment or the final expression. Cache
-    // the next lexer result (including EOF) so the latter path never re-lexes it.
+    // Cache the next lexer result (including EOF) after a top-level name or
+    // the first if branch, so disambiguation never re-lexes a token.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -790,16 +804,20 @@ impl Parser<'_> {
             let first = self.next_token()?.ok_or_else(|| {
                 Error::unsupported(
                     Span::at(self.lexer.offset),
-                    if self.bindings.is_empty() {
+                    if self.instructions.is_empty() {
                         "empty scripts are outside the arithmetic subset"
                     } else {
-                        "a final expression is required after binding statements"
+                        "a final expression is required after statements"
                     },
                 )
             })?;
             match first.kind {
                 TokenKind::Declaration(kind) => {
                     self.parse_declaration(kind)?;
+                    continue;
+                }
+                TokenKind::If => {
+                    self.parse_if()?;
                     continue;
                 }
                 TokenKind::Identifier => {
@@ -817,7 +835,7 @@ impl Parser<'_> {
                 }
                 _ => {}
             }
-            self.parse_expression(first, None)?;
+            self.parse_expression(first, ExpressionEnd::Script)?;
             break;
         }
         if let Some(token) = self.next_token()? {
@@ -845,6 +863,90 @@ impl Parser<'_> {
             .ok_or_else(|| Error::malformed(Span::at(self.lexer.offset), message))
     }
 
+    fn parse_if(&mut self) -> Result<(), Error> {
+        let open = self.require_token("expected '(' after 'if'")?;
+        if !matches!(open.kind, TokenKind::Open) {
+            return Err(Error::malformed(open.span, "expected '(' after 'if'"));
+        }
+        let end = self.parse_expression(open, ExpressionEnd::IfTest)?;
+        let branch = self.instructions.len();
+        // The test leaves one value, which this jump consumes on both paths.
+        self.emit(Instruction::JumpIfFalse(UNPATCHED), end)?;
+        let end = self.parse_if_branch()?;
+
+        let next = self.next_token()?;
+        if let Some(Token {
+            kind: TokenKind::Else,
+            span,
+            ..
+        }) = next
+        {
+            let jump = self.instructions.len();
+            self.emit(Instruction::Jump(UNPATCHED), span)?;
+            self.patch_jump(branch, span)?;
+            let end = self.parse_if_branch()?;
+            self.patch_jump(jump, end)
+        } else {
+            self.lookahead = Some(next);
+            self.patch_jump(branch, end)
+        }
+    }
+
+    fn parse_if_branch(&mut self) -> Result<Span, Error> {
+        let open = self.require_token("expected '{' to open an if branch")?;
+        match open.kind {
+            TokenKind::OpenBrace => {}
+            TokenKind::If => {
+                return Err(Error::unsupported(
+                    open.span,
+                    "nested if and else if are outside the subset",
+                ));
+            }
+            _ => {
+                return Err(Error::malformed(
+                    open.span,
+                    "expected '{' to open an if branch",
+                ));
+            }
+        }
+        loop {
+            let first = self.require_token("expected an assignment or '}' in if branch")?;
+            match first.kind {
+                TokenKind::CloseBrace => {
+                    if self.stack_depth != 0 {
+                        return Err(Error::malformed(
+                            first.span,
+                            "if branches must leave no operands",
+                        ));
+                    }
+                    return Ok(first.span);
+                }
+                TokenKind::If => {
+                    return Err(Error::unsupported(
+                        first.span,
+                        "nested if is outside the subset",
+                    ));
+                }
+                TokenKind::Identifier => {
+                    let equals = self.require_token("expected '=' after the assignment name")?;
+                    if !matches!(equals.kind, TokenKind::Equals) {
+                        return Err(Error::unsupported(
+                            equals.span,
+                            "only simple assignments are supported in if branches",
+                        ));
+                    }
+                    self.parse_assignment(first.span, equals.span)?;
+                }
+                _ => {
+                    return Err(Error::unsupported(
+                        first.span,
+                        "only simple assignments are supported in if branches",
+                    ));
+                }
+            }
+        }
+    }
+
     fn parse_declaration(&mut self, kind: BindingKind) -> Result<(), Error> {
         let name = self.require_token("expected a binding name")?;
         match name.kind {
@@ -859,6 +961,18 @@ impl Parser<'_> {
                 return Err(Error::unsupported(
                     name.span,
                     "Boolean literals cannot be used as binding names",
+                ));
+            }
+            TokenKind::If | TokenKind::Else => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "if and else are reserved names",
+                ));
+            }
+            TokenKind::OpenBrace => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "destructuring is outside the subset",
                 ));
             }
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
@@ -878,7 +992,7 @@ impl Parser<'_> {
             BindingKind::Const => "const declarations require explicit semicolons",
             BindingKind::Let => "let declarations require explicit semicolons",
         };
-        let end = self.parse_expression(first, Some(missing_semicolon))?;
+        let end = self.parse_expression(first, ExpressionEnd::Semicolon(missing_semicolon))?;
         self.emit(Instruction::InitBinding(kind), end)?;
         // Expose the name only after its initializer: self and forward access
         // cannot resolve to a slot.
@@ -900,7 +1014,10 @@ impl Parser<'_> {
             ));
         }
         let first = self.require_token("expected an assignment value")?;
-        let end = self.parse_expression(first, Some("assignments require explicit semicolons"))?;
+        let end = self.parse_expression(
+            first,
+            ExpressionEnd::Semicolon("assignments require explicit semicolons"),
+        )?;
         self.emit(Instruction::StoreBinding(slot), end)
     }
 
@@ -920,11 +1037,12 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    fn parse_expression(
-        &mut self,
-        first: Token,
-        missing_semicolon: Option<&'static str>,
-    ) -> Result<Span, Error> {
+    fn parse_expression(&mut self, first: Token, end_kind: ExpressionEnd) -> Result<Span, Error> {
+        let if_test = matches!(end_kind, ExpressionEnd::IfTest);
+        let missing_semicolon = match end_kind {
+            ExpressionEnd::Semicolon(message) => Some(message),
+            _ => None,
+        };
         let mut needs_operand = true;
         let mut seen_token = false;
         let mut next = Some(first);
@@ -964,6 +1082,24 @@ impl Parser<'_> {
                     return Err(Error::unsupported(
                         span,
                         "declarations are only allowed as top-level statements before the final expression",
+                    ));
+                }
+                (_, TokenKind::If | TokenKind::Else) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "if and else are not expression tokens",
+                    ));
+                }
+                (false, TokenKind::CloseBrace) if let Some(message) = missing_semicolon => {
+                    return Err(Error::unsupported(span, message));
+                }
+                (false, TokenKind::OpenBrace) if if_test => {
+                    return Err(Error::malformed(span, "expected ')' after the if test"));
+                }
+                (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "braces are only supported around if branches",
                     ));
                 }
                 (true, TokenKind::Number(value)) => {
@@ -1010,6 +1146,9 @@ impl Parser<'_> {
                 (true, TokenKind::Close)
                     if matches!(self.pending.last(), Some((Pending::Group, _))) =>
                 {
+                    if if_test && self.pending.len() == 1 {
+                        return Err(Error::malformed(span, "expected an if test expression"));
+                    }
                     // Empty parens can start an arrow function; don't misreport that as malformed.
                     self.lexer.skip_trivia()?;
                     let rest = self.lexer.rest();
@@ -1085,6 +1224,11 @@ impl Parser<'_> {
                             ));
                         }
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
+                    }
+                    // An if test starts with its required '(' as the first group.
+                    // Stop at that group's close without consuming the branch's '{'.
+                    if if_test && self.pending.is_empty() {
+                        break (span, false);
                     }
                 }
                 (false, TokenKind::Open) => {

@@ -25,6 +25,97 @@ fn assert_limit(source: &str, limits: Limits, limit: Limit, start: usize, end: u
 }
 
 #[test]
+fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
+    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBinding};
+
+    assert_postfix(
+        "let x=0;if(true){x=1;}else{x=2+(3+4);}x",
+        &[
+            Number(0.0),
+            InitBinding(BindingKind::Let),
+            Boolean(true),
+            JumpIfFalse(7),
+            Number(1.0),
+            StoreBinding(0),
+            Jump(13),
+            Number(2.0),
+            Number(3.0),
+            Number(4.0),
+            Add,
+            Add,
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        3,
+    );
+    assert_postfix(
+        "if(false){}42",
+        &[Boolean(false), JumpIfFalse(2), Number(42.0)],
+        1,
+    );
+}
+
+#[test]
+fn if_tokens_and_work_are_counted_once_even_in_untaken_branches() {
+    for (source, tokens, work_beyond_source) in [
+        ("let x=0;if(false){x=1;}x", 16, 14),
+        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 20),
+    ] {
+        // Besides the source bytes: decimal input bytes, the '(' marker,
+        // instruction emissions, and binding lookups for each store and load.
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: tokens,
+            max_work: source.len() + work_beyond_source,
+            max_nesting_depth: 1,
+        };
+        assert!(parse_script_with_limits(source, limits).is_ok());
+        for (limit, below) in [
+            (
+                Limit::Tokens,
+                Limits {
+                    max_tokens: tokens - 1,
+                    ..limits
+                },
+            ),
+            (
+                Limit::Work,
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+            ),
+        ] {
+            assert_limit(source, below, limit, source.len() - 1, source.len());
+        }
+
+        let body_start = source.find('{').unwrap() + 1;
+        assert_limit(
+            source,
+            Limits {
+                max_tokens: 10,
+                ..limits
+            },
+            Limit::Tokens,
+            body_start,
+            body_start + 1,
+        );
+        // Scanning through '{', plus the conversion of `0`, the group marker,
+        // and four instructions (Number, InitBinding, Boolean, JumpIfFalse).
+        assert_limit(
+            source,
+            Limits {
+                max_work: body_start + 6,
+                ..limits
+            },
+            Limit::Work,
+            body_start,
+            body_start + 1,
+        );
+    }
+}
+
+#[test]
 fn booleans_are_whole_tokens_not_names_or_prefixes_of_names() {
     use ErrorKind::{Malformed, Unsupported};
     use Instruction::Boolean;

@@ -559,9 +559,289 @@ fn stops_at_first_guest_trap_and_can_reuse_the_instance() {
 }
 
 #[test]
+fn selects_one_arm_using_i32_truthiness_and_preserves_outer_operands() {
+    let code = code_body(&[
+        1, 1, 0x7f, // One declared local (index 1).
+        0x41, 40, 0x20, 0, // Preserve 40 below the condition.
+        0x04, 0x7f, 0x41, 2, 0x22, 1, // Then: return 2 and write it to local 1.
+        0x05, 0x41, 3, 0x0b, // Else: return 3 without writing.
+        0x6a, 0x20, 1, 0x6a, 0x0b, // Add the preserved value, arm result and local 1.
+    ]);
+    let module = exported_function(&i32_type(1), &code);
+    let instance = module.instantiate();
+    for (condition, expected) in [(1, 44), (7, 44), (-1, 44), (i32::MIN, 44), (0, 43)] {
+        assert_eq!(
+            instance.invoke_i32_with_args("answer", &[condition]),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn traps_only_when_the_arm_is_taken() {
+    let safe = &[0x41, 42][..];
+    let trap = &[0x41, 1, 0x41, 0, 0x6d][..];
+    for (then, otherwise, trapping_condition) in [(safe, trap, 0), (trap, safe, 1)] {
+        let code = code_body(
+            &[
+                &[0, 0x20, 0, 0x04, 0x7f][..],
+                then,
+                &[0x05],
+                otherwise,
+                &[0x0b, 0x0b],
+            ]
+            .concat(),
+        );
+        let module = exported_function(&i32_type(1), &code);
+        let instance = module.instantiate();
+        for _ in 0..2 {
+            assert_eq!(
+                instance.invoke_i32_with_args("answer", &[1 - trapping_condition]),
+                Ok(42)
+            );
+            assert_eq!(
+                instance.invoke_i32_with_args("answer", &[trapping_condition]),
+                Err(InvokeError::Trap(Trap::IntegerDivideByZero))
+            );
+        }
+    }
+}
+
+#[test]
+fn joins_nested_arms_at_the_enclosing_else_or_function_exit() {
+    let code = code_body(&[
+        0, 0x20, 0, 0x04, 0x7f, // Outer if.
+        0x20, 1, 0x04, 0x7f, 0x41, 1, 0x05, 0x41, 2, 0x0b, // Nested in then.
+        0x05, 0x20, 1, 0x04, 0x7f, 0x41, 3, 0x05, 0x41, 4, 0x0b, // Nested in else.
+        0x0b, 0x0b, // End of outer if and function, respectively.
+    ]);
+    let module = exported_function(&i32_type(2), &code);
+    let instance = module.instantiate();
+    for (args, expected) in [([1, 1], 1), ([1, 0], 2), ([0, 1], 3), ([0, 0], 4)] {
+        assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
+    }
+}
+
+#[test]
+fn rejects_bad_if_block_type_and_missing_condition() {
+    for found in [0x40, 0x7e, 0, 0xff] {
+        bad_body(
+            &[0, 0x41, 1, 0x04, found],
+            4,
+            ErrorKind::UnexpectedByte {
+                expected: 0x7f,
+                found,
+            },
+        );
+    }
+    let mut code = code_body(&[0, 0x41, 1, 0x04]);
+    let boundary = code.len();
+    code.extend([0x7f, 0x41, 1, 0x05, 0x41, 2, 0x0b, 0x0b]);
+    bad_code(&code, boundary, ErrorKind::TruncatedByte { expected: 0x7f });
+    bad_body(
+        &[0, 0x04, 0x7f, 0x41, 1, 0x05, 0x41, 2, 0x0b, 0x0b],
+        1,
+        ErrorKind::StackUnderflow { depth: 0 },
+    );
+}
+
+#[test]
+fn both_arms_require_one_new_result_and_validate_untaken_code() {
+    let good = &[0x41, 7][..];
+    for (bad, depth) in [(&[][..], 0), (&[0x41, 2, 0x41, 3][..], 2)] {
+        for (condition, then, otherwise, bad_end) in [
+            (0, bad, good, 7 + bad.len()),
+            (1, good, bad, 8 + good.len() + bad.len()),
+        ] {
+            let body = [
+                &[0, 0x41, 10, 0x41, condition, 0x04, 0x7f][..],
+                then,
+                &[0x05],
+                otherwise,
+                &[0x0b, 0x6a, 0x0b],
+            ]
+            .concat();
+            bad_body(&body, bad_end, ErrorKind::InvalidResultDepth { depth });
+        }
+    }
+    bad_body(
+        &[0, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05, 0x20, 0, 0x0b, 0x0b],
+        9,
+        ErrorKind::InvalidIndex {
+            field: IntegerField::LocalIndex,
+            index: 0,
+        },
+    );
+}
+
+#[test]
+fn cannot_use_operands_below_the_arm_floor_even_if_restored() {
+    let good = &[0x41, 7][..];
+    for (bad, bad_op, depth) in [
+        (&[0x21, 0, 0x41, 0, 0x41, 7][..], 0, 0), // Pop below the floor then restore depth.
+        (&[0x22, 0, 0x41, 7], 0, 0),              // Access a floor operand without changing depth.
+        (&[0x41, 1, 0x6a, 0x41, 7], 2, 1),        // Binary op takes two, not just its net pop.
+        (&[0x04, 0x7f, 0x41, 1, 0x05, 0x41, 2, 0x0b, 0x41, 7], 0, 0), // Nested if needs its own condition.
+    ] {
+        for (condition, then, otherwise, arm_start) in
+            [(0, bad, good, 9), (1, good, bad, 10 + good.len())]
+        {
+            let body = [
+                &[1, 1, 0x7f, 0x41, 10, 0x41, condition, 0x04, 0x7f][..],
+                then,
+                &[0x05],
+                otherwise,
+                &[0x0b, 0x6a, 0x0b],
+            ]
+            .concat();
+            bad_body(
+                &body,
+                arm_start + bad_op,
+                ErrorKind::StackUnderflow { depth },
+            );
+        }
+    }
+}
+
+#[test]
+fn conditional_delimiters_respect_the_body_and_function_end() {
+    let then = &[0, 0x41, 1, 0x04, 0x7f, 0x41, 7][..];
+    for (tail, at, kind) in [
+        (&[][..], 0, ErrorKind::TruncatedByte { expected: 0x05 }),
+        (&[0x0b, 0x0b], 0, ErrorKind::MissingElse),
+        (
+            &[0x05, 0x41, 8, 0x05, 0x0b, 0x0b],
+            3,
+            ErrorKind::UnexpectedElse,
+        ),
+        (
+            &[0x05, 0x41, 8],
+            3,
+            ErrorKind::TruncatedByte { expected: 0x0b },
+        ),
+        (
+            &[0x05, 0x41, 8, 0x0b],
+            4,
+            ErrorKind::TruncatedByte { expected: 0x0b },
+        ),
+        (
+            &[0x05, 0x41, 8, 0x0b, 0x0b, 0x0b],
+            5,
+            ErrorKind::TrailingBodyBytes,
+        ),
+    ] {
+        bad_body(&[then, tail].concat(), then.len() + at, kind);
+    }
+    bad_body(
+        &[0, 0x41, 7, 0x05, 0x41, 8, 0x0b],
+        3,
+        ErrorKind::UnexpectedElse,
+    );
+    // Joining the arms checks their results, not the function's extra operand.
+    let body = [&[0, 0x41, 9][..], &then[1..], &[0x05, 0x41, 8, 0x0b, 0x0b]].concat();
+    bad_body(
+        &body,
+        body.len() - 1,
+        ErrorKind::InvalidResultDepth { depth: 2 },
+    );
+
+    // Even after a valid conditional function, the module suffix is checked.
+    let code = code_body(&[then, &[0x05, 0x41, 8, 0x0b, 0x0b]].concat());
+    let mut bytes = module(&[(1, TYPE), (3, FUNCTION), (10, &code)]);
+    let invalid = bytes.len();
+    bytes.push(0xff);
+    expect_error(&bytes, invalid, ErrorKind::UnknownSectionId { id: 0xff });
+}
+
+#[test]
+fn bounds_simultaneously_open_if_frames() {
+    let limit = Limit::ControlDepth;
+    let nested = |depth| {
+        let mut body = vec![0];
+        for _ in 0..depth {
+            body.extend([0x41, 1, 0x04, 0x7f]);
+        }
+        body.extend([0x41, 9]);
+        for _ in 0..depth {
+            body.extend([0x05, 0x41, 8, 0x0b]);
+        }
+        body.push(0x0b);
+        body
+    };
+    assert_body_result(&nested(limit.maximum()), 9);
+    bad_body(
+        &nested(limit.maximum() + 1),
+        3 + 4 * limit.maximum(),
+        ErrorKind::LimitExceeded { limit },
+    );
+}
+
+#[test]
+fn conditional_body_byte_budget_includes_both_ends() {
+    let limit = Limit::CodeBodyBytes;
+    let ops = [0x41, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 8, 0x0b, 0x0b];
+    let groups = (limit.maximum() - 1 - ops.len()) / 2;
+    let mut body = vec![u8::try_from(groups).unwrap()];
+    for _ in 0..groups {
+        body.extend([0, 0x7f]);
+    }
+    body.extend(ops);
+    assert_eq!(body.len(), limit.maximum());
+    assert_body_result(&body, 8);
+
+    // Pad the condition's LEB32 by one byte without changing decoded operations.
+    let condition = 2 + 2 * groups;
+    body.splice(condition..condition + 1, [0x80, 0]);
+    bad_code(&code_body(&body), 1, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn counts_control_ops_and_both_arms_together_in_the_instruction_budget() {
+    let limit = Limit::BodyInstructions;
+    let ty = i32_type(1);
+    let mut body = vec![0, 0x20, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 6];
+    let pairs = (limit.maximum() - 5) / 2;
+    assert_eq!(5 + 2 * pairs, limit.maximum());
+    for _ in 0..pairs {
+        body.extend([0x41, 0, 0x6a]);
+    }
+    body.extend([0x0b, 0x0b]);
+    let module = exported_function(&ty, &code_body(&body));
+    let instance = module.instantiate();
+    assert_eq!(instance.invoke_i32_with_args("answer", &[1]), Ok(7));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(6));
+
+    let extra = body.len() - 2;
+    body.splice(extra..extra, [0x22, 0]);
+    bad_typed_body(&ty, &body, extra, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn arm_operand_limit_includes_values_below_its_floor() {
+    let limit = Limit::OperandStackDepth;
+    let base = limit.maximum() - 2;
+    let mut body = vec![0];
+    for _ in 0..base {
+        body.extend([0x41, 1]);
+    }
+    body.extend([0x41, 0, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 1, 0x41, 2]);
+    let at_limit = body.len();
+    body.extend([0x6a, 0x0b]);
+    body.extend(std::iter::repeat_n(0x6a, base));
+    body.push(0x0b);
+    assert_body_result(&body, base as i32 + 3);
+    // The else arm exceeds the limit even though the condition now selects then.
+    body[2 + 2 * base] = 1;
+    body.splice(at_limit..at_limit, [0x41, 3, 0x6a]);
+    bad_body(&body, at_limit, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x0b, 0x20, 0x21, 0x22, 0x41].contains(&opcode) && !(0x6a..=0x70).contains(&opcode) {
+        if ![0x04, 0x05, 0x0b, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
+            && !(0x6a..=0x70).contains(&opcode)
+        {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],
                 3,

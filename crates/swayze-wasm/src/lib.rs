@@ -1,4 +1,4 @@
-//! Bounded WebAssembly binary validation and straight-line i32 execution.
+//! Bounded WebAssembly binary validation and i32 execution.
 //!
 //! # Supported slice
 //!
@@ -9,12 +9,14 @@
 //! The function must reference type zero. Its body may declare up to 16 `i32`
 //! locals in total. The number of groups and each group's local count are
 //! unsigned LEB32; zero-count groups are allowed but must still specify `i32`.
-//! The only instructions before a single final `end` are `local.get`, `local.set`,
-//! `local.tee` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
-//! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, and
-//! `i32.rem_u`. Local indices start at zero and address parameters first, then
-//! locals in declaration order. Both can be assigned.
-//! There are no calls, branches, or other control instructions.
+//! Supported instructions are `local.get`, `local.set`, `local.tee` (each with
+//! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.add`, `i32.sub`,
+//! `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, and
+//! `if (result i32) ... else ... end` (block type byte `0x7f`). Local indices
+//! start at zero and address parameters first, then locals in declaration order.
+//! Both can be assigned. `if` can nest, takes no block parameters, and requires
+//! both arms. There are no calls, `block`, `loop`, `br`, `return`, `unreachable`,
+//! or other control instructions.
 //! An optional export section between function and code may contain zero or one
 //! export, which must refer to function zero. Both kinds of names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
@@ -24,17 +26,29 @@
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
 //! `local.set` pops one, `local.tee` requires and leaves the top operand, and
-//! the binary operators consume two and push one. `end` must be the final
-//! byte of the body frame and leave exactly one result. The inclusive limits are
-//! 256 body bytes (including the locals vector and `end`), 127 instructions
-//! (excluding `end`), and 32 live i32 operands.
+//! the binary operators consume two and push one. `if` consumes an i32 condition
+//! from above the enclosing frame's operand floor and saves the remaining depth
+//! as the floor for both arms. Every operand access in an arm must stay above
+//! that floor. `else` checks for exactly one new result and resets validation to
+//! the saved depth, and the matching `end` checks that the else arm also leaves
+//! exactly one new result. Both arms are checked regardless of the condition.
+//! The function has a floor of zero; its own `end` must be the final byte of
+//! the body frame and leave exactly one result. The inclusive limits are 256
+//! body bytes (including the locals vector and all `end` bytes), 127 decoded
+//! instructions (including `if` and `else` across both arms, excluding `end`),
+//! 32 live i32 operands including those below arm floors, and 16 nested `if`s.
 //!
 //! Validation checks the entire input before returning an owned [`Module`] with
 //! private decoded instructions and an optional bounded export name. A separate
 //! [`Module::instantiate`] step creates an [`Instance`]. Its typed
 //! [`Instance::invoke_i32_with_args`] method looks up the exact export name,
-//! checks the argument count, and executes the stored instructions in order without
-//! allocating. Each invocation has a fixed operand stack and fixed local storage:
+//! checks the argument count, and executes without allocating or recursing.
+//! Zero selects the else arm; every nonzero i32 selects the then arm. Validation
+//! uses a fixed stack of control frames and backpatches private jump targets at
+//! matching delimiters. Each target is a strictly later decoded instruction
+//! index or the one-past-last index. Execution visits each decoded instruction
+//! at most once, and never executes an untaken arm.
+//! Each invocation has a fixed operand stack and fixed local storage:
 //! parameters are copied from the supplied arguments, and declared locals start
 //! at zero on every call. [`Instance::invoke_i32`] is equivalent to passing an
 //! empty argument slice. The top operand is the right-hand side of each binary
@@ -61,6 +75,11 @@
 //! successive calls, wrapping arithmetic after discarding the input, signed and
 //! unsigned division and remainder edge cases, name and arity checks before
 //! execution, and stopping at the first guest trap and reusing the instance.
+//! Conditional tests exercise zero and nonzero conditions, nested joins,
+//! preserved outer operands and selected-arm effects, suppression of untaken
+//! traps, rejection of untaken invalid code, arm result counts and floor
+//! violations (even when depth would later recover), delimiter errors, and
+//! control, instruction and operand bounds.
 //! Parsing checks declaration counts against the remaining local budget without
 //! expanding groups. It uses bounded borrowed frames and decodes instructions
 //! into a fixed-size scratch array. After checking `end` and the complete body

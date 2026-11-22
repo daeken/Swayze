@@ -12,6 +12,12 @@ pub struct Error {
 }
 
 /// Why the input was not accepted. Unsupported does not imply valid Wasm.
+///
+/// `UnexpectedElse` indicates a stray or duplicate `else`; `MissingElse`
+/// indicates an `if` closed by `end` without an `else`. The depth in
+/// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
+/// active frame's entry stack floor. The latter is reported at a delimiter
+/// when an arm or function fails to produce exactly one result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -37,6 +43,8 @@ pub enum ErrorKind {
     TrailingSectionBytes { id: u8 },
     TrailingBodyBytes,
     UnsupportedOpcode { opcode: u8 },
+    UnexpectedElse,
+    MissingElse,
     StackUnderflow { depth: usize },
     InvalidResultDepth { depth: usize },
     AllocationFailed,
@@ -83,10 +91,12 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded local and i32 operations; excludes `end`.
+    /// Decoded operations across the whole body, including `if` and `else` but not `end`.
     BodyInstructions,
     /// Peak number of live i32 operands in the code body.
     OperandStackDepth,
+    /// Number of simultaneously open `if` frames, excluding the function frame.
+    ControlDepth,
     /// Name bytes in one custom section, excluding its length field.
     CustomNameBytes,
     /// Name bytes in one export, excluding its length field.
@@ -94,7 +104,7 @@ pub enum Limit {
 }
 
 impl Limit {
-    /// The inclusive maximum in bytes, sections, instructions, or operands.
+    /// The inclusive maximum for this resource.
     pub const fn maximum(self) -> usize {
         match self {
             Self::ModuleBytes => 1024 * 1024,
@@ -103,6 +113,7 @@ impl Limit {
             Self::CodeBodyBytes => 256,
             Self::BodyInstructions => 127,
             Self::OperandStackDepth => 32,
+            Self::ControlDepth => 16,
             Self::CustomNameBytes | Self::ExportNameBytes => 4 * 1024,
         }
     }
@@ -155,8 +166,20 @@ impl fmt::Display for Error {
             TrailingSectionBytes { id } => write!(f, "trailing bytes in section ID {id}"),
             TrailingBodyBytes => f.write_str("trailing bytes after code body end"),
             UnsupportedOpcode { opcode } => write!(f, "unsupported opcode {opcode:#04x}"),
-            StackUnderflow { depth } => write!(f, "not enough operands, found {depth}"),
-            InvalidResultDepth { depth } => write!(f, "expected one result at end, found {depth}"),
+            UnexpectedElse => f.write_str("else without a matching then arm"),
+            MissingElse => f.write_str("i32-result if requires an else arm"),
+            StackUnderflow { depth } => {
+                write!(
+                    f,
+                    "not enough operands above the frame's stack floor, found {depth}"
+                )
+            }
+            InvalidResultDepth { depth } => {
+                write!(
+                    f,
+                    "expected one result above the frame's stack floor, found {depth}"
+                )
+            }
             AllocationFailed => f.write_str("could not reserve validated module storage"),
             LimitExceeded { limit } => {
                 write!(f, "{limit:?} limit exceeded (maximum {})", limit.maximum())
@@ -344,6 +367,8 @@ fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Erro
     Ok(Some(name))
 }
 
+const IF: u8 = 0x04;
+const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +378,8 @@ enum Instruction {
     LocalSet(u32),
     LocalTee(u32),
     Binary(BinaryOp),
+    JumpIfZero { target: usize },
+    Jump { target: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -390,8 +417,9 @@ impl BinaryOp {
     }
 }
 
-/// Only the decoder below constructs this, after checking local indices, every
-/// stack effect, and the complete body frame. It cannot be mutated after validation.
+/// Only the decoder constructs this, after checking local indices, every stack
+/// effect, and the complete body frame. Jump targets are strictly forward decoded
+/// instruction indices, or the one-past-last index. Code cannot be mutated after validation.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -411,10 +439,12 @@ impl ValidatedCode {
         locals[..self.parameter_count].copy_from_slice(args);
         let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
         let mut depth = 0;
-        // Each stored instruction runs at most once; a trap terminates execution.
+        // The PC strictly increases, so each stored instruction runs at most once.
         // Validation proves each local index is below the total slot count,
         // every stack access fits, and depth is one on completion.
-        for &instruction in &self.instructions {
+        let mut pc = 0;
+        while let Some(&instruction) = self.instructions.get(pc) {
+            pc += 1;
             match instruction {
                 Instruction::Const(value) => {
                     operands[depth] = value;
@@ -437,6 +467,13 @@ impl ValidatedCode {
                     *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
                     depth -= 1;
                 }
+                Instruction::JumpIfZero { target } => {
+                    depth -= 1;
+                    if operands[depth] == 0 {
+                        pc = target;
+                    }
+                }
+                Instruction::Jump { target } => pc = target,
             }
         }
         Ok(operands[0])
@@ -457,6 +494,56 @@ fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
     Ok(MAX_DECLARED_LOCALS - remaining)
 }
 
+#[derive(Clone, Copy)]
+struct IfFrame {
+    base: usize,
+    arm: IfArm,
+}
+
+#[derive(Clone, Copy)]
+enum IfArm {
+    Then { if_pc: usize },
+    Else { else_pc: usize },
+}
+
+fn check_result_depth(depth: usize, offset: usize) -> Result<(), Error> {
+    if depth == 1 {
+        Ok(())
+    } else {
+        Err(Error {
+            offset,
+            kind: ErrorKind::InvalidResultDepth { depth },
+        })
+    }
+}
+
+fn decode_plain(
+    body: &mut Reader<'_>,
+    opcode: u8,
+    offset: usize,
+    local_bound: u32,
+) -> Result<Instruction, Error> {
+    Ok(match opcode {
+        0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
+        0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
+        0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
+        0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
+        0x6a => Instruction::Binary(BinaryOp::Add),
+        0x6b => Instruction::Binary(BinaryOp::Sub),
+        0x6c => Instruction::Binary(BinaryOp::Mul),
+        0x6d => Instruction::Binary(BinaryOp::DivS),
+        0x6e => Instruction::Binary(BinaryOp::DivU),
+        0x6f => Instruction::Binary(BinaryOp::RemS),
+        0x70 => Instruction::Binary(BinaryOp::RemU),
+        _ => {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::UnsupportedOpcode { opcode },
+            });
+        }
+    })
+}
+
 fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
     section.count(IntegerField::CodeCount, 1..=1)?;
     let declared = section.length(LengthField::CodeBodySize)?;
@@ -469,81 +556,136 @@ fn validate_code(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
         },
     })?;
     let local_bound = parameter_count + validate_locals(&mut body)?;
+    // An if/else reserves an instruction slot, then its matching delimiter
+    // backpatches it. A final function end requires all frames to have closed.
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
     let mut count = 0;
     let mut depth = 0usize;
-    loop {
+    let mut frames = [IfFrame {
+        base: 0,
+        arm: IfArm::Then { if_pc: 0 },
+    }; Limit::ControlDepth.maximum()];
+    let mut nesting = 0;
+    let end_offset = loop {
         let offset = body.position();
-        let opcode = body
-            .byte()
-            .ok_or_else(|| body.error(ErrorKind::TruncatedByte { expected: END }))?;
+        let frame = frames[..nesting].last().copied();
+        let base = frame.map_or(0, |frame| frame.base);
+        let arm = frame.map(|frame| frame.arm);
+        let available = depth - base;
+        let opcode = body.byte().ok_or_else(|| {
+            let expected = if matches!(arm, Some(IfArm::Then { .. })) {
+                ELSE
+            } else {
+                END
+            };
+            body.error(ErrorKind::TruncatedByte { expected })
+        })?;
         if opcode == END {
-            if depth != 1 {
-                return Err(Error {
-                    offset,
-                    kind: ErrorKind::InvalidResultDepth { depth },
-                });
+            match arm {
+                Some(IfArm::Then { .. }) => {
+                    return Err(Error {
+                        offset,
+                        kind: ErrorKind::MissingElse,
+                    });
+                }
+                Some(IfArm::Else { else_pc }) => {
+                    check_result_depth(available, offset)?;
+                    // The source must be in the decoded prefix. Its target is
+                    // the next slot, possibly the final one-past-last index.
+                    decoded[..count][else_pc] = Instruction::Jump { target: count };
+                    nesting -= 1;
+                    continue;
+                }
+                None => {
+                    check_result_depth(available, offset)?;
+                    body.finish(ErrorKind::TrailingBodyBytes)?;
+                    break offset;
+                }
             }
-            body.finish(ErrorKind::TrailingBodyBytes)?;
-            let mut instructions = Vec::new();
-            instructions.try_reserve_exact(count).map_err(|_| Error {
+        }
+        let pc = count;
+        if pc == decoded.len() {
+            return Err(Error {
                 offset,
-                kind: ErrorKind::AllocationFailed,
-            })?;
-            instructions.extend_from_slice(&decoded[..count]);
-            return Ok(ValidatedCode {
-                parameter_count: parameter_count as usize,
-                instructions,
+                kind: ErrorKind::LimitExceeded {
+                    limit: Limit::BodyInstructions,
+                },
             });
         }
-        let slot = decoded.get_mut(count).ok_or(Error {
-            offset,
-            kind: ErrorKind::LimitExceeded {
-                limit: Limit::BodyInstructions,
-            },
-        })?;
-        let instruction = match opcode {
-            0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
-            0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
-            0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
-            0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
-            0x6a => Instruction::Binary(BinaryOp::Add),
-            0x6b => Instruction::Binary(BinaryOp::Sub),
-            0x6c => Instruction::Binary(BinaryOp::Mul),
-            0x6d => Instruction::Binary(BinaryOp::DivS),
-            0x6e => Instruction::Binary(BinaryOp::DivU),
-            0x6f => Instruction::Binary(BinaryOp::RemS),
-            0x70 => Instruction::Binary(BinaryOp::RemU),
-            _ => {
-                return Err(Error {
-                    offset,
-                    kind: ErrorKind::UnsupportedOpcode { opcode },
-                });
-            }
-        };
+        count += 1;
         let consume = |operands| {
-            depth.checked_sub(operands).ok_or(Error {
-                offset,
-                kind: ErrorKind::StackUnderflow { depth },
-            })
-        };
-        depth = match instruction {
-            Instruction::Const(_) | Instruction::LocalGet(_) => depth
-                .checked_add(1)
-                .filter(|&next| next <= Limit::OperandStackDepth.maximum())
+            available
+                .checked_sub(operands)
+                .map(|left| base + left)
                 .ok_or(Error {
                     offset,
-                    kind: ErrorKind::LimitExceeded {
-                        limit: Limit::OperandStackDepth,
-                    },
-                })?,
-            Instruction::LocalSet(_) => consume(1)?,
-            Instruction::LocalTee(_) => consume(1)? + 1,
-            Instruction::Binary(_) => consume(2)? + 1,
+                    kind: ErrorKind::StackUnderflow { depth: available },
+                })
         };
-        *slot = instruction;
-        count += 1;
-    }
+        match opcode {
+            IF => {
+                body.expect_byte(I32)?; // Only a single i32 result, no block parameters.
+                let next = frames.get_mut(nesting).ok_or(Error {
+                    offset,
+                    kind: ErrorKind::LimitExceeded {
+                        limit: Limit::ControlDepth,
+                    },
+                })?;
+                depth = consume(1)?;
+                *next = IfFrame {
+                    base: depth,
+                    arm: IfArm::Then { if_pc: pc },
+                };
+                nesting += 1;
+            }
+            ELSE => {
+                let Some(IfArm::Then { if_pc }) = arm else {
+                    return Err(Error {
+                        offset,
+                        kind: ErrorKind::UnexpectedElse,
+                    });
+                };
+                check_result_depth(available, offset)?;
+                // Skip the then arm and its else jump on a zero condition.
+                decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
+                frames[nesting - 1].arm = IfArm::Else { else_pc: pc };
+                depth = base;
+            }
+            _ => {
+                let instruction = decode_plain(&mut body, opcode, offset, local_bound)?;
+                depth = match instruction {
+                    Instruction::Const(_) | Instruction::LocalGet(_) => {
+                        if depth == Limit::OperandStackDepth.maximum() {
+                            return Err(Error {
+                                offset,
+                                kind: ErrorKind::LimitExceeded {
+                                    limit: Limit::OperandStackDepth,
+                                },
+                            });
+                        }
+                        depth + 1
+                    }
+                    Instruction::LocalSet(_) => consume(1)?,
+                    Instruction::LocalTee(_) => consume(1)? + 1,
+                    Instruction::Binary(_) => consume(2)? + 1,
+                    Instruction::JumpIfZero { .. } | Instruction::Jump { .. } => {
+                        unreachable!("only control delimiters create jumps")
+                    }
+                };
+                decoded[pc] = instruction;
+            }
+        }
+    };
+    let mut instructions = Vec::new();
+    instructions.try_reserve_exact(count).map_err(|_| Error {
+        offset: end_offset,
+        kind: ErrorKind::AllocationFailed,
+    })?;
+    instructions.extend_from_slice(&decoded[..count]);
+    Ok(ValidatedCode {
+        parameter_count: parameter_count as usize,
+        instructions,
+    })
 }
 
 struct Reader<'a> {

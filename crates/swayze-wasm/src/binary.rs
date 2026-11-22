@@ -1,4 +1,4 @@
-use crate::{ConstantFunction, Module};
+use crate::{Function, Module};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -36,6 +36,9 @@ pub enum ErrorKind {
     UnexpectedByte { expected: u8, found: u8 },
     TrailingSectionBytes { id: u8 },
     TrailingBodyBytes,
+    UnsupportedOpcode { opcode: u8 },
+    StackUnderflow { depth: usize },
+    InvalidResultDepth { depth: usize },
     AllocationFailed,
     LimitExceeded { limit: Limit },
 }
@@ -73,8 +76,14 @@ pub enum Limit {
     ModuleBytes,
     /// Number of sections, including custom sections with empty names or bodies.
     SectionCount,
-    /// Declared payload bytes in one section or nested code body, excluding framing.
+    /// Declared payload bytes in one section, excluding framing.
     SectionBytes,
+    /// Declared bytes in the code body, including the locals vector and `end`.
+    CodeBodyBytes,
+    /// Decoded `i32.const`, `i32.add`, `i32.sub`, and `i32.mul` operations; excludes `end`.
+    BodyInstructions,
+    /// Peak number of live i32 operands in the code body.
+    OperandStackDepth,
     /// Name bytes in one custom section, excluding its length field.
     CustomNameBytes,
     /// Name bytes in one export, excluding its length field.
@@ -82,12 +91,15 @@ pub enum Limit {
 }
 
 impl Limit {
-    /// The inclusive maximum in bytes or sections, depending on the limit.
+    /// The inclusive maximum in bytes, sections, instructions, or operands.
     pub const fn maximum(self) -> usize {
         match self {
             Self::ModuleBytes => 1024 * 1024,
             Self::SectionCount => 1024,
             Self::SectionBytes => 256 * 1024,
+            Self::CodeBodyBytes => 256,
+            Self::BodyInstructions => 127,
+            Self::OperandStackDepth => 32,
             Self::CustomNameBytes | Self::ExportNameBytes => 4 * 1024,
         }
     }
@@ -139,7 +151,12 @@ impl fmt::Display for Error {
             }
             TrailingSectionBytes { id } => write!(f, "trailing bytes in section ID {id}"),
             TrailingBodyBytes => f.write_str("trailing bytes after code body end"),
-            AllocationFailed => f.write_str("could not reserve export-name storage"),
+            UnsupportedOpcode { opcode } => write!(f, "unsupported opcode {opcode:#04x}"),
+            StackUnderflow { depth } => {
+                write!(f, "binary operator needs two operands, found {depth}")
+            }
+            InvalidResultDepth { depth } => write!(f, "expected one result at end, found {depth}"),
+            AllocationFailed => f.write_str("could not reserve validated module storage"),
             LimitExceeded { limit } => {
                 write!(f, "{limit:?} limit exceeded (maximum {})", limit.maximum())
             }
@@ -152,8 +169,9 @@ impl std::error::Error for Error {}
 /// Validate the crate's [supported slice](crate#supported-slice) of WebAssembly Core 1.0.
 ///
 /// Success checks the complete input and returns an owned module without
-/// executing it. Work is at most linear in the input length; the only allocation
-/// is for a retained export name, bounded by [`Limit::ExportNameBytes`].
+/// executing it. Work is at most linear in the input length. Allocations retain
+/// only validated instructions and an optional export name, with sizes bounded by
+/// [`Limit::BodyInstructions`] and [`Limit::ExportNameBytes`].
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -179,7 +197,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut has_type = false;
     let mut has_function = false;
     let mut export = None;
-    let mut value = None;
+    let mut code = None;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -222,7 +240,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 has_function = true;
             }
             7 => export = validate_export(&mut section)?,
-            10 => value = Some(validate_code(&mut section)?),
+            10 => code = Some(validate_code(&mut section)?),
             _ => {
                 return Err(Error {
                     offset: id_offset,
@@ -239,7 +257,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     if last_standard != 0 {
         // The exact counts, zero indices, and presence of all three sections
         // together establish the type/function/code and export relationships.
-        for (id, present) in [(1, has_type), (3, has_function), (10, value.is_some())] {
+        for (id, present) in [(1, has_type), (3, has_function), (10, code.is_some())] {
             if !present {
                 return Err(module.error(ErrorKind::MissingSection { id }));
             }
@@ -256,7 +274,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         None
     };
     Ok(Module {
-        function: value.map(|value| ConstantFunction { value, export }),
+        function: code.map(|code| Function { code, export }),
     })
 }
 
@@ -309,7 +327,58 @@ fn validate_export<'a>(section: &mut Reader<'a>) -> Result<Option<&'a str>, Erro
     Ok(Some(name))
 }
 
-fn validate_code(section: &mut Reader<'_>) -> Result<i32, Error> {
+const END: u8 = 0x0b;
+
+#[derive(Clone, Copy, Debug)]
+enum Instruction {
+    Const(i32),
+    Binary(BinaryOp),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Only the decoder below constructs this, after checking every stack effect
+/// and the complete body frame. There is no way to mutate it after validation.
+#[derive(Debug)]
+pub(super) struct ValidatedCode {
+    instructions: Vec<Instruction>,
+}
+
+impl ValidatedCode {
+    pub(super) fn execute(&self) -> i32 {
+        let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
+        let mut depth = 0;
+        // Each stored instruction runs once, for at most BodyInstructions steps.
+        // Validation starts at the same depth, proves every index fits, and
+        // establishes that depth is one on completion.
+        for &instruction in &self.instructions {
+            match instruction {
+                Instruction::Const(value) => {
+                    operands[depth] = value;
+                    depth += 1;
+                }
+                Instruction::Binary(op) => {
+                    let rhs = operands[depth - 1];
+                    let lhs = &mut operands[depth - 2];
+                    *lhs = match op {
+                        BinaryOp::Add => lhs.wrapping_add(rhs),
+                        BinaryOp::Sub => lhs.wrapping_sub(rhs),
+                        BinaryOp::Mul => lhs.wrapping_mul(rhs),
+                    };
+                    depth -= 1;
+                }
+            }
+        }
+        operands[0]
+    }
+}
+
+fn validate_code(section: &mut Reader<'_>) -> Result<ValidatedCode, Error> {
     section.count(IntegerField::CodeCount, 1..=1)?;
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -321,11 +390,70 @@ fn validate_code(section: &mut Reader<'_>) -> Result<i32, Error> {
         },
     })?;
     body.count(IntegerField::LocalGroupCount, 0..=0)?;
-    body.expect_byte(0x41)?; // i32.const
-    let value = body.integer(IntegerField::I32Const)? as i32;
-    body.expect_byte(0x0b)?; // end
-    body.finish(ErrorKind::TrailingBodyBytes)?;
-    Ok(value)
+    let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
+    let mut count = 0;
+    let mut depth = 0usize;
+    loop {
+        let offset = body.position();
+        let opcode = body
+            .byte()
+            .ok_or_else(|| body.error(ErrorKind::TruncatedByte { expected: END }))?;
+        if opcode == END {
+            if depth != 1 {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::InvalidResultDepth { depth },
+                });
+            }
+            body.finish(ErrorKind::TrailingBodyBytes)?;
+            let mut instructions = Vec::new();
+            instructions.try_reserve_exact(count).map_err(|_| Error {
+                offset,
+                kind: ErrorKind::AllocationFailed,
+            })?;
+            instructions.extend_from_slice(&decoded[..count]);
+            return Ok(ValidatedCode { instructions });
+        }
+        let slot = decoded.get_mut(count).ok_or(Error {
+            offset,
+            kind: ErrorKind::LimitExceeded {
+                limit: Limit::BodyInstructions,
+            },
+        })?;
+        let instruction = match opcode {
+            0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
+            0x6a => Instruction::Binary(BinaryOp::Add),
+            0x6b => Instruction::Binary(BinaryOp::Sub),
+            0x6c => Instruction::Binary(BinaryOp::Mul),
+            _ => {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::UnsupportedOpcode { opcode },
+                });
+            }
+        };
+        depth = match instruction {
+            Instruction::Const(_) => depth
+                .checked_add(1)
+                .filter(|&next| next <= Limit::OperandStackDepth.maximum())
+                .ok_or(Error {
+                    offset,
+                    kind: ErrorKind::LimitExceeded {
+                        limit: Limit::OperandStackDepth,
+                    },
+                })?,
+            Instruction::Binary(_) => {
+                // Consume both operands before accounting for the single result.
+                let remaining = depth.checked_sub(2).ok_or(Error {
+                    offset,
+                    kind: ErrorKind::StackUnderflow { depth },
+                })?;
+                remaining + 1
+            }
+        };
+        *slot = instruction;
+        count += 1;
+    }
 }
 
 struct Reader<'a> {
@@ -412,7 +540,8 @@ impl<'a> Reader<'a> {
             ErrorKind::LengthOverflow { field },
         )?;
         let limit = match field {
-            LengthField::SectionSize | LengthField::CodeBodySize => Limit::SectionBytes,
+            LengthField::SectionSize => Limit::SectionBytes,
+            LengthField::CodeBodySize => Limit::CodeBodyBytes,
             LengthField::CustomNameSize => Limit::CustomNameBytes,
             LengthField::ExportNameSize => Limit::ExportNameBytes,
         };

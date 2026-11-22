@@ -1,4 +1,4 @@
-use crate::{Export, InvokeError, Module, Trap};
+use crate::{ExecutionLimit, Export, InvokeError, Module, Trap};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -292,7 +292,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     }
     if last_standard != 0 {
         // The presence of all three sections makes the count and index checks
-        // above sufficient to associate each export with a validated body.
+        // above sufficient to associate each export and call with a validated body.
         for (id, present) in [
             (1, parameter_count.is_some()),
             (3, function_count.is_some()),
@@ -303,7 +303,11 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
         }
     }
-    Ok(Module { functions, exports })
+    Ok(Module {
+        parameter_count: parameter_count.unwrap_or(0) as usize,
+        functions,
+        exports,
+    })
 }
 
 fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
@@ -407,6 +411,7 @@ enum Instruction {
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
+    Call(u32),
     Eqz,
     Binary(BinaryOp),
     JumpIfZero { target: usize },
@@ -468,70 +473,128 @@ impl BinaryOp {
     }
 }
 
-/// Only the decoder constructs this, after checking local indices, every stack
-/// effect, and the complete body frame. Jump targets are strictly forward decoded
-/// instruction indices, or the one-past-last index. Code cannot be mutated after validation.
+/// Only the decoder constructs this, after checking local and function indices,
+/// every stack effect, and the complete body frame. Intra-body jump targets are
+/// strictly forward decoded instruction indices, or the one-past-last index.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
-    parameter_count: usize,
     instructions: Vec<Instruction>,
 }
 
-impl ValidatedCode {
-    pub(super) fn execute(&self, args: &[i32]) -> Result<i32, InvokeError> {
-        if args.len() != self.parameter_count {
-            return Err(InvokeError::ArityMismatch {
-                expected: self.parameter_count,
-                actual: args.len(),
+struct CallFrame {
+    function_index: usize,
+    pc: usize,
+    locals: [i32; MAX_LOCAL_SLOTS],
+    operands: [i32; Limit::OperandStackDepth.maximum()],
+    depth: usize,
+}
+
+impl CallFrame {
+    const EMPTY: Self = Self {
+        function_index: 0,
+        pc: 0,
+        locals: [0; MAX_LOCAL_SLOTS],
+        operands: [0; Limit::OperandStackDepth.maximum()],
+        depth: 0,
+    };
+
+    fn new(function_index: usize, args: &[i32]) -> Self {
+        let mut frame = Self {
+            function_index,
+            ..Self::EMPTY
+        };
+        frame.locals[..args.len()].copy_from_slice(args);
+        frame
+    }
+
+    fn push(&mut self, value: i32) {
+        self.operands[self.depth] = value;
+        self.depth += 1;
+    }
+
+    fn pop(&mut self) -> i32 {
+        self.depth -= 1;
+        self.operands[self.depth]
+    }
+}
+
+pub(super) fn execute(
+    module: &Module,
+    function_index: usize,
+    args: &[i32],
+) -> Result<i32, InvokeError> {
+    let parameter_count = module.parameter_count;
+    if args.len() != parameter_count {
+        return Err(InvokeError::ArityMismatch {
+            expected: parameter_count,
+            actual: args.len(),
+        });
+    }
+    let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
+    frames[0] = CallFrame::new(function_index, args);
+    let mut active = 0;
+    let mut remaining_dispatches = ExecutionLimit::InstructionDispatches.maximum();
+    loop {
+        let frame = &mut frames[active];
+        // Export and call indices are bounded by the exact decoded body count.
+        let code = &module.functions[frame.function_index];
+        let Some(&instruction) = code.instructions.get(frame.pc) else {
+            // At the one-past-last PC validation guarantees one result. Returning
+            // does not spend fuel, even when the final dispatch used it up.
+            debug_assert_eq!(frame.pc, code.instructions.len());
+            debug_assert_eq!(frame.depth, 1);
+            let value = frame.operands[0];
+            if active == 0 {
+                return Ok(value);
+            }
+            active -= 1;
+            frames[active].push(value);
+            continue;
+        };
+        if remaining_dispatches == 0 {
+            return Err(InvokeError::LimitExceeded {
+                limit: ExecutionLimit::InstructionDispatches,
             });
         }
-        // Only the parameter prefix is overwritten; declared locals start at zero.
-        let mut locals = [0i32; MAX_LOCAL_SLOTS];
-        locals[..self.parameter_count].copy_from_slice(args);
-        let mut operands = [0i32; Limit::OperandStackDepth.maximum()];
-        let mut depth = 0;
-        // The PC strictly increases, so each stored instruction runs at most once.
-        // Validation proves each local index is below the total slot count,
-        // every stack access fits, and depth is one on completion.
-        let mut pc = 0;
-        while let Some(&instruction) = self.instructions.get(pc) {
-            pc += 1;
-            match instruction {
-                Instruction::Const(value) => {
-                    operands[depth] = value;
-                    depth += 1;
-                }
-                Instruction::LocalGet(index) => {
-                    operands[depth] = locals[index as usize];
-                    depth += 1;
-                }
-                Instruction::LocalSet(index) => {
-                    depth -= 1;
-                    locals[index as usize] = operands[depth];
-                }
-                Instruction::LocalTee(index) => {
-                    locals[index as usize] = operands[depth - 1];
-                }
-                Instruction::Eqz => {
-                    let top = &mut operands[depth - 1];
-                    *top = i32::from(*top == 0);
-                }
-                Instruction::Binary(op) => {
-                    let rhs = operands[depth - 1];
-                    let lhs = &mut operands[depth - 2];
-                    *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
-                    depth -= 1;
-                }
-                Instruction::JumpIfZero { target } => {
-                    depth -= 1;
-                    if operands[depth] == 0 {
-                        pc = target;
-                    }
-                }
-                Instruction::Jump { target } => pc = target,
+        remaining_dispatches -= 1;
+        frame.pc += 1;
+        match instruction {
+            Instruction::Const(value) => frame.push(value),
+            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
+            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
+            Instruction::LocalTee(index) => {
+                frame.locals[index as usize] = frame.operands[frame.depth - 1]
             }
+            Instruction::Call(index) => {
+                if active + 1 == ExecutionLimit::CallDepth.maximum() {
+                    return Err(InvokeError::LimitExceeded {
+                        limit: ExecutionLimit::CallDepth,
+                    });
+                }
+                // Keep the caller's prefix; the argument suffix is already in
+                // parameter order. Reset reused frame storage before entering.
+                let end = frame.depth;
+                frame.depth -= parameter_count;
+                let callee = CallFrame::new(index as usize, &frame.operands[frame.depth..end]);
+                active += 1;
+                frames[active] = callee;
+            }
+            Instruction::Eqz => {
+                let top = &mut frame.operands[frame.depth - 1];
+                *top = i32::from(*top == 0);
+            }
+            Instruction::Binary(op) => {
+                let rhs = frame.pop();
+                let lhs = &mut frame.operands[frame.depth - 1];
+                *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
+            }
+            Instruction::JumpIfZero { target } => {
+                if frame.pop() == 0 {
+                    frame.pc = target;
+                }
+            }
+            Instruction::Jump { target } => frame.pc = target,
         }
-        Ok(operands[0])
     }
 }
 
@@ -577,8 +640,10 @@ fn decode_plain(
     opcode: u8,
     offset: usize,
     local_bound: u32,
+    function_bound: u32,
 ) -> Result<Instruction, Error> {
     Ok(match opcode {
+        0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
@@ -623,12 +688,20 @@ fn validate_code(
         .try_reserve_exact(count as usize)
         .map_err(|_| allocation_error)?;
     for _ in 0..count {
-        functions.push(validate_body(section, parameter_count)?);
+        functions.push(validate_body(
+            section,
+            parameter_count,
+            function_count.unwrap_or(0),
+        )?);
     }
     Ok(functions)
 }
 
-fn validate_body(section: &mut Reader<'_>, parameter_count: u32) -> Result<ValidatedCode, Error> {
+fn validate_body(
+    section: &mut Reader<'_>,
+    parameter_count: u32,
+    function_bound: u32,
+) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
     let mut body = section.frame(declared).ok_or(Error {
@@ -735,19 +808,11 @@ fn validate_body(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
                 depth = base;
             }
             _ => {
-                let instruction = decode_plain(&mut body, opcode, offset, local_bound)?;
+                let instruction =
+                    decode_plain(&mut body, opcode, offset, local_bound, function_bound)?;
                 depth = match instruction {
-                    Instruction::Const(_) | Instruction::LocalGet(_) => {
-                        if depth == Limit::OperandStackDepth.maximum() {
-                            return Err(Error {
-                                offset,
-                                kind: ErrorKind::LimitExceeded {
-                                    limit: Limit::OperandStackDepth,
-                                },
-                            });
-                        }
-                        depth + 1
-                    }
+                    Instruction::Const(_) | Instruction::LocalGet(_) => depth + 1,
+                    Instruction::Call(_) => consume(parameter_count as usize)? + 1,
                     Instruction::LocalSet(_) => consume(1)?,
                     Instruction::LocalTee(_) | Instruction::Eqz => consume(1)? + 1,
                     Instruction::Binary(_) => consume(2)? + 1,
@@ -755,6 +820,14 @@ fn validate_body(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
                         unreachable!("only control delimiters create jumps")
                     }
                 };
+                if depth > Limit::OperandStackDepth.maximum() {
+                    return Err(Error {
+                        offset,
+                        kind: ErrorKind::LimitExceeded {
+                            limit: Limit::OperandStackDepth,
+                        },
+                    });
+                }
                 decoded[pc] = instruction;
             }
         }
@@ -765,10 +838,7 @@ fn validate_body(section: &mut Reader<'_>, parameter_count: u32) -> Result<Valid
         kind: ErrorKind::AllocationFailed,
     })?;
     instructions.extend_from_slice(&decoded[..count]);
-    Ok(ValidatedCode {
-        parameter_count: parameter_count as usize,
-        instructions,
-    })
+    Ok(ValidatedCode { instructions })
 }
 
 struct Reader<'a> {

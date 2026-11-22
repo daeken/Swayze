@@ -1,5 +1,6 @@
 use swayze_wasm::{
-    Error, ErrorKind, IntegerField, InvokeError, LengthField, Limit, Module, Trap, validate_module,
+    Error, ErrorKind, ExecutionLimit, IntegerField, InvokeError, LengthField, Limit, Module, Trap,
+    validate_module,
 };
 
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
@@ -160,6 +161,18 @@ fn i32_type(parameter_count: u8) -> Vec<u8> {
 fn exported_function(ty: &[u8], code: &[u8]) -> Module {
     // Drop the original input before instantiation or invocation.
     validate_module(&module(&[(1, ty), (3, FUNCTION), (7, EXPORT), (10, code)])).unwrap()
+}
+
+fn exported_functions(arity: u8, exports: &[(&[u8], usize)], bodies: &[&[u8]]) -> Module {
+    let mut declarations = vec![0; bodies.len() + 1];
+    declarations[0] = u8::try_from(bodies.len()).unwrap();
+    validate_module(&module(&[
+        (1, &i32_type(arity)),
+        (3, &declarations),
+        (7, &function_exports(exports)),
+        (10, &code_bodies(bodies)),
+    ]))
+    .unwrap()
 }
 
 fn assert_body_result(body: &[u8], expected: i32) {
@@ -339,6 +352,245 @@ fn checks_every_declaration_and_export_index_against_its_actual_space() {
 }
 
 #[test]
+fn composes_nested_and_repeated_zero_arg_calls_to_forward_and_earlier_targets() {
+    let validated = exported_functions(
+        0,
+        &[(b"answer", 2)],
+        &[
+            b"\0\x41\x05\x0b",                           // 0: 5
+            b"\0\x41\x09\x10\x87\x80\x80\x80\0\x6b\x0b", // 1: 9 - f7() (padded index)
+            b"\0\x10\x01\x10\0\x6c\x10\x01\x6a\x0b",     // 2: f1() * f0() + f1()
+            &CODE[2..],
+            &CODE[2..],
+            &CODE[2..],
+            &CODE[2..],
+            b"\0\x10\0\x0b", // 7: f0()
+        ],
+    );
+    let instance = validated.instantiate();
+    assert_eq!(instance.invoke_i32("answer"), Ok(24));
+}
+
+#[test]
+fn passes_four_arguments_in_order_above_the_caller_arm_floor() {
+    let validated = exported_functions(
+        4,
+        &[(b"answer", 0)],
+        &[
+            // Keep 30 below the arm floor and pass the four inputs as a suffix.
+            b"\0\x41\x1e\x41\x01\x04\x7f\x20\0\x20\x01\x20\x02\x20\x03\x10\x01\
+              \x05\x41\0\x0b\x6a\x0b",
+            // (((a * 10) + b) * 10 + c) * 10 + d
+            b"\0\x20\0\x41\x0a\x6c\x20\x01\x6a\x41\x0a\x6c\x20\x02\x6a\
+              \x41\x0a\x6c\x20\x03\x6a\x0b",
+        ],
+    );
+    let instance = validated.instantiate();
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[1, 2, 3, 4]),
+        Ok(1264)
+    );
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[4, 3, 2, 1]),
+        Ok(4351)
+    );
+}
+
+#[test]
+fn keeps_caller_locals_and_operands_and_resets_reused_callee_storage() {
+    let validated = exported_functions(
+        1,
+        &[(b"answer", 0)],
+        &[
+            // local1 = 9; return 50 + f1(arg) + f1(arg) + arg + local1
+            b"\x01\x01\x7f\x41\x09\x21\x01\x41\x32\x20\0\x10\x01\x20\0\x10\x01\
+              \x6a\x6a\x20\0\x6a\x20\x01\x6a\x0b",
+            // Return the initial local plus the arg, but mutate both slots.
+            b"\x01\x01\x7f\x20\x01\x20\0\x22\x01\x6a\x41\x03\x21\0\x0b",
+        ],
+    );
+    let instance = validated.instantiate();
+    assert_eq!(instance.invoke_i32_with_args("answer", &[7]), Ok(80));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[-2]), Ok(53));
+}
+
+#[test]
+fn validates_call_indices_as_unsigned_leb32_against_the_declaration_count() {
+    let field = IntegerField::FunctionIndex;
+    for (immediate, index) in [
+        (&[1][..], 1),
+        (&[0x7f], 127),
+        (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX),
+    ] {
+        let mut body = vec![0, 0x10];
+        body.extend_from_slice(immediate);
+        body.push(0x0b);
+        bad_body(&body, 2, ErrorKind::InvalidIndex { field, index });
+    }
+    for continuation_bytes in 0..=4 {
+        let mut body = vec![0, 0x10];
+        body.extend(std::iter::repeat_n(0x80, continuation_bytes));
+        bad_body(&body, body.len(), ErrorKind::TruncatedInteger { field });
+        if continuation_bytes == 4 {
+            for fifth in [0x10, 0x7f, 0x80] {
+                body.push(fifth);
+                bad_body(&body, 6, ErrorKind::IntegerOverflow { field });
+                body.pop();
+            }
+        }
+    }
+    // The else arm is untaken, but index 1 is still invalid.
+    bad_body(
+        b"\0\x41\x01\x04\x7f\x41\x02\x05\x10\x01\x0b\x0b",
+        9,
+        ErrorKind::InvalidIndex { field, index: 1 },
+    );
+}
+
+#[test]
+fn validates_call_stack_effect_at_the_active_floor_including_untaken_arms() {
+    let ty = i32_type(4);
+    bad_typed_body(
+        &ty,
+        b"\0\x10\0\x0b",
+        1,
+        ErrorKind::StackUnderflow { depth: 0 },
+    );
+    // In the untaken outer else arm, the nested call has three operands above
+    // its floor. It cannot borrow the fourth from below that floor.
+    let body = b"\0\x41\x01\x04\x7f\x41\x2a\x05\x41\x09\x41\x01\x04\x7f\
+                 \x41\x01\x41\x02\x41\x03\x10\0\x05\x41\0\x0b\x6a\x0b\x0b";
+    bad_typed_body(&ty, body, 20, ErrorKind::StackUnderflow { depth: 3 });
+    bad_body(
+        b"\0\x10\0\x10\0\x0b",
+        5,
+        ErrorKind::InvalidResultDepth { depth: 2 },
+    );
+}
+
+#[test]
+fn zero_arg_result_obeys_the_operand_cap_without_sharing_caller_stack_space() {
+    let limit = Limit::OperandStackDepth;
+    let peak = limit.maximum();
+    let caller = |prefix| {
+        let mut body = vec![0];
+        for _ in 0..prefix {
+            body.extend([0x41, 1]);
+        }
+        body.extend([0x10, 1]);
+        body.extend(std::iter::repeat_n(0x6a, prefix));
+        body.push(0x0b);
+        body
+    };
+    let mut callee = vec![0];
+    for _ in 0..peak {
+        callee.extend([0x41, 1]);
+    }
+    callee.extend(std::iter::repeat_n(0x6a, peak - 1));
+    callee.push(0x0b);
+    let validated = exported_functions(0, &[(b"answer", 0)], &[&caller(peak - 1), &callee]);
+    assert_eq!(validated.instantiate().invoke_i32("answer"), Ok(63));
+
+    let too_deep = caller(peak);
+    let code = code_bodies(&[&too_deep, &callee]);
+    let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
+    let start = push_section(&mut bytes, 10, &code);
+    let caller_start = code_body(&too_deep).len() - too_deep.len();
+    expect_error(
+        &bytes,
+        start + caller_start + 1 + 2 * peak,
+        ErrorKind::LimitExceeded { limit },
+    );
+}
+
+#[test]
+fn propagates_the_first_nested_trap_and_reuses_the_instance() {
+    let validated = exported_functions(
+        1,
+        &[(b"answer", 0)],
+        &[
+            // f1(arg) / (arg + 1) -- would divide by zero for -1 if reached.
+            b"\0\x20\0\x10\x01\x20\0\x41\x01\x6a\x6d\x0b",
+            b"\0\x20\0\x10\x02\x0b",                     // f2(arg)
+            b"\0\x41\x80\x80\x80\x80\x78\x20\0\x6d\x0b", // MIN / arg
+        ],
+    );
+    let instance = validated.instantiate();
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[-1]),
+        Err(InvokeError::Trap(Trap::IntegerOverflow))
+    );
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[0]),
+        Err(InvokeError::Trap(Trap::IntegerDivideByZero))
+    );
+    assert_eq!(
+        instance.invoke_i32_with_args("answer", &[1]),
+        Ok(i32::MIN / 2)
+    );
+}
+
+#[test]
+fn bounds_live_frames_including_the_export_and_resumes_after_finite_self_calls() {
+    let validated = exported_functions(
+        1,
+        &[(b"answer", 0), (b"recur", 1)],
+        &[
+            // recur(arg) / (arg - 15) -- a depth failure must skip the divide.
+            b"\0\x20\0\x10\x01\x20\0\x41\x0f\x6b\x6d\x0b",
+            // arg != 0 ? 1 + recur(arg - 1) : 0
+            b"\0\x20\0\x04\x7f\x41\x01\x20\0\x41\x01\x6b\x10\x01\x6a\x05\x41\0\x0b\x0b",
+        ],
+    );
+    let instance = validated.instantiate();
+    let limit = ExecutionLimit::CallDepth;
+    assert_eq!(limit.maximum(), 16);
+    let failure = Err(InvokeError::LimitExceeded { limit });
+    assert_eq!(instance.invoke_i32_with_args("recur", &[15]), Ok(15));
+    assert_eq!(instance.invoke_i32_with_args("recur", &[16]), failure);
+    assert_eq!(instance.invoke_i32_with_args("answer", &[15]), failure);
+    assert_eq!(instance.invoke_i32_with_args("answer", &[14]), Ok(-14));
+}
+
+#[test]
+fn spends_one_dispatch_budget_across_sequential_calls_and_final_returns_are_free() {
+    let limit = ExecutionLimit::InstructionDispatches;
+    assert_eq!(limit.maximum(), 1024);
+    // Leaf: 126 dispatches (condition, if, const, 122 eqz, else jump).
+    // The untaken else arm's const does not count.
+    let mut leaf = vec![0, 0x41, 1, 0x04, 0x7f, 0x41, 1];
+    leaf.extend(std::iter::repeat_n(0x45, 122));
+    leaf.extend([0x05, 0x41, 0, 0x0b, 0x0b]);
+    let entry = |tail| {
+        let mut body = vec![1, 1, 0x7f];
+        for _ in 0..7 {
+            body.extend([0x10, 4, 0x21, 0]); // call leaf, local.set: 128 dispatches
+        }
+        body.extend([0x10, tail, 0x0b]);
+        body
+    };
+    let validated = exported_functions(
+        0,
+        &[(b"exact", 0), (b"over", 1), (b"leaf", 4)],
+        &[
+            &entry(2),
+            &entry(3),
+            b"\0\x10\x04\x0b",     // 7 * 128 + 2 calls + 126 = 1024, then unwind
+            b"\0\x10\x04\x45\x0b", // one further dispatch in the suspended caller
+            &leaf,
+        ],
+    );
+    let instance = validated.instantiate();
+    assert_eq!(instance.invoke_i32("exact"), Ok(1));
+    assert_eq!(
+        instance.invoke_i32("over"),
+        Err(InvokeError::LimitExceeded { limit })
+    );
+    assert_eq!(instance.invoke_i32("leaf"), Ok(1));
+    assert_eq!(instance.invoke_i32("exact"), Ok(1));
+}
+
+#[test]
 fn requires_exact_function_and_code_count_agreement() {
     for bodies in [1, 3] {
         let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
@@ -369,9 +621,16 @@ fn validates_later_unexported_bodies_with_their_own_local_space_and_frames() {
             },
         ),
         (
-            &[0, 0x10, 0, 0x0b],
+            &[0, 0x11, 0, 0x0b],
             2,
-            ErrorKind::UnsupportedOpcode { opcode: 0x10 },
+            ErrorKind::UnsupportedOpcode { opcode: 0x11 },
+        ),
+        (
+            &[0, 0x10, 0x80],
+            4,
+            ErrorKind::TruncatedInteger {
+                field: IntegerField::FunctionIndex,
+            },
         ),
         (
             &[0, 0x41, 0x80],
@@ -1158,7 +1417,7 @@ fn arm_operand_limit_includes_values_below_its_floor() {
 #[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x04, 0x05, 0x0b, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
+        if ![0x04, 0x05, 0x0b, 0x10, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
             && !(0x45..=0x4f).contains(&opcode)
             && !(0x6a..=0x70).contains(&opcode)
         {

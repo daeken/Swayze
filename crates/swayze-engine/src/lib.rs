@@ -2,7 +2,8 @@
 
 pub use swayze_js::{
     Error as JsParseError, ErrorKind as JsErrorKind, EvalError as JsEvalError, Limit as JsLimit,
-    Limits as JsLimits, Script, Span as JsSpan, parse_script, parse_script_with_limits,
+    Limits as JsLimits, Script, Span as JsSpan, Value as JsValue, parse_script,
+    parse_script_with_limits,
 };
 pub use swayze_wasm::{
     Error as WasmValidationError, ErrorKind as WasmErrorKind, Instance as WasmInstance,

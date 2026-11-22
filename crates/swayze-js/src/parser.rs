@@ -136,7 +136,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A validated Script in the numeric expression subset. Only the parser constructs it.
+/// A validated Script in the Number and Boolean subset. Only the parser constructs it.
 pub struct Script {
     instructions: Vec<Instruction>,
     max_stack_depth: usize,
@@ -182,6 +182,7 @@ pub(crate) enum BindingKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
+    Boolean(bool),
     LoadBinding(usize),
     InitBinding(BindingKind),
     StoreBinding(usize),
@@ -196,12 +197,12 @@ pub(crate) enum Instruction {
     Jump(usize),
 }
 
-/// Parse a complete Script in the numeric expression subset with default [`Limits`].
+/// Parse a complete Script in the Number and Boolean subset with default [`Limits`].
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
 
-/// Parse a complete Script in the numeric expression subset with caller-supplied limits.
+/// Parse a complete Script in the Number and Boolean subset with caller-supplied limits.
 pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, Error> {
     if source.len() > limits.max_source_bytes {
         // Starting within the source, back up at most three continuation bytes.
@@ -270,6 +271,7 @@ impl Operator {
 #[derive(Clone, Copy)]
 enum TokenKind {
     Number(f64),
+    Boolean(bool),
     Identifier,
     Declaration(BindingKind),
     Equals,
@@ -315,11 +317,11 @@ fn is_identifier_start(c: char) -> bool {
 fn is_excluded_name(name: &str) -> bool {
     matches!(
         name,
-        // Keywords, reserved literals, future/strict reserved words, and `await`.
+        // Other keywords, reserved literals, future/strict reserved words, and `await`.
         "break" | "case" | "catch" | "class" | "continue" | "debugger" | "default"
-            | "delete" | "do" | "else" | "enum" | "export" | "extends" | "false"
+            | "delete" | "do" | "else" | "enum" | "export" | "extends"
             | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
-            | "new" | "null" | "return" | "super" | "switch" | "this" | "throw" | "true"
+            | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
             | "try" | "typeof" | "var" | "void" | "while" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
@@ -468,6 +470,8 @@ impl Lexer<'_> {
         match name {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
             "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
+            "true" => Ok(TokenKind::Boolean(true)),
+            "false" => Ok(TokenKind::Boolean(false)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
@@ -730,6 +734,12 @@ impl Parser<'_> {
                     "const and let are reserved names",
                 ));
             }
+            TokenKind::Boolean(_) => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "Boolean literals cannot be used as binding names",
+                ));
+            }
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         if self.lookup_binding(name.span)?.is_some() {
@@ -839,6 +849,10 @@ impl Parser<'_> {
                     self.emit(Instruction::Number(value), span)?;
                     needs_operand = false;
                 }
+                (true, TokenKind::Boolean(value)) => {
+                    self.emit(Instruction::Boolean(value), span)?;
+                    needs_operand = false;
+                }
                 (true, TokenKind::Identifier) => {
                     let slot = self.lookup_binding(span)?.ok_or_else(|| {
                         Error::unsupported(span, "read requires an earlier declaration; self, forward and unbound reads are outside the subset")
@@ -936,7 +950,7 @@ impl Parser<'_> {
                         "call expressions are outside the arithmetic subset",
                     ));
                 }
-                (false, TokenKind::Number(_) | TokenKind::Identifier) => {
+                (false, TokenKind::Number(_) | TokenKind::Boolean(_) | TokenKind::Identifier) => {
                     if after_line_break {
                         self.reduce_expression()?;
                         if self.pending.is_empty() {
@@ -1061,7 +1075,9 @@ impl Parser<'_> {
             Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
-            Instruction::Number(_) | Instruction::LoadBinding(_) => (0, 1),
+            Instruction::Number(_) | Instruction::Boolean(_) | Instruction::LoadBinding(_) => {
+                (0, 1)
+            }
             Instruction::InitBinding(_)
             | Instruction::StoreBinding(_)
             | Instruction::JumpIfFalse(_) => (1, 0),

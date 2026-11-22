@@ -2,23 +2,25 @@
 
 `swayze_js::parse_script` validates source in the supported arithmetic subset.
 Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
-`Script`. For example, `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?`
-produces `14.0`.
+`Script` if a Number result is required. For example,
+`swayze_js::parse_script("2 + 3 * 4")?.evaluate()?` produces `14.0`.
+`Script::evaluate_value()` returns a tagged `Value::Number` or `Value::Boolean`;
+`evaluate()` returns `NonNumericResult` for a Boolean instead of converting it.
 
 This path evaluates an expression over decimal literals (including fractions and
 signed exponents) with binary
 `+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and initialized
-`let` declarations initialize numeric slots in source order. Simple assignment
+`let` declarations initialize slots in source order, preserving the value type. Simple assignment
 statements update earlier `let` slots. All statements require an explicit
 semicolon; the final expression's semicolon is optional. Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global
-lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
-calls, objects or nonnumeric coercions.
+lookup, temporal dead zone behavior or a runtime `TypeError`. For arithmetic,
+`true` converts to `1` and `false` to `+0`. There are no calls or objects.
 
 Conditional expressions (`test ? consequent : alternate`) evaluate only the
-selected arm. For numeric tests, either signed zero and NaN are false; other
-numbers are true. Conditionals are right-associative and bind less tightly than
+selected arm, preserving its value type. Boolean tests use their own value.
+For numeric tests, either signed zero and NaN are false; other numbers are true. Conditionals are right-associative and bind less tightly than
 arithmetic. Both arms are parsed and must use supported syntax and bindings.
 
 The evaluator sees only private instructions, not the original source. Before
@@ -48,6 +50,6 @@ and NaN. These are focused implementation tests, not a proof of correctness or
 ECMAScript conformance. They do not run Test262, and there is no JIT in this path.
 
 With Node.js installed, `sh tools/check-js-reference.sh` independently compares
-synthetic arithmetic fixtures in debug and release, using exact binary64 bits
-except for NaN payloads. It does not execute Test262 or user-supplied code and is
+synthetic fixtures in debug and release, comparing Boolean values exactly and
+Numbers by their binary64 bits except for NaN payloads. It does not execute Test262 or user-supplied code and is
 not required by the normal merge gate.

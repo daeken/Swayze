@@ -1,7 +1,7 @@
-//! Opt-in differential Number smoke check: run tools/check-js-reference.sh.
+//! Opt-in differential JS value smoke check: run tools/check-js-reference.sh.
 
 use std::{error::Error, process::Command};
-use swayze_engine::parse_script;
+use swayze_engine::{JsValue, parse_script};
 
 // Evaluate complete Scripts (including optional semicolons), not expressions
 // rewritten by the harness. Print binary64 in big-endian hex; ignore NaN payloads.
@@ -11,9 +11,14 @@ const bytes = Buffer.alloc(8);
 console.log(process.version);
 for (const [i, source] of process.argv.slice(1).entries()) {
     const value = runInNewContext(source, {}, { filename: `fixture-${i + 1}` });
-    if (typeof value !== 'number') throw new Error(`fixture ${i + 1} is not a Number`);
-    bytes.writeDoubleBE(value);
-    console.log(Number.isNaN(value) ? 'nan' : bytes.toString('hex'));
+    if (typeof value === 'boolean') {
+        console.log(`boolean:${value}`);
+    } else if (typeof value === 'number') {
+        bytes.writeDoubleBE(value);
+        console.log(`number:${Number.isNaN(value) ? 'nan' : bytes.toString('hex')}`);
+    } else {
+        throw new Error(`fixture ${i + 1} returned unsupported type ${typeof value}`);
+    }
 }
 "#;
 
@@ -109,6 +114,20 @@ fn fixtures() -> Vec<String> {
             "2 - 2 ? 1 : -0",
             "let x = 2; const y = x ? 3 : 4; x = y - 3 ? x : y; x",
             "1 ? /* branch */ 0 : 2 ? 3 : 4",
+            "true",
+            "false;",
+            "true ? false : 1",
+            "false ? 1 : true",
+            "(0 / 0) ? 1 : true",
+            "let x = true; x = x ? -0 : false; x",
+            "let x = 1; x = false; x",
+            "const trueValue = false; trueValue ? 10 : 11",
+            "true + true * true",
+            "false - true",
+            "-false",
+            "+true",
+            "true / false",
+            "false % false",
         ]
         .map(str::to_owned),
     );
@@ -137,8 +156,8 @@ fn fixtures() -> Vec<String> {
     cases
 }
 
-fn evaluate(source: &str) -> Result<f64, Box<dyn Error>> {
-    Ok(parse_script(source)?.evaluate()?)
+fn evaluate(source: &str) -> Result<JsValue, Box<dyn Error>> {
+    Ok(parse_script(source)?.evaluate_value()?)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -168,10 +187,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (i, (source, reference)) in cases.iter().zip(lines).enumerate() {
         let value =
             evaluate(source).map_err(|error| format!("fixture {} {source:?}: {error}", i + 1))?;
-        let actual = if value.is_nan() {
-            "nan".to_owned()
-        } else {
-            format!("{:016x}", value.to_bits())
+        let actual = match value {
+            JsValue::Number(value) if value.is_nan() => "number:nan".to_owned(),
+            JsValue::Number(value) => format!("number:{:016x}", value.to_bits()),
+            JsValue::Boolean(value) => format!("boolean:{value}"),
         };
         if actual != reference {
             return Err(format!(
@@ -181,6 +200,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    println!("Matched all {count} fixtures against Node {version} (f64 bits or NaN)");
+    println!(
+        "Matched all {count} fixtures against Node {version} (Boolean values and f64 bits or NaN)"
+    );
     Ok(())
 }

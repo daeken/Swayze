@@ -8,7 +8,35 @@ use crate::{
 // This is an execution ceiling, independent of custom parse limits.
 const MAX_INSTRUCTIONS: usize = 4096;
 
-/// Failure to evaluate a prepared arithmetic script.
+/// A result or intermediate value in the supported JavaScript subset.
+///
+/// Rust `PartialEq` compares tagged host values; it is not a guest equality operation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Value {
+    /// A JavaScript Number (binary64), including signed zeros, infinities, and NaN.
+    Number(f64),
+    /// A JavaScript Boolean.
+    Boolean(bool),
+}
+
+impl Value {
+    fn to_number(self) -> f64 {
+        match self {
+            Self::Number(value) => value,
+            Self::Boolean(true) => 1.0,
+            Self::Boolean(false) => 0.0,
+        }
+    }
+
+    fn to_boolean(self) -> bool {
+        match self {
+            Self::Number(value) => value != 0.0 && !value.is_nan(),
+            Self::Boolean(value) => value,
+        }
+    }
+}
+
+/// Failure to evaluate a prepared script or obtain a Number result from it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EvalError {
@@ -18,6 +46,8 @@ pub enum EvalError {
     InvalidScript,
     /// The evaluator could not allocate bounded operand or binding storage.
     AllocationFailed,
+    /// The numeric convenience API received a Boolean result instead of a Number.
+    NonNumericResult,
 }
 
 impl fmt::Display for EvalError {
@@ -26,6 +56,7 @@ impl fmt::Display for EvalError {
             Self::LimitExceeded => "arithmetic script exceeds the evaluation operation limit",
             Self::InvalidScript => "invalid prepared arithmetic instruction sequence",
             Self::AllocationFailed => "could not allocate arithmetic operand or binding storage",
+            Self::NonNumericResult => "script result is a Boolean, not a Number",
         })
     }
 }
@@ -33,23 +64,39 @@ impl fmt::Display for EvalError {
 impl std::error::Error for EvalError {}
 
 impl Script {
-    /// Evaluate this prepared arithmetic Script using JavaScript Number (binary64).
+    /// Evaluate the Script and return its Number result without coercing it.
     ///
-    /// Each operator works on numbers in the order chosen by the parser, rounding
-    /// each operation to binary64. Signed zeros, infinities, and NaN are numeric
-    /// results, not evaluation errors. This runs no host callbacks and does not
-    /// read source text. Initializations and assignments run in source order,
-    /// with fresh immutable `const` and mutable `let` slots for each call. The
-    /// final expression determines the result. A conditional evaluates its test
-    /// and only the selected arm; zero (of either sign) and NaN select the false arm.
-    /// The evaluation ceiling is 4,096 total instructions, including both arms
-    /// and their jumps, regardless of the parse limits used.
+    /// Use [`Script::evaluate_value`] to accept Boolean results as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Script::evaluate_value`], or
+    /// [`EvalError::NonNumericResult`] if the final value is a Boolean.
+    pub fn evaluate(&self) -> Result<f64, EvalError> {
+        match self.evaluate_value()? {
+            Value::Number(value) => Ok(value),
+            Value::Boolean(_) => Err(EvalError::NonNumericResult),
+        }
+    }
+
+    /// Evaluate the Script and return the final expression's Number or Boolean value.
+    ///
+    /// Arithmetic converts Boolean operands to `1` for `true` and `+0` for
+    /// `false`, then computes a binary64 Number. A conditional evaluates its
+    /// test and only the selected arm, preserving the arm's value and type.
+    /// `false`, either signed zero, and NaN select the false arm.
+    ///
+    /// This runs no host callbacks and does not read source text. Initializations
+    /// and assignments run in source order with fresh immutable `const` and
+    /// mutable `let` slots for each call. The evaluation ceiling is 4,096 total
+    /// instructions, including both conditional arms and their jumps, regardless
+    /// of the parse limits used.
     ///
     /// # Errors
     ///
     /// Returns an error if operand or binding storage could not be allocated, or if the
     /// prepared instruction sequence violates its internal shape or size limits.
-    pub fn evaluate(&self) -> Result<f64, EvalError> {
+    pub fn evaluate_value(&self) -> Result<Value, EvalError> {
         evaluate(
             self.instructions(),
             self.max_stack_depth(),
@@ -59,15 +106,15 @@ impl Script {
 }
 
 enum Slot {
-    Const(f64),
-    Let(f64),
+    Const(Value),
+    Let(Value),
 }
 
 fn evaluate(
     ops: &[Instruction],
     max_operands: usize,
     binding_slots: usize,
-) -> Result<f64, EvalError> {
+) -> Result<Value, EvalError> {
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
@@ -99,7 +146,12 @@ fn evaluate(
     while let Some(&op) = ops.get(ip) {
         ip += 1;
         match op {
-            Instruction::Number(value) => push_operand(&mut stack, max_operands, value)?,
+            Instruction::Number(value) => {
+                push_operand(&mut stack, max_operands, Value::Number(value))?;
+            }
+            Instruction::Boolean(value) => {
+                push_operand(&mut stack, max_operands, Value::Boolean(value))?;
+            }
             Instruction::LoadBinding(slot) => {
                 let (Slot::Const(value) | Slot::Let(value)) =
                     *bindings.get(slot).ok_or(EvalError::InvalidScript)?;
@@ -135,7 +187,7 @@ fn evaluate(
             Instruction::JumpIfFalse(target) => {
                 let target = check_target(ip, target, ops.len())?;
                 let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
-                if condition == 0.0 || condition.is_nan() {
+                if !condition.to_boolean() {
                     ip = target;
                 }
             }
@@ -157,7 +209,11 @@ fn check_target(next: usize, target: usize, exit: usize) -> Result<usize, EvalEr
     }
 }
 
-fn push_operand(stack: &mut Vec<f64>, max_operands: usize, value: f64) -> Result<(), EvalError> {
+fn push_operand(
+    stack: &mut Vec<Value>,
+    max_operands: usize,
+    value: Value,
+) -> Result<(), EvalError> {
     if stack.len() == max_operands {
         return Err(EvalError::InvalidScript);
     }
@@ -165,16 +221,16 @@ fn push_operand(stack: &mut Vec<f64>, max_operands: usize, value: f64) -> Result
     Ok(())
 }
 
-fn apply_unary(stack: &mut [f64], op: impl FnOnce(f64) -> f64) -> Result<(), EvalError> {
+fn apply_unary(stack: &mut [Value], op: impl FnOnce(f64) -> f64) -> Result<(), EvalError> {
     let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *value = op(*value);
+    *value = Value::Number(op(value.to_number()));
     Ok(())
 }
 
-fn apply_binary(stack: &mut Vec<f64>, op: impl FnOnce(f64, f64) -> f64) -> Result<(), EvalError> {
+fn apply_binary(stack: &mut Vec<Value>, op: impl FnOnce(f64, f64) -> f64) -> Result<(), EvalError> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
     let lhs = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *lhs = op(*lhs, rhs);
+    *lhs = Value::Number(op(lhs.to_number(), rhs.to_number()));
     Ok(())
 }
 
@@ -201,7 +257,7 @@ mod tests {
             (&[one, one, one, Instruction::Add, one][..], 3),
             (&[one][..], 0),
             (&[one][..], 2),
-            (&[one, one, Instruction::Add][..], 1),
+            (&[one, Instruction::Boolean(true), Instruction::Add][..], 1),
         ] {
             assert_eq!(evaluate(ops, peak, 0), Err(EvalError::InvalidScript));
         }
@@ -228,27 +284,25 @@ mod tests {
                 "{ops:?}"
             );
         }
-        assert_eq!(evaluate(&[one, Jump(2)], 1, 0), Ok(1.0));
+        assert_eq!(evaluate(&[one, Jump(2)], 1, 0), Ok(Value::Number(1.0)));
     }
 
     #[test]
     fn executes_only_the_selected_arm() {
-        use Instruction::{Jump, JumpIfFalse, LoadBinding, Number};
+        use Instruction::{Boolean, Jump, JumpIfFalse, LoadBinding, Number};
         // A bad slot is observable if executed, unlike ordinary arithmetic in
         // the subset. The parser would never emit this load.
         let bad = LoadBinding(0);
-        let answer = Number(42.0);
-        for (test, consequent, alternate) in [(1.0, answer, bad), (0.0, bad, answer)] {
-            let ops = [Number(test), JumpIfFalse(4), consequent, Jump(5), alternate];
-            assert_eq!(evaluate(&ops, 1, 0), Ok(42.0));
-            let flipped = [
-                Number(1.0 - test),
-                JumpIfFalse(4),
-                consequent,
-                Jump(5),
-                alternate,
-            ];
-            assert_eq!(evaluate(&flipped, 1, 0), Err(EvalError::InvalidScript));
+        let answer = Boolean(false);
+        for (truthy, falsy) in [(Number(1.0), Number(0.0)), (Boolean(true), Boolean(false))] {
+            for (test, flipped, consequent, alternate) in
+                [(truthy, falsy, answer, bad), (falsy, truthy, bad, answer)]
+            {
+                let mut ops = [test, JumpIfFalse(4), consequent, Jump(5), alternate];
+                assert_eq!(evaluate(&ops, 1, 0), Ok(Value::Boolean(false)));
+                ops[0] = flipped;
+                assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+            }
         }
     }
 
@@ -265,7 +319,10 @@ mod tests {
         ops.extend(std::iter::repeat_n(Instruction::Add, operands - 1));
         ops.push(Instruction::Positive);
         assert_eq!(ops.len(), MAX_INSTRUCTIONS);
-        assert_eq!(evaluate(&ops, operands, 0), Ok(operands as f64));
+        assert_eq!(
+            evaluate(&ops, operands, 0),
+            Ok(Value::Number(operands as f64))
+        );
     }
 
     #[test]
@@ -290,7 +347,10 @@ mod tests {
         ] {
             assert_eq!(evaluate(ops, peak, slots), Err(EvalError::InvalidScript));
         }
-        assert_eq!(evaluate(&[one, INIT_CONST, LoadBinding(0)], 1, 1), Ok(1.0));
+        assert_eq!(
+            evaluate(&[one, INIT_CONST, LoadBinding(0)], 1, 1),
+            Ok(Value::Number(1.0))
+        );
     }
 
     #[test]
@@ -311,7 +371,10 @@ mod tests {
         ] {
             assert_eq!(evaluate(ops, peak, 1), Err(EvalError::InvalidScript));
         }
-        assert_eq!(evaluate(&[one, INIT_LET, two, store, read], 1, 1), Ok(2.0));
+        assert_eq!(
+            evaluate(&[one, INIT_LET, two, store, read], 1, 1),
+            Ok(Value::Number(2.0))
+        );
     }
 
     #[test]
@@ -323,7 +386,10 @@ mod tests {
         }
         ops.extend([Instruction::LoadBinding(slots - 1), Instruction::Positive]);
         assert_eq!(ops.len(), MAX_INSTRUCTIONS);
-        assert_eq!(evaluate(&ops, 1, slots), Ok((slots - 1) as f64));
+        assert_eq!(
+            evaluate(&ops, 1, slots),
+            Ok(Value::Number((slots - 1) as f64))
+        );
         ops.push(Instruction::Positive);
         assert_eq!(evaluate(&ops, 1, slots), Err(EvalError::LimitExceeded));
     }
@@ -332,10 +398,10 @@ mod tests {
     fn non_finite_results_are_numbers() {
         let largest = Instruction::Number(f64::MAX);
         let overflow = [largest, Instruction::Number(2.0), Instruction::Multiply];
-        assert_eq!(evaluate(&overflow, 2, 0), Ok(f64::INFINITY));
+        assert_eq!(evaluate(&overflow, 2, 0), Ok(Value::Number(f64::INFINITY)));
 
         let mut ops = overflow.to_vec();
         ops.extend([Instruction::Number(0.0), Instruction::Multiply]);
-        assert!(evaluate(&ops, 2, 0).unwrap().is_nan());
+        assert!(matches!(evaluate(&ops, 2, 0), Ok(Value::Number(value)) if value.is_nan()));
     }
 }

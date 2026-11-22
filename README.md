@@ -34,4 +34,14 @@ sh tools/check-test262.sh
 
 This checks the revision and sample paths; it does **not** run JavaScript. See [corpus maintenance](docs/test262.md) for the trust boundary, license and update process.
 
+## Push and merge policy
+
+Push commits to their working branch by default. For a PR, run the internal gate on a clean checkout of the proposed merge with current `main`. Initialize Test262 as above, then run:
+
+```sh
+sh tools/check.sh
+```
+
+This checks the corpus pin, formatting, Clippy and both debug and release tests. Merge and push the tested result when the gate passes; if the PR or base changes, retest the new candidate. We run this on our side, not on GitHub Actions. For untrusted PRs use a disposable environment without credentials, and review changes to the gate itself before relying on it.
+
 Swayze is [MIT-licensed](LICENSE); third-party corpus files retain their upstream terms.

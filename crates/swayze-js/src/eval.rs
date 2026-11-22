@@ -103,8 +103,10 @@ impl Script {
     /// and NaN are falsy, and all other supported values are truthy. `!` returns
     /// a Boolean. `&&` returns a falsy left operand, and `||` returns a truthy
     /// left operand; otherwise they evaluate and return the right operand.
-    /// A conditional evaluates its test and only the selected arm. Both logical
-    /// operators and conditionals preserve the selected value and type.
+    /// A conditional expression evaluates its test and only the selected arm,
+    /// preserving the selected value and type. An `if` statement uses the same
+    /// truthiness but evaluates only the selected branch's assignments, leaving
+    /// no operand stack result. A falsy test with no `else` performs no writes.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments run in source order with fresh immutable `const` and

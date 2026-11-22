@@ -33,6 +33,12 @@ true. The same truthiness drives `!`, `&&`, and `||`. `!` returns a Boolean;
 Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
 All operands and arms must use supported syntax and bindings.
 
+Top-level `if (test) { ... }` statements may precede the final expression.
+Braced arms hold simple assignments to earlier `let` bindings. Only the
+selected arm runs; a false test with no `else` leaves the bindings unchanged.
+Both arms are checked without executing them. Nested statements, `else if`,
+and declarations in branches are outside the subset.
+
 The evaluator sees only private instructions, not the original source. Before
 allocating, it checks a ceiling of 4,096 instructions, counting skipped arms
 and operands and their forward jumps, independent of custom parse limits.

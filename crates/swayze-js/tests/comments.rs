@@ -103,7 +103,7 @@ fn eof_ends_line_comments_but_not_block_comments() {
         (
             "const x=1; /* no final expression */",
             ErrorKind::Unsupported,
-            "a final expression is required after binding statements",
+            "a final expression is required after statements",
         ),
         (
             "let x=1; x=2// no semicolon",

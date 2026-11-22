@@ -161,6 +161,12 @@ fn fixtures() -> Vec<String> {
             "1 < 2 && 2 !== true ? 42 : -0",
             "0 || 1 ? false && 4 : true",
             "let x = 0; x = x || 2; x && !false",
+            "let x = 0; if (true) { x = 42; } else { x = 2; } x",
+            "let x = 0; if (-0) { x = 42; } else { x = false; } x",
+            "let x = -0; if (0 / 0) { x = 42; } x",
+            "let x = 1; if (x === 1 && true) { x = x + 1; x = x * 5; } x + 1",
+            "let x = 1; if (false) {} else {} if (x) { x = true; } x",
+            "let x = false; if ((1 ? 2 : 3) < 3) { x = true; } const answer = x ? 42 : 0; answer",
         ]
         .map(str::to_owned),
     );

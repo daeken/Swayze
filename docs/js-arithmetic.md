@@ -28,13 +28,15 @@ bind more tightly than equality.
 Conditional expressions (`test ? consequent : alternate`) evaluate only the
 selected arm, preserving its value type. Boolean tests use their own value.
 For numeric tests, either signed zero and NaN are false; other numbers are
-true. Conditionals are right-associative and bind less tightly than equality.
-Both arms are parsed and must use supported syntax and bindings.
+true. The same truthiness drives `!`, `&&`, and `||`. `!` returns a Boolean;
+`&&` and `||` short-circuit and return the selected operand without coercion.
+Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
+All operands and arms must use supported syntax and bindings.
 
 The evaluator sees only private instructions, not the original source. Before
-allocating, it checks a ceiling of 4,096 instructions, counting both arms and
-their forward jumps, independent of custom parse limits. It visits each
-instruction at most once. Each literal adds one operand and each binary
+allocating, it checks a ceiling of 4,096 instructions, counting skipped arms
+and operands and their forward jumps, independent of custom parse limits.
+It visits each instruction at most once. Each literal adds one operand and each eager binary
 operation consumes two operands and leaves one. A unary operation replaces the
 top operand. Initialization consumes a value and appends a slot; a read pushes
 that slot's value. Assignment replaces the value of a mutable slot. The

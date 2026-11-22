@@ -98,15 +98,19 @@ impl Script {
     /// Strict equality and inequality compare tags and values without coercion
     /// and return a Boolean.
     ///
-    /// A conditional evaluates its test and only the selected arm, preserving
-    /// the arm's value and type. `false`, either signed zero, and NaN select the
-    /// false arm.
+    /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
+    /// conditional operator (`?:`) share truthiness: `false`, either signed zero,
+    /// and NaN are falsy, and all other supported values are truthy. `!` returns
+    /// a Boolean. `&&` returns a falsy left operand, and `||` returns a truthy
+    /// left operand; otherwise they evaluate and return the right operand.
+    /// A conditional evaluates its test and only the selected arm. Both logical
+    /// operators and conditionals preserve the selected value and type.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments run in source order with fresh immutable `const` and
     /// mutable `let` slots for each call. The evaluation ceiling is 4,096 total
-    /// instructions, including both conditional arms and their jumps, regardless
-    /// of the parse limits used.
+    /// instructions, including jumps and potentially skipped operands or arms,
+    /// regardless of the parse limits used.
     ///
     /// # Errors
     ///
@@ -209,13 +213,32 @@ fn evaluate(
             Instruction::LessThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs <= rhs)?,
             Instruction::GreaterThan => apply_relational(&mut stack, |lhs, rhs| lhs > rhs)?,
             Instruction::GreaterThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs >= rhs)?,
-            Instruction::Positive => apply_unary(&mut stack, |value| value)?,
-            Instruction::Negate => apply_unary(&mut stack, |value| -value)?,
+            Instruction::Positive => {
+                apply_unary(&mut stack, |value| Value::Number(value.to_number()))?;
+            }
+            Instruction::Negate => {
+                apply_unary(&mut stack, |value| Value::Number(-value.to_number()))?;
+            }
+            Instruction::Not => {
+                apply_unary(&mut stack, |value| Value::Boolean(!value.to_boolean()))?;
+            }
             Instruction::JumpIfFalse(target) => {
                 let target = check_target(ip, target, ops.len())?;
                 let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if !condition.to_boolean() {
                     ip = target;
+                }
+            }
+            Instruction::ShortCircuit {
+                target,
+                when_truthy,
+            } => {
+                let target = check_target(ip, target, ops.len())?;
+                let lhs = stack.last().ok_or(EvalError::InvalidScript)?;
+                if lhs.to_boolean() == when_truthy {
+                    ip = target;
+                } else {
+                    stack.pop();
                 }
             }
             Instruction::Jump(target) => ip = check_target(ip, target, ops.len())?,
@@ -248,9 +271,9 @@ fn push_operand(
     Ok(())
 }
 
-fn apply_unary(stack: &mut [Value], op: impl FnOnce(f64) -> f64) -> Result<(), EvalError> {
+fn apply_unary(stack: &mut [Value], op: impl FnOnce(Value) -> Value) -> Result<(), EvalError> {
     let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *value = Value::Number(op(value.to_number()));
+    *value = op(*value);
     Ok(())
 }
 
@@ -298,6 +321,7 @@ mod tests {
             (&[Instruction::Subtract][..], 1),
             (&[Instruction::Positive, one][..], 1),
             (&[Instruction::Negate, one][..], 1),
+            (&[Instruction::Not, one][..], 1),
             (&[one, Instruction::Divide][..], 1),
             (&[one, Instruction::Remainder][..], 1),
             (&[Instruction::StrictEqual][..], 1),
@@ -353,6 +377,58 @@ mod tests {
                 ops[0] = flipped;
                 assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
             }
+        }
+    }
+
+    #[test]
+    fn short_circuit_skips_rhs_or_pops_lhs_and_evaluates_rhs() {
+        use Instruction::{Boolean, LoadBinding, Number, ShortCircuit};
+        // An uninitialized slot makes RHS execution observable. Valid scripts
+        // cannot include the bad load, even when it would never be executed.
+        for (when_truthy, skip, fall_through, expected) in [
+            (false, Boolean(false), Boolean(true), Value::Boolean(false)),
+            (true, Number(7.0), Number(0.0), Value::Number(7.0)),
+        ] {
+            let mut ops = [
+                skip,
+                ShortCircuit {
+                    target: 3,
+                    when_truthy,
+                },
+                LoadBinding(0),
+            ];
+            assert_eq!(evaluate(&ops, 1, 0), Ok(expected));
+            ops[0] = fall_through;
+            assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+            ops[2] = Boolean(true);
+            assert_eq!(evaluate(&ops, 1, 0), Ok(Value::Boolean(true)));
+        }
+    }
+
+    #[test]
+    fn short_circuit_requires_a_forward_target_and_an_operand() {
+        use Instruction::{Boolean, ShortCircuit};
+        for when_truthy in [false, true] {
+            let fell_through = Boolean(!when_truthy);
+            for target in [0, 1, 4, usize::MAX] {
+                let ops = [
+                    fell_through,
+                    ShortCircuit {
+                        target,
+                        when_truthy,
+                    },
+                    Boolean(true),
+                ];
+                assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+            }
+            let ops = [
+                ShortCircuit {
+                    target: 2,
+                    when_truthy,
+                },
+                Boolean(true),
+            ];
+            assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
         }
     }
 

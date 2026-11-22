@@ -144,7 +144,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// The total number of instructions, including jumps and both arms of every conditional.
+    /// The total number of instructions, including jumps and potentially skipped operands or arms.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
@@ -193,6 +193,7 @@ pub(crate) enum Instruction {
     Remainder,
     Positive,
     Negate,
+    Not,
     StrictEqual,
     StrictNotEqual,
     LessThan,
@@ -200,6 +201,8 @@ pub(crate) enum Instruction {
     GreaterThan,
     GreaterThanOrEqual,
     JumpIfFalse(usize),
+    // Keep the test value when jumping; otherwise pop it before evaluating the RHS.
+    ShortCircuit { target: usize, when_truthy: bool },
     Jump(usize),
 }
 
@@ -243,6 +246,8 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
 
 #[derive(Clone, Copy, Debug)]
 enum Operator {
+    LogicalOr,
+    LogicalAnd,
     StrictEqual,
     StrictNotEqual,
     LessThan,
@@ -256,24 +261,31 @@ enum Operator {
     Remainder,
     Positive,
     Negate,
+    Not,
 }
 
 impl Operator {
     fn precedence(self) -> u8 {
         match self {
-            Self::StrictEqual | Self::StrictNotEqual => 1,
+            Self::LogicalOr => 1,
+            Self::LogicalAnd => 2,
+            Self::StrictEqual | Self::StrictNotEqual => 3,
             Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
-            | Self::GreaterThanOrEqual => 2,
-            Self::Add | Self::Subtract => 3,
-            Self::Multiply | Self::Divide | Self::Remainder => 4,
-            Self::Positive | Self::Negate => 5,
+            | Self::GreaterThanOrEqual => 4,
+            Self::Add | Self::Subtract => 5,
+            Self::Multiply | Self::Divide | Self::Remainder => 6,
+            Self::Positive | Self::Negate | Self::Not => 7,
         }
     }
 
     fn instruction(self) -> Instruction {
         match self {
+            Self::LogicalOr | Self::LogicalAnd => Instruction::ShortCircuit {
+                target: UNPATCHED,
+                when_truthy: matches!(self, Self::LogicalOr),
+            },
             Self::StrictEqual => Instruction::StrictEqual,
             Self::StrictNotEqual => Instruction::StrictNotEqual,
             Self::LessThan => Instruction::LessThan,
@@ -287,6 +299,7 @@ impl Operator {
             Self::Remainder => Instruction::Remainder,
             Self::Positive => Instruction::Positive,
             Self::Negate => Instruction::Negate,
+            Self::Not => Instruction::Not,
         }
     }
 }
@@ -447,7 +460,8 @@ impl Lexer<'_> {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             _ if is_identifier_start(c) => self.identifier(start)?,
-            '=' | '!' => self.equality_or_assignment(c, start)?,
+            '=' | '!' => self.equals_or_bang(c, start)?,
+            '&' | '|' => self.logical(c, start)?,
             // Annex B HTML-like comments remain outside the subset.
             '<' if self.rest().starts_with("!--") => {
                 return Err(Error::unsupported(
@@ -514,7 +528,7 @@ impl Lexer<'_> {
         }
     }
 
-    fn equality_or_assignment(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+    fn equals_or_bang(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
         if self.peek() == Some('=') {
             self.consume('=')?;
             if self.peek() == Some('=') {
@@ -530,6 +544,8 @@ impl Lexer<'_> {
                 return Ok(TokenKind::Equals);
             }
             self.consume('>')?;
+        } else {
+            return Ok(TokenKind::Operator(Operator::Not));
         }
         Err(Error::unsupported(
             Span {
@@ -537,6 +553,29 @@ impl Lexer<'_> {
                 end: self.offset,
             },
             "punctuator is outside the subset",
+        ))
+    }
+
+    fn logical(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        let doubled = self.peek() == Some(first);
+        if doubled {
+            self.consume(first)?;
+        }
+        if self.peek() == Some('=') {
+            self.consume('=')?;
+        } else if doubled {
+            return Ok(TokenKind::Operator(if first == '&' {
+                Operator::LogicalAnd
+            } else {
+                Operator::LogicalOr
+            }));
+        }
+        Err(Error::unsupported(
+            Span {
+                start,
+                end: self.offset,
+            },
+            "bitwise operators and compound assignments are outside the subset",
         ))
     }
 
@@ -706,12 +745,23 @@ impl Lexer<'_> {
 #[derive(Clone, Copy)]
 enum Pending {
     Op(Operator),
+    ShortCircuit {
+        op: Operator,
+        jump: usize,
+        join_depth: usize,
+    },
     Group,
-    Consequent { branch: usize, base_depth: usize },
-    Alternate { jump: usize, join_depth: usize },
+    Consequent {
+        branch: usize,
+        base_depth: usize,
+    },
+    Alternate {
+        jump: usize,
+        join_depth: usize,
+    },
 }
 
-// Only used while emitting a conditional; every jump is patched before a Script is returned.
+// Only used while emitting control flow; every jump is patched before a Script is returned.
 const UNPATCHED: usize = usize::MAX;
 
 struct Binding {
@@ -938,6 +988,7 @@ impl Parser<'_> {
                     let prefix = match op {
                         Operator::Add => Operator::Positive,
                         Operator::Subtract => Operator::Negate,
+                        Operator::Not => Operator::Not,
                         Operator::Divide => {
                             // In operand position a slash could begin a regexp, not division.
                             return Err(Error::unsupported(
@@ -978,9 +1029,30 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "empty parenthesized expression"));
                 }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
+                (false, TokenKind::Operator(Operator::Not)) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "'!' is only supported as a prefix operator",
+                    ));
+                }
                 (false, TokenKind::Operator(op)) => {
+                    // Equal precedence reduces first, so a preceding short circuit
+                    // joins before this operator consumes its left operand.
                     self.reduce_operators(op.precedence())?;
-                    self.push_pending(Pending::Op(op), span)?;
+                    let pending = match op.instruction() {
+                        branch @ Instruction::ShortCircuit { .. } => {
+                            let jump = self.instructions.len();
+                            let join_depth = self.stack_depth; // LHS stays on the taken path.
+                            self.emit(branch, span)?; // Track the fallthrough path, which pops it.
+                            Pending::ShortCircuit {
+                                op,
+                                jump,
+                                join_depth,
+                            }
+                        }
+                        _ => Pending::Op(op),
+                    };
+                    self.push_pending(pending, span)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Question) => {
@@ -1074,12 +1146,27 @@ impl Parser<'_> {
     }
 
     fn reduce_operators(&mut self, min_precedence: u8) -> Result<(), Error> {
-        while let Some(&(Pending::Op(op), span)) = self.pending.last() {
-            if op.precedence() < min_precedence {
-                break;
+        while let Some(&(pending, span)) = self.pending.last() {
+            match pending {
+                Pending::Op(op) if op.precedence() >= min_precedence => {
+                    self.emit(op.instruction(), span)?;
+                }
+                Pending::ShortCircuit {
+                    op,
+                    jump,
+                    join_depth,
+                } if op.precedence() >= min_precedence => {
+                    if self.stack_depth != join_depth {
+                        return Err(Error::malformed(
+                            span,
+                            "logical operands must each leave one result",
+                        ));
+                    }
+                    self.patch_jump(jump, span)?;
+                }
+                _ => break,
             }
             self.pending.pop();
-            self.emit(op.instruction(), span)?;
         }
         Ok(())
     }
@@ -1129,12 +1216,12 @@ impl Parser<'_> {
         // Since `at` must index an already emitted jump, the target is forward.
         let target = self.instructions.len();
         let slot = match self.instructions.get_mut(at) {
-            Some(Instruction::JumpIfFalse(slot) | Instruction::Jump(slot))
-                if *slot == UNPATCHED =>
-            {
-                slot
-            }
-            _ => return Err(Error::malformed(span, "invalid conditional jump")),
+            Some(
+                Instruction::JumpIfFalse(slot)
+                | Instruction::ShortCircuit { target: slot, .. }
+                | Instruction::Jump(slot),
+            ) if *slot == UNPATCHED => slot,
+            _ => return Err(Error::malformed(span, "invalid forward jump")),
         };
         *slot = target;
         Ok(())
@@ -1151,9 +1238,10 @@ impl Parser<'_> {
             }
             Instruction::InitBinding(_)
             | Instruction::StoreBinding(_)
-            | Instruction::JumpIfFalse(_) => (1, 0),
+            | Instruction::JumpIfFalse(_)
+            | Instruction::ShortCircuit { .. } => (1, 0),
             Instruction::Jump(_) => (0, 0),
-            Instruction::Positive | Instruction::Negate => (1, 1),
+            Instruction::Positive | Instruction::Negate | Instruction::Not => (1, 1),
             Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply

@@ -65,6 +65,27 @@ fn fixtures() -> Vec<(i32, Vec<u8>)> {
             cases.push((value, singleton_module(&expression)));
         }
     }
+    // Exercise operand ordering and overflow, with a third live operand.
+    for (a, b, c) in [
+        (17_i32, 4, 3),
+        (i32::MAX, i32::MIN, -1),
+        (i32::MAX, i32::MAX, 2),
+        (-65536, 65536, 0),
+    ] {
+        for (opcode, op) in [
+            (0x6a, i32::wrapping_add as fn(i32, i32) -> i32),
+            (0x6b, i32::wrapping_sub),
+            (0x6c, i32::wrapping_mul),
+        ] {
+            let mut expression = Vec::new();
+            for value in [a, b, c] {
+                expression.push(0x41);
+                expression.extend(sleb32(value, 1));
+            }
+            expression.extend([opcode, 0x6b]);
+            cases.push((a.wrapping_sub(op(b, c)), singleton_module(&expression)));
+        }
+    }
     cases
 }
 

@@ -121,6 +121,169 @@ fn validates_export_name_utf8_and_its_inclusive_limit() {
     );
 }
 
+fn code_body(body: &[u8]) -> Vec<u8> {
+    let mut code = vec![1];
+    push_u32(&mut code, body.len());
+    code.extend_from_slice(body);
+    code
+}
+
+fn assert_body_result(body: &[u8], expected: i32) {
+    let code = code_body(body);
+    // Drop the original input before instantiation or invocation.
+    let validated = validate_module(&module(&[
+        (1, TYPE),
+        (3, FUNCTION),
+        (7, EXPORT),
+        (10, &code),
+    ]))
+    .unwrap();
+    let instance = validated.instantiate();
+    assert_eq!(instance.invoke_i32("answer"), Ok(expected));
+    assert_eq!(instance.invoke_i32("answer"), Ok(expected));
+}
+
+fn bad_code(code: &[u8], offset: usize, kind: ErrorKind) {
+    let mut bytes = module(&SECTIONS[..3]);
+    let start = push_section(&mut bytes, 10, code);
+    push_section(&mut bytes, 0, &[0]);
+    expect_error(&bytes, start + offset, kind);
+}
+
+fn bad_body(body: &[u8], offset: usize, kind: ErrorKind) {
+    let code = code_body(body);
+    bad_code(&code, code.len() - body.len() + offset, kind);
+}
+
+#[test]
+fn executes_mixed_arithmetic_in_stack_order() {
+    // 7 * (3 - 9) + 11. The immediate 11 is itself spelled 0x0b, like `end`.
+    assert_body_result(
+        &[
+            0, 0x41, 7, 0x41, 3, 0x41, 9, 0x6b, 0x6c, 0x41, 0x0b, 0x6a, 0x0b,
+        ],
+        -31,
+    );
+}
+
+#[test]
+fn wraps_all_three_arithmetic_operations() {
+    let min = [0x41, 0x80, 0x80, 0x80, 0x80, 0x78];
+    let max = [0x41, 0xff, 0xff, 0xff, 0xff, 0x07];
+    for (lhs, rhs, opcode, expected) in [
+        (max, 1, 0x6a, i32::MIN),    // MAX + 1
+        (min, 1, 0x6b, i32::MAX),    // MIN - 1
+        (min, 0x7f, 0x6c, i32::MIN), // MIN * -1
+    ] {
+        assert_body_result(
+            &[&[0][..], &lhs, &[0x41, rhs, opcode, 0x0b]].concat(),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn rejects_every_opcode_outside_the_slice() {
+    for opcode in 0..=u8::MAX {
+        if ![0x0b, 0x41, 0x6a, 0x6b, 0x6c].contains(&opcode) {
+            bad_body(
+                &[0, 0x41, 3, opcode, 0x0b],
+                3,
+                ErrorKind::UnsupportedOpcode { opcode },
+            );
+        }
+    }
+}
+
+#[test]
+fn requires_two_operands_for_each_binary_op_and_one_result_at_end() {
+    for opcode in [0x6a, 0x6b, 0x6c] {
+        bad_body(
+            &[0, opcode, 0x0b],
+            1,
+            ErrorKind::StackUnderflow { depth: 0 },
+        );
+        bad_body(
+            &[0, 0x41, 1, opcode, 0x0b],
+            3,
+            ErrorKind::StackUnderflow { depth: 1 },
+        );
+        // A reduction may leave only one operand, too.
+        bad_body(
+            &[0, 0x41, 1, 0x41, 2, 0x6a, opcode, 0x0b],
+            6,
+            ErrorKind::StackUnderflow { depth: 1 },
+        );
+    }
+    bad_body(&[0, 0x0b], 1, ErrorKind::InvalidResultDepth { depth: 0 });
+    bad_body(
+        &[0, 0x41, 1, 0x41, 2, 0x0b],
+        5,
+        ErrorKind::InvalidResultDepth { depth: 2 },
+    );
+}
+
+#[test]
+fn bounds_body_bytes_inclusively() {
+    let limit = Limit::CodeBodyBytes;
+    let mut body = vec![0, 0x41, 0];
+    // Each addition costs seven bytes with a maximally padded but legal signed LEB32.
+    for _ in 0..36 {
+        body.extend([0x41, 0x81, 0x80, 0x80, 0x80, 0, 0x6a]);
+    }
+    body.push(0x0b);
+    assert_eq!(body.len(), limit.maximum());
+    assert_body_result(&body, 36);
+
+    // Change only the encoding of the first immediate, not the instruction count or values.
+    body.splice(2..3, [0x80, 0]);
+    assert_eq!(body.len(), limit.maximum() + 1);
+    bad_code(&code_body(&body), 1, ErrorKind::LimitExceeded { limit });
+    // The bound also applies before trying to frame an unavailable body.
+    let mut length_only = vec![1];
+    push_u32(&mut length_only, body.len());
+    bad_code(&length_only, 1, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn bounds_instruction_count_inclusively() {
+    let limit = Limit::BodyInstructions;
+    let pairs = (limit.maximum() - 1) / 2;
+    assert_eq!(1 + 2 * pairs, limit.maximum());
+    let mut body = vec![0, 0x41, 0];
+    for _ in 0..pairs {
+        body.extend([0x41, 1, 0x6a]);
+    }
+    body.push(0x0b);
+    assert_body_result(&body, pairs as i32);
+
+    // A balanced program needs an odd number of non-end instructions. A further
+    // pair would preserve that shape but exceeds the budget at its first opcode.
+    let extra = body.len() - 1;
+    body.splice(extra..extra, [0x41, 1, 0x6a]);
+    bad_body(&body, extra, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn bounds_operand_depth_inclusively() {
+    let limit = Limit::OperandStackDepth;
+    let body_at_depth = |depth: usize| {
+        let mut body = vec![0];
+        for _ in 0..depth {
+            body.extend([0x41, 1]);
+        }
+        body.extend(std::iter::repeat_n(0x6a, depth - 1));
+        body.push(0x0b);
+        body
+    };
+    assert_body_result(&body_at_depth(limit.maximum()), limit.maximum() as i32);
+    bad_body(
+        &body_at_depth(limit.maximum() + 1),
+        1 + 2 * limit.maximum(),
+        ErrorKind::LimitExceeded { limit },
+    );
+}
+
 fn code_immediate(leb: &[u8]) -> Vec<u8> {
     let mut code = vec![1, u8::try_from(leb.len() + 3).unwrap(), 0, 0x41];
     code.extend_from_slice(leb);
@@ -274,8 +437,6 @@ fn requires_singleton_type_function_code_and_at_most_one_export() {
         (1, &[1, 0x61, 0, 1, 0x7f][..], 1, 0x60),
         (1, &[1, 0x60, 0, 1, 0x7e], 4, 0x7f),
         (7, &[1, 0, 1, 0], 2, 0),
-        (10, &[1, 4, 0, 0x42, 42, 0x0b], 3, 0x41),
-        (10, &[1, 4, 0, 0x41, 42, 0x01], 5, 0x0b),
     ] {
         bad_payload(
             id,
@@ -341,7 +502,7 @@ fn rejects_every_proper_prefix_of_the_demo_except_the_valid_empty_module() {
 fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
     use IntegerField::*;
     for count in 0..=4 {
-        let body = [&[0, 0x41][..], &[0x80; 4][..count]].concat();
+        let body = [&[0, 0x41, 42, 0x41][..], &[0x80; 4][..count]].concat();
         // The apparent terminating LEB byte is in the section, but not in this body.
         let mut code = vec![1, u8::try_from(body.len()).unwrap()];
         code.extend(body);

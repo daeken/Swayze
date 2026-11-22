@@ -6,9 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let script = parse_script("(2 + 3) * 4;")?;
     println!("JavaScript result: {}", script.evaluate()?);
 
-    // Import-free `() -> i32` exported as `answer`, with body `i32.const 42`.
+    // `answer: () -> i32` with body `i32.const 40; i32.const 2; i32.add`.
     let bytes = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0\
-                  \x07\x0a\x01\x06answer\0\0\x0a\x06\x01\x04\0\x41\x2a\x0b";
+                  \x07\x0a\x01\x06answer\0\0\x0a\x09\x01\x07\0\x41\x28\x41\x02\x6a\x0b";
     let module = validate_module(bytes)?;
     let result = module.instantiate().invoke_i32("answer")?;
     println!("WebAssembly result: {result}");

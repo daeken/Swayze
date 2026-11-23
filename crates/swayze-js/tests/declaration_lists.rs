@@ -112,7 +112,7 @@ fn commas_only_separate_complete_single_name_declarators() {
         ("let x, |{y}=x; y", 1, Unsupported),
         ("const x=1, |[y]=x; y", 1, Unsupported),
         ("|var x=1,y=2; y", 3, Unsupported),
-        ("for(|const x=1,y=2;;){} 0", 5, Unsupported),
+        ("for(const x=(1|,2),y=x;;){} 0", 1, Unsupported),
         ("for(;false;|const x=1,y=2){} 0", 5, Unsupported),
         ("let x,y; for(x=1|,y=2;;){} 0", 1, Unsupported),
         ("let x,y; x=1|,y=2; y", 1, Unsupported),

@@ -772,6 +772,46 @@ fn else_if_edges_go_directly_to_the_next_test_or_the_common_join() {
 }
 
 #[test]
+fn single_arms_join_at_empty_stack_and_else_binds_to_nearest_if() {
+    use Instruction::{Boolean, Discard, JumpIfFalseStatement, JumpStatement};
+
+    assert_postfix(
+        "if(true)if(false)1;else 2;else ; true",
+        &[
+            Boolean(true),
+            JumpIfFalseStatement(10),
+            Boolean(false),
+            JumpIfFalseStatement(7),
+            Number(1.0),
+            Discard,
+            JumpStatement(9),
+            Number(2.0),
+            Discard,
+            JumpStatement(10), // Outer then-arm ends only after the inner else.
+            Boolean(true),
+        ],
+        1,
+    );
+
+    assert_postfix(
+        "top:alias:if(true)if(false)break top;else break alias;else break top;true",
+        &[
+            Boolean(true),
+            JumpIfFalseStatement(8),
+            Boolean(false),
+            JumpIfFalseStatement(6),
+            JumpStatement(9), // All named breaks skip both pending joins.
+            JumpStatement(7),
+            JumpStatement(9),
+            JumpStatement(9),
+            JumpStatement(9),
+            Boolean(true),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn if_breaks_from_every_arm_share_the_direct_join() {
     use Instruction::{Boolean, Discard, JumpIfFalseStatement, JumpStatement, LoopBack};
 

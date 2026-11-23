@@ -155,20 +155,9 @@ fn invalid_targets_and_cross_kind_duplicates_point_at_the_name() {
 }
 
 #[test]
-fn braces_semicolons_and_static_scope_checks_still_apply() {
-    use ErrorKind::{Malformed, Unsupported};
+fn semicolons_and_static_scope_checks_still_apply() {
+    use ErrorKind::Unsupported;
     for (source, kind, at) in [
-        ("done:if(true) break done;42", Malformed, "break"),
-        (
-            "done:if(true){}else if(false) break done;42",
-            Malformed,
-            "break",
-        ),
-        (
-            "done:if(true){}else inner:if(false){}42",
-            Malformed,
-            "inner",
-        ),
         ("done:if(true){break done}42", Unsupported, "}"),
         (
             "done:if(true){}else{break/*\n*/done;}42",

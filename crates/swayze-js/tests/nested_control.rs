@@ -109,7 +109,7 @@ fn checks_every_nested_block_even_if_never_reached() {
         ("x=1", Unsupported),
         ("x=1\nx=2;", Unsupported),
         ("x=;", Malformed),
-        ("if(true)x=1;", Malformed),
+        ("if(true)missing=1;", Unsupported),
         ("while(false)x=1;", Malformed),
     ] {
         let source = format!(

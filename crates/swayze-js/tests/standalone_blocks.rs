@@ -122,8 +122,6 @@ fn statement_positions_do_not_expand_expression_grammar_or_insert_semicolons() {
         ("{let x=1\n|}0", 1, Unsupported),
         ("let x=|{};x", 1, Unsupported),
         ("1+|;0", 1, Malformed),
-        ("if(true)|;0", 1, Malformed),
-        ("if(false){}else|;0", 1, Malformed),
         ("while(false)|;0", 1, Malformed),
         ("for(;false;)|;0", 1, Malformed),
         ("do|;while(false);0", 1, Malformed),

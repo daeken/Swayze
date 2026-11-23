@@ -154,11 +154,7 @@ fn i64_accesses_extend_and_truncate_at_every_width_and_share_bytes_with_i32() {
 fn each_i64_access_checks_zero_pages_and_both_sides_of_the_last_valid_address() {
     for (align, load, unsigned, store) in WIDTHS {
         let width = 1 << align;
-        for (memory, can_grow) in [
-            (&[1, 1, 0, 0][..], false),
-            (&[1, 0, 0][..], true),
-            (&[1, 1, 0, 1][..], true),
-        ] {
+        for (memory, can_grow) in [(&[1, 1, 0, 0][..], false), (&[1, 1, 0, 1][..], true)] {
             let module = width_module(memory, align, load, unsigned, store);
             let instance = module.instantiate().unwrap();
             let invoke = |name, address, pattern| {
@@ -199,6 +195,46 @@ fn each_i64_access_checks_zero_pages_and_both_sides_of_the_last_valid_address() 
             assert_eq!(invoke("word", 0, 0), Ok(1));
             assert_eq!(instance.invoke_i32_with_args("grow", &[1]), Ok(-1));
         }
+    }
+}
+
+#[test]
+fn each_width_checks_then_crosses_the_page_seam_after_growth() {
+    for (align, load, unsigned, store) in WIDTHS {
+        let width = 1usize << align;
+        let module = width_module(&[1, 0, 1], align, load, unsigned, store);
+        let instance = module.instantiate().unwrap();
+        let invoke =
+            |name, address, pattern| instance.invoke_i32_with_args(name, &args(address, pattern));
+        let address = PAGE - 2; // Offset 1: effective address PAGE - 1.
+        let pattern = 0x9876_54f2_e1d0_bca9u64 as i64;
+        // A byte fits in page one, but no wider store may change even that byte.
+        if width > 1 {
+            assert_eq!(invoke("write", address, -1), Err(OOB));
+            for name in ["signed", "unsigned"] {
+                assert_eq!(invoke(name, address, -1), Err(OOB));
+            }
+            assert_eq!(instance.invoke_i32_with_args("byte", &[PAGE - 1]), Ok(0));
+        }
+        assert_eq!(instance.invoke_i32_with_args("byte", &[PAGE]), Err(OOB));
+        assert_eq!(instance.invoke_i32_with_args("grow", &[1]), Ok(1));
+        let shift = 64 - width * 8;
+        for base in [address, address + 1] {
+            assert_eq!(invoke("write", base, pattern), Ok(42));
+            assert_eq!(invoke("signed", base, (pattern << shift) >> shift), Ok(1));
+            let zero_extended = ((pattern as u64) << shift >> shift) as i64;
+            assert_eq!(invoke("unsigned", base, zero_extended), Ok(1));
+            for (i, &byte) in pattern.to_le_bytes()[..width].iter().enumerate() {
+                assert_eq!(
+                    instance.invoke_i32_with_args("byte", &[base + 1 + i as i32]),
+                    Ok(i32::from(byte))
+                );
+            }
+        }
+        let last = 2 * PAGE - width as i32 - 1;
+        assert_eq!(invoke("write", last, pattern), Ok(42));
+        assert_eq!(invoke("write", last + 1, -1), Err(OOB));
+        assert_eq!(invoke("signed", last, (pattern << shift) >> shift), Ok(1));
     }
 }
 

@@ -103,12 +103,15 @@ fn counts_as_one_decoded_instruction_with_the_reserved_byte_inside_the_body() {
 
 #[test]
 fn growth_observes_the_declared_maximum_and_never_wraps_the_unsigned_delta() {
-    for (limits, initial, grows) in [
-        (MAX_ZERO, 0, false),
-        (ZERO_PAGES, 0, true),
-        (MAX_ONE, 0, true),
-        (ONE_PAGE, 1, false),
-        (TWO_BOUNDS, 1, false),
+    for (limits, initial, cap) in [
+        (MAX_ZERO, 0, 0),
+        (ZERO_PAGES, 0, 2),
+        (MAX_ONE, 0, 1),
+        (ONE_PAGE, 1, 1),
+        (&[1, 1, 0, 2], 0, 2),
+        (&[1, 0, 1], 1, 2),
+        (CORE_MAX, 0, 2),
+        (TWO_PAGES, 2, 2),
     ] {
         let module = memory_functions(
             limits,
@@ -137,47 +140,45 @@ fn growth_observes_the_declared_maximum_and_never_wraps_the_unsigned_delta() {
         let write = |address, value| instance.invoke_i32_with_args("write", &[address, value]);
         assert_eq!(size(), Ok(initial));
         assert_eq!(grow(0), Ok(initial));
-        if initial == 0 {
-            assert_eq!(read(0), Err(OOB));
-        }
-        for delta in [2, i32::MAX, i32::MIN, -1] {
-            assert_eq!(grow(delta), Ok(-1));
-            assert_eq!(size(), Ok(initial));
-        }
-        assert_eq!(grow(1), Ok(if grows { 0 } else { -1 }));
-        let current = initial + i32::from(grows);
-        assert_eq!(size(), Ok(current));
-        if current == 1 {
-            assert_eq!(read(0), Ok(0));
-            assert_eq!(read(PAGE - 4), Ok(0));
-            assert_eq!(read8(PAGE - 1), Ok(0));
-            assert_eq!(read8(PAGE), Err(OOB));
-            assert_eq!(write(0, 0x1122_3344), Ok(42));
-            assert_eq!(write(PAGE - 4, 0x1234_5678), Ok(42));
-        }
-        for delta in [1, 2, i32::MAX, i32::MIN, -1] {
-            assert_eq!(grow(delta), Ok(-1));
+        const MARK: i32 = 0x1234_5678;
+        for current in initial..=cap {
             assert_eq!(size(), Ok(current));
-            if current == 1 {
-                assert_eq!(read(0), Ok(0x1122_3344));
-                assert_eq!(read(PAGE - 4), Ok(0x1234_5678));
-                assert_eq!(read8(PAGE - 1), Ok(0x12));
+            assert_eq!(grow(0), Ok(current));
+            if current != 0 {
+                // The latest page starts zeroed, including the last byte.
+                assert_eq!(read((current - 1) * PAGE), Ok(0));
+                assert_eq!(read(current * PAGE - 4), Ok(0));
+                assert_eq!(read8(current * PAGE - 1), Ok(0));
+                assert_eq!(write(current * PAGE - 4, MARK), Ok(42));
             }
-        }
-        assert_eq!(grow(0), Ok(current));
-        assert_eq!(size(), Ok(current));
-        if current == 1 {
-            assert_eq!(read(PAGE - 4), Ok(0x1234_5678));
-            assert_eq!(read(PAGE - 3), Err(OOB));
-        } else {
-            assert_eq!(read(0), Err(OOB));
+            assert_eq!(
+                read(current * PAGE - if current == 0 { 0 } else { 3 }),
+                Err(OOB)
+            );
+            assert_eq!(read8(current * PAGE), Err(OOB));
+            for delta in [cap - current + 1, i32::MAX, i32::MIN, -1] {
+                assert_eq!(grow(delta), Ok(-1));
+                assert_eq!(size(), Ok(current));
+            }
+            // Rejected growth and any replacement keep all earlier stores.
+            for page in initial.max(1)..=current {
+                assert_eq!(read(page * PAGE - 4), Ok(MARK));
+                assert_eq!(read8(page * PAGE - 1), Ok(0x12));
+            }
+            assert_eq!(grow(1), Ok(if current < cap { current } else { -1 }));
         }
         let fresh = module.instantiate().unwrap();
         assert_eq!(fresh.invoke_i32("size"), Ok(initial));
         assert_eq!(
             fresh.invoke_i32_with_args("read", &[PAGE - 4]),
-            if initial == 1 { Ok(0) } else { Err(OOB) }
+            if initial == 0 { Err(OOB) } else { Ok(0) }
         );
+        if initial == 0 && cap == 2 {
+            assert_eq!(fresh.invoke_i32_with_args("grow", &[2]), Ok(0));
+            assert_eq!(fresh.invoke_i32("size"), Ok(2));
+            assert_eq!(fresh.invoke_i32_with_args("read", &[PAGE - 1]), Ok(0));
+            assert_eq!(fresh.invoke_i32_with_args("read", &[2 * PAGE - 4]), Ok(0));
+        }
     }
 }
 
@@ -189,7 +190,8 @@ fn direct_and_indirect_calls_share_growth_even_if_the_invocation_traps() {
         &[0, 0x41, 1, 0x41, 0, 0x11, 0, 0, SIZE, 0, 0x6a, 0x0b], // same via table
         &[
             0, 0x10, 2, 0x1a, // call the indirect wrapper and discard its result
-            0x41, 0, 0x41, 12, STORE, 2, 0, 0x00, 0x0b,
+            0x41, 0, 0x41, 12, STORE, 2, 0x80, 0x80, 0x04, // Store at PAGE.
+            0x00, 0x0b,
         ],
         SIZE_BODY,
         READ,
@@ -198,7 +200,7 @@ fn direct_and_indirect_calls_share_growth_even_if_the_invocation_traps() {
         (1, &i32_types(&[1, 0])),
         (3, &[6, 0, 1, 1, 1, 1, 0]),
         (4, &[1, 0x70, 0, 1]),
-        (5, ZERO_PAGES),
+        (5, &[1, 0, 1]),
         (
             7,
             &function_exports(&[
@@ -215,15 +217,16 @@ fn direct_and_indirect_calls_share_growth_even_if_the_invocation_traps() {
     let module = validate_module(&bytes).unwrap();
     for name in ["direct", "indirect", "trap"] {
         let instance = module.instantiate().unwrap();
-        assert_eq!(instance.invoke_i32("size"), Ok(0));
+        assert_eq!(instance.invoke_i32("size"), Ok(1));
+        assert_eq!(instance.invoke_i32_with_args("read", &[PAGE]), Err(OOB));
         let (result, stored) = if name == "trap" {
             (Err(InvokeError::Trap(Trap::Unreachable)), 12)
         } else {
-            (Ok(1), 0)
+            (Ok(3), 0)
         };
         assert_eq!(instance.invoke_i32(name), result);
-        assert_eq!(instance.invoke_i32("size"), Ok(1));
-        assert_eq!(instance.invoke_i32_with_args("read", &[0]), Ok(stored));
+        assert_eq!(instance.invoke_i32("size"), Ok(2));
+        assert_eq!(instance.invoke_i32_with_args("read", &[PAGE]), Ok(stored));
     }
 }
 
@@ -245,21 +248,35 @@ fn grow_consumes_one_dispatch_and_does_not_run_if_the_budget_is_exhausted() {
         body
     };
     let module = memory_functions(
-        ZERO_PAGES,
-        &[1, 0],
-        &[0, 0, 1],
-        &[(b"at_cap", 0), (b"over_cap", 1), (b"size", 2)],
-        &[&body(0), &body(1), SIZE_BODY],
+        &[1, 0, 1],
+        &[1, 0, 2],
+        &[0, 0, 1, 0, 2],
+        &[
+            (b"at_cap", 0),
+            (b"over_cap", 1),
+            (b"size", 2),
+            (b"read", 3),
+            (b"write", 4),
+        ],
+        &[&body(0), &body(1), SIZE_BODY, READ, WRITE],
     );
     let instance = module.instantiate().unwrap();
     let args = &[iterations as i32];
     assert_eq!(
+        instance.invoke_i32_with_args("write", &[PAGE - 4, 42]),
+        Ok(42)
+    );
+    assert_eq!(
         instance.invoke_i32_with_args("over_cap", args),
         Err(InvokeError::LimitExceeded { limit })
     );
-    assert_eq!(instance.invoke_i32("size"), Ok(0));
-    assert_eq!(instance.invoke_i32_with_args("at_cap", args), Ok(0));
     assert_eq!(instance.invoke_i32("size"), Ok(1));
+    assert_eq!(instance.invoke_i32_with_args("read", &[PAGE - 4]), Ok(42));
+    assert_eq!(instance.invoke_i32_with_args("read", &[PAGE]), Err(OOB));
+    assert_eq!(instance.invoke_i32_with_args("at_cap", args), Ok(1));
+    assert_eq!(instance.invoke_i32("size"), Ok(2));
+    assert_eq!(instance.invoke_i32_with_args("read", &[PAGE - 4]), Ok(42));
+    assert_eq!(instance.invoke_i32_with_args("read", &[PAGE]), Ok(0));
     assert_eq!(instance.invoke_i32_with_args("at_cap", args), Ok(-1));
 }
 

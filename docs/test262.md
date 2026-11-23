@@ -17,10 +17,49 @@ sh tools/check-test262.sh
 
 The check compares the submodule HEAD with the committed superproject gitlink,
 checks representative paths, and rejects tracked changes. It does not inventory
-untracked files. Use a fresh checkout for CI; a future runner should discover
-cases from the pinned Git tree rather than a filesystem glob. This is a corpus
-smoke check, not a Test262 runner or a conformance/pass claim. Normal Cargo builds
-do not initialize, download, or execute the corpus.
+untracked files. The default merge gate uses only this non-executing check.
+Normal Cargo builds do not initialize, download, or execute the corpus.
+
+## Run the reviewed slice
+
+In a disposable, credential-free checkout of the reviewed commit with the
+pinned submodule and Rust toolchain already installed, run:
+
+```sh
+sh tools/run-test262.sh
+```
+
+The opt-in wrapper builds and runs the Swayze example in debug and release.
+The example takes no arbitrary case paths, reads its committed allowlist and
+selected blobs from Git objects, and checks the exact Test262 pin. It evaluates
+these cases only through Swayze; no Test262 harness JS, includes, Node.js or
+external guest engine runs. Run with network disabled and access limited to the
+checkout and necessary tools. The wrapper itself is not a sandbox. Use
+`sh tools/run-test262.sh --self-test` for synthetic adapter checks without
+running corpus cases.
+
+An **adapted** case is a reviewed single final `assert.sameValue` call in a
+comment-only surrounding source. The adapter evaluates its parenthesized actual
+expression in Swayze and compares it with a separately evaluated primitive
+literal expectation. It compares exact value tags and UTF-16 code units,
+distinguishes `+0` and `-0`, and treats any two NaNs as the same value. It is not
+a general assertion rewriter. **Raw** mode is reserved for reviewed positive
+`raw` cases run unchanged; there are none in the first cohort. Strict variants
+are reported as not run, never as passes. No negative, module or harness-heavy
+cases are credited.
+
+The first cohort covers numeric separators, U+2028 in a String, and unary
+positive and negative zero. These are required adapted sloppy-mode passes.
+The `typeof x` unresolvable-reference test is a frontier case: the runner
+attempts it and reports its current unsupported result. A required variant
+becoming unsupported, a wrong result, or no required passes exits 1;
+infrastructure errors exit 2. Frontier unsupported alone does not fail the
+run. Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
+against the full pinned blob. Reproduce a frontier result before changing the
+engine, rerun the same blob after the fix, then promote the case to required.
+This is regression evidence for a small subset, not a Test262 conformance score.
+
+## Update the pin
 
 To update intentionally, fetch the official upstream in the submodule, check out a
 chosen commit, review its changes and license, and stage the new gitlink in the

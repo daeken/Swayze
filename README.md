@@ -46,7 +46,7 @@ git submodule update --init --depth 1 -- vendor/test262
 sh tools/check-test262.sh
 ```
 
-This checks the revision and sample paths; it does **not** run JavaScript. See [corpus maintenance](docs/test262.md) for the trust boundary, license and update process.
+This checks the revision and sample paths; it does **not** run JavaScript. For development, `sh tools/run-test262.sh` runs a small reviewed slice through Swayze in debug and release. It reports adapted cases separately from unmodified cases and is not a conformance run. See [Test262 development and maintenance](docs/test262.md) for the setup, isolation and how to add a regression.
 
 With Node.js on `PATH`, `sh tools/check-js-reference.sh` and `sh tools/check-wasm-reference.sh` compare generated fixtures against an independent engine. The Wasm check uses Node.js v22, compares `i64` values as BigInts, and compares copies from memory exports byte-for-byte. Neither check is required by the local merge gate.
 

@@ -87,7 +87,7 @@ fn module_invokes_a_validated_constant_export() {
     let bytes = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0\
                   \x07\x0a\x01\x06answer\0\0\x0a\x06\x01\x04\0\x41\x2a\x0b";
     let module = validate_module(bytes).unwrap();
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     assert_eq!(instance.invoke_i32("answer"), Ok(42));
     assert_eq!(
         instance.invoke_i32("other"),

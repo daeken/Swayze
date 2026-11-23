@@ -7,7 +7,8 @@ pub use swayze_js::{
 };
 pub use swayze_wasm::{
     Error as WasmValidationError, ErrorKind as WasmErrorKind, ExecutionLimit as WasmExecutionLimit,
-    Instance as WasmInstance, IntegerField as WasmIntegerField, InvokeError as WasmInvokeError,
+    Instance as WasmInstance, InstantiationError as WasmInstantiationError,
+    IntegerField as WasmIntegerField, InvokeError as WasmInvokeError,
     LengthField as WasmLengthField, Limit as WasmLimit, Module as WasmModule, Trap as WasmTrap,
     validate_module,
 };

@@ -41,11 +41,19 @@ fn sleb32(mut value: i32, min_width: usize) -> Vec<u8> {
     }
 }
 
-fn singleton_module(parameter_count: u8, locals: &[u8], expression: &[u8]) -> Vec<u8> {
+fn singleton_module(
+    parameter_count: u8,
+    locals: &[u8],
+    expression: &[u8],
+    memory_pages: Option<u8>,
+) -> Vec<u8> {
     let mut module = b"\0asm\x01\0\0\0".to_vec();
     module.extend([1, 5 + parameter_count, 1, 0x60, parameter_count]);
     module.extend(std::iter::repeat_n(0x7f, usize::from(parameter_count)));
     module.extend([1, 0x7f, 3, 2, 1, 0]); // One i32 result; one function of type 0.
+    if let Some(pages) = memory_pages {
+        module.extend([5, 3, 1, 0, pages]); // One defined memory, minimum only.
+    }
     let name_len = EXPORT.len() as u8;
     module.extend([7, name_len + 4, 1, name_len]); // Export section, one name.
     module.extend(EXPORT.bytes());
@@ -85,7 +93,7 @@ impl Fixture {
     ) -> Self {
         Self {
             expected,
-            bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression),
+            bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression, None),
             export: EXPORT,
             args: args.to_vec(),
         }
@@ -283,6 +291,29 @@ fn fixtures() -> Vec<Fixture> {
             &countdown,
         ));
     }
+    use WasmTrap::MemoryOutOfBounds;
+    let load = [0x20, 0, 0x28, 2, 0];
+    let store_then_load = [0x20, 0, 0x20, 1, 0x36, 2, 0, 0x20, 0, 0x28, 2, 0];
+    for (pages, args, expression, expected) in [
+        (1, &[1][..], &load[..], Ok(0)),
+        (0, &[0][..], &load[..], Err(MemoryOutOfBounds)),
+        (1, &[65533][..], &load[..], Err(MemoryOutOfBounds)),
+        (1, &[-1][..], &load[..], Err(MemoryOutOfBounds)),
+        (1, &[65532, -456][..], &store_then_load[..], Ok(-456)),
+        (
+            1,
+            &[1, 0x1234_5678][..],
+            &store_then_load[..],
+            Ok(0x1234_5678),
+        ),
+    ] {
+        cases.push(Fixture {
+            expected,
+            bytes: singleton_module(args.len() as u8, &[0], expression, Some(pages)),
+            export: EXPORT,
+            args: args.to_vec(),
+        });
+    }
     cases
 }
 
@@ -297,7 +328,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn evaluate(fixture: &Fixture) -> Result<Result<i32, WasmTrap>, Box<dyn Error>> {
     match validate_module(&fixture.bytes)?
-        .instantiate()
+        .instantiate()?
         .invoke_i32_with_args(fixture.export, &fixture.args)
     {
         Ok(value) => Ok(Ok(value)),

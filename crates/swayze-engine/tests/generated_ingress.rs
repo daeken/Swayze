@@ -125,7 +125,7 @@ fn generated_wasm_steps_evaluate_exactly() {
     for steps in 1..=CASES {
         let module = validate_module(&wasm_fixture(steps).bytes)
             .unwrap_or_else(|error| panic!("{steps} steps: {error}"));
-        let instance = module.instantiate();
+        let instance = module.instantiate().unwrap();
         for (seed, factor) in [(7_i32, 3_i32), (i32::MAX - 5, -2)] {
             // With delta = factor - 1, acc + 1 is multiplied by factor at
             // every step. Use the closed form in the same wrapping ring.

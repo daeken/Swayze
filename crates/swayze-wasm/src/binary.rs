@@ -970,6 +970,8 @@ enum Instruction {
     Select,
     Const(Operand),
     Convert(Conversion),
+    FloatUnary(FloatWidth, FloatUnaryOp),
+    FloatCopysign(FloatWidth),
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
@@ -1074,6 +1076,20 @@ impl Operand {
             _ => unreachable!("validated i64 operand"),
         }
     }
+
+    fn f32_bits(self) -> u32 {
+        match self {
+            Self::F32(bits) => bits,
+            _ => unreachable!("validated f32 operand"),
+        }
+    }
+
+    fn f64_bits(self) -> u64 {
+        match self {
+            Self::F64(bits) => bits,
+            _ => unreachable!("validated f64 operand"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1105,16 +1121,52 @@ impl Conversion {
             Self::WrapI64 => Operand::I32(value.as_i64() as i32),
             Self::ExtendI32S => Operand::I64(i64::from(value.as_i32())),
             Self::ExtendI32U => Operand::I64(i64::from(value.as_i32() as u32)),
-            Self::I32ReinterpretF32 => match value {
-                Operand::F32(bits) => Operand::I32(bits as i32),
-                _ => unreachable!("validated f32 operand"),
-            },
-            Self::I64ReinterpretF64 => match value {
-                Operand::F64(bits) => Operand::I64(bits as i64),
-                _ => unreachable!("validated f64 operand"),
-            },
+            Self::I32ReinterpretF32 => Operand::I32(value.f32_bits() as i32),
+            Self::I64ReinterpretF64 => Operand::I64(value.f64_bits() as i64),
             Self::F32ReinterpretI32 => Operand::F32(value.as_i32() as u32),
             Self::F64ReinterpretI64 => Operand::F64(value.as_i64() as u64),
+        }
+    }
+}
+
+const F32_SIGN: u32 = 1 << 31;
+const F64_SIGN: u64 = 1 << 63;
+
+#[derive(Clone, Copy, Debug)]
+enum FloatWidth {
+    F32,
+    F64,
+}
+
+impl FloatWidth {
+    fn operand_type(self) -> ValType {
+        match self {
+            Self::F32 => ValType::F32,
+            Self::F64 => ValType::F64,
+        }
+    }
+
+    fn copysign(self, lhs: Operand, rhs: Operand) -> Operand {
+        match self {
+            Self::F32 => Operand::F32((lhs.f32_bits() & !F32_SIGN) | (rhs.f32_bits() & F32_SIGN)),
+            Self::F64 => Operand::F64((lhs.f64_bits() & !F64_SIGN) | (rhs.f64_bits() & F64_SIGN)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FloatUnaryOp {
+    Abs,
+    Neg,
+}
+
+impl FloatUnaryOp {
+    fn apply(self, width: FloatWidth, value: Operand) -> Operand {
+        match (width, self) {
+            (FloatWidth::F32, Self::Abs) => Operand::F32(value.f32_bits() & !F32_SIGN),
+            (FloatWidth::F32, Self::Neg) => Operand::F32(value.f32_bits() ^ F32_SIGN),
+            (FloatWidth::F64, Self::Abs) => Operand::F64(value.f64_bits() & !F64_SIGN),
+            (FloatWidth::F64, Self::Neg) => Operand::F64(value.f64_bits() ^ F64_SIGN),
         }
     }
 }
@@ -1575,6 +1627,15 @@ pub(super) fn execute(
                 let value = op.apply(frame.pop());
                 frame.push(value);
             }
+            Instruction::FloatUnary(width, op) => {
+                let value = op.apply(width, frame.pop());
+                frame.push(value);
+            }
+            Instruction::FloatCopysign(width) => {
+                let rhs = frame.pop();
+                let lhs = frame.pop();
+                frame.push(width.copysign(lhs, rhs));
+            }
             Instruction::LocalGet(index) => frame.push(frame.locals[index as usize].into()),
             Instruction::LocalSet(index) => {
                 frame.locals[index as usize] = frame.pop().into_integer()
@@ -1978,6 +2039,14 @@ fn validate_plain_stack(
             let (from, to) = op.types();
             (1, Some(from), Some(to))
         }
+        Instruction::FloatUnary(width, _) => {
+            let ty = Some(width.operand_type());
+            (1, ty, ty)
+        }
+        Instruction::FloatCopysign(width) => {
+            let ty = Some(width.operand_type());
+            (2, ty, ty)
+        }
         Instruction::LocalGet(index) => (0, None, Some(local_zeros[index as usize].operand_type())),
         Instruction::GlobalGet(index) => (
             0,
@@ -2224,6 +2293,12 @@ fn decode_plain(
         0x88 => Instruction::I64Binary(I64BinaryOp::ShrU),
         0x89 => Instruction::I64Binary(I64BinaryOp::Rotl),
         0x8a => Instruction::I64Binary(I64BinaryOp::Rotr),
+        0x8b => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Abs),
+        0x8c => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Neg),
+        0x98 => Instruction::FloatCopysign(FloatWidth::F32),
+        0x99 => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Abs),
+        0x9a => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Neg),
+        0xa6 => Instruction::FloatCopysign(FloatWidth::F64),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),

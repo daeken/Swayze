@@ -8,6 +8,12 @@ const I32_FROM_F32: u8 = 0xbc;
 const I64_FROM_F64: u8 = 0xbd;
 const F32_FROM_I32: u8 = 0xbe;
 const F64_FROM_I64: u8 = 0xbf;
+const F32_ABS: u8 = 0x8b;
+const F32_NEG: u8 = 0x8c;
+const F32_COPYSIGN: u8 = 0x98;
+const F64_ABS: u8 = 0x99;
+const F64_NEG: u8 = 0x9a;
+const F64_COPYSIGN: u8 = 0xa6;
 const I64_RESULT: &[u8] = &[1, 0x60, 0, 1, 0x7e];
 const F32_SNAN: u32 = 0x7f80_0b12; // Includes a literal `end` byte.
 const F64_SNAN: u64 = 0xfff0_000b_89ab_cdef;
@@ -57,6 +63,70 @@ fn fixed_width_constants_and_all_reinterpretations_preserve_every_bit() {
         assert_bits(I64_RESULT, &body, &[], ResultKind::I64, value);
         let round_trip = [0, 0x20, 0, F64_FROM_I64, I64_FROM_F64, 0x0b];
         assert_bits(&i64_param, &round_trip, &[value], ResultKind::I64, value);
+    }
+}
+
+#[test]
+fn sign_operations_preserve_every_non_sign_bit() {
+    let f32_pairs = [
+        (0x0000_0000, 0x8000_0000), // Zero.
+        (0x7f80_0000, 0xff80_0000), // Infinity.
+        (0x40ad_4321, 0xc0ad_4321), // Normal.
+        (0x0012_3456, 0x8012_3456), // Subnormal.
+        (0x7fc1_2345, 0xffc1_2345), // Quiet NaN.
+        (F32_SNAN, 0xff80_0b12),    // Signaling NaN.
+    ]
+    .map(|(pos, neg): (u32, u32)| (Value::I32(pos as i32), Value::I32(neg as i32)));
+    let f64_pairs = [
+        (0x0000_0000_0000_0000, 0x8000_0000_0000_0000),
+        (0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000),
+        (0x43ad_cdef_789a_4321, 0xc3ad_cdef_789a_4321),
+        (0x0001_2345_6789_abcd, 0x8001_2345_6789_abcd),
+        (0x7ff8_7654_3210_0b01, 0xfff8_7654_3210_0b01),
+        (0x7ff0_000b_89ab_cdef, F64_SNAN),
+    ]
+    .map(|(pos, neg): (u64, u64)| (Value::I64(pos as i64), Value::I64(neg as i64)));
+
+    for (int, result, [to_float, to_int], [abs, neg, copysign], pairs) in [
+        (
+            0x7f,
+            ResultKind::I32,
+            [F32_FROM_I32, I32_FROM_F32],
+            [F32_ABS, F32_NEG, F32_COPYSIGN],
+            f32_pairs,
+        ),
+        (
+            0x7e,
+            ResultKind::I64,
+            [F64_FROM_I64, I64_FROM_F64],
+            [F64_ABS, F64_NEG, F64_COPYSIGN],
+            f64_pairs,
+        ),
+    ] {
+        let unary_type = types(&[(&[int], Some(int))]);
+        let binary_type = types(&[(&[int; 2], Some(int))]);
+        let body = [
+            0, 0x20, 0, to_float, 0x20, 1, to_float, copysign, to_int, 0x0b,
+        ];
+        let [zero, _, _, _, quiet, signaling] = pairs;
+        for (positive, negative) in pairs {
+            for (input, opposite) in [(positive, negative), (negative, positive)] {
+                for (opcode, expected) in [(abs, positive), (neg, opposite)] {
+                    let body = [0, 0x20, 0, to_float, opcode, to_int, 0x0b];
+                    assert_bits(&unary_type, &body, &[input], result, expected);
+                }
+                // Both zero signs and NaN signs are significant, but the rhs
+                // magnitude (including NaN quiet bit and payload) is ignored.
+                for (rhs, expected) in [
+                    (zero.0, positive),
+                    (zero.1, negative),
+                    (quiet.0, positive),
+                    (signaling.1, negative),
+                ] {
+                    assert_bits(&binary_type, &body, &[input, rhs], result, expected);
+                }
+            }
+        }
     }
 }
 
@@ -174,6 +244,95 @@ fn reinterpret_requires_its_exact_source_type_and_produces_a_concrete_type() {
         mismatch(I64, I32),
     );
     bad_body(&[0, 0, I64_FROM_F64, 0x0b], 3, mismatch(I32, I64));
+}
+
+#[test]
+fn sign_operations_require_same_width_float_operands_even_in_dead_code() {
+    let zero32 = &b"\x43\0\0\0\0"[..];
+    let zero64 = &b"\x44\0\0\0\0\0\0\0\0"[..];
+    let int32 = &b"\x41\0"[..];
+    let int64 = &b"\x42\0"[..];
+    for (ty, other, int, zero, wrong_width, wrong_kind, ops) in [
+        (
+            F32,
+            F64,
+            I32,
+            zero32,
+            zero64,
+            int32,
+            [F32_ABS, F32_NEG, F32_COPYSIGN],
+        ),
+        (
+            F64,
+            F32,
+            I64,
+            zero64,
+            zero32,
+            int64,
+            [F64_ABS, F64_NEG, F64_COPYSIGN],
+        ),
+    ] {
+        for (index, opcode) in ops.into_iter().enumerate() {
+            let binary = index == 2;
+            for prefix in [&[0][..], &[0, 0][..]] {
+                for (wrong, actual) in [(wrong_width, other), (wrong_kind, int)] {
+                    let mut body = [prefix, if binary { zero } else { &[] }, wrong].concat();
+                    let offset = body.len();
+                    body.extend([opcode, 0x1a, 0x41, 42, 0x0b]);
+                    bad_body(&body, offset, mismatch(ty, actual));
+                    if binary {
+                        // The lhs must also have the required type.
+                        let mut body = [prefix, wrong, zero].concat();
+                        let offset = body.len();
+                        body.extend([opcode, 0x1a, 0x41, 42, 0x0b]);
+                        bad_body(&body, offset, mismatch(ty, actual));
+                    }
+                }
+            }
+            // Even with entirely implicit inputs, the result is concrete.
+            bad_body(&[0, 0, opcode, 0x0b], 3, mismatch(I32, ty));
+        }
+        let mut body = [&[0][..], wrong_kind, wrong_width].concat();
+        let offset = body.len();
+        body.extend([ops[2], 0x1a, 0x41, 42, 0x0b]);
+        bad_body(&body, offset, mismatch(ty, other)); // Topmost mismatch first.
+
+        let mut body = [&[0, 0][..], wrong_kind].concat();
+        let offset = body.len();
+        body.extend([ops[2], 0x1a, 0x0b]);
+        bad_body(&body, offset, mismatch(ty, int)); // Dead floor supplies only the lhs.
+    }
+}
+
+#[test]
+fn sign_operations_preserve_underflow_and_dead_floor_diagnostics() {
+    for opcode in [
+        F32_ABS,
+        F32_NEG,
+        F32_COPYSIGN,
+        F64_ABS,
+        F64_NEG,
+        F64_COPYSIGN,
+    ] {
+        // The i32 prefix is below an inner void block's floor.
+        let mut body = vec![0, 0x41, 42, 0x02, 0x40, opcode, 0x1a, 0x0b, 0x0b];
+        bad_body(&body, 5, ErrorKind::StackUnderflow { depth: 0 });
+        body.insert(5, 0x00);
+        let validated = exported_function(TYPE, &code_body(&body));
+        assert_eq!(
+            validated.instantiate().unwrap().invoke_i32("answer"),
+            Err(InvokeError::Trap(Trap::Unreachable))
+        );
+        // An unknown slot above the dead floor is also a valid input.
+        body.insert(6, 0x1b);
+        exported_function(TYPE, &code_body(&body));
+    }
+    for opcode in [F32_COPYSIGN, F64_COPYSIGN] {
+        // With one wrong-typed operand above the live floor, report underflow
+        // before a type error, without counting the i32 below the floor.
+        let body = [0, 0x41, 42, 0x02, 0x40, 0x41, 0, opcode, 0x1a, 0x0b, 0x0b];
+        bad_body(&body, 7, ErrorKind::StackUnderflow { depth: 1 });
+    }
 }
 
 #[test]
@@ -335,7 +494,84 @@ fn constants_and_reinterprets_share_existing_body_and_stack_caps() {
 }
 
 #[test]
-fn all_six_opcodes_charge_the_shared_dispatch_budget() {
+fn sign_operations_share_the_existing_stack_and_instruction_caps() {
+    let mut body = vec![0, 0x41, 42];
+    for _ in 1..30 {
+        body.extend([0x41, 0]);
+    }
+    push_f32(&mut body, F32_SNAN);
+    push_f32(&mut body, 0x8000_0000);
+    let full = body.len(); // All 32 operand slots occupied.
+    body.extend([F32_ABS, F32_NEG, F32_COPYSIGN, 0x1a]);
+    body.extend([0x1a; 29]); // Leave the first i32 as the result.
+    body.extend([0x01; 62]);
+    let end = body.len();
+    body.push(0x0b); // 32 pushes + 3 sign ops + 30 drops + 62 nops = 127.
+    assert_body_result(&body, 42);
+    body.insert(end, 0x01);
+    bad_body(
+        &body,
+        end,
+        ErrorKind::LimitExceeded {
+            limit: Limit::BodyInstructions,
+        },
+    );
+
+    for opcode in [F32_ABS, F64_COPYSIGN] {
+        // A dead block entered at full depth can synthesize its inputs but
+        // still has no physical slot for the concrete float result.
+        let mut at_floor = body[..full].to_vec();
+        at_floor.extend([0x02, 0x40, 0x00, opcode, 0x1a, 0x0b, 0x0b]);
+        bad_body(
+            &at_floor,
+            full + 3,
+            ErrorKind::LimitExceeded {
+                limit: Limit::OperandStackDepth,
+            },
+        );
+    }
+}
+
+#[test]
+fn each_sign_operation_uses_one_shared_dispatch() {
+    let mut body = vec![0, 0x03, 0x40]; // Loop until --p0 == 0.
+    push_f32(&mut body, F32_SNAN);
+    body.extend([F32_ABS, F32_NEG]);
+    push_f32(&mut body, 0);
+    body.extend([F32_COPYSIGN, 0x1a]);
+    push_f64(&mut body, F64_SNAN);
+    body.extend([F64_ABS, F64_NEG]);
+    push_f64(&mut body, 1 << 63);
+    body.extend([F64_COPYSIGN, 0x1a]);
+    body.extend([0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x0d, 0, 0x0b]); // 17 per loop.
+    body.push(0x01);
+    push_f32(&mut body, F32_SNAN);
+    body.push(F32_NEG);
+    let last = body.len();
+    body.extend([I32_FROM_F32, 0x0b]); // 17 * 60 + 4 = 1024.
+    let ty = i32_type(1);
+    assert_bits(
+        &ty,
+        &body,
+        &[Value::I32(60)],
+        ResultKind::I32,
+        Value::I32(0xff80_0b12u32 as i32),
+    );
+    body.insert(last, F32_NEG);
+    let validated = exported_function(&ty, &code_body(&body));
+    assert_eq!(
+        validated
+            .instantiate()
+            .unwrap()
+            .invoke_i32_with_args("answer", &[60]),
+        Err(InvokeError::LimitExceeded {
+            limit: ExecutionLimit::InstructionDispatches
+        })
+    );
+}
+
+#[test]
+fn constants_and_reinterprets_charge_the_shared_dispatch_budget() {
     let mut body = vec![0, 0x03, 0x40]; // Loop until --p0 == 0.
     push_f32(&mut body, F32_SNAN);
     body.extend([I32_FROM_F32, F32_FROM_I32, I32_FROM_F32, 0x1a]);

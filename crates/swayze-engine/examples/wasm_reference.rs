@@ -1223,6 +1223,31 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(bits as i64)],
         });
     }
+    // Widening preserves the source value even for f32 subnormals.
+    for bits in [1, 0x007f_ffff, 0x8000_0000, 0x7f80_0000] {
+        cases.push(Fixture {
+            expected: Outcome::F64Invocation(Ok(f64::from(f32::from_bits(bits)).to_bits())),
+            bytes: modules(0x7d, 0x7c, 0xbb),
+            export: "x",
+            args: vec![WasmValue::F32(bits)],
+        });
+    }
+    // Demotion: midpoint between zero and the least subnormal, midpoint
+    // between 1 and its next f32 neighbor, and the overflow midpoint.
+    for (midpoint, at_tie, above_tie) in [
+        (0x3690_0000_0000_0000_u64, 0, 1),
+        (0x3ff0_0000_1000_0000, 0x3f80_0000, 0x3f80_0001),
+        (0x47ef_ffff_f000_0000, 0x7f80_0000, 0x7f80_0000),
+    ] {
+        for (input, expected) in [(midpoint, at_tie), (midpoint + 1, above_tie)] {
+            cases.push(Fixture {
+                expected: Outcome::F32Invocation(Ok(expected)),
+                bytes: modules(0x7c, 0x7d, 0xb6),
+                export: "x",
+                args: vec![WasmValue::F64(input)],
+            });
+        }
+    }
     // Exercise rounding and sqrt at both widths through the non-NaN host ABI.
     for (opcode, input, expected) in [
         (0x8d, -0.25_f32, -0.0_f32),

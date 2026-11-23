@@ -1323,9 +1323,13 @@ fn non_slice_numeric_lexemes_are_not_split() {
         "08",
         "01.5",
         "08e2",
+        "0_1",
+        "0_0.5",
+        "0_8e2",
+        "00_1",
+        "07_7",
         "077.toString()",
         "1n",
-        "1_000",
         "1foo",
         "1$foo",
         "1\\u0061",
@@ -1354,11 +1358,16 @@ fn non_slice_numeric_lexemes_are_not_split() {
         ("10n", 2, 3),
         (".5n", 2, 3),
         ("1.e2n", 4, 5),
-        ("1._5", 2, 3),
-        ("1.5_0", 3, 4),
-        ("1e_2", 2, 3),
-        ("1e+_2", 3, 4),
-        ("1e2_0", 3, 4),
+        ("._5", 0, 1),
+        ("1_0n", 3, 4),
+        (".5_0n", 4, 5),
+        ("1.e+2_0n", 7, 8),
+        ("1e3_09n", 6, 7),
+        ("1_0tail", 3, 4),
+        ("1_0$tail", 3, 4),
+        ("1_0\\u0061", 3, 4),
+        ("\u{FEFF}.5_0é", 7, 9),
+        ("1e2_0.3", 5, 6),
     ] {
         assert_error(source, Unsupported, start, end);
     }
@@ -1400,6 +1409,65 @@ fn decimal_literal_forms_and_token_boundaries() {
 }
 
 #[test]
+fn decimal_separator_positions_are_local_to_each_digit_sequence() {
+    for (source, expected) in [
+        ("1_000", 1000.0),
+        ("1_000.", 1000.0),
+        (".0_5", 0.05),
+        ("0.0_5", 0.05),
+        ("1_0.2_5", 10.25),
+        ("0e0_7", 0.0),
+        ("1e0_2", 100.0),
+        ("1.e+0_2", 100.0),
+        (".5_0E-0_2", 0.005),
+        ("1_0.2_5e+0_2", 1025.0),
+        ("1_0.2_5e-0_2", 0.1025),
+    ] {
+        assert_postfix(source, &[Number(expected)], 1);
+    }
+    assert_postfix(
+        "let _1 = 1_0; _1/*🦀*/+.5_0;",
+        &[Number(10.0), init_let(0), LoadBinding(0), Number(0.5), Add],
+        2,
+    );
+    for (source, start) in [
+        ("1__2", 1),
+        ("1_", 1),
+        ("1_.2", 1),
+        ("1._2", 2),
+        ("1_e2", 1),
+        ("1.2_e3", 3),
+        ("1e_2", 2),
+        ("1.e_2", 3),
+        ("1e+_2", 3),
+        ("1e-_2", 3),
+        ("1e2_", 3),
+        ("1e3_09_", 6),
+        ("1e+2__3", 4),
+        ("1e2_.3", 3),
+        (".5__0", 2),
+        (".5_", 2),
+        ("1_ 2", 1),
+        ("1_/*no join*/2", 1),
+        ("\u{FEFF}1_２", 4),
+    ] {
+        assert_error(source, ErrorKind::Malformed, start, start + 1);
+    }
+}
+
+fn separate_decimal_digits(source: &str) -> String {
+    let mut separated = String::new();
+    let mut digits = source.chars().peekable();
+    while let Some(c) = digits.next() {
+        separated.push(c);
+        if c.is_ascii_digit() && digits.peek().is_some_and(char::is_ascii_digit) {
+            separated.push('_');
+        }
+    }
+    separated
+}
+
+#[test]
 fn decimal_precision_and_overflow() {
     for (input, expected) in [
         ("9007199254740991", 9_007_199_254_740_991.), // 2^53 - 1
@@ -1409,6 +1477,7 @@ fn decimal_precision_and_overflow() {
         ("18446744073709551616", 18_446_744_073_709_551_616.), // 2^64
     ] {
         assert_postfix(input, &[Number(expected)], 1);
+        assert_postfix(&separate_decimal_digits(input), &[Number(expected)], 1);
     }
     // The 309-digit overflow midpoint is 2^1024 - 2^970. The preceding
     // integer rounds to the largest finite Number; the midpoint overflows.
@@ -1418,11 +1487,59 @@ fn decimal_precision_and_overflow() {
         "190890200070838367627385484581771153176447573027006985557136695962284291481986",
         "083493647529271907416844436551070434271155969950809304288017790417449779",
     );
-    assert_postfix(&format!("{prefix}1"), &[Number(f64::MAX)], 1);
-    assert_postfix(&format!("{prefix}2"), &[Number(f64::INFINITY)], 1);
+    for (tail, expected) in [(1, f64::MAX), (2, f64::INFINITY)] {
+        let input = format!("{prefix}{tail}");
+        assert_postfix(&input, &[Number(expected)], 1);
+        assert_postfix(&separate_decimal_digits(&input), &[Number(expected)], 1);
+    }
     let above = format!("1{}", "0".repeat(309));
     assert_postfix(&above, &[Number(f64::INFINITY)], 1);
     assert_error(&format!("{above}n"), ErrorKind::Unsupported, 310, 311);
+}
+
+#[test]
+fn separated_decimal_integer_overflow_still_scans_the_entire_lexeme() {
+    // The shortcut uses 310 significant digits, skips all conversion work, and
+    // is not subject to the decimal point/exponent byte ceiling.
+    for zeros in [309, 4096] {
+        let overflow = format!("1{}", "_0".repeat(zeros));
+        let end = overflow.len();
+        let limits = Limits {
+            max_tokens: 1,
+            max_source_bytes: end,
+            max_work: end + 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            parse_script_with_limits(&overflow, limits)
+                .unwrap()
+                .evaluate(),
+            Ok(f64::INFINITY)
+        );
+        assert_limit(
+            &overflow,
+            Limits {
+                max_work: end - 1,
+                ..limits
+            },
+            Limit::Work,
+            end - 1,
+            end,
+        );
+        assert_error(&format!("{overflow}_"), ErrorKind::Malformed, end, end + 1);
+        assert_error(
+            &format!("{overflow}n"),
+            ErrorKind::Unsupported,
+            end,
+            end + 1,
+        );
+        assert_error(
+            &format!("{overflow}🔑"),
+            ErrorKind::Unsupported,
+            end,
+            end + 4,
+        );
+    }
 }
 
 #[test]
@@ -1443,10 +1560,13 @@ fn fractional_and_exponential_literals_round_once() {
         ("2.4703282292062328e-324", f64::from_bits(1)),
     ] {
         assert_postfix(source, &[Number(expected)], 1);
+        assert_postfix(&separate_decimal_digits(source), &[Number(expected)], 1);
     }
     let zeros = "0".repeat(400);
     assert_postfix(&format!("125{zeros}e-402"), &[Number(1.25)], 1);
     assert_postfix(&format!("125{zeros}.0e-402"), &[Number(1.25)], 1);
+    let compensated = separate_decimal_digits(&format!("125{zeros}.0e-402"));
+    assert_postfix(&compensated, &[Number(1.25)], 1);
     assert_postfix(&format!("0.{zeros}125e401"), &[Number(1.25)], 1);
     let huge_exponent = "9".repeat(400);
     assert_postfix(&format!("1e{huge_exponent}"), &[Number(f64::INFINITY)], 1);
@@ -1488,6 +1608,68 @@ fn decimal_conversion_cap_and_work_budget() {
         Limit::Work,
         0,
         6,
+    );
+}
+
+#[test]
+fn separated_decimal_conversion_cap_includes_separators() {
+    let defaults = Limits::default();
+    for (prefix, value) in [(".", 0.0), ("1_0.", 10.0), ("1e+", 10.0), ("1e-", 0.1)] {
+        let at_cap = format!("{prefix}0_{}1", "0".repeat(4093 - prefix.len()));
+        assert_eq!(at_cap.len(), 4096);
+        assert_postfix(&at_cap, &[Number(value)], 1);
+        let above_cap = format!("{at_cap}0");
+        assert_limit(&above_cap, defaults, Limit::DecimalLiteralBytes, 0, 4097);
+        // Validate the lexeme before either treating it as a Number or applying the cap.
+        assert_error(&format!("{above_cap}_"), ErrorKind::Malformed, 4097, 4098);
+        assert_error(&format!("{above_cap}n"), ErrorKind::Unsupported, 4097, 4098);
+    }
+}
+
+#[test]
+fn separated_decimal_exact_work_and_token_budget() {
+    let source = ".5_0E+0_1";
+    let limits = Limits {
+        max_tokens: 1,
+        max_source_bytes: 9,
+        max_work: 26, // Nine scan, nine normalization, seven conversion, one emission.
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(5.0)
+    );
+    for (work, start, end) in [(7, 7, 8), (8, 8, 9), (9, 0, 9), (18, 0, 9), (25, 0, 9)] {
+        assert_limit(
+            source,
+            Limits {
+                max_work: work,
+                ..limits
+            },
+            Limit::Work,
+            start,
+            end,
+        );
+    }
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 0,
+            ..limits
+        },
+        Limit::Tokens,
+        0,
+        1,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_source_bytes: 8,
+            ..limits
+        },
+        Limit::SourceBytes,
+        8,
+        9,
     );
 }
 

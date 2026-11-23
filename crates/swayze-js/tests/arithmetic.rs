@@ -145,20 +145,22 @@ fn custom_parse_limits_do_not_raise_the_execution_ceiling() {
 
 #[test]
 fn unary_operators_count_toward_the_execution_ceiling() {
-    let source = "- ".repeat(4095) + "0";
-    let script = parse_script(&source).unwrap();
-    assert_eq!(script.instruction_count(), 4096);
-    assert_eq!(script.max_stack_depth(), 1);
-    assert_eq!(script.evaluate().unwrap().to_bits(), (-0.0_f64).to_bits());
+    for zero in ["0", "0.0_0e+0_1", "0b0_0", "0o0_0", "0x0_0"] {
+        let source = "- ".repeat(4095) + zero;
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.instruction_count(), 4096);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(script.evaluate().unwrap().to_bits(), (-0.0_f64).to_bits());
 
-    let script = parse_script_with_limits(
-        &format!("+ {source}"),
-        Limits {
-            max_tokens: 4097,
-            ..Limits::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(script.instruction_count(), 4097);
-    assert_eq!(script.evaluate(), Err(EvalError::LimitExceeded));
+        let script = parse_script_with_limits(
+            &format!("+ {source}"),
+            Limits {
+                max_tokens: 4097,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(script.instruction_count(), 4097);
+        assert_eq!(script.evaluate(), Err(EvalError::LimitExceeded));
+    }
 }

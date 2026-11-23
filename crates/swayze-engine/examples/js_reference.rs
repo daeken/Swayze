@@ -269,6 +269,14 @@ fn fixtures() -> Vec<String> {
             "0x20000000000003",
             "0x20000000000005",
             "0XfffffffF >>> 0",
+            "1_000.25_5e+0_2",
+            ".0_5e-0_1",
+            "1_0.",
+            "-0.0_0",
+            "0b10_1010 + 0O5_2 + 0x2_a",
+            "9_007_199_254_740_993",
+            "0x20_0000_0000_0003",
+            "4.940_656_458_412_465_4e-3_24",
         ]
         .map(str::to_owned),
     );
@@ -301,6 +309,9 @@ fn fixtures() -> Vec<String> {
         format!("0b{leading}1{}", "0".repeat(970)),
         format!("0b{leading}1{}1", "0".repeat(969)),
         format!("0o{}52", "0".repeat(2048)),
+        format!("1{}", "_0".repeat(309)),
+        format!("0b{}_1_{}", leading, "0".repeat(970)),
+        format!("0.{}00", "0_".repeat(2046)),
     ]);
     cases
 }

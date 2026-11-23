@@ -1,6 +1,6 @@
 use std::fmt;
 
-// Fixed ceiling for decimal literals with a point or exponent.
+// Fixed ceiling on source bytes (including separators) in decimals with a point or exponent.
 const MAX_DECIMAL_LITERAL_BYTES: usize = 4096;
 
 // Independent of the caller's expression nesting limit.
@@ -55,7 +55,7 @@ pub enum Limit {
     /// The caller's expression nesting limit or the fixed statement frame cap.
     NestingDepth,
     Work,
-    /// Fixed byte ceiling for a decimal literal with a point or exponent.
+    /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
     Allocation,
 }
@@ -804,18 +804,41 @@ impl Lexer<'_> {
         }
     }
 
-    fn decimal_digits(&mut self) -> Result<(), Error> {
-        while let Some(c @ '0'..='9') = self.peek() {
-            self.consume(c)?;
+    // Scan one digit sequence. `has_digit` is initially true only when the
+    // caller has already consumed its first digit.
+    fn number_digits(
+        &mut self,
+        radix: u32,
+        mut has_digit: bool,
+        mut push_digit: impl FnMut(u32),
+    ) -> Result<usize, Error> {
+        let mut separators = 0;
+        while let Some(c) = self.peek() {
+            if let Some(digit) = c.to_digit(radix) {
+                self.consume(c)?;
+                push_digit(digit);
+                has_digit = true;
+            } else if c == '_' {
+                let span = self.consume(c)?;
+                if !has_digit || !self.peek().is_some_and(|next| next.is_digit(radix)) {
+                    return Err(Error::malformed(
+                        span,
+                        "numeric separator must be between digits of the same sequence",
+                    ));
+                }
+                separators += 1;
+            } else {
+                break;
+            }
         }
-        Ok(())
+        Ok(separators)
     }
 
     fn reject_numeric_suffix(&mut self) -> Result<(), Error> {
         // Decline adjacent non-ASCII non-whitespace without classifying Unicode identifiers.
         if let Some(c) = self.peek()
             && (c.is_ascii_alphabetic()
-                || matches!(c, '.' | '_' | '$' | '\\')
+                || matches!(c, '.' | '$' | '\\')
                 || (!c.is_ascii() && !is_trivia_space(c)))
         {
             let span = self.consume(c)?;
@@ -829,21 +852,17 @@ impl Lexer<'_> {
 
     fn radix_integer(&mut self, bits_per_digit: u32) -> Result<TokenKind, Error> {
         let digits_start = self.offset;
-        let radix = 1 << bits_per_digit;
         let mut value = RadixInteger::default();
-        while let Some(c) = self.peek() {
-            if let Some(digit) = c.to_digit(radix) {
-                self.consume(c)?;
-                value.push(digit, bits_per_digit);
-            } else {
-                if c.is_ascii_digit() || (self.offset == digits_start && c.is_ascii_alphabetic()) {
-                    let span = self.consume(c)?;
-                    return Err(Error::malformed(span, "invalid digit for numeric base"));
-                }
-                break;
-            }
-        }
+        self.number_digits(1 << bits_per_digit, false, |digit| {
+            value.push(digit, bits_per_digit);
+        })?;
         // Check the boundary even if the accumulated value already overflows.
+        if let Some(c) = self.peek()
+            && (c.is_ascii_digit() || (self.offset == digits_start && c.is_ascii_alphabetic()))
+        {
+            let span = self.consume(c)?;
+            return Err(Error::malformed(span, "invalid digit for numeric base"));
+        }
         self.reject_numeric_suffix()?;
         if self.offset == digits_start {
             return Err(Error::malformed(
@@ -855,6 +874,7 @@ impl Lexer<'_> {
     }
 
     fn number(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        let mut separators = 0;
         if first == '0' {
             if let Some(prefix @ ('x' | 'X' | 'o' | 'O' | 'b' | 'B')) = self.peek() {
                 let bits_per_digit = match prefix {
@@ -865,21 +885,23 @@ impl Lexer<'_> {
                 self.consume(prefix)?;
                 return self.radix_integer(bits_per_digit);
             }
-            if let Some(c @ '0'..='9') = self.peek() {
+            if let Some(c @ ('0'..='9' | '_')) = self.peek() {
                 let span = self.consume(c)?;
                 return Err(Error::unsupported(
                     span,
                     "leading-zero numeric syntax is outside the subset",
                 ));
             }
-        } else {
-            self.decimal_digits()?;
+        } else if first != '.' {
+            separators += self.number_digits(10, true, |_| {})?;
         }
 
         let mut integer_only = first != '.';
-        if integer_only && self.peek() == Some('.') {
-            self.consume('.')?;
-            self.decimal_digits()?;
+        if !integer_only || self.peek() == Some('.') {
+            if integer_only {
+                self.consume('.')?;
+            }
+            separators += self.number_digits(10, false, |_| {})?;
             integer_only = false;
         }
         if let Some(marker @ ('e' | 'E')) = self.peek() {
@@ -888,10 +910,10 @@ impl Lexer<'_> {
                 self.consume(sign)?;
             }
             let digits_start = self.offset;
-            self.decimal_digits()?;
+            separators += self.number_digits(10, false, |_| {})?;
             if self.offset == digits_start {
-                // An adjacent identifier or separator is still unsupported, not
-                // necessarily an attempt to write an exponent in this grammar.
+                // An adjacent identifier is still unsupported, not necessarily
+                // an attempt to write an exponent in this grammar.
                 self.reject_numeric_suffix()?;
                 return Err(Error::malformed(
                     Span::at(self.offset),
@@ -907,19 +929,40 @@ impl Lexer<'_> {
             end: self.offset,
         };
         let bytes = span.end - span.start;
-        let value = if integer_only && bytes > 309 {
+        if integer_only && bytes - separators > 309 {
             // A canonical integer with 310+ digits is at least 10^309.
-            f64::INFINITY
+            return Ok(TokenKind::Number(f64::INFINITY));
+        }
+        if bytes > MAX_DECIMAL_LITERAL_BYTES {
+            return Err(Error::limit(span, Limit::DecimalLiteralBytes));
+        }
+        Ok(TokenKind::Number(self.decimal_value(span, separators)?))
+    }
+
+    fn decimal_value(&mut self, span: Span, separators: usize) -> Result<f64, Error> {
+        let raw = &self.source[span.start..span.end];
+        let conversion_bytes = raw.len() - separators;
+        if separators != 0 {
+            // Meter the full normalization pass before allocating; each source
+            // byte is visited once and at most one ASCII byte is copied per visit.
+            self.charge(raw.len(), span)?;
+        }
+        self.charge(conversion_bytes, span)?;
+        let mut normalized = String::new();
+        let input = if separators == 0 {
+            raw
         } else {
-            if bytes > MAX_DECIMAL_LITERAL_BYTES {
-                return Err(Error::limit(span, Limit::DecimalLiteralBytes));
+            normalized
+                .try_reserve_exact(conversion_bytes)
+                .map_err(|_| Error::limit(span, Limit::Allocation))?;
+            for byte in raw.bytes().filter(|&byte| byte != b'_') {
+                normalized.push(char::from(byte));
             }
-            self.charge(bytes, span)?;
-            self.source[start..self.offset]
-                .parse::<f64>()
-                .map_err(|_| Error::malformed(span, "could not convert decimal literal"))?
+            normalized.as_str()
         };
-        Ok(TokenKind::Number(value))
+        input
+            .parse::<f64>()
+            .map_err(|_| Error::malformed(span, "could not convert decimal literal"))
     }
 }
 

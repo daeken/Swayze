@@ -13,8 +13,11 @@ A top-level declaration of `undefined` is malformed in a classic script.
 Number literals include decimal fractions and signed exponents, plus binary
 (`0b`), octal (`0o`), and hexadecimal (`0x`) integers with either case of prefix.
 Explicit-radix literals round to binary64 with ties to even, including at the
-overflow boundary. Numeric separators, legacy octal, and BigInt stay outside
-the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
+overflow boundary. A numeric separator (`_`) is allowed only between digits
+of the same component and base. Separators count toward the 4,096-byte cap
+for decimal fractions and exponents. Decimal conversion strips separators
+with a metered, fallible pass; explicit-radix conversion skips them while
+scanning. Legacy octal and BigInt remain outside the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
 `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and initialized
 `let` declarations initialize slots in source order, preserving the value type.

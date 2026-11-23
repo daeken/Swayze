@@ -5,6 +5,8 @@ use swayze_wasm::{
 
 #[path = "execution/bits.rs"]
 mod bits;
+#[path = "execution/branch.rs"]
+mod branch;
 #[path = "execution/globals.rs"]
 mod globals;
 #[path = "execution/memory.rs"]
@@ -1761,9 +1763,9 @@ fn block_requires_a_new_result_and_checks_all_fallthrough_code() {
         ErrorKind::InvalidResultDepth { depth: 2 },
     );
     bad_body(
-        &[&branch[..], &[0x0c, 0, 0x0b, 0x0b]].concat(),
+        &[&branch[..], &[0x0f, 0x0b, 0x0b]].concat(),
         branch.len(),
-        ErrorKind::UnsupportedOpcode { opcode: 0x0c },
+        ErrorKind::UnsupportedOpcode { opcode: 0x0f },
     );
     bad_body(
         &[&branch[..], &[0x0d, 0x80]].concat(),
@@ -1834,9 +1836,17 @@ fn validates_block_type_and_delimiters_at_the_body_boundary() {
 
 #[test]
 fn validates_branch_label_leb_and_rejects_unsupported_destinations() {
+    for opcode in [0x0c, 0x0d] {
+        check_branch_label_errors(opcode);
+    }
+}
+
+fn check_branch_label_errors(opcode: u8) {
     let field = IntegerField::LabelIndex;
+    // Decode the full immediate and check its destination before consuming
+    // branch inputs: there are no available operands in any of these frames.
     for opener in [[0x02, 0x7f], [0x03, 0x40]] {
-        let prefix = [&[0][..], &opener, &opener, &[0x41, 7, 0x41, 1, 0x0d]].concat();
+        let prefix = [&[0][..], &opener, &opener, &[opcode]].concat();
         for (label, index) in [
             (&[0x82, 0][..], 2), // Implicit function label, padded.
             (&[3][..], 3),       // Beyond the function label.
@@ -1870,7 +1880,7 @@ fn validates_branch_label_leb_and_rejects_unsupported_destinations() {
         &[0, 0x03, 0x40, 0x41, 1, 0x04, 0x7f],                // Then label, even inside a loop.
         &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05], // Else label, even inside a block.
     ] {
-        let branch = [prefix, &[0x41, 7, 0x41, 1, 0x0d]].concat();
+        let branch = [prefix, &[opcode]].concat();
         bad_body(
             &[&branch[..], &[0, 0x0b]].concat(),
             branch.len(),
@@ -1883,7 +1893,7 @@ fn validates_branch_label_leb_and_rejects_unsupported_destinations() {
         let branch = [
             &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f][..],
             arm,
-            &[0x03, 0x40, 0x41, 7, 0x41, 1, 0x0d],
+            &[0x03, 0x40, opcode],
         ]
         .concat();
         bad_body(
@@ -1927,15 +1937,25 @@ fn bounds_blocks_and_ifs_on_the_same_control_stack() {
 }
 
 #[test]
-fn counts_br_if_but_not_block_or_end_as_body_instructions() {
+fn counts_both_branches_but_not_block_or_end_as_body_instructions() {
     let limit = Limit::BodyInstructions;
-    let mut body = vec![0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 1];
-    body.extend(std::iter::repeat_n(0x45, limit.maximum() - 3));
-    let branch = body.len() + 2;
-    body.extend([0x41, 1, 0x0d, 1, 0x0b, 0x0b, 0x0b]); // Branch is instruction 127.
-    assert_body_result(&body, 1);
-    body.insert(branch, 0x45); // Now the branch itself exceeds the cap.
-    bad_body(&body, branch + 1, ErrorKind::LimitExceeded { limit });
+    for opcode in [0x0c, 0x0d] {
+        let conditional = opcode == 0x0d;
+        let mut body = vec![0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 1];
+        body.extend(std::iter::repeat_n(
+            0x45,
+            limit.maximum() - 2 - usize::from(conditional),
+        ));
+        if conditional {
+            body.extend([0x41, 1]);
+        }
+        let branch = body.len();
+        body.extend([opcode, 1, 0x0b, 0x0b, 0x0b]); // Branch is instruction 127.
+        assert_body_result(&body, i32::from(conditional));
+        body.insert(branch, 0x45); // Now the branch itself exceeds the cap.
+        body.truncate(branch + 2); // The cap is checked before the missing immediate.
+        bad_body(&body, branch + 1, ErrorKind::LimitExceeded { limit });
+    }
 }
 
 #[test]
@@ -2072,9 +2092,9 @@ fn rejects_loop_floor_violations_and_nonempty_results() {
             ErrorKind::InvalidResultDepth { depth: 1 },
         ),
         (
-            &[0x0c, 0, 0x0b, 0x0b],
+            &[0x0f, 0x0b, 0x0b],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x0c },
+            ErrorKind::UnsupportedOpcode { opcode: 0x0f },
         ),
         (&[0x0b, 0x0b, 0x0b], 2, ErrorKind::TrailingBodyBytes),
     ] {
@@ -2229,8 +2249,8 @@ fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x1a, 0x1b, 0x20, 0x21, 0x22,
-            0x23, 0x24, 0x28, 0x36, 0x3a, 0x3b, 0x3f, 0x41,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x10, 0x1a, 0x1b, 0x20, 0x21,
+            0x22, 0x23, 0x24, 0x28, 0x36, 0x3a, 0x3b, 0x3f, 0x41,
         ]
         .contains(&opcode)
             && !(0x2c..=0x2f).contains(&opcode)

@@ -473,6 +473,22 @@ fn fixtures() -> Vec<Fixture> {
         &[0],
         &trap_or_answer,
     ));
+    // Pass a result through the outer block's label, skipping dead code.
+    cases.push(Fixture::new(
+        42,
+        &[],
+        &[
+            0x41, 3, 0x02, 0x7f, 0x02, 0x40, 0x41, 39, 0x0c, 1, 0x6a, 0x1a, 0x0b, 0x00, 0x0b, 0x6a,
+        ],
+    ));
+    // Exit the outer void block with br_if, otherwise continue the loop with br.
+    let countdown_with_exit = [
+        0x02, 0x40, 0x03, 0x40, 0x20, 0, 0x45, 0x0d, 1, 0x20, 0, 0x41, 1, 0x6b, 0x21, 0, 0x0c, 0,
+        0x0b, 0x0b, 0x20, 0,
+    ];
+    for input in [0, 4] {
+        cases.push(Fixture::new(0, &[input], &countdown_with_exit));
+    }
     cases
 }
 

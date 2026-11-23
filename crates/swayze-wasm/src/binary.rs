@@ -116,7 +116,7 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded operations across the whole body, including `if`, `else` and `br_if`,
+    /// Decoded operations across the whole body, including `if`, `else`, `br`, and `br_if`,
     /// but not `block`, `loop`, or `end`.
     BodyInstructions,
     /// Peak number of explicitly stacked i32 operands during body validation.
@@ -269,7 +269,7 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// A `br_if` depth that does not name an enclosing block or loop is reported as
+/// A `br` or `br_if` depth that does not name an enclosing block or loop is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
 /// the immediate. This includes depths naming an `if` or the function label.
 /// Oversized memory counts or page bounds are reported as
@@ -627,6 +627,7 @@ const EMPTY_BLOCK_TYPE: u8 = 0x40;
 const IF: u8 = 0x04;
 const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
+const BR: u8 = 0x0c;
 const BR_IF: u8 = 0x0d;
 const I32_CONST: u8 = 0x41;
 
@@ -675,15 +676,17 @@ enum Instruction {
     Jump {
         target: usize,
     },
-    BranchIfNonzero {
-        target: usize,
+    Branch {
+        target: BranchTarget,
         floor: usize,
-        result: ResultArity,
+        conditional: bool,
     },
-    ContinueIfNonzero {
-        target: LoopTarget,
-        floor: usize,
-    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BranchTarget {
+    Block { pc: usize, result: ResultArity },
+    Loop(LoopTarget),
 }
 
 /// The first decoded slot of the target loop body, no later than the
@@ -797,8 +800,8 @@ impl BinaryOp {
 /// jump targets are strictly later decoded instruction indices or the
 /// one-past-last index. Block exits carry their target floor and result arity.
 /// Loop continues target an in-body index at or before the branch. Implicit
-/// operands are validation-only: execution traps at `unreachable`, and all
-/// transfers that bypass it still establish the target's concrete stack depth.
+/// operands are validation-only: no execution falls through `unreachable` or
+/// `br`, and transfers establish the target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -949,29 +952,26 @@ pub(super) fn execute(
                 }
             }
             Instruction::Jump { target } => frame.pc = target,
-            Instruction::BranchIfNonzero {
+            Instruction::Branch {
                 target,
                 floor,
-                result,
+                conditional,
             } => {
-                if frame.pop() != 0 {
+                if !conditional || frame.pop() != 0 {
+                    let (pc, result) = match target {
+                        BranchTarget::Block { pc, result } => (pc, result),
+                        BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
+                    };
                     let value = match result {
                         ResultArity::Void => None,
                         ResultArity::I32 => Some(frame.pop()),
                     };
-                    // Match the depth of a normal block exit, preserving its prefix.
+                    // Restore the target's prefix, not the active frame's.
                     frame.depth = floor;
                     if let Some(value) = value {
                         frame.push(value);
                     }
-                    frame.pc = target;
-                }
-            }
-            Instruction::ContinueIfNonzero { target, floor } => {
-                if frame.pop() != 0 {
-                    // Restart with the loop's entry stack and unchanged locals.
-                    frame.depth = floor;
-                    frame.pc = target.0;
+                    frame.pc = pc;
                 }
             }
         }
@@ -1007,6 +1007,11 @@ impl ControlFrame {
         kind: ControlKind::Function,
         unreachable: false,
     };
+
+    fn mark_unreachable(&mut self) -> usize {
+        self.unreachable = true;
+        self.base
+    }
 
     fn check_result_depth(self, depth: usize, offset: usize) -> Result<(), Error> {
         let expected = self.result.count();
@@ -1262,11 +1267,14 @@ fn validate_body(
                 ControlKind::Loop { .. } => {}
                 ControlKind::Block { mut last_branch } => {
                     while let Some(pc) = last_branch {
-                        decoded[..count][pc] = Instruction::BranchIfNonzero {
-                            target: count,
-                            floor: base,
-                            result,
+                        let Instruction::Branch {
+                            target: BranchTarget::Block { pc: target_pc, .. },
+                            ..
+                        } = &mut decoded[..count][pc]
+                        else {
+                            unreachable!("block fixups link only incoming branches");
                         };
+                        *target_pc = count;
                         last_branch = previous_branch[pc];
                     }
                 }
@@ -1354,28 +1362,24 @@ fn validate_body(
                 frames[nesting].unreachable = false;
                 depth = base;
             }
-            BR_IF => {
+            BR | BR_IF => {
                 // Count all explicit frames. An if label or the implicit
                 // function label is not a supported destination.
                 let label_offset = body.position();
                 let label = body.index(IntegerField::LabelIndex, nesting as u32)?;
                 let target = &mut frames[nesting - label as usize];
-                // `consume` checks the active floor; only the taken edge uses
-                // the target floor. For fallthrough, push the target's result
-                // back if there is one, even if it was popped implicitly.
-                match &mut target.kind {
+                let destination = match &mut target.kind {
                     ControlKind::Block { last_branch } => {
-                        let results = target.result.count();
-                        depth = consume(1 + results)? + results;
                         previous_branch[pc] = *last_branch;
                         *last_branch = Some(pc);
+                        // The block's end backpatches the forward PC.
+                        BranchTarget::Block {
+                            pc: 0,
+                            result: target.result,
+                        }
                     }
                     ControlKind::Loop { body_pc } => {
-                        depth = consume(1)?;
-                        decoded[pc] = Instruction::ContinueIfNonzero {
-                            target: LoopTarget::at_branch(*body_pc, pc),
-                            floor: target.base,
-                        };
+                        BranchTarget::Loop(LoopTarget::at_branch(*body_pc, pc))
                     }
                     ControlKind::Function | ControlKind::Then { .. } | ControlKind::Else { .. } => {
                         return Err(Error {
@@ -1386,7 +1390,23 @@ fn validate_body(
                             },
                         });
                     }
-                }
+                };
+                // Pop against the active floor. Only execution of the taken
+                // branch uses the target floor.
+                let conditional = opcode == BR_IF;
+                let results = target.result.count(); // Supported loops are void.
+                let after_pop = consume(usize::from(conditional) + results)?;
+                decoded[pc] = Instruction::Branch {
+                    target: destination,
+                    floor: target.base,
+                    conditional,
+                };
+                depth = if conditional {
+                    // Fallthrough restores the result, even if it was implicit.
+                    after_pop + results
+                } else {
+                    frames[nesting].mark_unreachable()
+                };
             }
             _ => {
                 let instruction = decode_plain(
@@ -1399,10 +1419,7 @@ fn validate_body(
                     globals,
                 )?;
                 depth = match instruction {
-                    Instruction::Unreachable => {
-                        frames[nesting].unreachable = true;
-                        base
-                    }
+                    Instruction::Unreachable => frames[nesting].mark_unreachable(),
                     Instruction::Nop => depth,
                     Instruction::Select => consume(3)? + 1,
                     Instruction::Const(_)
@@ -1422,8 +1439,7 @@ fn validate_body(
                     Instruction::Binary(_) => consume(2)? + 1,
                     Instruction::JumpIfZero { .. }
                     | Instruction::Jump { .. }
-                    | Instruction::BranchIfNonzero { .. }
-                    | Instruction::ContinueIfNonzero { .. } => {
+                    | Instruction::Branch { .. } => {
                         unreachable!("plain instructions do not create jumps")
                     }
                 };

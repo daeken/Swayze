@@ -24,17 +24,17 @@ pub struct Error {
 /// depth in `StackUnderflow` and `InvalidResultDepth` counts only operands
 /// above the active frame's entry stack floor. The latter is reported at a
 /// delimiter if the depth differs from the frame's result arity (zero for
-/// void, one for i32 or i64), unless a missing result is supplied by an
+/// void, one for a numeric value), unless a missing result is supplied by an
 /// unreachable frame's polymorphic floor. `TypeMismatch` is reported at the
 /// consuming opcode or delimiter.
 /// `BranchTableArityMismatch` and `BranchTableTypeMismatch` compare a
 /// `br_table` target's result to that of the first target. The former is
-/// reported for void versus a value, the latter for i32 versus i64.
-/// [`ErrorKind::UnsupportedExportSignature`] is retained for compatibility
-/// but is no longer emitted.
+/// reported for void versus a value, the latter for different numeric types.
+/// [`ErrorKind::UnsupportedExportSignature`] identifies an export whose
+/// signature contains a float parameter or result.
 /// `InvalidStartSignature` reports the parameter count and void or i32 result
-/// of a start target that is not `() -> ()`; `InvalidStartI64Result` reports
-/// a start target with an i64 result.
+/// of a start target that is not `() -> ()`; `InvalidStartI64Result` and
+/// `InvalidStartFloatResult` report start targets with i64 or float results.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -60,6 +60,7 @@ pub enum ErrorKind {
     InvalidIndex { field: IntegerField, index: u32 },
     InvalidStartSignature { parameters: u32, result: ResultKind },
     InvalidStartI64Result { parameters: u32 },
+    InvalidStartFloatResult { parameters: u32, result: ValType },
     UnsupportedExportSignature { function: u32 },
     TruncatedTableLimitsFlags,
     UnsupportedTableLimitsFlags { flags: u8 },
@@ -273,9 +274,13 @@ impl fmt::Display for Error {
                 f,
                 "start function must take no parameters and return void, found {parameters} parameters and i64 result"
             ),
+            InvalidStartFloatResult { parameters, result } => write!(
+                f,
+                "start function must take no parameters and return void, found {parameters} parameters and {result} result"
+            ),
             UnsupportedExportSignature { function } => write!(
                 f,
-                "cannot export function {function}: i64 parameters and results are not supported in exports"
+                "cannot export function {function}: float parameters and results are not supported in exports"
             ),
             TruncatedTableLimitsFlags => f.write_str("missing table limits flags"),
             UnsupportedTableLimitsFlags { flags } => {
@@ -376,10 +381,13 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// The start section checks its index and exact frame before requiring a
-/// `() -> ()` target. [`ErrorKind::InvalidStartSignature`] and
-/// [`ErrorKind::InvalidStartI64Result`] point to the start of the index and are
-/// reported only after other module checks pass.
+/// Export and start signature checks run only after all other module checks
+/// pass, including section framing, index bounds and code validation.
+/// [`ErrorKind::UnsupportedExportSignature`] points to the start of the
+/// first offending export's function index and takes precedence over a start
+/// signature error. [`ErrorKind::InvalidStartSignature`],
+/// [`ErrorKind::InvalidStartI64Result`] and [`ErrorKind::InvalidStartFloatResult`]
+/// point to the start of the start function index.
 /// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
 /// (including the implicit function label) is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
@@ -435,6 +443,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
+    let mut unsupported_export = None;
     let mut start = None;
     let mut table_entries = None;
     let mut element_segments = Vec::new();
@@ -491,7 +500,10 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             4 => table_entries = validate_table(&mut section)?,
             5 => memory_limits = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
-            7 => exports = validate_exports(&mut section, function_count)?,
+            7 => {
+                let signatures = function_count.map(|count| &function_types[..count as usize]);
+                (exports, unsupported_export) = validate_exports(&mut section, signatures)?;
+            }
             8 => {
                 let offset = section.position();
                 let index =
@@ -544,15 +556,27 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
     }
     // Do not report a signature error for a placeholder type or mask malformed code.
+    if let Some(error) = unsupported_export {
+        return Err(error);
+    }
     let start_function = if let Some((index, offset)) = start {
         let signature = function_types[index];
         let parameters = u32::from(signature.parameter_count);
-        let kind = match signature.result_kind() {
-            ResultKind::Void if parameters == 0 => None,
-            ResultKind::I64 => Some(ErrorKind::InvalidStartI64Result { parameters }),
-            result => Some(ErrorKind::InvalidStartSignature { parameters, result }),
-        };
-        if let Some(kind) = kind {
+        if parameters != 0 || signature.result.is_some() {
+            let kind = match signature.result {
+                None => ErrorKind::InvalidStartSignature {
+                    parameters,
+                    result: ResultKind::Void,
+                },
+                Some(ValType::I32) => ErrorKind::InvalidStartSignature {
+                    parameters,
+                    result: ResultKind::I32,
+                },
+                Some(ValType::I64) => ErrorKind::InvalidStartI64Result { parameters },
+                Some(result @ (ValType::F32 | ValType::F64)) => {
+                    ErrorKind::InvalidStartFloatResult { parameters, result }
+                }
+            };
             return Err(Error { offset, kind });
         }
         Some(index)
@@ -614,51 +638,40 @@ const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IntegerType {
-    I32,
-    I64,
-}
-
-impl From<IntegerType> for ValType {
-    fn from(ty: IntegerType) -> Self {
-        match ty {
-            IntegerType::I32 => Self::I32,
-            IntegerType::I64 => Self::I64,
-        }
-    }
-}
-
 // Unused parameter slots are always i32, so derived equality is structural
 // (arity, every positional parameter type, and result), independent of type indices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FunctionType {
-    parameters: [IntegerType; MAX_PARAMETERS as usize],
+    parameters: [ValType; MAX_PARAMETERS as usize],
     parameter_count: u8,
-    result: Option<IntegerType>,
+    result: Option<ValType>,
 }
 
 impl FunctionType {
     // Keep the existing framing checks for a module missing its type section.
     const PLACEHOLDER: Self = Self {
-        parameters: [IntegerType::I32; MAX_PARAMETERS as usize],
+        parameters: [ValType::I32; MAX_PARAMETERS as usize],
         parameter_count: 0,
-        result: Some(IntegerType::I32),
+        result: Some(ValType::I32),
     };
 
-    fn parameters(&self) -> &[IntegerType] {
+    fn parameters(&self) -> &[ValType] {
         &self.parameters[..self.parameter_count as usize]
     }
 
-    fn result_type(self) -> Option<ValType> {
-        self.result.map(ValType::from)
-    }
-
-    fn result_kind(self) -> ResultKind {
+    fn host_result_kind(self) -> Option<ResultKind> {
+        if self
+            .parameters()
+            .iter()
+            .any(|ty| matches!(ty, ValType::F32 | ValType::F64))
+        {
+            return None;
+        }
         match self.result {
-            None => ResultKind::Void,
-            Some(IntegerType::I32) => ResultKind::I32,
-            Some(IntegerType::I64) => ResultKind::I64,
+            None => Some(ResultKind::Void),
+            Some(ValType::I32) => Some(ResultKind::I32),
+            Some(ValType::I64) => Some(ResultKind::I64),
+            Some(ValType::F32 | ValType::F64) => None,
         }
     }
 }
@@ -671,14 +684,14 @@ fn validate_types(
     for signature in &mut types[..count as usize] {
         section.expect_byte(0x60)?; // functype
         let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
-        let mut parameters = [IntegerType::I32; MAX_PARAMETERS as usize];
+        let mut parameters = [ValType::I32; MAX_PARAMETERS as usize];
         for ty in &mut parameters[..parameter_count as usize] {
-            *ty = section.integer_type()?;
+            *ty = section.numeric_type()?;
         }
         let result = if section.count(IntegerField::ResultCount, 0..=1)? == 0 {
             None
         } else {
-            Some(section.integer_type()?)
+            Some(section.numeric_type()?)
         };
         *signature = FunctionType {
             parameters,
@@ -778,7 +791,7 @@ fn validate_globals(
 ) -> Result<usize, Error> {
     let count = section.count(IntegerField::GlobalCount, 0..=MAX_GLOBALS)? as usize;
     for global in &mut globals[..count] {
-        let ty = section.storage_type()?;
+        let ty = section.numeric_type()?;
         let offset = section.position();
         let mutable = match section.byte() {
             Some(0) => false,
@@ -801,8 +814,9 @@ fn validate_globals(
 
 fn validate_exports(
     section: &mut Reader<'_>,
-    function_count: Option<u32>,
-) -> Result<Vec<Export>, Error> {
+    signatures: Option<&[FunctionType]>,
+) -> Result<(Vec<Export>, Option<Error>), Error> {
+    let mut unsupported_signature = None;
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
     let mut exports: Vec<Export> = Vec::new();
@@ -819,8 +833,18 @@ fn validate_exports(
             });
         }
         section.expect_byte(0x00)?; // function export descriptor
-        let index = if let Some(count) = function_count {
-            section.index(IntegerField::FunctionIndex, count)?
+        let index = if let Some(signatures) = signatures {
+            let offset = section.position();
+            let index = section.index(IntegerField::FunctionIndex, signatures.len() as u32)?;
+            if unsupported_signature.is_none()
+                && signatures[index as usize].host_result_kind().is_none()
+            {
+                unsupported_signature = Some(Error {
+                    offset,
+                    kind: ErrorKind::UnsupportedExportSignature { function: index },
+                });
+            }
+            index
         } else {
             // No valid target without a function section. Preserve framing and
             // order checks before the final required-section check rejects it.
@@ -837,7 +861,7 @@ fn validate_exports(
             function_index: index as usize,
         });
     }
-    Ok(exports)
+    Ok((exports, unsupported_signature))
 }
 
 fn validate_elements(
@@ -1021,15 +1045,11 @@ pub enum Value {
 }
 
 impl Value {
-    fn integer_type(self) -> IntegerType {
-        match self {
-            Self::I32(_) => IntegerType::I32,
-            Self::I64(_) => IntegerType::I64,
-        }
-    }
-
     fn operand_type(self) -> ValType {
-        self.integer_type().into()
+        match self {
+            Self::I32(_) => ValType::I32,
+            Self::I64(_) => ValType::I64,
+        }
     }
 }
 
@@ -1059,14 +1079,6 @@ impl Operand {
             ValType::I64 => Self::I64(0),
             ValType::F32 => Self::F32(0),
             ValType::F64 => Self::F64(0),
-        }
-    }
-
-    fn into_integer(self) -> Value {
-        match self {
-            Self::I32(value) => Value::I32(value),
-            Self::I64(value) => Value::I64(value),
-            _ => unreachable!("validated integer function boundary"),
         }
     }
 
@@ -1552,7 +1564,7 @@ impl CallFrame {
     fn new(
         function_index: usize,
         code: &ValidatedCode,
-        args: impl ExactSizeIterator<Item = Value>,
+        args: impl ExactSizeIterator<Item = Operand>,
     ) -> Self {
         let mut frame = Self {
             function_index,
@@ -1562,7 +1574,7 @@ impl CallFrame {
         debug_assert_eq!(args.len(), code.signature.parameter_count as usize);
         for (local, arg) in frame.locals[..args.len()].iter_mut().zip(args) {
             debug_assert_eq!(local.operand_type(), arg.operand_type());
-            *local = arg.into();
+            *local = arg;
         }
         frame
     }
@@ -1589,7 +1601,7 @@ impl CallFrame {
         let (pc, result) = match edge.target {
             BranchTarget::End { pc, result } => (pc, result),
             BranchTarget::Loop(LoopTarget(pc)) => (pc, None),
-            BranchTarget::Function => (code.instructions.len(), code.signature.result_type()),
+            BranchTarget::Function => (code.instructions.len(), code.signature.result),
         };
         let value = result.map(|ty| {
             let value = self.pop();
@@ -1619,24 +1631,35 @@ pub(super) fn invoke_index(
             actual: args.len(),
         });
     }
-    let actual = signature.result_kind();
+    let actual = signature
+        .host_result_kind()
+        .expect("validated export signature");
     if actual != expected {
         return Err(InvokeError::ResultMismatch { expected, actual });
     }
     // Arity bounds both passes over the borrowed arguments to four items.
     for (index, (&expected, arg)) in parameters.iter().zip(args.clone()).enumerate() {
-        let actual = arg.integer_type();
+        let actual = arg.operand_type();
         if actual != expected {
             return Err(InvokeError::ArgumentTypeMismatch {
                 index,
-                expected: expected.into(),
-                actual: actual.into(),
+                expected,
+                actual,
             });
         }
     }
-    execute(instance, function_index, args).map_err(|error| match error {
-        ExecutionError::Trap(trap) => InvokeError::Trap(trap),
-        ExecutionError::LimitExceeded { limit } => InvokeError::LimitExceeded { limit },
+    let result =
+        execute(instance, function_index, args.map(Operand::from)).map_err(
+            |error| match error {
+                ExecutionError::Trap(trap) => InvokeError::Trap(trap),
+                ExecutionError::LimitExceeded { limit } => InvokeError::LimitExceeded { limit },
+            },
+        )?;
+    Ok(match result {
+        None => None,
+        Some(Operand::I32(value)) => Some(Value::I32(value)),
+        Some(Operand::I64(value)) => Some(Value::I64(value)),
+        Some(Operand::F32(_) | Operand::F64(_)) => unreachable!("validated export result"),
     })
 }
 
@@ -1645,13 +1668,22 @@ pub(super) enum ExecutionError {
     LimitExceeded { limit: ExecutionLimit },
 }
 
-// The caller has already checked the entry function's host signature:
-// no arguments for start, or the exact parameter types for an export.
-pub(super) fn execute(
+pub(super) fn execute_start(
     instance: &Instance<'_>,
     function_index: usize,
-    args: impl ExactSizeIterator<Item = Value>,
-) -> Result<Option<Value>, ExecutionError> {
+) -> Result<(), ExecutionError> {
+    let result = execute(instance, function_index, std::iter::empty())?;
+    debug_assert!(result.is_none(), "validated start signature");
+    Ok(())
+}
+
+// The caller supplies the checked entry arguments. Execution keeps all
+// arguments and results tagged as operands, including across private calls.
+fn execute(
+    instance: &Instance<'_>,
+    function_index: usize,
+    args: impl ExactSizeIterator<Item = Operand>,
+) -> Result<Option<Operand>, ExecutionError> {
     let module = instance.module;
     let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
     frames[0] = CallFrame::new(function_index, &module.functions[function_index], args);
@@ -1665,7 +1697,7 @@ pub(super) fn execute(
             // Fallthrough and function exits leave exactly the declared results
             // in this frame. Completing the call requires no dispatch.
             debug_assert_eq!(frame.pc, code.instructions.len());
-            let result = code.signature.result_type();
+            let result = code.signature.result;
             debug_assert_eq!(frame.depth, usize::from(result.is_some()));
             let value = result.map(|ty| {
                 let value = frame.operands[0];
@@ -1673,7 +1705,7 @@ pub(super) fn execute(
                 value
             });
             if active == 0 {
-                return Ok(value.map(Operand::into_integer));
+                return Ok(value);
             }
             active -= 1;
             if let Some(value) = value {
@@ -1752,10 +1784,7 @@ pub(super) fn execute(
                 let callee_code = &module.functions[index];
                 let end = frame.depth;
                 frame.depth -= callee_code.signature.parameter_count as usize;
-                let args = frame.operands[frame.depth..end]
-                    .iter()
-                    .copied()
-                    .map(Operand::into_integer);
+                let args = frame.operands[frame.depth..end].iter().copied();
                 let callee = CallFrame::new(index, callee_code, args);
                 active += 1;
                 frames[active] = callee;
@@ -1852,13 +1881,13 @@ fn decode_locals(
     let mut bound = u32::from(signature.parameter_count);
     let limit = bound + MAX_DECLARED_LOCALS;
     for (zero, &ty) in zeros.iter_mut().zip(signature.parameters()) {
-        *zero = Operand::zero(ty.into());
+        *zero = Operand::zero(ty);
     }
     // Every group consumes at least two bytes of the bounded body, even if its
     // count is zero. Expand only checked counts into the fixed slot array.
     for _ in 0..groups {
         let count = body.count(IntegerField::LocalCount, 0..=limit - bound)?;
-        let zero = Operand::zero(body.storage_type()?);
+        let zero = Operand::zero(body.numeric_type()?);
         let end = bound + count;
         zeros[bound as usize..end as usize].fill(zero);
         bound = end;
@@ -2042,9 +2071,9 @@ impl OperandStack {
             self.pop(frame, 1, Some(ValType::I32), offset)?;
         }
         for &ty in parameters.iter().rev() {
-            self.pop(frame, 1, Some(ty.into()), offset)?;
+            self.pop(frame, 1, Some(ty), offset)?;
         }
-        if let Some(result) = signature.result_type() {
+        if let Some(result) = signature.result {
             self.push(result, offset)?;
         }
         Ok(())
@@ -2453,8 +2482,7 @@ fn validate_body(
     let mut count = 0;
     let mut operands = OperandStack::new();
     // Slot zero is the function frame, which does not count against the cap.
-    let mut frames =
-        [ControlFrame::function(signature.result_type()); Limit::ControlDepth.maximum() + 1];
+    let mut frames = [ControlFrame::function(signature.result); Limit::ControlDepth.maximum() + 1];
     let mut nesting = 0;
     let end_offset = loop {
         let offset = body.position();
@@ -2746,26 +2774,8 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn integer_type(&mut self) -> Result<IntegerType, Error> {
+    fn numeric_type(&mut self) -> Result<ValType, Error> {
         let offset = self.position();
-        // Preserve the original expected byte for unsupported and missing types.
-        match self.byte() {
-            Some(I32) => Ok(IntegerType::I32),
-            Some(I64) => Ok(IntegerType::I64),
-            Some(found) => Err(Error {
-                offset,
-                kind: ErrorKind::UnexpectedByte {
-                    expected: I32,
-                    found,
-                },
-            }),
-            None => Err(self.error(ErrorKind::TruncatedByte { expected: I32 })),
-        }
-    }
-
-    fn storage_type(&mut self) -> Result<ValType, Error> {
-        let offset = self.position();
-        // Locals and globals may be floats; signatures still use integer_type.
         // Keep the existing error byte for unsupported and missing types.
         match self.byte() {
             Some(I32) => Ok(ValType::I32),

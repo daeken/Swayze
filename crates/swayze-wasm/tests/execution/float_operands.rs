@@ -555,16 +555,9 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
 }
 
 #[test]
-fn float_signatures_loop_results_and_other_numeric_ops_stay_unsupported() {
+fn float_loop_results_and_other_numeric_ops_stay_unsupported() {
     let unexpected = |expected, found| ErrorKind::UnexpectedByte { expected, found };
     for ty in [0x7d, 0x7c] {
-        bad_payload(1, &[1, 0x60, 1, ty, 0], 3, unexpected(0x7f, ty));
-        let mut exported = HEADER.to_vec();
-        let start = push_section(&mut exported, 1, &types(&[(&[], Some(ty))]));
-        for (id, payload) in [(3, FUNCTION), (7, EXPORT), (10, CODE)] {
-            push_section(&mut exported, id, payload);
-        }
-        expect_error(&exported, start + 4, unexpected(0x7f, ty));
         bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
     }
     bad_payload(6, &[1, 0x7f, 0, F32_CONST], 3, unexpected(0x41, F32_CONST));

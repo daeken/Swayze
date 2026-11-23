@@ -1006,6 +1006,55 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![address],
         });
     }
+    // A private (f32, f64) -> f32 callee returns its first parameter verbatim.
+    // Call it from an integer export, including through a distinct type index.
+    for (indirect, reordered) in [(false, false), (true, false), (true, true)] {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x11\x03\x60\x02\x7d\x7c\x01\x7d\
+                          \x60\0\x01\x7f\x60\x02"
+            .to_vec();
+        bytes.extend(if reordered {
+            [0x7c, 0x7d]
+        } else {
+            [0x7d, 0x7c]
+        });
+        bytes.extend(b"\x01\x7d\x03\x03\x02\0\x01");
+        if indirect {
+            bytes.extend(b"\x04\x04\x01\x70\0\x01");
+        }
+        bytes.extend(b"\x07\x05\x01\x01x\0\x01");
+        if indirect {
+            bytes.extend(b"\x09\x07\x01\0\x41\0\x0b\x01\0");
+        }
+        let mut caller = vec![0];
+        let snan = [0x43, 0x42, 0, 0x80, 0x7f];
+        let negative_zero = [0x44, 0, 0, 0, 0, 0, 0, 0, 0x80];
+        if reordered {
+            caller.extend(negative_zero);
+            caller.extend(snan);
+        } else {
+            caller.extend(snan);
+            caller.extend(negative_zero);
+        }
+        if indirect {
+            caller.extend([0x41, 0, 0x11, 2, 0]);
+        } else {
+            caller.extend([0x10, 0]);
+        }
+        caller.extend([0xbc, 0x0b]);
+        let len = u8::try_from(caller.len()).unwrap();
+        bytes.extend([10, 7 + len, 2, 4, 0, 0x20, 0, 0x0b, len]);
+        bytes.extend(caller);
+        cases.push(Fixture {
+            expected: Outcome::Invocation(if reordered {
+                Err(WasmTrap::IndirectCallTypeMismatch)
+            } else {
+                Ok(0x7f80_0042)
+            }),
+            bytes,
+            export: "x",
+            args: vec![],
+        });
+    }
     cases
 }
 

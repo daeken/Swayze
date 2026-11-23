@@ -1221,6 +1221,23 @@ fn lets_and_assignments_compile_to_ordered_slot_operations() {
 }
 
 #[test]
+fn initializerless_let_pushes_undefined_and_initializes_its_own_slot() {
+    assert_postfix(
+        "let first; let second=first; let third; second",
+        &[
+            Instruction::Undefined,
+            init_let(0),
+            LoadBinding(0),
+            init_let(1),
+            Instruction::Undefined,
+            init_let(2),
+            LoadBinding(1),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn compound_assignment_loads_once_before_the_rhs_and_stores_to_the_same_slot() {
     use Instruction::{Jump, JumpIfFalse, StoreBinding};
     assert_postfix(
@@ -1253,7 +1270,6 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
         ("let eval=1; 2", Unsupported, 4, 8),
         ("leté=1; 2", Unsupported, 3, 5),
         ("let\\u0078=1; 2", Unsupported, 3, 4),
-        ("let x; x", Malformed, 5, 6),
         ("let x=; x", Malformed, 6, 7),
         ("let x=x; x", Unsupported, 6, 7),
         ("let x=y; let y=1; x", Unsupported, 6, 7),

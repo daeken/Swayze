@@ -483,6 +483,26 @@ fn only_postfix_forbids_a_line_terminator_before_its_operator() {
 }
 
 #[test]
+fn postfix_line_terminator_diagnostic_is_distinct_from_standalone_dispatch() {
+    use ErrorKind::Unsupported;
+    for source in [
+        "let x = 2; (x/*\n*/@++@ ** 2) + x",
+        "let x = 2; x/*\n*/@++@ + 1; x",
+    ] {
+        assert_error(
+            source,
+            Unsupported,
+            "a line terminator cannot precede a postfix update",
+        );
+    }
+    assert_error(
+        "let x = 2; x@++@ + 1; x",
+        Unsupported,
+        "increment and decrement expressions are outside the subset at the start of a statement or for clause",
+    );
+}
+
+#[test]
 fn grouped_updates_charge_the_group_one_emission_and_one_lookup() {
     for form in ["x/*💡*/++", "--/*💡*/x"] {
         let source = format!("let x=false;({form})");

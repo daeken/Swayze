@@ -180,6 +180,9 @@ fn grouping_controls_unary_bases_without_leaking_across_conditional_or_sequence_
 #[test]
 fn updates_are_valid_power_bases_but_unary_expressions_still_need_groups() {
     for (source, expected) in [
+        ("let x = 2; (x++ ** 2) + x", 7.0),
+        ("let x = 2; (++x ** 2) + x", 12.0),
+        ("let x = 2; (-x++) ** 2", 4.0),
         ("let x=2; let y=x++**x--; y*10+x", 82.0),
         ("let x=1; 2**++x**x++", 16.0),
         ("let x=2; (x--**2)", 4.0),
@@ -192,7 +195,7 @@ fn updates_are_valid_power_bases_but_unary_expressions_still_need_groups() {
         assert_number(source, expected);
     }
     for source in [
-        "let x=2; -x++@**@2",
+        "let x = 2; -x++ @**@ 2",
         "let x=2; -++x@**@2",
         "let x=2; 2**-x++@**@2",
         "let x=2; false && void ++x@**@2",

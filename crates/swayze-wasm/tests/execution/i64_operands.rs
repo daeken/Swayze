@@ -349,9 +349,8 @@ fn i64_numeric_ops_check_concrete_results_even_with_polymorphic_inputs() {
 }
 
 #[test]
-fn other_i64_numeric_and_memory_opcodes_remain_unsupported() {
-    // i64.load, i64.store, and post-Core-1.0 i64 sign extensions.
-    for opcode in [0x29, 0x37, 0xc2, 0xc3, 0xc4] {
+fn post_core_1_0_i64_sign_extension_opcodes_remain_unsupported() {
+    for opcode in [0xc2, 0xc3, 0xc4] {
         bad_body(
             &[0, 0x00, opcode, 0x0b],
             2,
@@ -506,7 +505,7 @@ fn calls_check_i32_args_and_selector_but_protect_the_caller_i64_prefix() {
 }
 
 #[test]
-fn memory_and_globals_do_not_accept_i64_operands_even_in_dead_code() {
+fn i32_memory_operands_and_i32_globals_reject_i64_even_in_dead_code() {
     for (pushes, op) in [
         (&b"\x42\0"[..], &b"\x28\0\0"[..]),
         (b"\x42\0\x41\0", b"\x36\0\0"), // Store address.

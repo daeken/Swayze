@@ -19,6 +19,7 @@ pub(super) enum AccessWidth {
     Byte = 1,
     Halfword = 2,
     Word = 4,
+    Doubleword = 8,
 }
 
 impl AccessWidth {
@@ -29,19 +30,22 @@ impl AccessWidth {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum LoadKind {
-    Full,
     ByteSigned,
     ByteUnsigned,
     HalfwordSigned,
     HalfwordUnsigned,
+    WordSigned,
+    WordUnsigned,
+    Doubleword,
 }
 
 impl LoadKind {
     pub(super) const fn width(self) -> AccessWidth {
         match self {
-            Self::Full => AccessWidth::Word,
             Self::ByteSigned | Self::ByteUnsigned => AccessWidth::Byte,
             Self::HalfwordSigned | Self::HalfwordUnsigned => AccessWidth::Halfword,
+            Self::WordSigned | Self::WordUnsigned => AccessWidth::Word,
+            Self::Doubleword => AccessWidth::Doubleword,
         }
     }
 }
@@ -170,30 +174,34 @@ impl LinearMemory {
         Ok(&bytes[start as usize..end as usize])
     }
 
-    pub(super) fn load_i32(&self, base: i32, offset: u32, kind: LoadKind) -> Result<i32, Trap> {
+    pub(super) fn load(&self, base: i32, offset: u32, kind: LoadKind) -> Result<i64, Trap> {
         let bytes = self.access(base, offset, kind.width())?;
-        let mut le = [0; 4];
+        let mut le = [0; 8];
         for (dst, byte) in le.iter_mut().zip(bytes) {
             *dst = byte.get();
         }
-        let value = i32::from_le_bytes(le);
+        let value = i64::from_le_bytes(le);
         // The zero padding already handles unsigned extension.
         Ok(match kind {
-            LoadKind::ByteSigned => i32::from(value as i8),
-            LoadKind::HalfwordSigned => i32::from(value as i16),
-            LoadKind::Full | LoadKind::ByteUnsigned | LoadKind::HalfwordUnsigned => value,
+            LoadKind::ByteSigned => i64::from(value as i8),
+            LoadKind::HalfwordSigned => i64::from(value as i16),
+            LoadKind::WordSigned => i64::from(value as i32),
+            LoadKind::ByteUnsigned
+            | LoadKind::HalfwordUnsigned
+            | LoadKind::WordUnsigned
+            | LoadKind::Doubleword => value,
         })
     }
 
-    pub(super) fn store_i32(
+    pub(super) fn store(
         &self,
         base: i32,
         offset: u32,
         width: AccessWidth,
-        value: i32,
+        value: i64,
     ) -> Result<(), Trap> {
         // The range is checked before setting any cell. Zipping with the slice
-        // writes only the low bytes of the i32.
+        // writes only the low bytes of the value.
         let bytes = self.access(base, offset, width)?;
         for (byte, value) in bytes.iter().zip(value.to_le_bytes()) {
             byte.set(value);
@@ -244,7 +252,7 @@ mod tests {
         assert_eq!(memory.grow_with(1, || Err(error)), -1);
         assert!(memory.page.get().is_none());
         assert_eq!(
-            memory.load_i32(0, 0, LoadKind::Full),
+            memory.load(0, 0, LoadKind::WordUnsigned),
             Err(Trap::MemoryOutOfBounds)
         );
 

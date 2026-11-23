@@ -27,7 +27,10 @@
 //! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
-//! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
+//! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`,
+//! `i64.load`, `i64.load8_s`, `i64.load8_u`, `i64.load16_s`, `i64.load16_u`,
+//! `i64.load32_s`, `i64.load32_u`, `i64.store`, `i64.store8`, `i64.store16`,
+//! `i64.store32`, `memory.size`,
 //! `memory.grow` (`0x40`), `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`,
 //! `call_indirect` (`0x11`), `if`, `block`, `loop`, `br <depth>` (`0x0c`),
 //! `br_if <depth>`, `br_table` (`0x0e`), and `return` (`0x0f`). Local indices
@@ -72,9 +75,9 @@
 //! minimum is the initial size; an omitted maximum has an effective limit of one
 //! page. Loads, stores, `memory.size`, and `memory.grow` require a defined
 //! memory, even in dead code; a zero-page memory qualifies. Loads and stores
-//! take an unsigned LEB32 alignment exponent and an unsigned LEB32 byte offset. The exponent
-//! must be 0 for byte accesses, at most 1 for 16-bit accesses, and at most 2 for
-//! 32-bit accesses.
+//! take an unsigned LEB32 alignment exponent and an unsigned LEB32 byte offset.
+//! Valid padding is accepted for both fields. The exponent must not exceed the
+//! natural alignment of the access width: 0, 1, 2, or 3 for 1, 2, 4, or 8 bytes.
 //! `memory.size` and `memory.grow` take a literal reserved byte `0x00`, not a
 //! general LEB32 index. Other memory instructions are unsupported.
 //!
@@ -141,9 +144,9 @@
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
-//! i64 is limited to internal operands, declared locals, private globals,
-//! and `block` and `if` results. Function signatures and memory instructions
-//! do not accept i64.
+//! i64 values stay inside the guest: they can be operands (including load
+//! results and stored values), declared locals, private globals, or `block`
+//! and `if` results. Function signatures do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
 //! i64) and an i32 condition, pushed in first-candidate, second-candidate,
@@ -158,8 +161,9 @@
 //! function or nothing for a void function. `call_indirect` consumes an i32 selector above the arguments
 //! and uses the immediate's type for the parameter count and result kind.
 //! Both calls validate their operands above the active frame's entry floor.
-//! Loads consume an i32 base address and push an i32. Stores consume an i32
-//! address and an i32 value (value on top) and produce no result. `memory.size`
+//! Loads consume an i32 base address and push a value of the opcode's type
+//! (i32 or i64). Stores consume an i32 base address and a value of the opcode's
+//! type (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
 //! `memory.grow` consumes an i32 page delta as unsigned and pushes the old
 //! page count on success or `-1` on failure. A zero delta always succeeds
@@ -314,12 +318,13 @@
 //! and `rotr` wrap the shifted-out bits to the opposite end in the indicated
 //! direction.
 //! Loads and stores add the base bits interpreted as `u32` and the `u32` offset
-//! in `u64`, without wrapping at 32 bits. The entire 1-, 2-, or 4-byte range
+//! in `u64`, without wrapping at 32 bits. The entire 1-, 2-, 4-, or 8-byte range
 //! must be in bounds, or the instruction returns [`Trap::MemoryOutOfBounds`]
 //! without reading or writing any bytes. Accesses are little-endian and may
 //! be unaligned; validated alignment annotations do not constrain addresses.
-//! Narrow loads sign-extend (`_s`) or zero-extend (`_u`) to i32, and narrow
-//! stores write only the low 8 or 16 bits of the value.
+//! Narrow loads sign-extend (`_s`) or zero-extend (`_u`) to the opcode's
+//! result type. Narrow stores write only the low 8, 16, or (for `i64.store32`)
+//! 32 bits of the value. Each load or store uses one dispatch.
 //!
 //! A zero right operand raises [`Trap::IntegerDivideByZero`] for all division
 //! and remainder instructions at either width. Signed division of the minimum
@@ -472,6 +477,9 @@
 //! partial-store prevention, widened address arithmetic, independent instances,
 //! and sharing across calls and exports. They also check store persistence
 //! and suppression of later stores after guest traps or dispatch exhaustion.
+//! i64 memory tests compare all 64 result bits, check i64 and i32 accesses to
+//! overlapping bytes, and cover typed stack effects and all four access widths
+//! before and after growth and at the exact instruction and dispatch caps.
 //! Growth tests check optional maxima, unsigned deltas, reserve bounds and
 //! failure, stack and dispatch limits, and persistence through exports, calls,
 //! start, and traps. Start growth cannot bypass initial data preflight.

@@ -50,7 +50,8 @@ distinguishes `+0` and `-0`, and treats any two NaNs as the same value. It is no
 a general assertion rewriter. **Raw** mode is reserved for reviewed positive
 `raw` cases run unchanged. The required hashbang comment case is the first
 unmodified pass: Swayze parses the original bytes and executes the resulting
-Script to normal completion, without a harness or injected value. The summary
+Script to normal completion, without a harness or injected value. Three more
+raw hashbang cases cover CR, LS and PS before an empty block. The summary
 counts raw and adapted passes separately. Strict variants are reported as not
 run, never as passes. No negative, module or harness-heavy
 cases are credited.

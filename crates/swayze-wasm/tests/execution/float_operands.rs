@@ -538,8 +538,8 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
         &[0x36, 0, 0][..], // i32.store
         &[0x10, 0][..],    // call (i32) -> i32
     ] {
-        let mut body = vec![0, 0]; // An implicit address, if needed, is available below the value.
-        push_f32(&mut body, F32_SNAN);
+        // Read f32 local 1 in a dead tail (which can supply an implicit address).
+        let mut body = vec![1, 1, 0x7d, 0, 0x20, 1];
         let offset = body.len();
         body.extend(consumer);
         body.push(0x0b);
@@ -555,7 +555,7 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
 }
 
 #[test]
-fn floating_point_declarations_labels_memory_and_numeric_ops_stay_unsupported() {
+fn float_signatures_globals_labels_memory_and_other_numeric_ops_stay_unsupported() {
     let unexpected = |expected, found| ErrorKind::UnexpectedByte { expected, found };
     for ty in [0x7d, 0x7c] {
         bad_payload(1, &[1, 0x60, 1, ty, 0], 3, unexpected(0x7f, ty));
@@ -566,7 +566,6 @@ fn floating_point_declarations_labels_memory_and_numeric_ops_stay_unsupported() 
         }
         expect_error(&exported, start + 4, unexpected(0x7f, ty));
         bad_payload(6, &[1, ty, 0], 1, unexpected(0x7f, ty));
-        bad_body(&[1, 0, ty, 0x41, 42, 0x0b], 2, unexpected(0x7f, ty));
         bad_body(&[0, 0x02, ty, 0x0b, 0x0b], 2, unexpected(0x7f, ty));
         bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
         bad_body(&[0, 0x41, 0, 0x04, ty, 0x0b, 0x0b], 4, unexpected(0x7f, ty));

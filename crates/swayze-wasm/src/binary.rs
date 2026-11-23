@@ -1025,7 +1025,7 @@ impl Value {
     }
 }
 
-// Floats are operand-only. Keep their IEEE 754 encodings in integer storage
+// Private stack and local slots keep IEEE 754 encodings in integer storage
 // so even signaling NaNs pass through without a native float operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operand {
@@ -1510,7 +1510,7 @@ pub(super) struct ValidatedCode {
     signature: FunctionType,
     // The tags provide local types during validation; each call copies these
     // typed zeros before loading tagged arguments into the parameter prefix.
-    local_zeros: [Value; MAX_LOCAL_SLOTS],
+    local_zeros: [Operand; MAX_LOCAL_SLOTS],
     instructions: Vec<Instruction>,
     table_targets: Vec<BranchEdge>,
 }
@@ -1518,7 +1518,7 @@ pub(super) struct ValidatedCode {
 struct CallFrame {
     function_index: usize,
     pc: usize,
-    locals: [Value; MAX_LOCAL_SLOTS],
+    locals: [Operand; MAX_LOCAL_SLOTS],
     operands: [Operand; Limit::OperandStackDepth.maximum()],
     depth: usize,
 }
@@ -1527,7 +1527,7 @@ impl CallFrame {
     const EMPTY: Self = Self {
         function_index: 0,
         pc: 0,
-        locals: [Value::I32(0); MAX_LOCAL_SLOTS],
+        locals: [Operand::I32(0); MAX_LOCAL_SLOTS],
         operands: [Operand::I32(0); Limit::OperandStackDepth.maximum()],
         depth: 0,
     };
@@ -1545,7 +1545,7 @@ impl CallFrame {
         debug_assert_eq!(args.len(), code.signature.parameter_count as usize);
         for (local, arg) in frame.locals[..args.len()].iter_mut().zip(args) {
             debug_assert_eq!(local.operand_type(), arg.operand_type());
-            *local = arg;
+            *local = arg.into();
         }
         frame
     }
@@ -1702,12 +1702,10 @@ pub(super) fn execute(
                 let lhs = frame.pop();
                 frame.push(Operand::I32(op.apply(width, lhs, rhs)));
             }
-            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize].into()),
-            Instruction::LocalSet(index) => {
-                frame.locals[index as usize] = frame.pop().into_integer()
-            }
+            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
+            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
             Instruction::LocalTee(index) => {
-                frame.locals[index as usize] = frame.operands[frame.depth - 1].into_integer();
+                frame.locals[index as usize] = frame.operands[frame.depth - 1];
             }
             Instruction::GlobalGet(index) => {
                 frame.push(instance.globals[index as usize].get().into())
@@ -1839,19 +1837,19 @@ pub(super) fn execute(
 fn decode_locals(
     body: &mut Reader<'_>,
     signature: FunctionType,
-) -> Result<([Value; MAX_LOCAL_SLOTS], u32), Error> {
+) -> Result<([Operand; MAX_LOCAL_SLOTS], u32), Error> {
     let groups = body.integer(IntegerField::LocalGroupCount)?;
-    let mut zeros = [Value::I32(0); MAX_LOCAL_SLOTS];
+    let mut zeros = [Operand::I32(0); MAX_LOCAL_SLOTS];
     let mut bound = u32::from(signature.parameter_count);
     let limit = bound + MAX_DECLARED_LOCALS;
     for (zero, &ty) in zeros.iter_mut().zip(signature.parameters()) {
-        *zero = Value::zero(ty);
+        *zero = Value::zero(ty).into();
     }
     // Every group consumes at least two bytes of the bounded body, even if its
     // count is zero. Expand only checked counts into the fixed slot array.
     for _ in 0..groups {
         let count = body.count(IntegerField::LocalCount, 0..=limit - bound)?;
-        let zero = Value::zero(body.integer_type()?);
+        let zero = body.local_zero()?;
         let end = bound + count;
         zeros[bound as usize..end as usize].fill(zero);
         bound = end;
@@ -2092,7 +2090,7 @@ fn validate_plain_stack(
     frame: ControlFrame,
     offset: usize,
     environment: &BodyEnvironment<'_>,
-    local_zeros: &[Value; MAX_LOCAL_SLOTS],
+    local_zeros: &[Operand; MAX_LOCAL_SLOTS],
 ) -> Result<(), Error> {
     use ValType::{I32, I64};
     let i32_type = Some(I32);
@@ -2753,6 +2751,26 @@ impl<'a> Reader<'a> {
         match self.byte() {
             Some(I32) => Ok(IntegerType::I32),
             Some(I64) => Ok(IntegerType::I64),
+            Some(found) => Err(Error {
+                offset,
+                kind: ErrorKind::UnexpectedByte {
+                    expected: I32,
+                    found,
+                },
+            }),
+            None => Err(self.error(ErrorKind::TruncatedByte { expected: I32 })),
+        }
+    }
+
+    fn local_zero(&mut self) -> Result<Operand, Error> {
+        let offset = self.position();
+        // Only local declarations accept float types here; signatures and
+        // globals still use integer_type. Keep the existing error byte.
+        match self.byte() {
+            Some(I32) => Ok(Operand::I32(0)),
+            Some(I64) => Ok(Operand::I64(0)),
+            Some(0x7d) => Ok(Operand::F32(0)),
+            Some(0x7c) => Ok(Operand::F64(0)),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {

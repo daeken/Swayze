@@ -906,6 +906,29 @@ fn fixtures() -> Vec<Fixture> {
         expression.push(op);
         cases.push(Fixture::new(expected, &[], &expression));
     }
+    // The i32 parameter precedes f64 and f32 locals, which start with +0 bits.
+    let float_locals = &[2, 1, 0x7c, 1, 0x7d];
+    cases.push(Fixture::with_locals(
+        0,
+        &[42],
+        float_locals,
+        &[0x20, 2, 0xbc],
+    ));
+    cases.push(Fixture::with_locals(
+        0x7f80_0042,
+        &[0x7f80_0042],
+        float_locals,
+        &[0x20, 0, 0xbe, 0x22, 2, 0x1a, 0x20, 2, 0xbc],
+    ));
+    // Store an f64 negative zero, then test that local.get preserved its sign bit.
+    cases.push(Fixture::with_locals(
+        1,
+        &[0],
+        float_locals,
+        &[
+            0x44, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x21, 1, 0x20, 1, 0xbd, 0x42, 0, 0x53,
+        ],
+    ));
     cases
 }
 

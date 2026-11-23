@@ -13,7 +13,7 @@
 //! may be shared. Each body may declare up to 16 locals in total, in addition
 //! to its parameters. The number of groups and each group's local count are
 //! unsigned LEB32. Every group, even a zero-count group, must specify `i32`
-//! (`0x7f`) or `i64` (`0x7e`).
+//! (`0x7f`), `i64` (`0x7e`), `f32` (`0x7d`), or `f64` (`0x7c`).
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
@@ -137,10 +137,12 @@
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` pushes the indexed slot's
-//! declared type; `local.set` consumes a value of that
-//! type, and `local.tee` writes and leaves a value of that type on the stack.
+//! declared type; `local.set` stores and consumes a value of that type, and
+//! `local.tee` stores it and leaves it on the stack. These moves preserve all
+//! bits, including the sign of zero and signaling NaN payloads.
 //! `global.get` pushes the declared type; `global.set` consumes that type.
-//! Both are checked even in dead code. `i32.const` pushes one i32.
+//! Local and global stack effects are checked even in dead code.
+//! `i32.const` pushes one i32.
 //! `i64.const` pushes one i64 and accepts valid padding within ten signed LEB128
 //! bytes. In a ten-byte encoding the terminal byte must be `0x00` or `0x7f` to
 //! match the sign bit. The immediate cannot read beyond its body frame.
@@ -161,10 +163,10 @@
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! sign operations, and comparisons each count as one dispatch. None uses native
-//! floating-point operations or quiets signaling NaNs. Floats are operand-only:
-//! function signatures (and thus exports and host arguments/results), locals,
-//! globals, control label results, floating-point memory instructions, and other
-//! floating-point numeric instructions remain unsupported.
+//! floating-point operations or quiets signaling NaNs. Floats are supported as
+//! operands and private declared locals only. Float function signatures (and
+//! thus host arguments and results), globals, control label results, memory
+//! instructions, and other floating-point numeric instructions remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -313,13 +315,13 @@
 //! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and separate fixed
-//! local storage. Only the private operand slots can hold f32 or f64 bits;
-//! locals and globals hold tagged i32/i64 values. Parameters are copied
-//! from the supplied arguments or caller's operands, and each declared local
-//! starts at zero of its own type for every frame, including reused frame
-//! slots. A callee starts with no operands. A callee returning a value pushes
-//! the full tagged result onto the caller's remaining operands; a void callee
-//! leaves them unchanged.
+//! local storage. Both hold private tagged values, including raw f32 and f64
+//! encodings. Globals still hold only tagged i32/i64 values. Each frame starts
+//! by copying a fixed array of typed zeros, including the exact +0 encoding
+//! for every float local, even when reusing a frame slot. Integer arguments
+//! then fill the parameter prefix. A callee starts with no operands. A callee
+//! returning a value pushes the full tagged result onto the caller's remaining
+//! operands; a void callee leaves them unchanged.
 //! `call_indirect` interprets the selector as `u32` and traps with
 //! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
 //! [`Trap::UninitializedElement`] for a null entry, or
@@ -461,6 +463,16 @@
 //! concrete types in reachable and polymorphic code. They exercise fresh
 //! zero-initialization and frame isolation on repeated direct and indirect
 //! calls, and one dispatch per local instruction at the fuel boundary.
+//! Float-local tests interleave both float and integer widths after integer
+//! parameters, check exact zero and stored bits through reinterpretation, and
+//! check isolation across repeated invocations and recursion. They also cover
+//! live and dead local index and type diagnostics, stack floors, and shared
+//! declaration, operand, and dispatch limits. With the pinned compiler on
+//! arm64 macOS, `size_of` probes before and after float locals agreed in debug
+//! and release: 320 bytes for 20 local slots, 856 bytes per call frame (13,696
+//! for 16), and 17,512 bytes summed across body-validation scratch (local zeros,
+//! operand types and depth, control frames, instructions, table edges, and
+//! fixup links). These are layout observations, not cross-target guarantees.
 //! i64 bit-operation tests compare full-width results using `i64.eq`. They
 //! distinguish high-bit patterns and sign filling, check count endpoints and
 //! low-six-bit masking (including negative counts), and exercise typed input and

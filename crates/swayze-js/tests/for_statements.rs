@@ -318,7 +318,7 @@ fn requires_braces_and_explicit_delimiters() {
         ("for(;;;){}42", Malformed, ";;|;"),
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
-        ("for(i**=1;false;){}42", Unsupported, "**="),
+        ("for(i**=1;false;){}42", Unsupported, "for(|i"),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
         ("for(;i=1;){}42", Unsupported, "="),
         ("for(;false;i++){}42", Unsupported, "false;|i"),

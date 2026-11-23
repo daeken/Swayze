@@ -149,6 +149,8 @@ impl Script {
     /// `true` to `1`, `false` and `null` to `+0`, and `undefined` to NaN.
     /// Arithmetic returns a Number; relational
     /// operators return a Boolean, always `false` if either operand is NaN.
+    /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
+    /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators also use this conversion, then truncate and wrap to 32
     /// bits (nonfinite values and signed zeros become zero). Shifts use the
     /// low five bits of the converted count. Bitwise results are Numbers
@@ -321,6 +323,7 @@ fn evaluate(
             Instruction::Divide => apply_arithmetic(&mut stack, |lhs, rhs| lhs / rhs)?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
             Instruction::Remainder => apply_arithmetic(&mut stack, |lhs, rhs| lhs % rhs)?,
+            Instruction::Exponentiate => apply_arithmetic(&mut stack, exponentiate)?,
             Instruction::BitwiseAnd => apply_bitwise(&mut stack, |lhs, rhs| lhs & rhs)?,
             Instruction::BitwiseXor => apply_bitwise(&mut stack, |lhs, rhs| lhs ^ rhs)?,
             Instruction::BitwiseOr => apply_bitwise(&mut stack, |lhs, rhs| lhs | rhs)?,
@@ -464,6 +467,51 @@ fn apply_arithmetic(
     })
 }
 
+// ECMA-262 Number::exponentiate, with the platform's powf for the
+// implementation-approximated magnitude of ordinary finite powers.
+fn exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() {
+        return f64::NAN;
+    }
+    // Both signs of zero produce +1, even for a NaN base.
+    if exponent == 0.0 {
+        return 1.0;
+    }
+    if base.is_nan() {
+        return f64::NAN;
+    }
+
+    let magnitude = base.abs();
+    if exponent.is_infinite() {
+        return if magnitude == 1.0 {
+            f64::NAN
+        } else if (magnitude > 1.0) == (exponent > 0.0) {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+    }
+
+    // Test parity of the represented Number without narrowing to an integer:
+    // ±1 is the remainder only for odd integers, and all Numbers at or above
+    // 2^53 in magnitude are even integers.
+    let negative_result = base.is_sign_negative() && (exponent % 2.0).abs() == 1.0;
+    let result = if magnitude == 0.0 || magnitude.is_infinite() {
+        if exponent > 0.0 {
+            magnitude
+        } else if magnitude == 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        }
+    } else if base < 0.0 && exponent != exponent.trunc() {
+        return f64::NAN;
+    } else {
+        magnitude.powf(exponent)
+    };
+    if negative_result { -result } else { result }
+}
+
 fn apply_bitwise(
     stack: &mut Vec<Value>,
     op: impl FnOnce(i32, i32) -> i32,
@@ -517,6 +565,8 @@ mod tests {
             (&[one, Instruction::ShiftRightUnsigned][..], 1),
             (&[one, Instruction::Divide][..], 1),
             (&[one, Instruction::Remainder][..], 1),
+            (&[Instruction::Exponentiate, one][..], 1),
+            (&[one, Instruction::Exponentiate][..], 1),
             (&[Instruction::LooseEqual][..], 1),
             (&[one, Instruction::LooseNotEqual][..], 1),
             (&[Instruction::StrictEqual][..], 1),

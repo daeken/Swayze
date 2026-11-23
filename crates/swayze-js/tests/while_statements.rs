@@ -111,7 +111,7 @@ fn checks_the_whole_body_even_when_the_test_is_initially_false() {
         ("x=;", Malformed),
         ("x=1+;", Malformed),
         ("x=(x=1);", Unsupported),
-        ("x**=1;", Unsupported),
+        ("c**=1;", Unsupported),
         ("break outer;", Unsupported),
         ("continue outer;", Unsupported),
         ("{x=1}", Unsupported),

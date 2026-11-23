@@ -22,6 +22,11 @@ scanning. Legacy octal and BigInt remain outside the subset. Arithmetic includes
 Unary `void` evaluates its operand once, then returns `undefined` without
 coercion. It has the same precedence and right associativity as the other
 prefix operators.
+Exponentiation (`**`) binds more tightly than multiplication and associates
+right to left. A prefix unary base must be parenthesized (`(-2) ** 2`), but
+a unary exponent is allowed (`2 ** -2`). Number special cases are handled
+explicitly; ordinary finite powers use a platform-dependent approximation.
+The statement-only `**=` uses the same exponentiation operation.
 The parser determines precedence and associativity. `const` and `let`
 declarations initialize slots in source order, including left to right within
 comma-separated lists. Each `const` item requires an initializer. A `let`

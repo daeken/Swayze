@@ -336,7 +336,16 @@ fn fixtures() -> Vec<String> {
             "let n = 0; while (n < 2) { n, undefined; n++; } n",
             "let n = 0; for (n, void 1; n < 3; n + 1, undefined) { n++; } n",
             "let n = 0; for (let end = 3; n < end; end, n) { n++; if (n < end) { continue; } } n",
-            "let n = 42; for (n ? null : undefined, n; true; void n) { break; } n"
+            "let n = 42; for (n ? null : undefined, n; true; void n) { break; } n",
+            "2 ** 3 ** 2",
+            "2 ** -(2 ** 2)",
+            "2 ** (-2) ** 2",
+            "let n = -2; n **= 3; n",
+            "(-0) ** 9007199254740991",
+            "(-0) ** 9007199254740992",
+            "(-0.5) ** 1075",
+            "1 ** (1 / 0)",
+            "undefined ** 0"
         ]
         .map(str::to_owned),
     );

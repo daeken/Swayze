@@ -27,8 +27,12 @@ apply the corresponding operator, and store the result. Logical assignments
 (`&&=`, `||=`, `??=`) read the target once and may skip both the right operand
 and the store, using the same tests as `&&`, `||`, and `??`. Skipped operands
 are still checked during parsing, and `const` targets are rejected even when
-no store would run. Assignments do not produce expression values in this subset.
-Declaration and assignment statements require an explicit semicolon; the
+no store would run. Prefix and postfix `++` and `--` convert an initialized
+`let` value to Number, add or subtract one, and store the result. Postfix
+forms cannot cross a line terminator between the name and operator, including
+a line terminator in a comment. Assignments and updates do not produce
+expression values in this subset.
+Declaration, assignment, and update statements require an explicit semicolon; the
 final expression's semicolon is optional. Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global
 lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
@@ -74,8 +78,8 @@ binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. `for (init; test; update)` permits any clause
 to be empty; a missing test is true. The initializer and update, when present,
-must be simple or supported compound assignments to an existing mutable
-binding in the enclosing scope. `break;` skips the update.
+must be supported assignments, increments, or decrements of an existing
+mutable binding in the enclosing scope. `break;` skips the update.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`
 jumps to the test; `break;` skips it. Untaken arms and skipped loop bodies

@@ -159,7 +159,7 @@ fn requires_braces_delimiters_and_assignment_clauses() {
         ("for(i**=1;false;){}42", Unsupported, "**="),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
         ("for(;i=1;){}42", Unsupported, "="),
-        ("for(;false;i++){}42", Unsupported, "++"),
+        ("for(;false;i++){}42", Unsupported, "false;|i"),
         ("for(;false;1+2){}42", Unsupported, "1"),
         ("for(;false;i+1){}42", Unsupported, "+"),
         ("for(;false;i=0,i=1){}42", Unsupported, ","),

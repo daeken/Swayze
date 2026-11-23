@@ -97,6 +97,40 @@ fn sibling_bindings_and_a_later_root_binding_have_distinct_fixed_slots() {
 }
 
 #[test]
+fn updates_load_and_store_the_same_slot_once_with_no_result() {
+    use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
+    assert_postfix(
+        "let x=0;++x;if(true){let x=0;x--;--x;}x++;x",
+        &[
+            Number(0.0),
+            init_let(0),
+            LoadBinding(0),
+            Number(1.0),
+            Add,
+            StoreBinding(0),
+            Boolean(true),
+            JumpIfFalseStatement(18),
+            Number(0.0),
+            init_let(1),
+            LoadBinding(1),
+            Number(1.0),
+            Subtract,
+            StoreBinding(1),
+            LoadBinding(1),
+            Number(1.0),
+            Subtract,
+            StoreBinding(1),
+            LoadBinding(0),
+            Number(1.0),
+            Add,
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
     use Instruction::{Boolean, JumpIfFalseStatement, LoopBack, StoreBinding};
 

@@ -225,6 +225,20 @@
 //! nonzero value by zero returns signed infinity, not a trap. An infinity
 //! numerator gives signed infinity, and a zero numerator or infinity denominator
 //! gives signed zero in the remaining cases. Each `div` uses one guest dispatch.
+//!
+//! In a normal binade, the exact quotient's normalized significand is at most
+//! `2 - 1/H`, where `H = 2^h` for `h` fraction bits. For normalized integer
+//! significands `H <= a,b < 2H`, either `a >= b` and `a/b <= (2H-1)/H`, or
+//! `a < b` and `2a/b <= 2(2H-2)/(2H-1) < (2H-1)/H`. Thus division cannot
+//! land in the gap above the last finite value of that binade, including the
+//! overflow half-gap above max finite. Overflow requires an exact magnitude
+//! of at least `2^(emax+1)`, where `emax` is the largest normal exponent.
+//!
+//! Below the normal range the destination quantum is the least subnormal,
+//! and exact ties are possible. Half of the least subnormal rounds to signed
+//! zero; the midpoint between the greatest subnormal and least normal rounds
+//! to the least normal.
+//!
 //! `min` and `max` (`0x96`/`0x97` for f32, `0xa4`/`0xa5` for f64) consume two
 //! operands of their width and return the exact encoding of the lesser or
 //! greater operand, respectively. Mixed-sign zeros return -0 for `min` and +0

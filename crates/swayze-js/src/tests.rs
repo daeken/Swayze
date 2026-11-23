@@ -90,6 +90,83 @@ fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
 }
 
 #[test]
+fn nested_control_edges_target_their_own_tests_and_joins() {
+    use Instruction::{Boolean, Jump, JumpIfFalseStatement, LoopBack};
+
+    assert_postfix(
+        "while(false){if(true){while(false){}}else{if(1+(2+3)){}}}42",
+        &[
+            Boolean(false),
+            JumpIfFalseStatement(15),
+            Boolean(true),
+            JumpIfFalseStatement(8),
+            Boolean(false),
+            JumpIfFalseStatement(7),
+            LoopBack(4),
+            Jump(14),
+            Number(1.0),
+            Number(2.0),
+            Number(3.0),
+            Add,
+            Add,
+            JumpIfFalseStatement(14),
+            LoopBack(0),
+            Number(42.0),
+        ],
+        3,
+    );
+}
+
+#[test]
+fn nested_controls_charge_one_frame_push_per_statement_and_lex_each_token_once() {
+    let source = "let x=0;if(false){while(true){x=1;}}else{if(true){x=2;}}x";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 35,
+        max_nesting_depth: 1,
+        // 15 instructions + 3 conversions + 3 expression markers + 3
+        // statement frames + 6 lookup units. Else reuses the enclosing frame.
+        max_work: source.len() + 30,
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(2.0)
+    );
+    for (limit, below) in [
+        (
+            Limit::Tokens,
+            Limits {
+                max_tokens: limits.max_tokens - 1,
+                ..limits
+            },
+        ),
+        (
+            Limit::Work,
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+        ),
+    ] {
+        assert_limit(source, below, limit, source.len() - 1, source.len());
+    }
+
+    let inner_open = source.find("{x=1").unwrap();
+    // Enough work through the inner '{', but not to push the inner frame:
+    // 3 for the declaration, 3 for each test, and 1 for the outer frame.
+    assert_limit(
+        source,
+        Limits {
+            max_work: inner_open + 1 + 10,
+            ..limits
+        },
+        Limit::Work,
+        inner_open,
+        inner_open + 1,
+    );
+}
+
+#[test]
 fn while_body_and_back_edge_are_metered_even_if_skipped() {
     let source = "let x=0;while(false){x=1;}x";
     let limits = Limits {
@@ -97,7 +174,7 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
         max_tokens: 16,
         max_nesting_depth: 1,
         // Same as an if with no else, plus one emission for the back edge.
-        max_work: source.len() + 15,
+        max_work: source.len() + 16,
     };
     assert!(parse_script_with_limits(source, limits).is_ok());
     assert_limit(
@@ -114,13 +191,13 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
     assert_limit(
         source,
         Limits {
-            max_work: close + 1 + 11,
+            max_work: close + 1 + 12,
             ..limits
         },
         Limit::Work,
         close,
         close + 1,
-    ); // The source through '}', two conversions, one marker, six prior emissions, and a lookup.
+    ); // Source through '}', two conversions, a marker, a frame, six emissions, and a lookup.
     assert_limit(
         source,
         Limits {
@@ -136,11 +213,11 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
 #[test]
 fn if_tokens_and_work_are_counted_once_even_in_untaken_branches() {
     for (source, tokens, work_beyond_source) in [
-        ("let x=0;if(false){x=1;}x", 16, 14),
-        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 20),
+        ("let x=0;if(false){x=1;}x", 16, 15),
+        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 21),
     ] {
-        // Besides the source bytes: decimal input bytes, the '(' marker,
-        // instruction emissions, and binding lookups for each store and load.
+        // Besides the source bytes: decimal input bytes, the '(' marker, the
+        // statement frame, instruction emissions, and binding lookups.
         let limits = Limits {
             max_source_bytes: source.len(),
             max_tokens: tokens,
@@ -179,11 +256,12 @@ fn if_tokens_and_work_are_counted_once_even_in_untaken_branches() {
             body_start + 1,
         );
         // Scanning through '{', plus the conversion of `0`, the group marker,
-        // and four instructions (Number, InitBinding, Boolean, JumpIfFalse).
+        // four instructions (Number, InitBinding, Boolean, JumpIfFalseStatement),
+        // and the statement frame.
         assert_limit(
             source,
             Limits {
-                max_work: body_start + 6,
+                max_work: body_start + 7,
                 ..limits
             },
             Limit::Work,

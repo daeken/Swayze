@@ -182,7 +182,7 @@ fn declaration_rules_apply_before_initialization_even_in_inactive_code() {
 }
 
 #[test]
-fn declarations_still_require_explicit_semicolons_and_single_names() {
+fn declarations_still_require_explicit_semicolons_and_name_targets() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, len, kind) in [
         ("const x|;", 1, Malformed),
@@ -191,7 +191,6 @@ fn declarations_still_require_explicit_semicolons_and_single_names() {
         ("let x|", 0, Malformed),
         ("let x;|", 0, Unsupported),
         ("let |{x}; x", 1, Unsupported),
-        ("let x|,y; x", 1, Unsupported),
         ("|var x; x", 3, Unsupported),
         ("for(|let x;;){} 0", 3, Unsupported),
         ("for(;false;|let x){} 0", 3, Unsupported),

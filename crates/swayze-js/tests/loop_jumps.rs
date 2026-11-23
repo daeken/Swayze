@@ -136,7 +136,6 @@ fn rejects_invalid_and_out_of_slice_syntax_in_loop_paths_that_never_run() {
         ("while(false){break\n}42", Unsupported, "}"),
         ("while(false){continue 1;}42", Malformed, "1"),
         ("while(false){label: break;}42", Unsupported, ":"),
-        ("for(;;){break;}42", Unsupported, "for"),
         ("switch(1){break;}42", Unsupported, "switch"),
         ("while(true){break;}42; 1", Unsupported, "1"),
     ] {

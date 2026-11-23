@@ -131,6 +131,40 @@ fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
 }
 
 #[test]
+fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
+    use Instruction::{JumpIfFalseStatement, JumpStatement, LessThan, LoopBack, StoreBinding};
+
+    assert_postfix(
+        "let i=9;for(i=0;i<3;i=i+(1+1)){if(i){break;}continue;}i",
+        &[
+            Number(9.0),
+            init_let(0),
+            Number(0.0),
+            StoreBinding(0),
+            LoadBinding(0), // 4: test
+            Number(3.0),
+            LessThan,
+            JumpIfFalseStatement(21),
+            JumpStatement(16),
+            LoadBinding(0), // 9: update
+            Number(1.0),
+            Number(1.0),
+            Add,
+            Add,
+            StoreBinding(0),
+            LoopBack(4),
+            LoadBinding(0), // 16: body
+            JumpIfFalseStatement(19),
+            JumpStatement(21), // break
+            LoopBack(9),       // continue
+            LoopBack(9),       // body fallthrough
+            LoadBinding(0),    // 21: exit
+        ],
+        3,
+    );
+}
+
+#[test]
 fn nested_control_edges_target_their_own_tests_and_joins() {
     use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
 

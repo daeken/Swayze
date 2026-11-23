@@ -161,8 +161,12 @@ impl Script {
     /// truthiness but executes only the selected branch, leaving no operand
     /// stack result. A falsy test with no `else` performs no writes.
     /// A `while` statement evaluates its test before each iteration and runs its
-    /// body only when the test is truthy. `break;` exits the innermost enclosing
-    /// loop, and `continue;` returns to its test. None leaves a result.
+    /// body only when the test is truthy. A `for` statement first runs its
+    /// optional initializer and then tests (an omitted test is truthy). Each
+    /// normal iteration ends with the optional update, then another test.
+    /// `break;` exits the innermost loop without updating, and `continue;`
+    /// skips the rest of its body but still runs its update, if any, before
+    /// retesting. None of these statements leaves a result.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments use fresh immutable `const` and mutable `let` slots for
@@ -204,7 +208,7 @@ fn evaluate(
     }
     // Back edges require an empty stack, so repeated passes cannot build up
     // operands. A path to the peak needs that many distinct pushes and at
-    // least one less distinct pop to finish or return to a loop test. Each
+    // least one less distinct pop to finish or reach a loop back edge. Each
     // binding also needs a push and initializer, plus a final expression.
     if max_operands == 0
         || max_operands > ops.len().div_ceil(2)
@@ -223,7 +227,7 @@ fn evaluate(
     // No clearing on scope exit is needed: the parser emits references only
     // within the declaration's scope after its initializer. A jump can skip a
     // block or leave it, but cannot enter a suffix from outside the block.
-    // Loop back edges restart at a test, before the body initializes again.
+    // Loop back edges restart at a test or update, outside the body scope.
     let mut bindings = Vec::<Option<Slot>>::new();
     bindings
         .try_reserve_exact(binding_slots)
@@ -367,7 +371,7 @@ fn evaluate(
             }
             Instruction::LoopBack(target) => {
                 // `ip` already points past this instruction. Reject self and
-                // forward edges, and only re-enter a test at statement depth.
+                // forward edges, and require statement depth on entry.
                 if target >= ip - 1 || !stack.is_empty() {
                     return Err(EvalError::InvalidScript);
                 }

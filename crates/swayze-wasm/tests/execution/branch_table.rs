@@ -1,30 +1,34 @@
 use super::*;
 
 #[test]
-fn result_table_exits_if_block_or_function_with_the_selected_floor() {
+fn direct_and_table_fixups_share_an_if_with_duplicate_entries_and_default() {
     let body = [
         0, 0x41, 40, 0x02, 0x7f, // Result block preserves 40.
         0x41, 7, 0x20, 0, 0x04, 0x7f, // Result if preserves 40 and 7.
         0x41, 9, 0x02, 0x40, // The inner frame freezes 9 as well.
-        0x41, 5, 0x41, 2, 0x20, 1, 0x0e, 3, 1, 2, 1, 3, // if, block, if; default function.
+        0x41, 5, 0x41, 2, 0x20, 1, 0x0e, 4, 2, 1, 1, 3,
+        1, // Block, if, if, function; default if.
         0x00, 0x0b, 0x1a, 0x41, 3, // Trap and normal continuation are skipped.
-        0x05, 0x41, 4, 0x20, 1, 0x0d, 0, // Else: inline fixup to the same if.
-        0x41, 6, 0x20, 1, 0x0e, 1, 1, 0, // Another table: block; default if.
+        0x05, 0x41, 4, 0x20, 1, 0x45, 0x0d,
+        0, // Else: inline fixup to the same if when p1 == 0.
+        0x41, 6, 0x20, 1, 0x0e, 2, 1, 1, 0, // Another table: block twice; default if.
         0x0b, 0x6a, 0x0b, 0x6a, 0x0b,
     ];
     let caller = [0, 0x41, 1, 0x20, 0, 0x20, 1, 0x10, 0, 0x6a, 0x0b];
     let module = exported_functions(2, &[(b"answer", 0), (b"caller", 1)], &[&body, &caller]);
     let instance = module.instantiate().unwrap();
     for (args, expected) in [
-        ([1, 0], 49),
-        ([1, 1], 42),
+        ([1, 0], 42), // Block floor: preserve 40.
+        ([1, 1], 49), // If floor: preserve 40 and 7, on both duplicates and default.
         ([1, 2], 49),
-        ([1, 3], 2),
-        ([1, -1], 2),
-        ([1, i32::MIN], 2),
-        ([1, i32::MAX], 2),
-        ([0, 0], 46),
-        ([0, 1], 51),
+        ([1, 3], 2), // Function floor: preserve neither.
+        ([1, 4], 49),
+        ([1, -1], 49),
+        ([1, i32::MIN], 49),
+        ([1, i32::MAX], 49),
+        ([0, 0], 51), // Direct branch joins the same if.
+        ([0, 1], 46),
+        ([0, 2], 53), // Default of the second table joins the same if too.
     ] {
         assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
         assert_eq!(
@@ -203,6 +207,24 @@ fn validates_table_immediates_exactly_within_the_body_frame() {
     ] {
         bad_body(&[prefix, immediates].concat(), prefix.len() + offset, kind);
     }
+}
+
+#[test]
+fn requires_complete_body_before_accepting_patched_branch_tables() {
+    let mut body = vec![
+        0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 42, 0x41, 0, 0x0e, 1, 0, 1, 0x0b,
+    ];
+    // The explicit edge is patched, but its default still awaits the outer end.
+    bad_body(
+        &body,
+        body.len(),
+        ErrorKind::TruncatedByte { expected: 0x0b },
+    );
+    body.extend([0x0b, 0x0b]);
+    assert_body_result(&body, 42);
+    // All edges resolve, but trailing body bytes must still reject the module.
+    body.push(0x01);
+    bad_body(&body, body.len() - 1, ErrorKind::TrailingBodyBytes);
 }
 
 #[test]

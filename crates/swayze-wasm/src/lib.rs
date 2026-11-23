@@ -167,10 +167,15 @@
 //! `return` and branches to the function label share an exit target at the
 //! one-past-last instruction index.
 //! Each table decodes to one instruction that indexes a separate per-body array
-//! of resolved edges. Validation retains only the actual entries and defaults,
-//! at most 256 targets per body because each depth consumes at least one of the
-//! 256 body bytes. The scratch fixup storage has one link slot per decoded
-//! instruction and one per possible table target; execution never uses it.
+//! of resolved edges. Each table occupies consecutive slots starting at its
+//! base, with the default at `base + explicit_count`. Dispatch clamps the `u32`
+//! selector to `explicit_count` (at most 16) before converting it to an index;
+//! adding that index to the base cannot go past the stored default. Validation
+//! retains at most 256 edges per body because each depth consumes at least one
+//! of the 256 body bytes. The scratch fixup storage has one link slot per
+//! decoded instruction and one per possible table target; execution never uses
+//! it. Validation retains decoded code only after all edges have been resolved
+//! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and

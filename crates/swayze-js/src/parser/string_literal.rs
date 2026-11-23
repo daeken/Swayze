@@ -26,24 +26,25 @@ impl StringRange {
     }
 }
 
+pub(super) enum CookedSegment {
+    Final(StringRange),
+    Substitution(StringRange),
+}
+
 impl Lexer<'_> {
-    // The opening quote or backtick has already been consumed and charged.
-    pub(super) fn string_literal(
+    // The initial quote, backtick or substitution-closing brace has already
+    // been consumed and charged, but still counts toward this segment's cap.
+    pub(super) fn cooked_segment(
         &mut self,
         delimiter: char,
         start: usize,
-    ) -> Result<StringRange, Error> {
+    ) -> Result<CookedSegment, Error> {
         let template = delimiter == '`';
         let unit_start = self.string_units.len();
         while let Some(c) = self.peek() {
             let span = self.consume_string(c, start)?;
             if c == delimiter {
-                return Ok(StringRange {
-                    // The append ceiling bounds both fields, including the start of
-                    // an empty literal immediately after a full pool.
-                    start: unit_start as u16,
-                    len: (self.string_units.len() - unit_start) as u16,
-                });
+                return Ok(CookedSegment::Final(self.cooked_range(unit_start)));
             }
             let value = match c {
                 '\n' | '\r' if !template => {
@@ -58,13 +59,7 @@ impl Lexer<'_> {
                 }
                 '$' if template && self.peek() == Some('{') => {
                     self.consume_string('{', start)?;
-                    return Err(Error::unsupported(
-                        Span {
-                            start: span.start,
-                            end: self.offset,
-                        },
-                        "template interpolation is outside the subset",
-                    ));
+                    return Ok(CookedSegment::Substitution(self.cooked_range(unit_start)));
                 }
                 '\\' => match self.string_escape(start, span.start, template)? {
                     Some(value) => value,
@@ -94,6 +89,15 @@ impl Lexer<'_> {
         ))
     }
 
+    fn cooked_range(&self, start: usize) -> StringRange {
+        // The append ceiling bounds both fields, including the start of
+        // an empty segment immediately after a full pool.
+        StringRange {
+            start: start as u16,
+            len: (self.string_units.len() - start) as u16,
+        }
+    }
+
     fn consume_string(&mut self, c: char, start: usize) -> Result<Span, Error> {
         let end = self.offset + c.len_utf8();
         if end - start > MAX_STRING_LITERAL_BYTES {
@@ -104,9 +108,9 @@ impl Lexer<'_> {
                 },
                 Limit::StringLiteralBytes,
             );
-            return Err(if self.source.as_bytes()[start] == b'`' {
+            return Err(if matches!(self.source.as_bytes()[start], b'`' | b'}') {
                 Error {
-                    message: "template literal byte ceiling exceeded (including backticks)",
+                    message: "template segment byte ceiling exceeded (including delimiters)",
                     ..err
                 }
             } else {

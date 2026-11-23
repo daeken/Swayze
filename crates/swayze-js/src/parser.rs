@@ -3,6 +3,7 @@ use std::fmt;
 use crate::radix_integer::RadixInteger;
 
 mod string_literal;
+use string_literal::CookedSegment;
 pub(crate) use string_literal::{MAX_STRING_LITERAL_CODE_UNITS, StringRange};
 
 // Fixed ceiling on source bytes (including separators) in decimals with a point or exponent.
@@ -35,7 +36,8 @@ pub struct Limits {
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
     /// Maximum combined depth of open parentheses (including control headers)
-    /// and pending conditional expressions or ungrouped assignment RHSs.
+    /// and pending conditionals, ungrouped assignment RHSs, or open templates
+    /// with substitutions.
     /// Statement frames have a separate fixed cap.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
@@ -63,7 +65,7 @@ pub enum Limit {
     Work,
     /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
-    /// Fixed source-byte ceiling for a quoted String or template token, including delimiters.
+    /// Fixed source-byte ceiling for a quoted String or cooked template segment, including delimiters.
     StringLiteralBytes,
     /// Fixed ceiling on aggregate decoded UTF-16 code units across all String literals in one Script.
     StringLiteralUnits,
@@ -218,6 +220,7 @@ pub(crate) enum Instruction {
     Number(f64),
     String(StringRange),
     Boolean(bool),
+    TemplateAppend(StringRange),
     Null,
     Undefined,
     StringLength,
@@ -477,6 +480,7 @@ enum TokenKind {
     Number(f64),
     String(StringRange),
     Template(StringRange),
+    TemplateHead(StringRange),
     Boolean(bool),
     Null,
     Identifier,
@@ -687,11 +691,10 @@ impl Lexer<'_> {
                     // scan a tag's template body (even on a skipped path).
                     return Err(unsupported_token(first));
                 }
-                let range = self.string_literal(c, start)?;
-                if template {
-                    TokenKind::Template(range)
-                } else {
-                    TokenKind::String(range)
+                match self.cooked_segment(c, start)? {
+                    CookedSegment::Final(range) if template => TokenKind::Template(range),
+                    CookedSegment::Final(range) => TokenKind::String(range),
+                    CookedSegment::Substitution(range) => TokenKind::TemplateHead(range),
                 }
             }
             _ if is_identifier_start(c) => self.identifier(start)?,
@@ -1089,6 +1092,9 @@ enum Pending {
     StatementTest,
     Group {
         preserves_reference: bool,
+    },
+    Template {
+        prefix_depth: usize,
     },
     AssignmentGroup(ExpressionAssignment),
     Assignment(ExpressionAssignment),
@@ -2720,6 +2726,9 @@ impl Parser<'_> {
         // Only the most recent operand can be the direct argument of a pending
         // prefix. Track its read-access index, not the shape of emitted code.
         let mut direct_read = None;
+        // Keep the legacy brace diagnostics outside templates without searching
+        // pending entries. Only the reducer can authorize raw continuation.
+        let mut template_depth = 0;
         let (end, delimiter) = loop {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
@@ -2790,6 +2799,19 @@ impl Parser<'_> {
                         "control-flow keywords are not expression tokens",
                     ));
                 }
+                (true, TokenKind::CloseBrace) if template_depth != 0 => {
+                    return Err(Error::malformed(
+                        span,
+                        "expected a template substitution operand",
+                    ));
+                }
+                (false, TokenKind::CloseBrace) if template_depth != 0 => {
+                    needs_operand = self.finish_template_substitution(span, &mut direct_read)?;
+                    if !needs_operand {
+                        template_depth -= 1;
+                        allow_dot = true;
+                    }
+                }
                 (false, TokenKind::CloseBrace) if let Some(message) = missing_semicolon => {
                     return Err(Error::unsupported(span, message));
                 }
@@ -2815,6 +2837,16 @@ impl Parser<'_> {
                     self.emit(Instruction::String(range), span)?;
                     needs_operand = false;
                     allow_dot = true;
+                }
+                (true, TokenKind::TemplateHead(range)) => {
+                    self.emit(Instruction::String(range), span)?;
+                    self.open_pending(
+                        Pending::Template {
+                            prefix_depth: self.stack_depth,
+                        },
+                        span,
+                    )?;
+                    template_depth += 1;
                 }
                 (true, TokenKind::Number(value)) => {
                     self.emit(Instruction::Number(value), span)?;
@@ -2935,7 +2967,12 @@ impl Parser<'_> {
                         {
                             break (span, Some(kind));
                         }
-                        Some((Pending::Group { .. } | Pending::StatementTest, _)) => {}
+                        Some((
+                            Pending::Group { .. }
+                            | Pending::StatementTest
+                            | Pending::Template { .. },
+                            _,
+                        )) => {}
                         None if matches!(
                             end_kind,
                             ExpressionEnd::Script
@@ -3033,7 +3070,7 @@ impl Parser<'_> {
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
                 }
-                (false, TokenKind::Template(_)) => {
+                (false, TokenKind::Template(_) | TokenKind::TemplateHead(_)) => {
                     // Normally rejected by the lexer before decoding the body.
                     return Err(unsupported_token(Span {
                         start: span.start,
@@ -3076,12 +3113,17 @@ impl Parser<'_> {
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
             after_open = matches!(kind, TokenKind::Open);
-            // Only a comma that emitted Discard reaches here; separators
-            // and commas rejected by the surrounding production do not.
-            allow_assignment = matches!(
-                kind,
-                TokenKind::Question | TokenKind::Colon | TokenKind::Comma
-            );
+            // A head or middle starts a fresh substitution expression; a
+            // comma that emitted Discard starts another sequence operand.
+            allow_assignment = needs_operand
+                && matches!(
+                    kind,
+                    TokenKind::Question
+                        | TokenKind::Colon
+                        | TokenKind::Comma
+                        | TokenKind::TemplateHead(_)
+                        | TokenKind::CloseBrace
+                );
             next = self.next_token(if needs_operand {
                 TokenPosition::Operand
             } else if allow_dot {
@@ -3102,6 +3144,10 @@ impl Parser<'_> {
                 Pending::Group { .. } | Pending::StatementTest | Pending::AssignmentGroup(_) => {
                     "semicolon inside a parenthesized expression"
                 }
+                Pending::Template { .. } if at_eof => {
+                    "expected '}' before end of template substitution"
+                }
+                Pending::Template { .. } => "semicolon inside a template substitution",
                 _ => "expected ':' to complete conditional expression",
             };
             return Err(Error::malformed(end, message));
@@ -3119,6 +3165,49 @@ impl Parser<'_> {
             ));
         }
         Ok((end, delimiter))
+    }
+
+    // Returns true for Middle (another operand required), false for Tail.
+    fn finish_template_substitution(
+        &mut self,
+        brace: Span,
+        direct_read: &mut Option<usize>,
+    ) -> Result<bool, Error> {
+        self.reduce_expression(brace, direct_read)?;
+        let prefix_depth = match self.pending.last() {
+            Some((Pending::Template { prefix_depth }, _)) => *prefix_depth,
+            Some((Pending::Consequent { .. }, _)) => {
+                return Err(Error::malformed(brace, "expected ':' before '}'"));
+            }
+            _ => return Err(Error::malformed(brace, "expected ')' before '}'")),
+        };
+        if self.stack_depth.checked_sub(prefix_depth) != Some(1) {
+            return Err(Error::malformed(
+                brace,
+                "template substitution must leave one result",
+            ));
+        }
+        // The normal '}' token supplied this segment's token and first byte
+        // charge (possibly via identifier lookahead). Enter raw mode only
+        // now, with no trivia scan or cached token.
+        let (range, middle) = match self.lexer.cooked_segment('`', brace.start)? {
+            CookedSegment::Final(range) => (range, false),
+            CookedSegment::Substitution(range) => (range, true),
+        };
+        self.emit(
+            Instruction::TemplateAppend(range),
+            Span {
+                start: brace.start,
+                end: self.lexer.offset,
+            },
+        )?;
+        *direct_read = None;
+        if !middle {
+            self.pending.pop();
+            self.nesting_depth -= 1;
+        }
+        // On Middle the append left one prefix; reuse the existing marker.
+        Ok(middle)
     }
 
     fn push_infix(
@@ -3231,7 +3320,8 @@ impl Parser<'_> {
     // a test, RHS, arm or sequence operand prefix, so neither marker has
     // operators immediately beneath it. An arm's assignments finish before
     // its conditional joins; an assignment whose RHS is that conditional
-    // finishes after the join. Groups, the statement test's outer delimiter,
+    // finishes after the join. Groups, template markers, the statement test's
+    // outer delimiter,
     // and consequents still awaiting ':' stop reduction.
     fn reduce_expression(
         &mut self,
@@ -3363,6 +3453,7 @@ impl Parser<'_> {
             | Instruction::Typeof
             | Instruction::StringLength => (1, 1),
             Instruction::UpdateNumber(_)
+            | Instruction::TemplateAppend(_)
             | Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply

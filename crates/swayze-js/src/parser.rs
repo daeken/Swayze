@@ -1014,7 +1014,7 @@ enum Pending {
 // All unresolved jump targets and binding operands are patched before returning a Script.
 const UNPATCHED: usize = usize::MAX;
 
-// Root is index 0. Each braced body and each `for` header with `let` gets its own scope.
+// Root is index 0. Each braced body and `for` declaration header gets its own scope.
 struct Scope {
     parent: Option<usize>,
     last_binding: Option<usize>,
@@ -1048,9 +1048,15 @@ enum ExpressionEnd {
     Semicolon(&'static str),
     Declarator(DeclaratorEnd),
     StatementTest,
-    ForInit,
     ForTest,
-    ForUpdate,
+    ForClause(ForClauseEnd),
+    ForStore(ForClauseEnd),
+}
+
+#[derive(Clone, Copy)]
+enum ForClauseEnd {
+    Init,
+    Update,
 }
 
 #[derive(Clone, Copy)]
@@ -1060,6 +1066,7 @@ enum DeclaratorEnd {
 }
 
 const FOR_SEMICOLON: &str = "expected ';' between for clauses";
+const FOR_UPDATE_CLOSE: &str = "expected ')' after the for update";
 const EXPRESSION_STATEMENT_SEMICOLON: &str = "expression statements require explicit semicolons";
 
 const STORE_STATEMENT_END: ExpressionEnd =
@@ -1112,7 +1119,8 @@ struct BlockFrame {
 struct Parser<'s> {
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) when disambiguating a
-    // statement-start name, a root semicolon, or an if's then-arm.
+    // name at the start of a statement or for clause, a root semicolon,
+    // or an if's then-arm.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -1120,7 +1128,7 @@ struct Parser<'s> {
     statement_frames: Vec<BlockFrame>,
     // Index into statement_frames; non-loop frames do not change it.
     innermost_loop: Option<usize>,
-    // Only active while parsing a `for (let ... )` header and opening its body.
+    // Only active while parsing a `for` declaration header and opening its body.
     // Once the body frame is pushed, its own scope links to this one.
     for_header_scope: Option<usize>,
     instructions: Vec<Instruction>,
@@ -1437,8 +1445,6 @@ impl Parser<'_> {
         self.lexer.charge(1, open.span)?;
 
         let init = self.require_token("expected a for initializer or ';'")?;
-        let unsupported_store =
-            "for initializers and updates must assign to, increment or decrement a name";
         match init.kind {
             TokenKind::Close => return Err(Error::malformed(init.span, FOR_SEMICOLON)),
             TokenKind::Semicolon => {}
@@ -1449,7 +1455,7 @@ impl Parser<'_> {
                 self.parse_declaration_list(kind, DeclaratorEnd::ForHeader)?;
             }
             _ => {
-                self.parse_required_store(init, ExpressionEnd::ForInit, unsupported_store)?;
+                self.parse_for_clause(init, ForClauseEnd::Init)?;
             }
         }
 
@@ -1481,8 +1487,7 @@ impl Parser<'_> {
             let skip_update = self.instructions.len();
             self.emit(Instruction::JumpStatement(UNPATCHED), first.span)?;
             let update = self.instructions.len();
-            let close =
-                self.parse_required_store(first, ExpressionEnd::ForUpdate, unsupported_store)?;
+            let close = self.parse_for_clause(first, ForClauseEnd::Update)?;
             self.emit(Instruction::LoopBack(test), close)?;
             self.patch_jump(skip_update, close)?;
             (update, close)
@@ -1495,47 +1500,61 @@ impl Parser<'_> {
         }))
     }
 
-    fn parse_required_store(
-        &mut self,
-        first: Token,
-        end: ExpressionEnd,
-        unsupported: &'static str,
-    ) -> Result<Span, Error> {
-        match first.kind {
-            TokenKind::Update(op) => self.parse_prefix_update(op, first.span, end),
-            TokenKind::Identifier => {
-                let operator =
-                    self.require_token("expected an assignment or update operator after the name")?;
-                self.parse_store_after_name(first.span, &operator, end)?
-                    .ok_or_else(|| Error::unsupported(operator.span, unsupported))
-            }
-            _ => Err(Error::unsupported(first.span, unsupported)),
+    fn parse_for_clause(&mut self, first: Token, end: ForClauseEnd) -> Result<Span, Error> {
+        // Stores are standalone. Only the non-store path permits an ungrouped sequence.
+        if let Some(span) = self.parse_optional_store(&first, ExpressionEnd::ForStore(end))? {
+            return Ok(span);
         }
+        self.parse_discarded_expression(first, ExpressionEnd::ForClause(end))
     }
 
-    fn parse_store_after_name(
+    fn parse_optional_store(
         &mut self,
-        name: Span,
-        operator: &Token,
+        first: &Token,
         end: ExpressionEnd,
     ) -> Result<Option<Span>, Error> {
-        match operator.kind {
-            TokenKind::Assignment(op) => self
-                .parse_assignment(name, op, operator.span, end)
-                .map(Some),
-            // The lexer records LineTerminator trivia (including inside comments)
-            // while scanning it. The cached token never needs a trivia rescan.
-            TokenKind::Update(op) => {
-                if operator.after_line_break {
-                    return Err(Error::unsupported(
-                        operator.span,
-                        "a line terminator cannot precede a postfix update",
-                    ));
+        match first.kind {
+            TokenKind::Update(op) => self.parse_prefix_update(op, first.span, end).map(Some),
+            TokenKind::Identifier => {
+                let next = self.next_token()?;
+                match next {
+                    Some(Token {
+                        kind: TokenKind::Assignment(op),
+                        span,
+                        ..
+                    }) => self.parse_assignment(first.span, op, span, end).map(Some),
+                    Some(Token {
+                        kind: TokenKind::Update(op),
+                        span,
+                        after_line_break,
+                    }) => {
+                        // The lexer records LineTerminator trivia, including inside comments.
+                        if after_line_break {
+                            return Err(Error::unsupported(
+                                span,
+                                "a line terminator cannot precede a postfix update",
+                            ));
+                        }
+                        self.parse_update(first.span, op, span, end).map(Some)
+                    }
+                    _ => {
+                        self.lookahead = Some(next);
+                        Ok(None)
+                    }
                 }
-                self.parse_update(name, op, operator.span, end).map(Some)
             }
             _ => Ok(None),
         }
+    }
+
+    fn parse_discarded_expression(
+        &mut self,
+        first: Token,
+        end: ExpressionEnd,
+    ) -> Result<Span, Error> {
+        let (span, _) = self.parse_expression(first, end)?;
+        self.emit(Instruction::Discard, span)?;
+        Ok(span)
     }
 
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
@@ -1576,8 +1595,7 @@ impl Parser<'_> {
             return self.close_block(first.span);
         }
         if let Some(first) = self.parse_non_expression_statement(first)? {
-            let (end, _) = self.parse_expression(first, ExpressionEnd::ExpressionStatement)?;
-            self.emit(Instruction::Discard, end)?;
+            self.parse_discarded_expression(first, ExpressionEnd::ExpressionStatement)?;
         }
         Ok(())
     }
@@ -1594,22 +1612,14 @@ impl Parser<'_> {
             | TokenKind::For
             | TokenKind::Do => self.open_statement(first)?,
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first)?,
-            TokenKind::Update(op) => {
-                self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
-            }
-            TokenKind::Identifier => {
-                let next = self.next_token()?;
-                if let Some(operator) = &next
-                    && self
-                        .parse_store_after_name(first.span, operator, STORE_STATEMENT_END)?
-                        .is_some()
+            _ => {
+                if self
+                    .parse_optional_store(&first, STORE_STATEMENT_END)?
+                    .is_none()
                 {
-                    return Ok(None);
+                    return Ok(Some(first));
                 }
-                self.lookahead = Some(next);
-                return Ok(Some(first));
             }
-            _ => return Ok(Some(first)),
         }
         Ok(None)
     }
@@ -1834,8 +1844,11 @@ impl Parser<'_> {
         let kind = next.as_ref().map(|t| t.kind);
         // Only a complete, explicitly delimited update is a supported write.
         match (end, kind) {
-            (ExpressionEnd::Semicolon(_) | ExpressionEnd::ForInit, Some(TokenKind::Semicolon))
-            | (ExpressionEnd::ForUpdate, Some(TokenKind::Close)) => {}
+            (
+                ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(ForClauseEnd::Init),
+                Some(TokenKind::Semicolon),
+            )
+            | (ExpressionEnd::ForStore(ForClauseEnd::Update), Some(TokenKind::Close)) => {}
             (ExpressionEnd::Semicolon(_), None | Some(TokenKind::CloseBrace)) => {
                 return Err(Error::unsupported(
                     span,
@@ -1849,16 +1862,16 @@ impl Parser<'_> {
                 ));
             }
             (
-                ExpressionEnd::ForInit,
+                ExpressionEnd::ForStore(ForClauseEnd::Init),
                 None | Some(TokenKind::Close | TokenKind::OpenBrace | TokenKind::CloseBrace),
             ) => {
                 return Err(Error::malformed(span, FOR_SEMICOLON));
             }
             (
-                ExpressionEnd::ForUpdate,
+                ExpressionEnd::ForStore(ForClauseEnd::Update),
                 None | Some(TokenKind::Semicolon | TokenKind::OpenBrace | TokenKind::CloseBrace),
             ) => {
-                return Err(Error::malformed(span, "expected ')' after the for update"));
+                return Err(Error::malformed(span, FOR_UPDATE_CLOSE));
             }
             _ => {
                 return Err(Error::unsupported(
@@ -2065,11 +2078,17 @@ impl Parser<'_> {
         // Compound assignment keeps its loaded LHS below the RHS operands.
         let base_depth = self.stack_depth;
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
+        let for_update = matches!(
+            end_kind,
+            ExpressionEnd::ForClause(ForClauseEnd::Update)
+                | ExpressionEnd::ForStore(ForClauseEnd::Update)
+        );
         let for_delimiter = match end_kind {
-            ExpressionEnd::ForInit
+            ExpressionEnd::ForClause(ForClauseEnd::Init)
+            | ExpressionEnd::ForStore(ForClauseEnd::Init)
             | ExpressionEnd::ForTest
             | ExpressionEnd::Declarator(DeclaratorEnd::ForHeader) => Some(FOR_SEMICOLON),
-            ExpressionEnd::ForUpdate => Some("expected ')' after the for update"),
+            _ if for_update => Some(FOR_UPDATE_CLOSE),
             _ => None,
         };
         let missing_semicolon = match end_kind {
@@ -2238,6 +2257,7 @@ impl Parser<'_> {
                             ExpressionEnd::Script
                                 | ExpressionEnd::ExpressionStatement
                                 | ExpressionEnd::ForTest
+                                | ExpressionEnd::ForClause(_)
                         ) => {}
                         _ => {
                             return Err(Error::unsupported(
@@ -2293,7 +2313,7 @@ impl Parser<'_> {
                                 "expected ':' before closing parenthesis",
                             ));
                         }
-                        None if matches!(end_kind, ExpressionEnd::ForUpdate) => {
+                        None if for_update => {
                             break (span, Some(kind));
                         }
                         None if let Some(message) = for_delimiter => {
@@ -2336,8 +2356,8 @@ impl Parser<'_> {
                     self.push_infix(op, span)?;
                     needs_operand = true;
                 }
-                (false, TokenKind::Semicolon) if matches!(end_kind, ExpressionEnd::ForUpdate) => {
-                    return Err(Error::malformed(span, "expected ')' after the for update"));
+                (false, TokenKind::Semicolon) if for_update => {
+                    return Err(Error::malformed(span, FOR_UPDATE_CLOSE));
                 }
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }

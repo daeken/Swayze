@@ -266,6 +266,50 @@ fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
 }
 
 #[test]
+fn for_expression_clauses_join_at_discards_before_statement_edges() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{
+        Boolean, Discard, Jump, JumpIfFalse, JumpIfFalseStatement, JumpStatement, LoopBack, Null,
+        ShortCircuit, Void,
+    };
+
+    assert_postfix(
+        "for(true?null:false,void 1;true;false&&1,(null,true)){continue;break;}42",
+        &[
+            Boolean(true),
+            JumpIfFalse(4),
+            Null,
+            Jump(5),
+            Boolean(false),
+            Discard, // join of the completed conditional, at the comma
+            Number(1.0),
+            Void,
+            Discard,       // final initializer result
+            Boolean(true), // 9: test
+            JumpIfFalseStatement(24),
+            JumpStatement(21),
+            Boolean(false), // 12: update
+            ShortCircuit {
+                target: 15,
+                condition: ShortCircuitCondition::Falsy,
+            },
+            Number(1.0),
+            Discard, // join of the short circuit, at the comma
+            Null,
+            Discard, // grouped comma
+            Boolean(true),
+            Discard, // final update result
+            LoopBack(9),
+            LoopBack(12),      // 21: body, continue
+            JumpStatement(24), // break
+            LoopBack(12),      // body fallthrough
+            Number(42.0),      // 24: exit
+        ],
+        1,
+    );
+}
+
+#[test]
 fn logical_assignment_tests_one_load_and_skips_past_the_store() {
     use Instruction::{ShortCircuitStatement, StoreBinding};
 

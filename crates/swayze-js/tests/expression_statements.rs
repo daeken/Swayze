@@ -98,7 +98,6 @@ fn statement_expressions_do_not_enable_other_syntax() {
         ("1; @\"use strict\"; 2", 1, "outside"),
         ("{@function f(){}; } 2", 8, "outside"),
         ("{(@{x: 1});} 2", 1, "braces are not expression tokens"),
-        ("for (@true;false;){} 2", 4, "initializers and updates"),
     ] {
         assert_error(source, width, Unsupported, message);
     }

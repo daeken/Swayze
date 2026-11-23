@@ -498,6 +498,15 @@ fn fixtures() -> Vec<Fixture> {
         cases.push(Fixture::new(expected, &args, &function_label));
     }
     cases.push(Fixture::new(42, &[], &[0x41, 7, 0x41, 42, 0x0f, 0x00]));
+    // Both arms can branch to their shared if label. The branch leaves the
+    // chosen result on top of the prefix below the if.
+    let if_end = [
+        0x41, 3, 0x20, 0, 0x04, 0x7f, 0x41, 39, 0x0c, 0, 0x00, 0x05, 0x41, 4, 0x20, 1, 0x0d, 0,
+        0x1a, 0x41, 8, 0x0b, 0x6a,
+    ];
+    for (args, expected) in [([1, 0], 42), ([0, -1], 7), ([0, 0], 11)] {
+        cases.push(Fixture::new(expected, &args, &if_end));
+    }
     cases
 }
 

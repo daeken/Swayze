@@ -94,6 +94,11 @@ fn rounding_cases(
     let k = 1 << ((h - 2) / 2);
     let j = n / (2 * k);
     let even = one + j + k;
+    // With these bounds both adjustments of a and b are representable and
+    // change the product by less than one largest-binade ulp (N product units).
+    assert!(n < a && a + 1 < b && b < 2 * n - 1);
+    let wide_n = u128::from(n);
+    assert_eq!(u128::from(a) * u128::from(b), (4 * wide_n - 1) * wide_n / 2);
     [
         // (1+k/N)(1+j/N) is exactly halfway above the even encoding.
         // Preserve k+j and decrease/increase k*j to sit just below/above.
@@ -115,10 +120,12 @@ fn rounding_cases(
         (1, two_and_half - 1, 2),
         (1, two_and_half, 2),
         (1, two_and_half + 1, 3),
-        // At the boundary, (2N-1)*0.5 is a tie and carries to min normal.
-        (2 * n - 1, half - 1, n - 1),
-        (2 * n - 1, half, n),
-        (2 * n - 1, half + 1, n),
+        // The predecessor of 1 is 1 - 1/(2N). Multiplying it by min
+        // normal gives N - 0.5 subnormal units, which ties to min normal.
+        // The adjacent factors give N - 1 and N subnormal units exactly.
+        (n, one - 2, n - 1),
+        (n, one - 1, n),
+        (n, one, n),
         // (N+1)(2N-3)/(2N) = N - 0.5 - 3/(2N) subnormal units.
         // A first rounding to normal precision would create a false tie.
         (n + 1, one - 3, n - 1),
@@ -150,6 +157,8 @@ fn mul_rounds_exact_midpoints_and_their_neighbors_at_each_width() {
             [0x0016_2ab0_3556_b800, 0x0017_1900_0000_0000],
         ),
     ] {
+        // Exercise all sign combinations, including negative zero at the
+        // min-subnormal times 0.5 tie with exactly one negative operand.
         op.check_bits(rounding_cases(h, bias, factors).into_iter().flat_map(
             |(lhs, rhs, result)| {
                 [(lhs, rhs), (rhs, lhs)]

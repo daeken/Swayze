@@ -1666,9 +1666,11 @@ fn mul_bits(
 
     // Round once, in units of 2^(max(exponent, min_exponent)-h). In
     // particular, do not round to normal precision before shifting into
-    // the subnormal range. The right shift is h or h+1 for normal results,
-    // and at most 195 or 1178 with underflow. At >=128 the full product is
-    // strictly below half a destination unit, so no shift is necessary.
+    // the subnormal range. For normal results S = top - h (h or h+1).
+    // Below the normal range, substituting exponent cancels top:
+    // S = h + min_exponent - lhs_e - rhs_e, at most 195 (f32) or 1178 (f64).
+    // At S >= 128 the product is strictly below half a destination unit;
+    // exit before forming the shift mask.
     let shift = top - h + (min_exponent - exponent).max(0);
     if shift >= 128 {
         return sign;

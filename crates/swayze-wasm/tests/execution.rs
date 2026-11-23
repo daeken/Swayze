@@ -39,6 +39,8 @@ mod float_sqrt;
 mod float_to_int;
 #[path = "execution/function_exit.rs"]
 mod function_exit;
+#[path = "execution/global_exports.rs"]
+mod global_exports;
 #[path = "execution/globals.rs"]
 mod globals;
 #[path = "execution/host_invocation.rs"]

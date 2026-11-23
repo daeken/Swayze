@@ -385,6 +385,9 @@ impl std::error::Error for Error {}
 /// within the section frame. In a memory export, a nonzero index reports
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::MemoryIndex`] at the start
 /// of that field, even if the module has no memory.
+/// In a global export, an index outside the defined globals (including when
+/// there are none) reports [`ErrorKind::InvalidIndex`] with
+/// [`IntegerField::GlobalIndex`] at the start of the index field.
 /// The start signature check runs only after all other module checks pass,
 /// including section framing, index bounds and code validation.
 /// [`ErrorKind::InvalidStartSignature`],
@@ -503,9 +506,14 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             5 => memory_limits = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
             7 => {
-                exports = validate_exports(&mut section, function_count, memory_limits.is_some())?;
-                // Exempt only a nonempty list consisting of memory exports. An
-                // empty list retains the legacy function-section requirement.
+                exports = validate_exports(
+                    &mut section,
+                    function_count,
+                    memory_limits.is_some(),
+                    global_count as u32,
+                )?;
+                // Exempt nonempty lists with no function exports. An empty
+                // list retains the legacy function-section requirement.
                 requires_function_sections |= exports.is_empty()
                     || exports
                         .iter()
@@ -814,6 +822,7 @@ fn validate_exports(
     section: &mut Reader<'_>,
     function_count: Option<u32>,
     has_memory: bool,
+    global_count: u32,
 ) -> Result<Vec<Export>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
@@ -848,6 +857,9 @@ fn validate_exports(
                 require_memory(has_memory, index_offset)?;
                 ExportTarget::Memory
             }
+            Some(0x03) => ExportTarget::Global(
+                section.index(IntegerField::GlobalIndex, global_count)? as usize,
+            ),
             // Preserve the existing diagnostics for missing or unsupported kinds.
             Some(found) => {
                 return Err(Error {

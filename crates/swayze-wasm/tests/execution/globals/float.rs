@@ -246,23 +246,13 @@ fn float_initializers_check_mutability_opcode_width_and_end_in_order() {
 }
 
 #[test]
-fn float_globals_stay_private_and_data_offsets_stay_i32_const() {
+fn float_global_imports_and_non_i32_const_data_offsets_stay_unsupported() {
     let globals = [&[1][..], F32_SNAN].concat();
     let bytes = module(&[(2, b"\x01\x01m\x01g\x03\x7d\0")]);
     expect_error(
         &bytes,
         super::HEADER.len(),
         ErrorKind::UnsupportedSection { id: 2 },
-    );
-    let mut bytes = module(&[(6, &globals)]);
-    let start = push_section(&mut bytes, 7, b"\x01\x01g\x03\0");
-    expect_error(
-        &bytes,
-        start + 3,
-        ErrorKind::UnexpectedByte {
-            expected: 0,
-            found: 3,
-        },
     );
     for opcode in [0x23, 0x43, 0x44] {
         let mut bytes = module(&[(5, &[1, 0, 1]), (6, &globals)]);

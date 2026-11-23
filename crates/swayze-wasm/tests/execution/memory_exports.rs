@@ -242,11 +242,11 @@ fn binary_index_and_name_diagnostics_are_section_framed() {
                 },
             ),
             (
-                b"\x01\x01m\x03\0",
+                b"\x01\x01m\x04\0",
                 3,
                 UnexpectedByte {
                     expected: 0,
-                    found: 3,
+                    found: 4,
                 },
             ),
             (

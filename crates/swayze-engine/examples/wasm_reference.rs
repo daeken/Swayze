@@ -688,6 +688,23 @@ fn fixtures() -> Vec<Fixture> {
             &[0x42, 1, 0x42, 0x7f, 0x89, 0x42, 1, 0x42, 1, 0x8a, 0x51],
         ),
     ]);
+    // Both candidates have low word 42. Check which high word survives select.
+    for (condition, expected) in [(0, 0), (1, 1), (-1, 1)] {
+        cases.push(Fixture::new(
+            expected,
+            &[condition],
+            &[
+                0x42, 0xaa, 0x80, 0x80, 0x80, 0x10, // (1 << 32) + 42
+                0x42, 42, 0x20, 0, 0x1b, 0x42, 42, 0x52, // select != 42
+            ],
+        ));
+    }
+    cases.push(Fixture::with_outcome(
+        Err(WasmTrap::Unreachable),
+        &[],
+        &[0],
+        &[0x00, 0x1b, 0xa7],
+    ));
     cases
 }
 

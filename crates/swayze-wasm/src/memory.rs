@@ -53,12 +53,12 @@ impl fmt::Debug for DataSegment {
 pub(super) struct LinearMemory(Vec<Cell<u8>>);
 
 impl LinearMemory {
-    pub(super) fn new(
+    pub(super) fn preflight(
         byte_len: usize,
         segments: &[DataSegment],
-    ) -> Result<Self, InstantiationError> {
-        // Preflight every segment before allocating or copying. Payload lengths
-        // are bounded to one page; widening the u32 offset avoids wrapping.
+    ) -> Result<(), InstantiationError> {
+        // Payload lengths are bounded to one page; widening the u32 offset
+        // avoids wrapping.
         // For an empty segment, its offset itself must be at or below byte_len.
         for (segment_index, segment) in segments.iter().enumerate() {
             let end = u64::from(segment.offset) + segment.bytes.len() as u64;
@@ -66,6 +66,13 @@ impl LinearMemory {
                 return Err(InstantiationError::DataSegmentOutOfBounds { segment_index });
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn new_preflighted(
+        byte_len: usize,
+        segments: &[DataSegment],
+    ) -> Result<Self, InstantiationError> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(byte_len)

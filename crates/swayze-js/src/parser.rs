@@ -357,6 +357,24 @@ fn parse(
     limits: Limits,
     allow_empty_exit: bool,
 ) -> Result<(PreparedScript, ExitStack), Error> {
+    let mut parser = new_parser(source, limits, BindingPolicy::Legacy)?;
+    let exit = parser.parse(allow_empty_exit)?;
+    // Legacy resolves names on every path, at the same point and with the
+    // same parser work budget as the grammar it just completed.
+    parser.resolve_accesses()?;
+    Ok((parser.into_program(), exit))
+}
+
+mod realm;
+pub(crate) use realm::compile_realm;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingPolicy {
+    Legacy,
+    Realm,
+}
+
+fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Parser<'_>, Error> {
     if source.len() > limits.max_source_bytes {
         // Starting within the source, back up at most three continuation bytes.
         let mut start = limits.max_source_bytes;
@@ -369,7 +387,8 @@ fn parse(
             .map_or(start, |c| start + c.len_utf8());
         return Err(Error::limit(Span { start, end }, Limit::SourceBytes));
     }
-    Parser {
+    Ok(Parser {
+        policy,
         lexer: Lexer {
             source,
             offset: 0,
@@ -392,8 +411,7 @@ fn parse(
         accesses: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
-    }
-    .parse(allow_empty_exit)
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1337,6 +1355,7 @@ struct BlockFrame {
 }
 
 struct Parser<'s> {
+    policy: BindingPolicy,
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) while disambiguating a
     // name, a root semicolon, or an if's then-arm.
@@ -1365,7 +1384,7 @@ struct Parser<'s> {
 }
 
 impl Parser<'_> {
-    fn parse(mut self, allow_empty_exit: bool) -> Result<(PreparedScript, ExitStack), Error> {
+    fn parse(&mut self, allow_empty_exit: bool) -> Result<ExitStack, Error> {
         self.add_scope(None, Span::at(0))?;
         let mut saw_statement = false;
         let mut in_directive_prologue = true;
@@ -1420,6 +1439,9 @@ impl Parser<'_> {
                 in_directive_prologue = false;
             }
             if delimiter.is_none() {
+                if self.policy == BindingPolicy::Realm {
+                    return Err(Error::unsupported(end, EXPRESSION_STATEMENT_SEMICOLON));
+                }
                 break ExitStack::Value;
             }
             // A root semicolon terminates the final expression only at EOF.
@@ -1431,17 +1453,16 @@ impl Parser<'_> {
             self.lookahead = Some(next);
             self.emit(Instruction::Discard, end)?;
         };
-        // Resolve names on all paths before returning either shape of program.
-        self.resolve_accesses()?;
-        Ok((
-            PreparedScript {
-                instructions: self.instructions,
-                string_units: self.lexer.string_units,
-                max_stack_depth: self.max_stack_depth,
-                binding_slots: self.bindings.len(),
-            },
-            exit,
-        ))
+        Ok(exit)
+    }
+
+    fn into_program(self) -> PreparedScript {
+        PreparedScript {
+            instructions: self.instructions,
+            string_units: self.lexer.string_units,
+            max_stack_depth: self.max_stack_depth,
+            binding_slots: self.bindings.len(),
+        }
     }
 
     fn next_token(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {
@@ -2186,6 +2207,14 @@ impl Parser<'_> {
     // was consumed and another binding name is required.
     fn parse_declarator(&mut self, kind: BindingKind, mode: DeclaratorEnd) -> Result<bool, Error> {
         let name = self.require_token(TokenPosition::Plain, "expected a binding name")?;
+        if self.policy == BindingPolicy::Realm
+            && (self.current_scope() != 0 || matches!(mode, DeclaratorEnd::ForHeader))
+        {
+            return Err(Error::unsupported(
+                name.span,
+                "Realm lexical declarations must be at the Script root",
+            ));
+        }
         match name.kind {
             TokenKind::Identifier => {}
             TokenKind::Declaration(_) => {
@@ -2239,16 +2268,18 @@ impl Parser<'_> {
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         let scope = self.current_scope();
-        // The classic Script global scope cannot lexically redeclare its
-        // non-configurable `undefined` property. Nested scopes can shadow it.
-        if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
-            return Err(Error::malformed(
-                name.span,
-                "undefined cannot be declared in the Script scope",
-            ));
-        }
-        if self.find_in_scope(scope, name.span)?.is_some() {
-            return Err(Error::malformed(name.span, "duplicate binding declaration"));
+        if self.policy == BindingPolicy::Legacy {
+            // The classic Script global scope cannot lexically redeclare its
+            // non-configurable `undefined` property. Nested scopes can shadow it.
+            if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
+                return Err(Error::malformed(
+                    name.span,
+                    "undefined cannot be declared in the Script scope",
+                ));
+            }
+            if self.find_in_scope(scope, name.span)?.is_some() {
+                return Err(Error::malformed(name.span, "duplicate binding declaration"));
+            }
         }
         let expected_delimiter = match kind {
             BindingKind::Const => "expected '=' after the binding name",
@@ -2678,53 +2709,58 @@ impl Parser<'_> {
         for index in 0..self.accesses.len() {
             let access = self.accesses[index];
             let slot = self.resolve_access(access)?;
-            match (
-                access.kind,
-                slot,
-                self.instructions.get_mut(access.instruction),
-            ) {
-                (
-                    AccessKind::Read | AccessKind::TypeofRead,
-                    _,
-                    Some(op @ Instruction::LoadBinding(UNPATCHED)),
-                ) => {
-                    *op = slot.map_or(Instruction::Undefined, Instruction::LoadBinding);
+            self.patch_access(access, slot)?;
+        }
+        Ok(())
+    }
+
+    fn patch_access(&mut self, access: Access, slot: Option<usize>) -> Result<(), Error> {
+        match (
+            access.kind,
+            slot,
+            self.instructions.get_mut(access.instruction),
+        ) {
+            (
+                AccessKind::Read | AccessKind::TypeofRead,
+                _,
+                Some(op @ Instruction::LoadBinding(UNPATCHED)),
+            ) => {
+                *op = slot.map_or(Instruction::Undefined, Instruction::LoadBinding);
+            }
+            (
+                AccessKind::Write(WriteAccess { load: None, .. }),
+                Some(slot),
+                Some(Instruction::UpdateBinding {
+                    slot: binding @ UNPATCHED,
+                    ..
+                }),
+            ) => *binding = slot,
+            (
+                AccessKind::Write(write),
+                Some(slot),
+                Some(
+                    Instruction::StoreBinding(binding @ UNPATCHED)
+                    | Instruction::StoreBindingKeep(binding @ UNPATCHED),
+                ),
+            ) => {
+                *binding = slot;
+                if let Some(load) = write.load {
+                    let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
+                        self.instructions.get_mut(load)
+                    else {
+                        return Err(Error::malformed(
+                            access.name,
+                            "invalid pending write target load",
+                        ));
+                    };
+                    *op = Instruction::LoadBinding(slot);
                 }
-                (
-                    AccessKind::Write(WriteAccess { load: None, .. }),
-                    Some(slot),
-                    Some(Instruction::UpdateBinding {
-                        slot: binding @ UNPATCHED,
-                        ..
-                    }),
-                ) => *binding = slot,
-                (
-                    AccessKind::Write(write),
-                    Some(slot),
-                    Some(
-                        Instruction::StoreBinding(binding @ UNPATCHED)
-                        | Instruction::StoreBindingKeep(binding @ UNPATCHED),
-                    ),
-                ) => {
-                    *binding = slot;
-                    if let Some(load) = write.load {
-                        let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
-                            self.instructions.get_mut(load)
-                        else {
-                            return Err(Error::malformed(
-                                access.name,
-                                "invalid pending write target load",
-                            ));
-                        };
-                        *op = Instruction::LoadBinding(slot);
-                    }
-                }
-                _ => {
-                    return Err(Error::malformed(
-                        access.name,
-                        "invalid pending binding access",
-                    ));
-                }
+            }
+            _ => {
+                return Err(Error::malformed(
+                    access.name,
+                    "invalid pending binding access",
+                ));
             }
         }
         Ok(())

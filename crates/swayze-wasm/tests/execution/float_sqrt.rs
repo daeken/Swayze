@@ -46,9 +46,15 @@ fn sqrt_handles_special_values_and_rounds_edge_cases_to_exact_bits() {
         special_cases(0x8000_0000, 0x7f80_0000, 0x7fc0_0000, 0x3f80_0000).chain([
             (0x0000_0001, 0x1a35_04f3), // Smallest subnormal, odd exponent.
             (0x0000_0002, 0x1a80_0000), // Exact subnormal input root.
+            (0x0000_0003, 0x1a9c_c471),
+            (0x007f_fffe, 0x1fff_fffe),
             (0x007f_ffff, 0x1fff_ffff), // Just below the smallest normal input.
             (0x0080_0000, 0x2000_0000),
             (0x0080_0001, 0x2000_0000),
+            // Below 1/4, the exponent is -3 (odd); at and above it, -2 (even).
+            (0x3e7f_ffff, 0x3eff_ffff),
+            (0x3e80_0000, 0x3f00_0000),
+            (0x3e80_0001, 0x3f00_0000),
             (0x3f80_0001, 0x3f80_0000), // Just below the squared midpoint above 1.
             (0x3f80_0002, 0x3f80_0001),
             (0x3fc7_fffe, 0x3f9f_ffff), // Two input ulps below 1.25^2.
@@ -74,9 +80,15 @@ fn sqrt_handles_special_values_and_rounds_edge_cases_to_exact_bits() {
         .chain([
             (0x0000_0000_0000_0001, 0x1e60_0000_0000_0000), // Smallest subnormal, exact root.
             (0x0000_0000_0000_0002, 0x1e66_a09e_667f_3bcd), // Odd exponent.
+            (0x0000_0000_0000_0003, 0x1e6b_b67a_e858_4caa),
+            (0x000f_ffff_ffff_fffe, 0x1fff_ffff_ffff_fffe),
             (0x000f_ffff_ffff_ffff, 0x1fff_ffff_ffff_ffff),
             (0x0010_0000_0000_0000, 0x2000_0000_0000_0000),
             (0x0010_0000_0000_0001, 0x2000_0000_0000_0000),
+            // The same negative odd-to-even exponent transition as f32.
+            (0x3fcf_ffff_ffff_ffff, 0x3fdf_ffff_ffff_ffff),
+            (0x3fd0_0000_0000_0000, 0x3fe0_0000_0000_0000),
+            (0x3fd0_0000_0000_0001, 0x3fe0_0000_0000_0000),
             (0x3ff0_0000_0000_0001, 0x3ff0_0000_0000_0000),
             (0x3ff0_0000_0000_0002, 0x3ff0_0000_0000_0001),
             (0x3ff8_ffff_ffff_fffe, 0x3ff3_ffff_ffff_ffff),

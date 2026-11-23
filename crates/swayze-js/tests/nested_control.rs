@@ -64,7 +64,6 @@ fn checks_every_nested_block_even_if_never_reached() {
         ("later=1;", Unsupported),
         ("x=later;", Unsupported),
         ("c=1;", Unsupported),
-        ("let x=1;", Unsupported),
         ("const y=1; let y=2;", Malformed),
         ("break", Unsupported),
         ("continue\n", Unsupported),

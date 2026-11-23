@@ -185,6 +185,9 @@ fn fixtures() -> Vec<String> {
             "let out = 0; if (false) { const item = 42; out = item; } else { let item = 2; item = item + 3; out = item; } out",
             "let i = 0; let out = 0; while (i < 4) { i = i + 1; if (i === 2) { continue; } const item = i * 2; out = out + item; } out",
             "let out = 0; while (true) { let item = 42; if (item) { out = item; break; } } out",
+            "let x = 3; let out = 0; if (x) { let x = 40; x = x + 2; out = x; } out + x",
+            "let out = 0; if (true) { if (true) { const x = 42; out = x; } const x = 3; out = out + x; } out",
+            "let i = 2; let out = 0; while (i) { i = i - 1; if (true) { const i = 21; out = out + i; } } out",
         ]
         .map(str::to_owned),
     );

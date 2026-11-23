@@ -36,12 +36,13 @@ All operands and arms must use supported syntax and bindings.
 `if (test) { ... }` and `while (test) { ... }` statements may precede the final
 expression. Braced bodies can contain initialized `let` and `const`
 declarations, simple assignments to earlier visible `let` bindings, and nested
-`if` and `while` statements. A block-local binding is visible only in that
-block and its descendants after initialization. Sibling blocks can reuse a
-name; shadowing between enclosing and nested blocks is unsupported. Unlabeled `break;` exits the innermost
+`if` and `while` statements. A block-local declaration shadows enclosing
+bindings throughout its block. The parser resolves every access to the nearest
+lexical declaration after parsing the script. Access before initialization is
+unsupported, even in code that would not run; it never falls back to an outer
+binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 `while`; `continue;` reevaluates its test. Both require explicit semicolons.
-Only the selected `if` arm runs; a false
-test with no `else` skips the body. A `while` reevaluates its test before each
+Only the selected `if` arm runs; a false test with no `else` skips the body. A `while` reevaluates its test before each
 iteration. Untaken arms and skipped loop bodies are still checked. The parser
 uses at most 128 active statement frames, separate from the expression nesting
 limit. Unbraced `else if` is unsupported.

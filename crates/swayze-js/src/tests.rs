@@ -260,8 +260,9 @@ fn nested_controls_charge_one_frame_push_per_statement_and_lex_each_token_once()
         max_tokens: 35,
         max_nesting_depth: 1,
         // 15 instructions + 3 conversions + 3 expression markers + 3
-        // statement frames + 6 lookup units. Else reuses the enclosing frame.
-        max_work: source.len() + 30,
+        // statement frames + 10 lookup units (including 4 parent hops).
+        // Else reuses the enclosing frame but gets its own scope.
+        max_work: source.len() + 34,
     };
     assert_eq!(
         parse_script_with_limits(source, limits).unwrap().evaluate(),
@@ -309,7 +310,7 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
         max_tokens: 16,
         max_nesting_depth: 1,
         // Same as an if with no else, plus one emission for the back edge.
-        max_work: source.len() + 16,
+        max_work: source.len() + 17,
     };
     assert!(parse_script_with_limits(source, limits).is_ok());
     assert_limit(
@@ -326,13 +327,13 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
     assert_limit(
         source,
         Limits {
-            max_work: close + 1 + 12,
+            max_work: close + 1 + 10,
             ..limits
         },
         Limit::Work,
         close,
         close + 1,
-    ); // Source through '}', two conversions, a marker, a frame, six emissions, and a lookup.
+    ); // Source through '}', two conversions, a marker, a frame and six emissions.
     assert_limit(
         source,
         Limits {
@@ -348,8 +349,8 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
 #[test]
 fn if_tokens_and_work_are_counted_once_even_in_untaken_branches() {
     for (source, tokens, work_beyond_source) in [
-        ("let x=0;if(false){x=1;}x", 16, 15),
-        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 21),
+        ("let x=0;if(false){x=1;}x", 16, 16),
+        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 23),
     ] {
         // Besides the source bytes: decimal input bytes, the '(' marker, the
         // statement frame, instruction emissions, and binding lookups.
@@ -893,7 +894,7 @@ fn consts_decline_reserved_and_non_subset_names_without_splitting() {
     }
     for (source, start, end) in [
         ("constx=1; x", 0, 6),
-        ("Const x=1; x", 0, 5),
+        ("Const=1; x", 0, 5),
         ("consté x=1; x", 5, 7),
         ("const\\u0078=1; x", 5, 6),
         ("const é=1; 1", 6, 8),
@@ -915,6 +916,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const x; x", Malformed, 7, 8),
         ("const x=; x", Malformed, 8, 9),
         ("const x===1; x", Malformed, 7, 10),
+        ("Const x=1; x", Malformed, 6, 7), // Syntax is checked before name resolution.
         ("const x=1", Unsupported, 9, 9),
         ("const x=1;", Unsupported, 10, 10),
         ("const x=1\nx", Unsupported, 10, 11),
@@ -926,7 +928,8 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const x=1;; x", Unsupported, 10, 11),
         ("const x=1; x; x", Unsupported, 14, 15),
         ("const x=1; x; const y=1; y", Unsupported, 14, 19),
-        ("const x=1; x=2", Unsupported, 12, 13),
+        ("const x=1; x=2", Unsupported, 14, 14),
+        ("const x=1; x=2; x", Unsupported, 12, 13),
         ("const x=1; x += 2", Unsupported, 13, 15),
         ("const x=1; x(2)", Unsupported, 12, 13),
         ("const x=1; x.y", Unsupported, 12, 13),
@@ -945,19 +948,34 @@ fn duplicate_declarations_are_early_errors_and_unavailable_reads_are_unsupported
         parse_script(duplicate).unwrap_err().message(),
         "duplicate binding declaration"
     );
-    for (source, start, end) in [
-        ("x", 0, 1),
-        ("const x=x; x", 8, 9),
-        ("const x=y; const y=1; x", 8, 9),
-        ("const x=1; const y=y+x; y", 19, 20),
-        ("const x=1; X", 11, 12), // case-sensitive
+    for (source, start, end, message) in [
+        ("x", 0, 1, "unbound name"),
+        (
+            "const x=x; x",
+            8,
+            9,
+            "before lexical binding initialization",
+        ),
+        (
+            "const x=y; const y=1; x",
+            8,
+            9,
+            "before lexical binding initialization",
+        ),
+        (
+            "const x=1; const y=y+x; y",
+            19,
+            20,
+            "before lexical binding initialization",
+        ),
+        ("const x=1; X", 11, 12, "unbound name"), // case-sensitive
     ] {
         assert_error(source, Unsupported, start, end);
         assert!(
             parse_script(source)
                 .unwrap_err()
                 .message()
-                .contains("earlier visible declaration")
+                .contains(message)
         );
     }
 }
@@ -1122,6 +1140,7 @@ fn assignment_lookahead_and_resolution_respect_inclusive_budgets() {
         semicolon,
         semicolon + 1,
     );
+    let last_name = source.rfind('x').unwrap();
     assert_limit(
         source,
         Limits {
@@ -1129,17 +1148,17 @@ fn assignment_lookahead_and_resolution_respect_inclusive_budgets() {
             ..limits
         },
         Limit::Work,
-        source.len() - 'β'.len_utf8(),
-        source.len(),
+        last_name,
+        last_name + 1,
     );
     assert_limit("let x=0;x=(1);x", limits, Limit::NestingDepth, 10, 11);
 
-    // Stop within the assignment target lookup: eight scanned bytes,
-    // one conversion, two emitted ops, and two scanned lookahead bytes.
+    // Stop within the deferred assignment target lookup: 13 scanned bytes,
+    // two conversions, five emissions, and one candidate visit.
     assert_limit(
         "let x=0;x=1;x",
         Limits {
-            max_work: 14,
+            max_work: 21,
             ..limits
         },
         Limit::Work,

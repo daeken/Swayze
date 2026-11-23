@@ -64,7 +64,7 @@ pub enum Limit {
 pub enum ErrorKind {
     /// Recognized syntax is incomplete or violates a static rule of the subset.
     Malformed,
-    /// Parsing would require syntax outside the slice. This is not a validity claim.
+    /// Input requires syntax or semantics outside the slice. This is not a validity claim.
     Unsupported,
     /// A resource ceiling or available allocation was exhausted.
     LimitExceeded(Limit),
@@ -251,7 +251,9 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         statement_frames: Vec::new(),
         innermost_loop: None,
         instructions: Vec::new(),
+        scopes: Vec::new(),
         bindings: Vec::new(),
+        accesses: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
     }
@@ -789,21 +791,29 @@ enum Pending {
     },
 }
 
-// Only used while emitting control flow; every jump is patched before a Script is returned.
+// All unresolved jump targets and binding operands are patched before returning a Script.
 const UNPATCHED: usize = usize::MAX;
 
-// The byte offset just past the opening brace uniquely identifies a block.
-// The root (depth 0) has no brace and uses 0.
-#[derive(Clone, Copy, Eq, PartialEq)]
+// Root is index 0; every block (including each else arm) gets its own index.
 struct Scope {
-    start: usize,
-    depth: usize,
+    parent: Option<usize>,
+    last_binding: Option<usize>,
 }
 
 struct Binding {
     name: Span,
     kind: BindingKind,
-    scope: Scope,
+    initialized_at: usize,
+    previous: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct Access {
+    name: Span,
+    scope: usize,
+    instruction: usize,
+    // Present for a write, for the diagnostic if the resolved binding is const.
+    equals: Option<Span>,
 }
 
 enum ExpressionEnd {
@@ -833,7 +843,7 @@ enum StatementFrame {
 
 struct BlockFrame {
     statement: StatementFrame,
-    scope_start: usize,
+    scope: usize,
 }
 
 struct Parser<'s> {
@@ -848,14 +858,17 @@ struct Parser<'s> {
     // Index into statement_frames; opening or closing an if does not change it.
     innermost_loop: Option<usize>,
     instructions: Vec<Instruction>,
-    // Parse-only declarations in slot order; never retained by Script.
+    // Parse-only scope, declaration (in slot order), and access tables.
+    scopes: Vec<Scope>,
     bindings: Vec<Binding>,
+    accesses: Vec<Access>,
     stack_depth: usize,
     max_stack_depth: usize,
 }
 
 impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
+        self.add_scope(None, Span::at(0))?;
         loop {
             if !self.statement_frames.is_empty() {
                 self.parse_block_item()?;
@@ -913,6 +926,7 @@ impl Parser<'_> {
                 "no additional statements are supported after the final expression",
             ));
         }
+        self.resolve_accesses()?;
         Ok(Script {
             instructions: self.instructions,
             max_stack_depth: self.max_stack_depth,
@@ -940,6 +954,23 @@ impl Parser<'_> {
             ));
         }
         Ok(())
+    }
+
+    fn current_scope(&self) -> usize {
+        self.statement_frames.last().map_or(0, |frame| frame.scope)
+    }
+
+    fn add_scope(&mut self, parent: Option<usize>, span: Span) -> Result<usize, Error> {
+        let id = self.scopes.len();
+        try_push(
+            &mut self.scopes,
+            Scope {
+                parent,
+                last_binding: None,
+            },
+            span,
+        )?;
+        Ok(id)
     }
 
     fn open_statement(&mut self, keyword: Token) -> Result<(), Error> {
@@ -975,11 +1006,12 @@ impl Parser<'_> {
         let brace = self.require_block_open(missing_brace)?;
         self.lexer.charge(1, brace)?;
         let index = self.statement_frames.len();
+        let scope = self.add_scope(Some(self.current_scope()), brace)?;
         try_push(
             &mut self.statement_frames,
             BlockFrame {
                 statement: frame,
-                scope_start: brace.end,
+                scope,
             },
             brace,
         )?;
@@ -1010,10 +1042,12 @@ impl Parser<'_> {
                     self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
                     self.patch_jump(branch, span)?;
                     let brace = self.require_block_open("expected '{' after 'else'")?;
-                    // Same control frame, disjoint lexical scope.
+                    // Same control frame, disjoint lexical scope with the same parent.
+                    let parent = self.scopes[self.statement_frames[index].scope].parent;
+                    let scope = self.add_scope(parent, brace)?;
                     self.statement_frames[index] = BlockFrame {
                         statement: StatementFrame::IfElse { join },
-                        scope_start: brace.end,
+                        scope,
                     };
                     return Ok(());
                 }
@@ -1186,21 +1220,9 @@ impl Parser<'_> {
             }
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
-        let scope = Scope {
-            start: self
-                .statement_frames
-                .last()
-                .map_or(0, |frame| frame.scope_start),
-            depth: self.statement_frames.len(),
-        };
-        if let Some(slot) = self.find_binding(name.span, Some(scope))? {
-            if self.bindings[slot].scope == scope {
-                return Err(Error::malformed(name.span, "duplicate binding declaration"));
-            }
-            return Err(Error::unsupported(
-                name.span,
-                "shadowing between enclosing and nested scopes is outside the subset",
-            ));
+        let scope = self.current_scope();
+        if self.find_in_scope(scope, name.span)?.is_some() {
+            return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
         let equals = self.require_token("expected '=' after the binding name")?;
         if !matches!(equals.kind, TokenKind::Equals) {
@@ -1217,61 +1239,52 @@ impl Parser<'_> {
         let end = self.parse_expression(first, ExpressionEnd::Semicolon(missing_semicolon))?;
         let slot = self.bindings.len();
         self.emit(Instruction::InitBinding { slot, kind }, end)?;
-        // Expose the name only after its initializer: self and forward access
-        // cannot resolve to a slot. Slots are never reused between declarations.
         let binding = Binding {
             name: name.span,
             kind,
-            scope,
+            initialized_at: end.end,
+            previous: self.scopes[scope].last_binding,
         };
-        try_push(&mut self.bindings, binding, name.span)
+        try_push(&mut self.bindings, binding, name.span)?;
+        self.scopes[scope].last_binding = Some(slot);
+        Ok(())
     }
 
     fn parse_assignment(&mut self, name: Span, equals: Span) -> Result<(), Error> {
-        let slot = self.find_binding(name, None)?.ok_or_else(|| {
-            Error::unsupported(
-                name,
-                "assignment requires an earlier visible let declaration",
-            )
-        })?;
-        if self.bindings[slot].kind != BindingKind::Let {
-            return Err(Error::unsupported(
-                equals,
-                "assignment to const is outside the subset",
-            ));
-        }
+        // Record the target before the RHS reads to preserve diagnostic order.
+        let access = self.record_access(name, Some(equals))?;
         let first = self.require_token("expected an assignment value")?;
         let end = self.parse_expression(
             first,
             ExpressionEnd::Semicolon("assignments require explicit semicolons"),
         )?;
-        self.emit(Instruction::StoreBinding(slot), end)
+        self.accesses[access].instruction = self.instructions.len();
+        self.emit(Instruction::StoreBinding(UNPATCHED), end)
     }
 
-    fn find_binding(
-        &mut self,
-        span: Span,
-        include_descendants_of: Option<Scope>,
-    ) -> Result<Option<usize>, Error> {
+    fn record_access(&mut self, name: Span, equals: Option<Span>) -> Result<usize, Error> {
+        let index = self.accesses.len();
+        let scope = self.current_scope();
+        try_push(
+            &mut self.accesses,
+            Access {
+                name,
+                scope,
+                instruction: self.instructions.len(),
+                equals,
+            },
+            name,
+        )?;
+        Ok(index)
+    }
+
+    fn find_in_scope(&mut self, scope: usize, span: Span) -> Result<Option<usize>, Error> {
         let source = self.lexer.source;
         let name = &source[span.start..span.end];
-        for (slot, binding) in self.bindings.iter().enumerate() {
+        let mut next = self.scopes[scope].last_binding;
+        while let Some(slot) = next {
             self.lexer.charge(1, span)?;
-            let scope = binding.scope;
-            let active = scope.depth == 0
-                || self
-                    .statement_frames
-                    .get(scope.depth - 1)
-                    .is_some_and(|frame| frame.scope_start == scope.start);
-            // For a declaration check, also inspect earlier declarations in
-            // descendants. A block is still open here, so any already parsed
-            // scope starting after its brace must be nested within that block.
-            // A later declaration in the current block would shadow for its
-            // whole extent, potentially changing already resolved references.
-            if !active && !include_descendants_of.is_some_and(|current| scope.start > current.start)
-            {
-                continue;
-            }
+            let binding = &self.bindings[slot];
             let candidate = &source[binding.name.start..binding.name.end];
             if name.len() == candidate.len() {
                 self.lexer.charge(name.len(), span)?;
@@ -1279,8 +1292,66 @@ impl Parser<'_> {
                     return Ok(Some(slot));
                 }
             }
+            next = binding.previous;
         }
         Ok(None)
+    }
+
+    fn resolve_access(&mut self, access: Access) -> Result<usize, Error> {
+        let mut scope = access.scope;
+        loop {
+            // Resolve by lexical proximity before checking initialization or mutability.
+            // In particular, do not skip a later declaration to find an earlier one.
+            if let Some(slot) = self.find_in_scope(scope, access.name)? {
+                let binding = &self.bindings[slot];
+                if access.name.start < binding.initialized_at {
+                    return Err(Error::unsupported(
+                        access.name,
+                        "access before lexical binding initialization is outside the subset",
+                    ));
+                }
+                if let Some(equals) = access.equals
+                    && binding.kind == BindingKind::Const
+                {
+                    return Err(Error::unsupported(
+                        equals,
+                        "assignment to const is outside the subset",
+                    ));
+                }
+                return Ok(slot);
+            }
+            let Some(parent) = self.scopes[scope].parent else {
+                return Err(Error::unsupported(
+                    access.name,
+                    "unbound name is outside the subset",
+                ));
+            };
+            self.lexer.charge(1, access.name)?;
+            scope = parent;
+        }
+    }
+
+    fn resolve_accesses(&mut self) -> Result<(), Error> {
+        // One site per emitted load or store. The search alone takes extra work.
+        for index in 0..self.accesses.len() {
+            let access = self.accesses[index];
+            let slot = self.resolve_access(access)?;
+            match self.instructions.get_mut(access.instruction) {
+                Some(Instruction::LoadBinding(operand @ UNPATCHED)) if access.equals.is_none() => {
+                    *operand = slot;
+                }
+                Some(Instruction::StoreBinding(operand @ UNPATCHED)) if access.equals.is_some() => {
+                    *operand = slot;
+                }
+                _ => {
+                    return Err(Error::malformed(
+                        access.name,
+                        "invalid pending binding access",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_expression(&mut self, first: Token, end_kind: ExpressionEnd) -> Result<Span, Error> {
@@ -1367,10 +1438,8 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Identifier) => {
-                    let slot = self.find_binding(span, None)?.ok_or_else(|| {
-                        Error::unsupported(span, "read requires an earlier visible declaration; self, forward and unbound reads are outside the subset")
-                    })?;
-                    self.emit(Instruction::LoadBinding(slot), span)?;
+                    self.record_access(span, None)?;
+                    self.emit(Instruction::LoadBinding(UNPATCHED), span)?;
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {

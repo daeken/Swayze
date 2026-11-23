@@ -108,18 +108,130 @@ fn inaccessible_names_are_rejected_even_in_inactive_or_unreachable_code() {
 }
 
 #[test]
-fn shadowing_is_rejected_in_both_source_orders() {
+fn shadowing_works_in_both_declaration_orders() {
+    for (source, expected) in [
+        (
+            "const x=4; let out=0;
+             if(x) {
+                 let x=2; x=x+1;
+                 if(x===3) { const x=7; out=x; }
+                 out=out+x;
+             }
+             out*10+x",
+            104.0,
+        ),
+        (
+            "let out=0; if(true){const x=7;out=x;} let x=2; x=x+1; out*10+x",
+            73.0,
+        ),
+    ] {
+        assert_eq!(parse_script(source).unwrap().evaluate(), Ok(expected));
+    }
+}
+
+#[test]
+fn later_enclosing_binding_does_not_hide_an_earlier_descendant_local() {
+    let source = "let x=8; let out=0;
+                  if(true) {
+                      if(true) { let x=3; while(x<5) { x=x+1; } out=x; }
+                      let x=6; out=out*10+x;
+                  }
+                  out*10+x";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(568.0));
+}
+
+#[test]
+fn test_and_other_arm_are_outside_a_shadowing_scope() {
+    for (outer, expected) in [(9.0, 9.0), (0.0, 1.0)] {
+        let source = format!("let x={outer}; let out=0; if(x){{out=x;}}else{{let x=1;out=x;}}out");
+        assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(expected));
+    }
+}
+
+#[test]
+fn loop_test_keeps_outer_binding_and_reentry_initializes_the_shadow() {
+    let script = parse_script(
+        "const x=1; let left=4; let out=0;
+         while (x && left) {
+             left=left-1;
+             if (left===2) { continue; }
+             let x=left;
+             x=x+10;
+             out=out+x;
+         }
+         out*10+x",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(341.0));
+    assert_eq!(script.evaluate(), Ok(341.0));
+}
+
+#[test]
+fn pre_initialization_accesses_are_rejected_even_with_a_known_outer_binding() {
     for source in [
-        "let x=0;if(false){let |x=1;}x",
-        // Without the shadow check the earlier assignment could resolve to
-        // the root x, even though the inner x would be in its TDZ.
-        "let x=0;if(true){x=2;const |x=1;}x",
-        "if(true){let x=0;while(false){if(true){let |x=1;}}}0",
-        "if(true){let x=1;}const |x=2;x",
-        "let out=0;if(true){while(false){if(true){const x=1;out=x;}}let |x=2;}out",
+        "let x=1;if(false){const x=|x;}x",
+        "let x=1;if(false){let x=false && |x;}x",
+        "let x=1;if(false){let a=|x;let x=2;}x",
+        "let x=1;if(false){|x=3;const x=2;}x",
+        "const x=1;if(false){|x=3;let x=2;}x",
+        "let x=1;if(false){if(|x){let x=3;}let x=2;}x",
+        "let x=1;if(false){while(|x){let x=3;}let x=2;}x",
+        "let x=1;if(false){if(false){}else{const a=|x;}let x=2;}x",
+        "let x=1;if(false){while(true){break;|x=3;}let x=2;}x",
+        "let out=0;if(true){out=|x;}let x=1;out",
+        "if(true){|x=3;}let x=2;x",
     ] {
         let error = error_at(source, 1, ErrorKind::Unsupported);
-        assert!(error.message().contains("shadowing"), "{error}");
+        assert!(
+            error
+                .message()
+                .contains("before lexical binding initialization"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn const_write_checks_the_resolved_binding() {
+    // A mutable inner binding may shadow a const (covered above), but an
+    // initialized inner const cannot be written through an outer let.
+    let error = error_at(
+        "let x=1;if(false){const x=2;x|=3;}x",
+        1,
+        ErrorKind::Unsupported,
+    );
+    assert!(error.message().contains("assignment to const"), "{error}");
+}
+
+#[test]
+fn shadow_access_resolution_has_an_exact_work_budget() {
+    let source = "let x=1;if(x){let x=2;if(true){x=x+1;}}x";
+    // Source bytes, 13 emissions, 3 conversion bytes, 2 frames, 2 groups,
+    // 1 operator, 8 units for four matching candidates and 2 parent hops.
+    let limits = Limits {
+        max_work: source.len() + 31,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(1.0)
+    );
+    let target = source.find("x=x").unwrap();
+    for (max_work, start) in [
+        (source.len() + 23, target), // no work left for the first parent hop
+        (source.len() + 24, target), // hop paid, no work left to visit a candidate
+        (source.len() + 25, target), // candidate visit paid, not the comparison
+        (limits.max_work - 1, source.len() - 1), // final root name comparison
+    ] {
+        let error = parse_script_with_limits(source, Limits { max_work, ..limits }).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            }
+        );
     }
 }
 
@@ -132,6 +244,10 @@ fn local_declarations_require_one_initializer_and_a_semicolon() {
         ("while(false){let x=1|}0", Unsupported),
         ("if(false){let x=1|,y=2;}0", Unsupported),
         ("if(false){const x=1;let |x=2;}0", Malformed),
+        (
+            "let x=0;if(false){let x=1;while(false){let x=2;}const |x=3;}x",
+            Malformed,
+        ),
         ("while(true){let x=1;break;const |x=2;}0", Malformed),
     ] {
         error_at(source, 1, kind);
@@ -143,9 +259,9 @@ fn skipped_block_declarations_count_against_parse_budgets() {
     let source = "if(false){let x=0;}else{const x=1;}2";
     let limits = Limits {
         max_tokens: 20,
-        // Source bytes, frame, pending test group, 8 emissions, 3 decimal
-        // conversion bytes and 1 candidate visit (no disjoint-name comparison).
-        max_work: source.len() + 14,
+        // Source bytes, frame, pending test group, 8 emissions and 3 decimal
+        // conversion bytes. Disjoint scopes don't scan each other's declarations.
+        max_work: source.len() + 13,
         ..Limits::default()
     };
     let script = parse_script_with_limits(source, limits).unwrap();

@@ -87,6 +87,16 @@ impl Value {
     }
 }
 
+impl ShortCircuitCondition {
+    fn skips_rhs(self, lhs: Value) -> bool {
+        match self {
+            Self::Falsy => !lhs.to_boolean(),
+            Self::Truthy => lhs.to_boolean(),
+            Self::NonNullish => !matches!(lhs, Value::Null | Value::Undefined),
+        }
+    }
+}
+
 /// Failure to evaluate a prepared script or obtain a Number result from it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -156,6 +166,9 @@ impl Script {
     /// `!` returns a Boolean. `&&` returns a falsy left operand, `||` returns a
     /// truthy left operand, and `??` returns a left operand that is neither `null`
     /// nor `undefined`. Otherwise they evaluate and return the right operand.
+    /// Logical assignments (`&&=`, `||=`, `??=`) use the same tests to skip
+    /// both RHS evaluation and the store on an initialized `let` target.
+    /// They leave no result, and their RHS is still checked during parsing.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. An `if` statement uses the same
     /// truthiness but executes only the selected branch, leaving no operand
@@ -348,18 +361,21 @@ fn evaluate(
             }
             Instruction::ShortCircuit { target, condition } => {
                 let target = check_forward_target(ip, target, ops.len())?;
-                let lhs = stack.last().ok_or(EvalError::InvalidScript)?;
-                let skip_rhs = match condition {
-                    ShortCircuitCondition::Falsy => !lhs.to_boolean(),
-                    ShortCircuitCondition::Truthy => lhs.to_boolean(),
-                    ShortCircuitCondition::NonNullish => {
-                        !matches!(lhs, Value::Null | Value::Undefined)
-                    }
-                };
-                if skip_rhs {
+                let lhs = *stack.last().ok_or(EvalError::InvalidScript)?;
+                if condition.skips_rhs(lhs) {
                     ip = target;
                 } else {
                     stack.pop();
+                }
+            }
+            Instruction::ShortCircuitStatement { target, condition } => {
+                let target = check_forward_target(ip, target, ops.len())?;
+                if stack.len() != 1 {
+                    return Err(EvalError::InvalidScript);
+                }
+                let lhs = stack.pop().ok_or(EvalError::InvalidScript)?;
+                if condition.skips_rhs(lhs) {
+                    ip = target;
                 }
             }
             Instruction::Jump(target) => ip = check_forward_target(ip, target, ops.len())?,
@@ -705,6 +721,25 @@ mod tests {
             ];
             assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
         }
+    }
+
+    #[test]
+    fn statement_short_circuit_checks_target_and_requires_exactly_one_operand() {
+        use Instruction::{Boolean, ShortCircuitStatement};
+        let branch = |target| ShortCircuitStatement {
+            target,
+            condition: ShortCircuitCondition::Truthy,
+        };
+        for test in [Boolean(true), Boolean(false)] {
+            for target in [0, 1, 4, usize::MAX] {
+                let ops = [test, branch(target), Boolean(true)];
+                assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+            }
+            let ops = [Boolean(true), test, branch(3), Boolean(true)];
+            assert_eq!(evaluate(&ops, 2, 0), Err(EvalError::InvalidScript));
+        }
+        let ops = [branch(1), Boolean(true)];
+        assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
     }
 
     #[test]

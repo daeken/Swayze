@@ -235,6 +235,11 @@ pub(crate) enum Instruction {
         target: usize,
         condition: ShortCircuitCondition,
     },
+    // Unlike an expression, a logical assignment consumes its only operand on both paths.
+    ShortCircuitStatement {
+        target: usize,
+        condition: ShortCircuitCondition,
+    },
     Jump(usize),
     // Unconditional statement transfers require an empty operand stack.
     JumpStatement(usize),
@@ -538,7 +543,7 @@ impl Lexer<'_> {
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
-            '&' | '|' | '^' => self.bitwise_or_logical(c, start)?,
+            '&' | '|' | '^' => self.bitwise_or_logical(c)?,
             '~' => TokenKind::Operator(Operator::BitwiseNot),
             // Annex B HTML-like comments remain outside the subset.
             '<' if self.rest().starts_with("!--") => {
@@ -647,7 +652,7 @@ impl Lexer<'_> {
         ))
     }
 
-    fn bitwise_or_logical(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+    fn bitwise_or_logical(&mut self, first: char) -> Result<TokenKind, Error> {
         let doubled = matches!(first, '&' | '|') && self.peek() == Some(first);
         if doubled {
             self.consume(first)?;
@@ -660,20 +665,7 @@ impl Lexer<'_> {
             ('|', true) => Operator::LogicalOr,
             _ => unreachable!("not a bitwise or logical operator"),
         };
-        if !doubled {
-            return self.operator_or_assignment(op);
-        }
-        if self.peek() == Some('=') {
-            self.consume('=')?;
-            return Err(Error::unsupported(
-                Span {
-                    start,
-                    end: self.offset,
-                },
-                "logical assignments are outside the subset",
-            ));
-        }
-        Ok(TokenKind::Operator(op))
+        self.operator_or_assignment(op)
     }
 
     fn relational_or_shift(&mut self, first: char) -> Result<TokenKind, Error> {
@@ -705,12 +697,9 @@ impl Lexer<'_> {
     fn question(&mut self, start: usize) -> Result<TokenKind, Error> {
         if self.peek() == Some('?') {
             self.consume('?')?;
-            if self.peek() == Some('=') {
-                self.consume('=')?;
-            } else {
-                return Ok(TokenKind::Operator(Operator::Coalesce));
-            }
-        } else if self.rest().strip_prefix('.').is_some_and(|rest| {
+            return self.operator_or_assignment(Operator::Coalesce);
+        }
+        if self.rest().strip_prefix('.').is_some_and(|rest| {
             // `?.` is not optional chaining when followed by a decimal digit.
             !matches!(rest.as_bytes().first(), Some(b'0'..=b'9'))
         }) {
@@ -1462,13 +1451,31 @@ impl Parser<'_> {
         if op.is_some() {
             self.emit(Instruction::LoadBinding(UNPATCHED), name)?;
         }
+        // The assignment test is not part of the RHS expression grammar.
+        let (skip, binary) = match op.map(Operator::instruction) {
+            Some(Instruction::ShortCircuit { condition, .. }) => {
+                let branch = self.instructions.len();
+                self.emit(
+                    Instruction::ShortCircuitStatement {
+                        target: UNPATCHED,
+                        condition,
+                    },
+                    operator_span,
+                )?;
+                (Some(branch), None)
+            }
+            binary => (None, binary),
+        };
         let first = self.require_token("expected an assignment value")?;
         let end = self.parse_expression(first, end)?;
-        if let Some(op) = op {
-            self.emit(op.instruction(), operator_span)?;
+        if let Some(binary) = binary {
+            self.emit(binary, operator_span)?;
         }
         self.accesses[access].instruction = self.instructions.len();
         self.emit(Instruction::StoreBinding(UNPATCHED), end)?;
+        if let Some(skip) = skip {
+            self.patch_jump(skip, end)?;
+        }
         Ok(end)
     }
 
@@ -2001,6 +2008,11 @@ impl Parser<'_> {
                 | Instruction::Jump(slot)
                 | Instruction::JumpStatement(slot),
             ) if *slot == UNPATCHED => slot,
+            Some(Instruction::ShortCircuitStatement { target: slot, .. })
+                if *slot == UNPATCHED && self.stack_depth == 0 =>
+            {
+                slot
+            }
             _ => return Err(Error::malformed(span, "invalid forward jump")),
         };
         *slot = target;
@@ -2018,7 +2030,9 @@ impl Parser<'_> {
             | Instruction::Null
             | Instruction::Undefined
             | Instruction::LoadBinding(_) => (0, 1),
-            Instruction::JumpIfFalseStatement(_) if self.stack_depth != 1 => {
+            Instruction::JumpIfFalseStatement(_) | Instruction::ShortCircuitStatement { .. }
+                if self.stack_depth != 1 =>
+            {
                 return Err(Error::malformed(
                     span,
                     "expected one statement test operand",
@@ -2039,7 +2053,8 @@ impl Parser<'_> {
             | Instruction::StoreBinding(_)
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfFalseStatement(_)
-            | Instruction::ShortCircuit { .. } => (1, 0),
+            | Instruction::ShortCircuit { .. }
+            | Instruction::ShortCircuitStatement { .. } => (1, 0),
             Instruction::Jump(_) | Instruction::JumpStatement(_) | Instruction::LoopBack(_) => {
                 (0, 0)
             }

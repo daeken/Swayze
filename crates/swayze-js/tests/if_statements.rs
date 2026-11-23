@@ -170,7 +170,7 @@ fn validates_both_bodies_even_when_untaken() {
         ("x=;", Malformed),
         ("x=1+;", Malformed),
         ("x=(x=1);", Unsupported),
-        ("x||=1;", Unsupported),
+        ("x||=later;", Unsupported),
         ("function f() {}", Unsupported),
     ] {
         for statement in [

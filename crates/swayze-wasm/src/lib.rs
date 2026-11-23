@@ -20,8 +20,8 @@
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
-//! `nop`, `drop`, untyped `select`, `call`, `if`, `block`, `loop`, and
-//! `br_if <depth>`. Local indices start at zero and address parameters first,
+//! `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`, `if`, `block`,
+//! `loop`, and `br_if <depth>`. Local indices start at zero and address parameters first,
 //! then locals in declaration order. Both can be assigned.
 //! `call` takes an unsigned LEB32 index into the exact function declarations,
 //! including forward and self references. The control constructs may nest
@@ -32,7 +32,7 @@
 //! and each enclosing frame, including `if`, adds one to the depth. A branch may
 //! cross any of these frames but may target only a `block` or `loop`. Branches to
 //! `if` or the implicit function label, other block types, typed `select`, `br`,
-//! `return`, `unreachable`, and indirect calls are unsupported.
+//! `return`, and indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
 //! any global, export, and code sections. It may be empty (a zero-length vector) or
@@ -92,30 +92,38 @@
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
-//! `if` consumes an i32 condition from above the enclosing frame's operand floor
-//! and saves the remaining depth as the floor for both arms. `else` checks the
-//! then arm's result depth and resets validation to the saved floor. `end` checks
-//! the final arm's result depth, including the then arm of an `if` without `else`.
-//! `block` and `loop` save the current depth as their floor without consuming
-//! any operands. Normal exits from void blocks, void arms, and loops must leave
-//! no values above their floor; i32-result blocks and arms must leave exactly one.
-//! Every operand access must stay above the active floor. `br_if` requires an i32
-//! condition and, only for an i32-result block target, an i32 result immediately
-//! below it. Both operands must be above the active innermost frame's floor,
-//! even when targeting an outer frame. With a zero condition, execution pops
-//! only the condition and continues. With a nonzero condition, a block branch
-//! truncates to the target block's floor, keeps the result if required, and
+//! `if` pops an i32 condition in the enclosing frame and saves the remaining
+//! depth as the floor for both arms. `block` and `loop`
+//! save the current depth as their floor without consuming any operands.
+//! `unreachable` discards operands above the current floor for validation and
+//! marks only that frame unreachable. In that frame, a pop at the floor supplies
+//! an implicit i32 without reducing the depth; pushes still count as explicit
+//! operands. No operand access crosses the active floor. At `else` or `end`, an
+//! unreachable frame may supply a missing i32 result implicitly, but any excess
+//! explicit operands are still rejected. Every new frame starts reachable,
+//! even inside an unreachable frame. `else` checks the then result and starts
+//! a reachable else arm at the same floor. `end` checks the final result, then
+//! leaves the declared result on the parent's stack (none for void) without
+//! changing the parent's reachability flag.
+//! `br_if` requires an i32 condition and, only for an i32-result block target,
+//! an i32 result immediately below it. These operands are popped at the active
+//! frame, even when targeting an outer frame. Validation pushes the result back
+//! for fallthrough if the target requires one. With a zero condition, execution
+//! pops only the condition and continues. With a nonzero condition, a block
+//! branch truncates to the target block's floor, keeps the result if required, and
 //! resumes after that block's `end`. A taken loop branch truncates to the target
 //! loop's floor and resumes at its body start. Both taken edges preserve the
 //! target's operand prefix and locals. Both `if` arms and the entire `br_if`
-//! fallthrough path are validated regardless of the condition; no unreachable
-//! typing is used.
-//! The function has a floor of zero; its own `end` must be the final byte of
-//! the body frame and leave exactly one result. The inclusive limits are 256
-//! body bytes (including the locals vector and all delimiters), 127 decoded
-//! instructions (including `nop`, `drop`, `select`, `if`, `else`, and `br_if`,
-//! but not `block`, `loop`, or `end`), 32 live i32 operands including those below
-//! floors, and 16 simultaneously open `block`, `loop`, and `if` frames combined,
+//! fallthrough path are validated regardless of the condition. Unreachable code
+//! is fully decoded and checked, including all immediates, indices, mutability,
+//! delimiters, and limits.
+//! The function has a floor of zero and its own unreachable flag; its `end`
+//! must be the final byte of the body frame and checks for one i32 result. The
+//! inclusive limits are 256 body bytes (including the locals vector and all
+//! delimiters), 127 decoded instructions (including `unreachable`, `nop`,
+//! `drop`, `select`, `if`, `else`, and `br_if`, but not `block`, `loop`, or
+//! `end`), 32 explicitly stacked i32 operands including those below floors,
+//! and 16 simultaneously open `block`, `loop`, and `if` frames combined,
 //! excluding the function frame.
 //!
 //! Validation resolves every function's type index and validates all global
@@ -178,14 +186,16 @@
 //!
 //! A zero right operand traps for all four division and remainder instructions.
 //! `i32::MIN / -1` traps for signed division; signed remainder for those operands
-//! returns zero. These are runtime outcomes, not validation errors.
-//! [`InvokeError::Trap`] reports the first guest trap and skips all remaining
-//! instructions, including in callers. Host resource limits are separate:
+//! returns zero. Executing `unreachable` immediately raises [`Trap::Unreachable`].
+//! These are runtime outcomes, not validation errors. [`InvokeError::Trap`]
+//! reports the first guest trap and skips all remaining instructions, including
+//! in callers. Host resource limits are separate:
 //! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
-//! including `nop`, `drop`, `select`, memory and global instructions, a `call`,
-//! an `if` test, an executed `else` jump, or a `br_if` with either outcome.
+//! including `unreachable`, `nop`, `drop`, `select`, memory and global
+//! instructions, a `call`, an `if` test, an executed `else` jump, or a `br_if`
+//! with either outcome.
 //! An omitted `else` introduces no dispatch. Skipped instructions, `block`,
 //! `loop`, and `end` delimiters, and returning from frames cost nothing.
 //! A continue does not reset the budget: all loop
@@ -253,6 +263,12 @@
 //! zero-result branch exits across mixed frames and preserved operand prefixes,
 //! floor and depth errors even in skipped code, shared inclusive caps, exact
 //! dispatch charging across calls and loops, and instance reuse.
+//! `unreachable` tests cover implicit operands and results, truncation to the
+//! current floor, concrete result counts, fresh inner frames and alternate
+//! arms, and preservation of the parent's flag. They also check syntax, indices,
+//! mutability, and limits in dead code, taken branches that bypass the trap,
+//! trap propagation across calls, store persistence, repeated invocation, and
+//! precedence of the dispatch limit over a trap beyond the budget.
 //! Memory tests cover exact limits, width-specific alignment and framed memarg
 //! decoding, actual page counts and the reserved `memory.size` byte, absent and
 //! zero-page memory, ordering and unsupported features, operand floors and
@@ -497,11 +513,14 @@ pub enum Trap {
     IntegerOverflow,
     /// The full range of a load or store was not within the instance's memory.
     MemoryOutOfBounds,
+    /// An `unreachable` instruction was executed.
+    Unreachable,
 }
 
 impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unreachable => f.write_str("unreachable instruction executed"),
             Self::IntegerDivideByZero => f.write_str("integer divide by zero"),
             Self::IntegerOverflow => f.write_str("integer overflow"),
             Self::MemoryOutOfBounds => f.write_str("out of bounds memory access"),

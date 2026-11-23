@@ -113,14 +113,27 @@ fn growth_observes_the_declared_maximum_and_never_wraps_the_unsigned_delta() {
         let module = memory_functions(
             limits,
             &[0, 1, 2],
-            &[0, 1, 1, 2],
-            &[(b"size", 0), (b"grow", 1), (b"read", 2), (b"write", 3)],
-            &[SIZE_BODY, GROW_BODY, READ, WRITE],
+            &[0, 1, 1, 2, 1],
+            &[
+                (b"size", 0),
+                (b"grow", 1),
+                (b"read", 2),
+                (b"write", 3),
+                (b"read8", 4),
+            ],
+            &[
+                SIZE_BODY,
+                GROW_BODY,
+                READ,
+                WRITE,
+                &[0, 0x20, 0, LOAD8_U, 0, 0, 0x0b],
+            ],
         );
         let instance = module.instantiate().unwrap();
         let size = || instance.invoke_i32("size");
         let grow = |delta| instance.invoke_i32_with_args("grow", &[delta]);
         let read = |address| instance.invoke_i32_with_args("read", &[address]);
+        let read8 = |address| instance.invoke_i32_with_args("read8", &[address]);
         let write = |address, value| instance.invoke_i32_with_args("write", &[address, value]);
         assert_eq!(size(), Ok(initial));
         assert_eq!(grow(0), Ok(initial));
@@ -137,10 +150,19 @@ fn growth_observes_the_declared_maximum_and_never_wraps_the_unsigned_delta() {
         if current == 1 {
             assert_eq!(read(0), Ok(0));
             assert_eq!(read(PAGE - 4), Ok(0));
+            assert_eq!(read8(PAGE - 1), Ok(0));
+            assert_eq!(read8(PAGE), Err(OOB));
+            assert_eq!(write(0, 0x1122_3344), Ok(42));
             assert_eq!(write(PAGE - 4, 0x1234_5678), Ok(42));
         }
         for delta in [1, 2, i32::MAX, i32::MIN, -1] {
             assert_eq!(grow(delta), Ok(-1));
+            assert_eq!(size(), Ok(current));
+            if current == 1 {
+                assert_eq!(read(0), Ok(0x1122_3344));
+                assert_eq!(read(PAGE - 4), Ok(0x1234_5678));
+                assert_eq!(read8(PAGE - 1), Ok(0x12));
+            }
         }
         assert_eq!(grow(0), Ok(current));
         assert_eq!(size(), Ok(current));

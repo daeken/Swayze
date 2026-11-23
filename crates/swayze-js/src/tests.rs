@@ -120,6 +120,35 @@ fn both_conditional_rhs_edges_join_before_assignment_stores() {
 }
 
 #[test]
+fn arm_stores_precede_the_join_and_the_outer_store_follows_it() {
+    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBinding, StoreBindingKeep, Undefined};
+    assert_postfix(
+        "let x,y,z,w; x = true ? y=z=1 : w=2; x",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Undefined,
+            init_let(2),
+            Undefined,
+            init_let(3),
+            Boolean(true),
+            JumpIfFalse(14),
+            Number(1.0),
+            StoreBindingKeep(2),
+            StoreBindingKeep(1),
+            Jump(16),
+            Number(2.0),
+            StoreBindingKeep(3),
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn updates_load_and_store_the_same_slot_once_with_no_result() {
     use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
     assert_postfix(

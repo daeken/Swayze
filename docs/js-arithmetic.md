@@ -57,11 +57,12 @@ compound returns the old value on a skip, with no write. Otherwise it stores
 and returns the right-hand value without coercion. A comma right-hand side
 needs its own group, as in `(x = (a, b))`. The required parentheses around
 a control test are not an expression group: use `if ((x = a))`.
-A lexical initializer or an existing assignment's right-hand side can start
-with a chain of simple name assignments, as in `let y = x = 3;` or
-`x = y = 1;`. The final right-hand side is evaluated once; writes run from
-right to left, preserving its value. Starting a bare assignment in a ternary
-arm, comma operand, or control test is still outside this subset.
+A lexical initializer, an existing assignment's right-hand side, or either
+ternary arm can start with a chain of simple name assignments. Examples are
+`let y = x = 3;`, `x = y = 1;`, and `test ? x = a : x = b`. The final
+right-hand side is evaluated once; writes run from right to left, preserving
+its value. Only the selected ternary arm runs. Starting a bare assignment in
+a comma operand or control test is still outside this subset.
 Declarations, assignments, updates, and nonfinal expression statements require
 explicit semicolons. Expression statements discard their values. The script
 must end in a root-level expression, whose trailing semicolon is optional;

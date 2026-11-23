@@ -381,7 +381,10 @@ fn fixtures() -> Vec<String> {
             "let x; let y = x = 3, z = 4; x * 100 + y * 10 + z",
             "let x, y, n = 0; x = y = true ? (++n) : 99; x * 100 + y * 10 + n",
             "let x = 1, y = 42; (x ||= y = 0); y",
-            "let x = 1, y; (x += y = 20) + y + 1"
+            "let x = 1, y; (x += y = 20) + y + 1",
+            "let x, y, z; z = true ? x = false ? 1 : y = 2 : 99; x * 100 + y * 10 + z",
+            "let x = 1, y = 7; const z = false ? y = 0 : x = null; x === null && z === null && y === 7",
+            "let x = 0; let y = 0; (true ? x = 40 : x = 1, y++); x + y"
         ]
         .map(str::to_owned),
     );

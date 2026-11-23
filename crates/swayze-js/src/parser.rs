@@ -2439,8 +2439,8 @@ impl Parser<'_> {
         };
         let mut needs_operand = true;
         let mut after_open = false;
-        // Ungrouped simple assignment is allowed only as an RHS prefix, not
-        // after an operator, at a ternary arm, in tests, or after a comma.
+        // An ungrouped simple assignment can start an RHS or a ternary arm,
+        // but not an operator operand, a comma operand, or a bare test.
         let mut rhs_start = matches!(
             end_kind,
             ExpressionEnd::Declarator(_) | ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(_)
@@ -2768,7 +2768,7 @@ impl Parser<'_> {
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
             after_open = matches!(kind, TokenKind::Open);
-            rhs_start = false;
+            rhs_start = matches!(kind, TokenKind::Question | TokenKind::Colon);
             next = self.next_token()?;
         };
         let at_eof = delimiter.is_none();
@@ -2892,8 +2892,10 @@ impl Parser<'_> {
 
     // At a delimiter, finish conditionals and ungrouped assignments inside out.
     // '?' drained operators at its level, and a simple assignment began at an
-    // RHS prefix, so neither marker has operators immediately beneath it.
-    // Groups and conditionals that haven't seen their ':' still stop reduction.
+    // RHS or arm prefix, so neither marker has operators immediately beneath it.
+    // An arm's assignments finish before its conditional joins; an assignment
+    // whose RHS is that conditional finishes after the join. Groups and
+    // consequents still awaiting ':' stop reduction.
     fn reduce_expression(&mut self, end: Span) -> Result<(), Error> {
         self.reduce_operators(0)?;
         while let Some(&(pending, span)) = self.pending.last() {

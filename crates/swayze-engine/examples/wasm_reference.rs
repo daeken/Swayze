@@ -785,6 +785,58 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![],
         });
     }
+    // Call a private (i64, i32) -> i64 function behind an i32 export.
+    // The indirect call uses a second type index with an equal or reordered signature.
+    for (indirect, reordered) in [(false, false), (true, false), (true, true)] {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x12\x03\x60\x01\x7f\x01\x7f\
+                          \x60\x02\x7e\x7f\x01\x7e\x60\x02"
+            .to_vec();
+        bytes.extend(if reordered {
+            [0x7f, 0x7e]
+        } else {
+            [0x7e, 0x7f]
+        });
+        bytes.extend(b"\x01\x7e\x03\x03\x02\x01\0");
+        if indirect {
+            bytes.extend(b"\x04\x04\x01\x70\0\x01");
+        }
+        bytes.extend(b"\x07\x05\x01\x01x\0\x01");
+        if indirect {
+            bytes.extend(b"\x09\x07\x01\0\x41\0\x0b\x01\0");
+        }
+        let callee = b"\0\x20\0\x20\x01\xac\x7c\x0b"; // i64 + extend_i32_s(i32)
+        let mut caller = vec![0];
+        let mut call_args = wide.to_vec();
+        call_args.extend([0x20, 0]);
+        if reordered {
+            caller.extend([0x20, 0]);
+            caller.extend(wide);
+        } else {
+            caller.extend(call_args);
+        }
+        if indirect {
+            caller.extend([0x41, 0, 0x11, 2, 0]);
+        } else {
+            caller.extend([0x10, 0]);
+        }
+        caller.extend([0x42, 0xab, 0x80, 0x80, 0x80, 0x10, 0x51, 0x0b]);
+        let caller_len = u8::try_from(caller.len()).unwrap();
+        let callee_len = u8::try_from(callee.len()).unwrap();
+        bytes.extend([10, 3 + callee_len + caller_len, 2, callee_len]);
+        bytes.extend(callee);
+        bytes.push(caller_len);
+        bytes.extend(caller);
+        cases.push(Fixture {
+            expected: Outcome::Invocation(if reordered {
+                Err(WasmTrap::IndirectCallTypeMismatch)
+            } else {
+                Ok(1)
+            }),
+            bytes,
+            export: "x",
+            args: vec![1],
+        });
+    }
     cases
 }
 

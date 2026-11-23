@@ -7,8 +7,8 @@
 //! start, element, and data sections. Modules with functions must have one to eight
 //! types, one to eight function declarations, and exactly as many code bodies
 //! as function declarations, in that section order. Each type must have zero
-//! to four `i32` parameters and either no result (void) or one `i32` result,
-//! even if unused.
+//! to four parameters, each `i32` or `i64` in any order, and either no result
+//! (void) or one `i32` or `i64` result, even if unused.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 locals in total, in addition
 //! to its parameters. The number of groups and each group's local count are
@@ -105,8 +105,8 @@
 //! encodes the Core 1.0 table index zero as unsigned LEB32, exactly
 //! `i32.const <signed LEB32> end`, and an unsigned LEB32 count followed by that
 //! many unsigned LEB32 indices into the defined function declarations. Padded
-//! LEB32 encodings are accepted if valid. Both i32-result and void functions can
-//! be referenced. An element section with no segments does not require a table;
+//! LEB32 encodings are accepted if valid. Functions of any supported signature
+//! can be referenced. An element section with no segments does not require a table;
 //! a segment with no function indices still does. Passive and declarative
 //! segments, element expressions, and global offsets are unsupported.
 //!
@@ -119,11 +119,14 @@
 //! memory, and global offsets are unsupported.
 //!
 //! An optional export section after any table, memory, and globals and before
-//! any start, elements, and code may contain zero to eight function exports. Tables, memory, and globals cannot be exported. Name
-//! matching is exact (no Unicode normalization), and duplicate export names
-//! are rejected. Each export refers to a defined function (void or i32-result)
-//! by its zero-based declaration index. Distinct names may refer to the same
-//! function.
+//! any start, elements, and code may contain zero to eight function exports.
+//! Tables, memory, and globals cannot be exported. Name matching is exact (no
+//! Unicode normalization), and duplicate export names are rejected. Each export
+//! refers to a defined function by its zero-based declaration index. The host API
+//! accepts only i32 parameters and a void or i32 result. An i64 parameter or
+//! result in an exported function is rejected with
+//! [`ErrorKind::UnsupportedExportSignature`] at the export's function index.
+//! Distinct names may refer to the same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
@@ -131,7 +134,7 @@
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` pushes the indexed slot's
-//! declared type (`i32` for parameters); `local.set` consumes a value of that
+//! declared type; `local.set` consumes a value of that
 //! type, and `local.tee` writes and leaves a value of that type on the stack.
 //! `global.get` pushes the declared type; `global.set` consumes that type.
 //! Both are checked even in dead code. `i32.const` pushes one i32.
@@ -145,8 +148,8 @@
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
 //! i64 values stay inside the guest: they can be operands (including load
-//! results and stored values), declared locals, private globals, or `block`
-//! and `if` results. Function signatures do not accept i64.
+//! results and stored values), locals, private globals, `block` and `if`
+//! results, and private function parameters or results.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
 //! i64) and an i32 condition, pushed in first-candidate, second-candidate,
@@ -156,11 +159,12 @@
 //! even if its result would be unselected or dropped.
 //! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one i32 and
 //! push one i32; the i32 binary operators consume two i32s and push one i32.
-//! `call` consumes as many i32s as the target function's type has parameters
-//! (the top operand is the last parameter) and pushes one i32 for a result
-//! function or nothing for a void function. `call_indirect` consumes an i32 selector above the arguments
-//! and uses the immediate's type for the parameter count and result kind.
-//! Both calls validate their operands above the active frame's entry floor.
+//! `call` consumes arguments in declared parameter order (the top operand
+//! is the last parameter) and pushes the declared result, if any.
+//! `call_indirect` consumes an i32 selector above the arguments and uses the
+//! immediate's signature for the argument and result types. Both calls check
+//! arity and each positional type above the active frame's entry floor, and
+//! any result is concrete even when the floor supplied implicit arguments.
 //! Loads consume an i32 base address and push a value of the opcode's type
 //! (i32 or i64). Stores consume an i32 base address and a value of the opcode's
 //! type (value on top) and produce no result. `memory.size`
@@ -286,15 +290,16 @@
 //! local storage, both holding tagged i32/i64 values. Parameters are copied
 //! from the supplied arguments or caller's operands, and each declared local
 //! starts at zero of its own type for every frame, including reused frame
-//! slots. A callee starts with no operands. A callee returning i32 pushes that
-//! value onto the caller's remaining operands; a void callee leaves them unchanged.
+//! slots. A callee starts with no operands. A callee returning a value pushes
+//! the full tagged result onto the caller's remaining operands; a void callee
+//! leaves them unchanged.
 //! `call_indirect` interprets the selector as `u32` and traps with
 //! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
 //! [`Trap::UninitializedElement`] for a null entry, or
-//! [`Trap::IndirectCallTypeMismatch`] if the selected function's parameters or
-//! result kind differ from the expected signature. Type indices need not be
-//! equal if the signatures match. A successful lookup uses the same frame
-//! machinery as `call`.
+//! [`Trap::IndirectCallTypeMismatch`] if the selected function's parameter
+//! count, any positional parameter type, or result differs from the expected
+//! signature. Type indices need not be equal if the signatures match. A
+//! successful lookup uses the same frame machinery as `call`.
 //! [`Instance::invoke_i32`] and [`Instance::invoke_void`] are equivalent to
 //! passing an empty argument slice to their respective typed methods.
 //! The top operand is the right-hand side of each binary operation. At either
@@ -495,6 +500,9 @@
 //! parameter order, matching duplicate type declarations, void and i32 results,
 //! target traps and their ordering against both budgets, and shared memory and
 //! globals through indirect calls.
+//! Mixed-signature tests cover full-width arguments and returns, structural
+//! equality and same-arity mismatches, active floors and concrete results in
+//! dead tails, and rejection at the export and start boundaries.
 //! Global tests cover section order, the shared declaration cap, exact typed
 //! initializer expressions and framing, index decoding and bounds, mutability
 //! and type-check precedence, operand floors and caps, and unsupported imports,

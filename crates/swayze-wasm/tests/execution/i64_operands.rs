@@ -528,21 +528,7 @@ fn i32_memory_operands_and_i32_globals_reject_i64_even_in_dead_code() {
 }
 
 #[test]
-fn i64_remains_unsupported_in_signatures_and_loop_labels() {
-    for (payload, offset, expected) in [
-        (&b"\x01\x60\x01\x7e\0"[..], 3, 0x7f), // Parameter.
-        (b"\x01\x60\0\x01\x7e", 4, 0x7f),      // Result.
-    ] {
-        bad_payload(
-            1,
-            payload,
-            offset,
-            ErrorKind::UnexpectedByte {
-                expected,
-                found: payload[offset],
-            },
-        );
-    }
+fn i64_remains_unsupported_in_loop_labels() {
     bad_body(
         b"\0\x03\x7e\x0b",
         2,

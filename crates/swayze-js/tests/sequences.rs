@@ -93,6 +93,18 @@ fn grouped_assignment_sequences_finish_the_first_write_before_later_operands() {
 }
 
 #[test]
+fn a_comma_after_a_grouped_assignment_is_not_part_of_its_rhs() {
+    for (expression, result, stored) in [
+        ("(x = 1, x + 1)", 2.0, 1.0),
+        ("(x = (1, x + 1))", 11.0, 11.0),
+    ] {
+        let source = format!("let x = 10; let r = {expression};");
+        assert_value(&format!("{source} r"), Value::Number(result));
+        assert_value(&format!("{source} x"), Value::Number(stored));
+    }
+}
+
+#[test]
 fn grouped_assignment_sequences_preserve_stored_bits_and_the_last_operand_tag() {
     use Value::{Boolean, Null, Undefined};
     for (source, expected) in [
@@ -110,6 +122,14 @@ fn grouped_assignment_sequences_preserve_stored_bits_and_the_last_operand_tag() 
         let value = parse_script(source).unwrap().evaluate().unwrap();
         assert_eq!(value.to_bits(), (-0.0f64).to_bits(), "{source}");
     }
+}
+
+#[test]
+fn a_grouped_logical_assignment_skip_reaches_the_discard_before_the_next_operand() {
+    assert_value(
+        "let x = 1, n = 0; let r = (x ||= (n = 99), ++n); x * 100 + n * 10 + r",
+        Value::Number(111.0),
+    );
 }
 
 #[test]

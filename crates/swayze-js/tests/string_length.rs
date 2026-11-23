@@ -216,14 +216,75 @@ fn property_targets_and_ineligible_dots_are_static_errors() {
     ] {
         assert_error(source, ErrorKind::Unsupported, start, width);
     }
-    let old_diagnostic = parse_script("(1).toString()").unwrap_err();
-    assert_eq!(
-        old_diagnostic.message(),
-        "token is outside the arithmetic subset"
-    );
     assert_number("true?.5:0", 0.5);
     assert_number("false ? .5 : 'ab'.length", 2.0);
     assert_error("'x'.5", ErrorKind::Malformed, 3, 2);
+}
+
+#[test]
+fn only_eligible_dots_probe_suffix_trivia_before_reporting_unsupported() {
+    let at_dot = |source: &str, limits: Limits| {
+        let start = source.find('.').unwrap();
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{source:?}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            },
+            "{source:?}"
+        );
+        assert_eq!(
+            error.message(),
+            "token is outside the arithmetic subset",
+            "{source:?}"
+        );
+    };
+    for source in [
+        "(1).toString()",
+        "(1)./* suffix trivia */ toString()",
+        "let s='x'; s./* suffix trivia */ length2",
+        "(1).other/* not needed to reject other",
+        "++s./*",
+        "s++./*",
+        "let s='x'; false && ++s./*",
+        "let s='x'; false && s++./*",
+        "for (;; 'a')./*",
+        "if (true)./*",
+        "while (false)./*",
+        "do {} while (false)./*",
+    ] {
+        at_dot(source, Limits::default());
+    }
+    // Only the two bytes up to and including the dot fit. The old dot
+    // diagnostic still wins over later lookahead or the name emission.
+    let two_bytes = Limits {
+        max_work: 2,
+        ..Limits::default()
+    };
+    at_dot("s.other", two_bytes);
+    at_dot(
+        "s./* done */other",
+        Limits {
+            max_work: 12,
+            ..Limits::default()
+        },
+    );
+    at_dot(
+        "++s./*",
+        Limits {
+            max_work: 4,
+            ..Limits::default()
+        },
+    );
+    let work = parse_script_with_limits("s./*", two_bytes).unwrap_err();
+    assert_eq!(work.kind(), ErrorKind::LimitExceeded(Limit::Work));
+    assert_eq!(work.span(), Span { start: 2, end: 3 });
+    let comment = parse_script("(1)./*").unwrap_err();
+    assert_eq!(comment.kind(), ErrorKind::Malformed);
+    assert_eq!(comment.span(), Span { start: 4, end: 6 });
+    assert_eq!(comment.message(), "unterminated block comment");
 }
 
 #[test]

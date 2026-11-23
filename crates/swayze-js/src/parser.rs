@@ -482,7 +482,7 @@ enum TokenKind {
     OpenBrace,
     CloseBrace,
     Question,
-    Dot,
+    LengthSuffix,
     Colon,
     Comma,
     Semicolon,
@@ -646,7 +646,16 @@ impl Lexer<'_> {
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
-            '.' if allow_dot => TokenKind::Dot,
+            '.' if allow_dot => {
+                self.consume_length(first)?;
+                // Lookahead after a name may cache the complete suffix. Use
+                // the dot span for emission, not a span including trivia.
+                return Ok(Some(Token {
+                    kind: TokenKind::LengthSuffix,
+                    span: first,
+                    after_line_break,
+                }));
+            }
             '\'' | '"' => TokenKind::String(self.string_literal(c, start)?),
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
@@ -1317,7 +1326,7 @@ impl Parser<'_> {
 
     fn next_token_with_dot(&mut self, allow_dot: bool) -> Result<Option<Token>, Error> {
         match self.lookahead.take() {
-            Some(Some(token)) if !allow_dot && matches!(token.kind, TokenKind::Dot) => {
+            Some(Some(token)) if !allow_dot && matches!(token.kind, TokenKind::LengthSuffix) => {
                 Err(unsupported_token(token.span))
             }
             Some(next) => Ok(next),
@@ -2715,8 +2724,7 @@ impl Parser<'_> {
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
-                (false, TokenKind::Dot) => {
-                    self.lexer.consume_length(span)?;
+                (false, TokenKind::LengthSuffix) => {
                     self.emit(Instruction::StringLength, span)?;
                 }
                 (true, TokenKind::String(range)) => {

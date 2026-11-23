@@ -3,6 +3,8 @@ use swayze_wasm::{
     validate_module,
 };
 
+#[path = "execution/bits.rs"]
+mod bits;
 #[path = "execution/globals.rs"]
 mod globals;
 #[path = "execution/memory.rs"]
@@ -2147,7 +2149,7 @@ fn rejects_every_opcode_outside_the_slice() {
         .contains(&opcode)
             && !(0x2c..=0x2f).contains(&opcode)
             && !(0x45..=0x4f).contains(&opcode)
-            && !(0x6a..=0x70).contains(&opcode)
+            && !(0x67..=0x78).contains(&opcode)
         {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],

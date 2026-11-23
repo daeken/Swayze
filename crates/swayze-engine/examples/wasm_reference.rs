@@ -44,6 +44,10 @@ for (const fixture of fixtures) {
         console.log('instantiation-error');
         continue;
     }
+    if (result === 'instantiate') {
+        console.log('instantiated');
+        continue;
+    }
     const exported = instance.exports[name];
     if (result === 'memory') {
         if (!(exported instanceof WebAssembly.Memory)) throw new Error('expected a memory export');
@@ -133,6 +137,7 @@ enum Outcome {
     VoidInvocation(Result<(), WasmTrap>),
     MemoryRead { offset: u32, bytes: [u8; 4] },
     GlobalRead(WasmValue),
+    Instantiated,
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
     StartTrap(WasmTrap),
@@ -206,6 +211,9 @@ impl Fixture<WasmValue> {
                 hex(self.export.as_bytes()),
                 bytes.len()
             );
+        }
+        if self.expected == Outcome::Instantiated {
+            return format!("{}::instantiate", hex(&self.bytes));
         }
         let result = match self.expected.result_kind() {
             WasmResultKind::Void => "void",
@@ -1613,6 +1621,32 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     cases.into_iter()
 }
 
+fn empty_section_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    // Independently omit or encode each empty section. Test the canonical
+    // count and the longest permitted unsigned LEB32 encoding of zero.
+    [&[0][..], &[0x80, 0x80, 0x80, 0x80, 0][..]]
+        .into_iter()
+        .flat_map(|count| {
+            (0..16)
+                .filter(move |&mask| mask != 0 || count.len() == 1)
+                .map(move |mask| {
+                    let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+                    for (bit, id) in [1, 3, 7, 10].into_iter().enumerate() {
+                        if mask & (1 << bit) != 0 {
+                            bytes.extend([id, u8::try_from(count.len()).unwrap()]);
+                            bytes.extend_from_slice(count);
+                        }
+                    }
+                    Fixture {
+                        expected: Outcome::Instantiated,
+                        bytes,
+                        export: "",
+                        args: vec![],
+                    }
+                })
+        })
+}
+
 fn global_export_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     let values = [
         (0x7f, &b"\x41\x2a"[..], WasmValue::I32(42)),
@@ -1740,6 +1774,9 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
     if let Outcome::GlobalRead(_) = fixture.expected {
         return Ok(Outcome::GlobalRead(instance.read_global(fixture.export)?));
     }
+    if fixture.expected == Outcome::Instantiated {
+        return Ok(Outcome::Instantiated);
+    }
     let expected_kind = fixture.expected.result_kind();
     match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
         Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
@@ -1765,6 +1802,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain(typed_fixtures())
         .chain(memory_export_fixtures())
         .chain(global_export_fixtures())
+        .chain(empty_section_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
@@ -1812,6 +1850,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     == Some(bits)
             }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
+            Outcome::Instantiated => reference == "instantiated",
             Outcome::GlobalRead(value) => {
                 reference
                     == match value {
@@ -1841,7 +1880,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, global snapshots, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, global snapshots, invocation traps, or instantiation outcomes)"
     );
     Ok(())
 }

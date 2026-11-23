@@ -378,8 +378,10 @@ impl std::error::Error for Error {}
 /// of the invalid or incomplete sequence.
 /// A local group's count that exceeds the remaining declared-local budget is
 /// reported as [`ErrorKind::UnsupportedCount`] with [`IntegerField::LocalCount`].
-/// A code count differing from the function count is reported as
-/// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
+/// With a function section present, a code count differing from its declaration
+/// count is reported as [`ErrorKind::UnsupportedCount`] with
+/// [`IntegerField::CodeCount`]. Without a function section, nonempty code is
+/// checked provisionally before reporting a missing section.
 /// A repeated export name (regardless of kind) is reported at the start of its
 /// length field, before checking the descriptor. An export index is decoded
 /// within the section frame. In a memory export, a nonzero index reports
@@ -456,7 +458,6 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut globals = [Global::EMPTY; MAX_GLOBALS as usize];
     let mut global_count = 0;
     let mut data_segments = Vec::new();
-    let mut requires_function_sections = false;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -491,7 +492,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         match id {
             1 => type_count = Some(validate_types(&mut section, &mut types)?),
             3 => {
-                let count = section.count(IntegerField::FunctionCount, 1..=MAX_FUNCTIONS)?;
+                let count = section.count(IntegerField::FunctionCount, 0..=MAX_FUNCTIONS)?;
                 // Without a type section, use a placeholder zero-arg type at
                 // index zero while checking framing and order. Reject its absence
                 // in the final required-section check.
@@ -512,12 +513,6 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     memory_limits.is_some(),
                     global_count as u32,
                 )?;
-                // Exempt nonempty lists with no function exports. An empty
-                // list retains the legacy function-section requirement.
-                requires_function_sections |= exports.is_empty()
-                    || exports
-                        .iter()
-                        .any(|export| matches!(export.target, ExportTarget::Function(_)));
             }
             8 => {
                 let offset = section.position();
@@ -540,7 +535,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     has_memory: memory_limits.is_some(),
                     globals: &globals[..global_count],
                 };
-                functions = validate_code(&mut section, &environment)?;
+                functions = validate_code(&mut section, &environment, function_count)?;
             }
             11 => data_segments = validate_data(&mut section, memory_limits.is_some())?,
             _ => {
@@ -552,14 +547,20 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         section.finish(ErrorKind::TrailingSectionBytes { id })?;
         last_standard = id;
-        requires_function_sections |= matches!(id, 1 | 3 | 10);
     }
     if !module.remaining.is_empty() {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
     }
-    if requires_function_sections {
-        // The presence of all three sections makes the count and index checks
-        // above sufficient to associate exports, calls, and start with validated bodies.
+    if function_count.unwrap_or(0) != 0
+        || !functions.is_empty()
+        || exports
+            .iter()
+            .any(|export| matches!(export.target, ExportTarget::Function(_)))
+    {
+        // Only declarations, bodies, and function exports need these sections.
+        // Preserve missing-section precedence when validation used placeholders
+        // or deferred export bounds. With nonzero declarations, any present
+        // code section has already been checked to have the same nonzero count.
         for (id, present) in [
             (1, type_count.is_some()),
             (3, function_count.is_some()),
@@ -686,7 +687,7 @@ fn validate_types(
     section: &mut Reader<'_>,
     types: &mut [FunctionType; MAX_TYPES as usize],
 ) -> Result<u32, Error> {
-    let count = section.count(IntegerField::TypeCount, 1..=MAX_TYPES)?;
+    let count = section.count(IntegerField::TypeCount, 0..=MAX_TYPES)?;
     for signature in &mut types[..count as usize] {
         section.expect_byte(0x60)?; // functype
         let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
@@ -3179,13 +3180,14 @@ fn decode_plain(
 fn validate_code(
     section: &mut Reader<'_>,
     environment: &BodyEnvironment<'_>,
+    declaration_count: Option<u32>,
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
-    let declaration_count = environment.functions.len() as u32;
-    let allowed_counts = if declaration_count == 0 {
-        1..=MAX_FUNCTIONS
-    } else {
-        declaration_count..=declaration_count
+    // An explicit declaration count is authoritative, even when it is zero.
+    // With no section, validate any bodies provisionally before reporting absence.
+    let allowed_counts = match declaration_count {
+        Some(count) => count..=count,
+        None => 0..=MAX_FUNCTIONS,
     };
     let count = section.count(IntegerField::CodeCount, allowed_counts)?;
     let mut functions = Vec::new();

@@ -13,6 +13,8 @@ mod branch_table;
 mod call_indirect;
 #[path = "execution/debug_format.rs"]
 mod debug_format;
+#[path = "execution/empty_vectors.rs"]
+mod empty_vectors;
 #[path = "execution/float_add_sub.rs"]
 mod float_add_sub;
 #[path = "execution/float_control.rs"]
@@ -2567,26 +2569,24 @@ fn rejects_unsigned_leb_overflow_and_max_u32_indices() {
 #[test]
 fn bounds_type_function_code_and_export_counts() {
     use IntegerField::*;
-    for (id, prefix, field, bad_counts) in [
-        (1, &[][..], TypeCount, &[0, 9][..]),
-        (1, &[1, 0x60], ParameterCount, &[5]),
-        (1, &[1, 0x60, 0], ResultCount, &[2]),
-        (3, &[], FunctionCount, &[0, 9]),
-        (7, &[], ExportCount, &[9]),
-        (10, &[], CodeCount, &[0, 9]),
+    for (id, prefix, field, count) in [
+        (1, &[][..], TypeCount, 9),
+        (1, &[1, 0x60], ParameterCount, 5),
+        (1, &[1, 0x60, 0], ResultCount, 2),
+        (3, &[], FunctionCount, 9),
+        (7, &[], ExportCount, 9),
+        (10, &[], CodeCount, 9),
     ] {
-        for &count in bad_counts {
-            let payload = [prefix, &[count]].concat();
-            bad_payload(
-                id,
-                &payload,
-                prefix.len(),
-                ErrorKind::UnsupportedCount {
-                    field,
-                    count: u32::from(count),
-                },
-            );
-        }
+        let payload = [prefix, &[count]].concat();
+        bad_payload(
+            id,
+            &payload,
+            prefix.len(),
+            ErrorKind::UnsupportedCount {
+                field,
+                count: u32::from(count),
+            },
+        );
     }
     for (id, payload, index, expected) in [
         (1, &[1, 0x61, 0, 1, 0x7f][..], 1, 0x60),
@@ -2653,7 +2653,7 @@ fn rejects_malformed_parameter_type_vectors() {
 }
 
 #[test]
-fn requires_each_standard_section_once_in_order_except_optional_export() {
+fn requires_sections_for_defined_functions_and_rejects_duplicate_or_reordered_sections() {
     for missing in [1, 3, 10] {
         let sections: Vec<_> = SECTIONS
             .into_iter()
@@ -2688,15 +2688,15 @@ fn requires_each_standard_section_once_in_order_except_optional_export() {
 }
 
 #[test]
-fn rejects_every_proper_prefix_of_the_demo_except_the_valid_empty_module() {
+fn accepts_only_the_empty_and_type_only_proper_prefixes_of_the_demo() {
     let bytes = module(&SECTIONS);
+    let type_end = module(&SECTIONS[..1]).len();
     for end in 0..bytes.len() {
-        if end != HEADER.len() {
-            assert!(
-                validate_module(&bytes[..end]).is_err(),
-                "accepted {end}-byte prefix"
-            );
-        }
+        assert_eq!(
+            validate_module(&bytes[..end]).is_ok(),
+            end == HEADER.len() || end == type_end,
+            "unexpected result for {end}-byte prefix"
+        );
     }
 }
 

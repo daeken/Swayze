@@ -402,8 +402,8 @@ fn global_export_names_share_count_utf8_budget_and_duplicate_precedence() {
 #[test]
 fn globals_keep_legacy_function_section_requirements_and_error_order() {
     let mixed = b"\x03\x01m\x02\0\x01g\x03\0\x01f\0\0";
-    // The empty vector and explicit legacy sections still opt in. Test the
-    // explicit section case even when the exports would not require functions.
+    // Nonempty declarations and bodies still require the other function
+    // sections, even when the exports do not reference any functions.
     for names in [&mixed[..], &[0], GLOBAL_EXPORT] {
         let valid = [
             (1, TYPE),
@@ -424,10 +424,10 @@ fn globals_keep_legacy_function_section_requirements_and_error_order() {
             );
         }
     }
-    let mut bytes = module(&[(6, GLOBALS), (7, &[0])]);
-    expect_error(&bytes, bytes.len(), ErrorKind::MissingSection { id: 1 });
+    let bytes = module(&[(6, GLOBALS), (7, &[0])]);
+    validate_module(&bytes).unwrap().instantiate().unwrap();
     let exports = b"\x02\x01g\x03\0\x01f\0\x7f";
-    bytes = module(&[(6, GLOBALS), (7, exports)]);
+    let mut bytes = module(&[(6, GLOBALS), (7, exports)]);
     // Without #3, a decodable function index is checked at the final section
     // presence check. Out-of-order sections still take precedence.
     expect_error(&bytes, bytes.len(), ErrorKind::MissingSection { id: 1 });

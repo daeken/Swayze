@@ -159,7 +159,7 @@ pub enum EvalError {
     NonNumericResult,
     /// The scalar convenience API received a String result.
     NonScalarResult,
-    /// Execution reached an operator whose String behavior is outside the subset.
+    /// An operator's String behavior is outside the subset (retained for compatibility).
     UnsupportedStringOperation,
     /// A String comparison would exceed the evaluation's 65,536-pair budget.
     StringComparisonLimitExceeded,
@@ -271,9 +271,10 @@ impl Script {
     /// Booleans, and Strings numerically after conversion. Strings compare code
     /// units with other Strings; mixed strict equality and String/nullish loose
     /// equality are false without conversion. `!==` and `!=` negate their
-    /// corresponding equality results. Binary `+` and `+=` concatenate two
-    /// Strings in left-to-right UTF-16 order, without normalization. Mixed
-    /// String/scalar `+` and `+=` are unsupported.
+    /// corresponding equality results. Binary `+` and `+=` concatenate if
+    /// either operand is a String, converting a scalar operand to its ECMAScript
+    /// String spelling. This appends UTF-16 units left to right without normalization.
+    /// If neither operand is a String, both are converted to Numbers and added.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -340,9 +341,12 @@ impl Script {
     /// before validating decimal syntax. Skipped instructions, scalar operands,
     /// and noncoercing comparisons cost no conversion credits.
     /// Concatenations may produce at most 4,094 UTF-16 units each and append at
-    /// most 32,768 units in total per call, including discarded results. This
-    /// append budget is independent of the other budgets. Skipped and empty
-    /// concatenations append no units and do not allocate runtime String storage.
+    /// most 32,768 units in total per call, including scalar text and discarded
+    /// results. This append budget is independent of the other budgets. A reached
+    /// `Add` can format at most one Number, using bounded binary64 arithmetic and
+    /// at most 25 UTF-16 units of stack scratch, without a separate formatting
+    /// charge. Skipped and empty concatenations append no units and do not allocate
+    /// runtime String storage.
     ///
     /// # Errors
     ///
@@ -350,9 +354,8 @@ impl Script {
     /// [`EvalError::DispatchLimitExceeded`] if another dispatch would exceed
     /// its budget, [`EvalError::InvalidScript`] for an invalid instruction
     /// sequence, or [`EvalError::AllocationFailed`] if storage cannot be allocated.
-    /// Returns [`EvalError::UnsupportedStringOperation`] if execution reaches an
-    /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
-    /// if a comparison would exceed its pair budget. Returns
+    /// Returns [`EvalError::StringComparisonLimitExceeded`] if a comparison would
+    /// exceed its pair budget. Returns
     /// [`EvalError::StringNumericConversionLimitExceeded`] if an operator's
     /// String-to-Number conversion would exceed its credit budget. A reached
     /// concatenation can return [`EvalError::StringConcatenationLengthLimitExceeded`]
@@ -909,7 +912,12 @@ fn add(
         (Operand::String(lhs), Operand::String(rhs)) => scratch
             .concatenate(string_units, lhs, rhs)
             .map(Operand::String),
-        _ => Err(EvalError::UnsupportedStringOperation),
+        (Operand::String(string), Operand::Scalar(scalar)) => scratch
+            .concatenate_scalar(string_units, string, scalar, false)
+            .map(Operand::String),
+        (Operand::Scalar(scalar), Operand::String(string)) => scratch
+            .concatenate_scalar(string_units, string, scalar, true)
+            .map(Operand::String),
     }
 }
 
@@ -1030,6 +1038,90 @@ mod tests {
             // It is only reached when the Add succeeds.
             *store = Instruction::StoreBinding(usize::MAX);
             assert_eq!(evaluate_for_error(&script, &ops), Err(expected));
+        }
+    }
+
+    #[test]
+    fn mixed_add_formats_raw_binary64_values() {
+        use Instruction::{Add, Number, String};
+        let script = crate::parse_script(r"'\uD800'").unwrap();
+        let &[literal @ String(_)] = script.instructions() else {
+            panic!("expected a String literal");
+        };
+        for (bits, text) in [
+            (0x8000_0000_0000_0000, "0"),
+            (0x7ff0_0000_0000_0001, "NaN"),
+            (0xffff_ffff_ffff_ffff, "NaN"),
+            (0x0000_0000_0000_0001, "5e-324"),
+            (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
+            (0x4310_0000_0000_0001, "1125899906842624.2"),
+            (0x4310_0000_0000_0003, "1125899906842624.8"),
+            (0x4490_17f7_df96_be17, "1.8999999999999998e+22"),
+            (0x4490_17f7_df96_be18, "1.9e+22"),
+            (0x3eb0_c6f7_a0b5_ed8d, "0.000001"),
+            (0xbeb0_c6f7_a0b5_ed8e, "-0.0000010000000000000002"),
+            (0x444b_1ae4_d6e2_ef4f, "999999999999999900000"),
+            (0x444b_1ae4_d6e2_ef50, "1e+21"),
+        ] {
+            let number = Number(f64::from_bits(bits));
+            for (ops, scalar_first) in [
+                ([literal, number, Add], false),
+                ([number, literal, Add], true),
+            ] {
+                let mut scratch = EvalScratch::new();
+                let literals = script.string_units();
+                let Operand::String(result) =
+                    super::evaluate(&ops, 2, 0, literals, &mut scratch).unwrap()
+                else {
+                    panic!("mixed Add must return a String");
+                };
+                let expected: Vec<_> = if scalar_first {
+                    text.encode_utf16().chain([0xD800]).collect()
+                } else {
+                    [0xD800].into_iter().chain(text.encode_utf16()).collect()
+                };
+                assert_eq!(
+                    result.get(scratch.pools(literals)),
+                    Some(expected.as_slice()),
+                    "{bits:016x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_compound_add_failure_stops_before_either_store_form() {
+        let wide = "x".repeat(4094);
+        let full = format!(
+            "const s = '{wide}'; let i = 0; while (i++ < 8) {{ s + ''; }} '1234567890123456' + ''; "
+        );
+        for (prefix, lhs, expected) in [
+            ("", "'a'".to_owned(), EvalError::InvalidScript),
+            (
+                "",
+                format!("'{wide}'"),
+                EvalError::StringConcatenationLengthLimitExceeded,
+            ),
+            (
+                &full,
+                "'a'".to_owned(),
+                EvalError::StringConcatenationBudgetExceeded,
+            ),
+        ] {
+            for tail in ["x += 1; x", "(x += 1)"] {
+                let script =
+                    crate::parse_script(&format!("{prefix}let x = {lhs}; {tail}")).unwrap();
+                let mut ops = script.instructions().to_vec();
+                let add = ops.iter().rposition(|op| *op == Instruction::Add).unwrap();
+                let store = &mut ops[add + 1];
+                *store = match *store {
+                    Instruction::StoreBinding(_) => Instruction::StoreBinding(usize::MAX),
+                    Instruction::StoreBindingKeep(_) => Instruction::StoreBindingKeep(usize::MAX),
+                    _ => panic!("compound store must follow Add"),
+                };
+                // Only a successful Add reaches the deliberately invalid store.
+                assert_eq!(evaluate_for_error(&script, &ops), Err(expected), "{tail}");
+            }
         }
     }
 

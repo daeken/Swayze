@@ -145,9 +145,11 @@ fn strict_directive_depends_on_raw_spelling_and_root_prologue() {
         "{ 'use strict'; } if (true) { 'use strict'; } 42",
         Value::Number(42.0),
     );
+    let script = parse_script("'use strict'\n+ 1").unwrap();
+    assert_eq!(script.evaluate(), Err(EvalError::NonNumericResult));
     assert_eq!(
-        parse_script("'use strict'\n+ 1").unwrap().evaluate(),
-        Err(EvalError::UnsupportedStringOperation)
+        script.evaluate_primitive(),
+        Err(EvalError::RuntimeStringResultRequiresScratch)
     );
     assert_error("'use strict'\n42", ErrorKind::Unsupported, 13, 15); // no ASI
 }
@@ -471,27 +473,9 @@ fn skipped_mixed_comparisons_still_validate_literals_and_bindings() {
 }
 
 #[test]
-fn mixed_string_addition_fails_only_when_dispatched() {
+fn skipped_mixed_string_addition_and_updates_leave_bindings_alone() {
     for expr in ["'2' + 1", "1 + '2'", "('' + '2') + 1", "1 + ('' + '2')"] {
-        let script = parse_script(expr).unwrap();
-        assert_eq!(
-            script.evaluate_primitive(),
-            Err(EvalError::UnsupportedStringOperation),
-            "{expr}"
-        );
         assert_scalar(&format!("false && ({expr})"), Value::Boolean(false));
-    }
-    for source in [
-        "let x = '2'; x += 1; 0",
-        "let x = 1; (x += '2')",
-        "let x = '' + '2'; x += 1; 0",
-        "let x = 1; (x += '' + '2')",
-    ] {
-        assert_eq!(
-            parse_script(source).unwrap().evaluate(),
-            Err(EvalError::UnsupportedStringOperation),
-            "{source}"
-        );
     }
     assert_scalar(
         "let x = ''; if ('') { x++; x += 1; } 42",

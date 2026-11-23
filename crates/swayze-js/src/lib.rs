@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 
 mod eval;
+mod number_format;
 mod parser;
 mod radix_integer;
 
@@ -11,9 +12,6 @@ pub use eval::{EvalError, EvalScratch, PrimitiveValue, Value};
 pub use parser::{
     Error, ErrorKind, Limit, Limits, Script, Span, parse_script, parse_script_with_limits,
 };
-
-#[cfg(test)]
-mod number_format;
 
 #[cfg(test)]
 mod tests;

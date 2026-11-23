@@ -1,17 +1,19 @@
-//! Test-only ECMAScript Number::toString (radix 10). The digit interval and
-//! decimal tie selection are handled by Ryū; notation is chosen here, after
-//! rounding. Neither the VM nor the parser calls this module.
+//! Private ECMAScript Number::toString (radix 10) for mixed concatenation.
+//! The digit interval and decimal tie selection are handled by Ryū; notation
+//! is chosen here, after rounding.
 
 mod ryu;
 mod tables;
+
+#[cfg(test)]
 mod tests;
 
-const MAX_UNITS: usize = 25;
+pub(crate) const MAX_UNITS: usize = 25;
 const FRACTION_MASK: u64 = (1 << 52) - 1;
 const EXPONENT_MASK: u64 = (1 << 11) - 1;
 
 /// Write one binary64 value as ASCII code points in a UTF-16 stack buffer.
-fn format_bits(bits: u64, output: &mut [u16; MAX_UNITS]) -> &[u16] {
+pub(crate) fn format_bits(bits: u64, output: &mut [u16; MAX_UNITS]) -> &[u16] {
     let fraction = bits & FRACTION_MASK;
     let exponent = ((bits >> 52) & EXPONENT_MASK) as i32;
     let mut out = Writer { output, len: 0 };

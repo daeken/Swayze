@@ -375,8 +375,11 @@ impl std::error::Error for Error {}
 /// Oversized global counts are reported as [`ErrorKind::UnsupportedCount`]
 /// with [`IntegerField::GlobalCount`]. Invalid or missing global mutability
 /// bytes are reported as [`ErrorKind::InvalidGlobalMutability`] or
-/// [`ErrorKind::TruncatedGlobalMutability`]. [`ErrorKind::ImmutableGlobal`]
-/// points to the start of the `global.set` index field.
+/// [`ErrorKind::TruncatedGlobalMutability`] before checking the initializer.
+/// An initializer opcode that does not match the declared type reports
+/// [`ErrorKind::UnexpectedByte`] at that opcode. After index validation,
+/// [`ErrorKind::ImmutableGlobal`] points to the start of the `global.set`
+/// index field and takes precedence over operand errors.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -402,7 +405,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut table_entries = None;
     let mut element_segments = Vec::new();
     let mut memory_limits = None;
-    let mut globals = [Global::default(); MAX_GLOBALS as usize];
+    let mut globals = [Global::EMPTY; MAX_GLOBALS as usize];
     let mut global_count = 0;
     let mut data_segments = Vec::new();
     let mut has_function_sections = false;
@@ -678,10 +681,21 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Err
     }))
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Global {
-    initial_value: i32,
+    initial_value: Value,
     mutable: bool,
+}
+
+impl Global {
+    const EMPTY: Self = Self {
+        initial_value: Value::I32(0),
+        mutable: false,
+    };
+
+    fn operand_type(self) -> ValType {
+        self.initial_value.operand_type()
+    }
 }
 
 fn validate_globals(
@@ -690,7 +704,7 @@ fn validate_globals(
 ) -> Result<usize, Error> {
     let count = section.count(IntegerField::GlobalCount, 0..=MAX_GLOBALS)? as usize;
     for global in &mut globals[..count] {
-        section.expect_byte(I32)?;
+        let ty = section.integer_type()?;
         let offset = section.position();
         let mutable = match section.byte() {
             Some(0) => false,
@@ -704,7 +718,10 @@ fn validate_globals(
             None => return Err(section.error(ErrorKind::TruncatedGlobalMutability)),
         };
         *global = Global {
-            initial_value: section.i32_const_expr()?,
+            initial_value: match ty {
+                ValType::I32 => Value::I32(section.i32_const_expr()?),
+                ValType::I64 => Value::I64(section.i64_const_expr()?),
+            },
             mutable,
         };
     }
@@ -864,6 +881,7 @@ const BR_IF: u8 = 0x0d;
 const BR_TABLE: u8 = 0x0e;
 const RETURN: u8 = 0x0f;
 const I32_CONST: u8 = 0x41;
+const I64_CONST: u8 = 0x42;
 
 const MAX_BR_TABLE_ENTRIES: u32 = 16;
 // Separate per-body pool, including defaults. Each target uses at least one
@@ -909,7 +927,7 @@ enum Instruction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Value {
+pub(super) enum Value {
     I32(i32),
     I64(i64),
 }
@@ -1413,8 +1431,8 @@ pub(super) fn execute(
             Instruction::LocalTee(index) => {
                 frame.locals[index as usize] = frame.operands[frame.depth - 1];
             }
-            Instruction::GlobalGet(index) => frame.push_i32(instance.globals[index as usize].get()),
-            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop_i32()),
+            Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
+            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
             Instruction::Call(target) => {
                 let index = match target {
                     CallTarget::Direct(index) => index as usize,
@@ -1726,7 +1744,7 @@ fn validate_plain_stack(
     operands: &mut OperandStack,
     frame: ControlFrame,
     offset: usize,
-    functions: &[FunctionType],
+    environment: &BodyEnvironment<'_>,
     local_zeros: &[Value; MAX_LOCAL_SLOTS],
 ) -> Result<(), Error> {
     use ValType::{I32, I64};
@@ -1741,10 +1759,15 @@ fn validate_plain_stack(
             (1, Some(from), Some(to))
         }
         Instruction::LocalGet(index) => (0, None, Some(local_zeros[index as usize].operand_type())),
-        Instruction::GlobalGet(_) | Instruction::MemorySize => (0, None, i32_type),
+        Instruction::GlobalGet(index) => (
+            0,
+            None,
+            Some(environment.globals[index as usize].operand_type()),
+        ),
+        Instruction::MemorySize => (0, None, i32_type),
         Instruction::Call(target) => {
             let (signature, selectors) = match target {
-                CallTarget::Direct(index) => (functions[index as usize], 0),
+                CallTarget::Direct(index) => (environment.functions[index as usize], 0),
                 CallTarget::Indirect(expected) => (expected, 1),
             };
             let result = (signature.result == ResultKind::I32).then_some(I32);
@@ -1755,7 +1778,11 @@ fn validate_plain_stack(
             let ty = Some(local_zeros[index as usize].operand_type());
             (1, ty, ty)
         }
-        Instruction::GlobalSet(_) => (1, i32_type, None),
+        Instruction::GlobalSet(index) => (
+            1,
+            Some(environment.globals[index as usize].operand_type()),
+            None,
+        ),
         Instruction::Unary(_) | Instruction::MemoryGrow | Instruction::LoadI32 { .. } => {
             (1, i32_type, i32_type)
         }
@@ -1889,7 +1916,7 @@ fn decode_plain(
             }
         }
         I32_CONST => Instruction::Const(Value::I32(body.integer(IntegerField::I32Const)? as i32)),
-        0x42 => Instruction::Const(Value::I64(body.i64_const()?)),
+        I64_CONST => Instruction::Const(Value::I64(body.i64_const()?)),
         0x45 => Instruction::Unary(UnaryOp::Eqz),
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
@@ -2216,7 +2243,7 @@ fn validate_body(
                         &mut operands,
                         frame,
                         offset,
-                        environment.functions,
+                        environment,
                         &local_zeros,
                     )?;
                 }
@@ -2308,12 +2335,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn local_zero(&mut self) -> Result<Value, Error> {
+    fn integer_type(&mut self) -> Result<ValType, Error> {
         let offset = self.position();
         // Preserve the original expected byte for unsupported and missing types.
         match self.byte() {
-            Some(I32) => Ok(Value::I32(0)),
-            Some(I64) => Ok(Value::I64(0)),
+            Some(I32) => Ok(ValType::I32),
+            Some(I64) => Ok(ValType::I64),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {
@@ -2323,6 +2350,13 @@ impl<'a> Reader<'a> {
             }),
             None => Err(self.error(ErrorKind::TruncatedByte { expected: I32 })),
         }
+    }
+
+    fn local_zero(&mut self) -> Result<Value, Error> {
+        Ok(match self.integer_type()? {
+            ValType::I32 => Value::I32(0),
+            ValType::I64 => Value::I64(0),
+        })
     }
 
     fn block_result(&mut self) -> Result<ResultKind, Error> {
@@ -2345,6 +2379,13 @@ impl<'a> Reader<'a> {
     fn i32_const_expr(&mut self) -> Result<i32, Error> {
         self.expect_byte(I32_CONST)?;
         let value = self.integer(IntegerField::I32Const)? as i32;
+        self.expect_byte(END)?;
+        Ok(value)
+    }
+
+    fn i64_const_expr(&mut self) -> Result<i64, Error> {
+        self.expect_byte(I64_CONST)?;
+        let value = self.i64_const()?;
         self.expect_byte(END)?;
         Ok(value)
     }

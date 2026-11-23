@@ -529,15 +529,13 @@ fn memory_and_globals_do_not_accept_i64_operands_even_in_dead_code() {
 }
 
 #[test]
-fn i64_remains_unsupported_in_signatures_globals_and_control_labels() {
-    for (id, payload, offset, expected) in [
-        (1, &b"\x01\x60\x01\x7e\0"[..], 3, 0x7f), // Parameter.
-        (1, b"\x01\x60\0\x01\x7e", 4, 0x7f),      // Result.
-        (6, b"\x01\x7e\0\x42\0\x0b", 1, 0x7f),    // Global.
-        (6, b"\x01\x7f\0\x42\0\x0b", 3, 0x41),    // Initializer.
+fn i64_remains_unsupported_in_signatures_and_control_labels() {
+    for (payload, offset, expected) in [
+        (&b"\x01\x60\x01\x7e\0"[..], 3, 0x7f), // Parameter.
+        (b"\x01\x60\0\x01\x7e", 4, 0x7f),      // Result.
     ] {
         bad_payload(
-            id,
+            1,
             payload,
             offset,
             ErrorKind::UnexpectedByte {

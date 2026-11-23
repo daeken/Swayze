@@ -184,6 +184,41 @@ fn control_test_stores_follow_the_rhs_join_and_precede_comma_and_test() {
 }
 
 #[test]
+fn sequence_stores_finish_inside_out_before_discard_and_the_next_operand() {
+    use Instruction::{
+        Boolean, Discard, Jump, JumpIfFalse, JumpIfFalseStatement, StoreBindingKeep, Undefined,
+    };
+    assert_postfix(
+        "let x,y,z; if (true, x=y=false ? z=1 : z=2, x=3) {} y",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Undefined,
+            init_let(2),
+            Boolean(true),
+            Discard,
+            Boolean(false),
+            JumpIfFalse(13),
+            Number(1.0),
+            StoreBindingKeep(2),
+            Jump(15),
+            Number(2.0),
+            StoreBindingKeep(2),
+            StoreBindingKeep(1),
+            StoreBindingKeep(0),
+            Discard,
+            Number(3.0),
+            StoreBindingKeep(0),
+            JumpIfFalseStatement(21),
+            LoadBinding(1),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn updates_load_and_store_the_same_slot_once_with_no_result() {
     use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
     assert_postfix(

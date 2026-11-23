@@ -389,7 +389,11 @@ fn fixtures() -> Vec<String> {
             "let x, y; if (x = y = null) {} else if (x = y = 21) {} x + y",
             "let x = 3, n = 0; while (x = x - 1) { n++; continue; } n * 10 + x",
             "let x = 3, n = 0; do { n++; } while (x = x - 1); n * 10 + x",
-            "let x = 4, sum = 0; for (; x = x - 1;) { sum += x; } sum"
+            "let x = 4, sum = 0; for (; x = x - 1;) { sum += x; } sum",
+            "let x, y; 0, x = y = 3, x + y",
+            "let x = 7; if (true, x = 0) { x += 42; } x",
+            "let x = true; 0, x = null",
+            "let x = 0, y = 1; false && (0, x = 99); 0, x = y++, x = x + y, x * 10 + y"
         ]
         .map(str::to_owned),
     );

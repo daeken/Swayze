@@ -64,8 +64,10 @@ assignments. Examples are `let y = x = 3;`, `test ? x = a : x = b`, and
 `if (x = y = test)`. The final right-hand side is evaluated once; writes run
 from right to left, preserving its value. Only the selected ternary arm
 runs. A comma at test level follows the assignment, so `if (x = 0, true)`
-stores `0` and tests `true`. Starting a bare assignment after that comma is
-still outside this subset.
+stores `0` and tests `true`. After a comma in a supported sequence, the next
+operand can start with a simple assignment chain, as in `0, x = y = 3, x + y`.
+Declaration separators and commas disallowed by the enclosing assignment or
+ternary syntax do not start sequence operands.
 Declarations, assignments, updates, and nonfinal expression statements require
 explicit semicolons. Expression statements discard their values. The script
 must end in a root-level expression, whose trailing semicolon is optional;

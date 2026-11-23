@@ -75,14 +75,17 @@ fn truthiness_does_not_coerce_the_stored_value_and_rhs_runs_once() {
 }
 
 #[test]
-fn test_assignment_precedes_comma_but_cannot_start_its_right_operand() {
-    let source = "let x = 7; if (x = 0, true) { x += 42; } x";
-    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(42.0));
-    assert_marked_error(
-        "let x = 7; if (true, x @=@ 0) {} x",
-        ErrorKind::Unsupported,
-        "assignment expressions",
-    );
+fn test_assignment_can_run_before_or_after_comma() {
+    for source in [
+        "let x = 7; if (x = 0, true) { x += 42; } x",
+        "let x = 7; if (true, x = 0) { x += 42; } x + 42",
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(42.0),
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -126,14 +129,12 @@ fn only_simple_prefixes_at_the_test_start_are_newly_admitted() {
     for source in [
         "let x; if (false) {} else if (x @||=@ 1) {} x",
         "let x,y; if (x=y @+=@ 1) {} x",
-        "let x,y; if (x=0, y @=@ 1) {} x",
-        "let x,y; for (; x=0, y @=@ 1;) {} x",
-        "let x; if ((0, x @=@ 1)) {} x",
+        "let x; if (true, x @+=@ 1) {} x",
+        "let x; for (; x=0, !x @=@ 1;) {} x",
         "let x; if ((x) @=@ 1) {} x",
         "let x; while (true && x @=@ 1) {} x",
         "let x; do {} while (!x @=@ 1); x",
         "let x; for (; x+1 @=@ 1;) {} x",
-        "let x; if (false) {} 0, x @=@ 1",
     ] {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");
     }

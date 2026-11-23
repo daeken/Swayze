@@ -48,6 +48,79 @@ fn sequence_keeps_the_last_primitive_without_coercion() {
 }
 
 #[test]
+fn simple_assignments_in_later_operands_keep_the_rhs_tag_and_store_in_order() {
+    for (source, expected) in [
+        ("let x; 0, x = 3, x + 1", 4.0),
+        ("let x=0; 0, x=++x", 1.0),
+        ("let x=0; {x, x=42;} x", 42.0),
+        ("let x,y,n=2; (n++, x=y=n++, x=x+y+n, x*100+y*10+n)", 1034.0),
+        ("let x=8,y; x += (0,y=2); x*10+y", 102.0),
+        ("let x; const a=(0,x=2), b=x+40; b", 42.0),
+        ("let x=1; { let x; 0,x=2; } x", 1.0),
+    ] {
+        assert_value(source, Value::Number(expected));
+    }
+    for (rhs, expected) in [
+        ("null", Value::Null),
+        ("undefined", Value::Undefined),
+        ("false", Value::Boolean(false)),
+    ] {
+        assert_value(&format!("let x,y; 0, x=y={rhs};"), expected);
+        assert_value(&format!("let x,y; 0, x=y={rhs}, x"), expected);
+    }
+    let script = parse_script("let x,y; 0, x=y=-0").unwrap();
+    assert_eq!(script.evaluate().unwrap().to_bits(), (-0.0f64).to_bits());
+}
+
+#[test]
+fn existing_sequence_contexts_admit_simple_chains_after_a_comma() {
+    for (source, expected) in [
+        ("let x=1; if (true, x=0) { x=99; } x", 0.0),
+        ("let x,y; if (x=0, y=1) { x=41; } x+y", 42.0),
+        (
+            "let n=3,total=0; while (true,n=n-1) { total+=n; } total",
+            3.0,
+        ),
+        (
+            "let n=3,total=0; do { total+=n; } while (true,n=n-1); total",
+            6.0,
+        ),
+        (
+            "let n=3,total=0; for (;false,n=n-1;) { total+=n; } total",
+            3.0,
+        ),
+        (
+            "let i,total=0; for (i,i=3;i; i,i=i-1) { total+=i; } total",
+            6.0,
+        ),
+    ] {
+        assert_value(source, Value::Number(expected));
+    }
+}
+
+#[test]
+fn skipped_paths_skip_both_rhs_and_stores_but_still_check_bindings() {
+    assert_value(
+        "let x=1,y=2,n=4;
+         false && (0,x=y=n++);
+         true ? 0 : (0,x=y=++n);
+         if (true) {} else if (0,x=y=n++) {}
+         x*100+y*10+n",
+        Value::Number(124.0),
+    );
+    for (source, len) in [
+        ("const x=1; false && (0,x/*☃*/|=missing)", 1),
+        ("let x=1; { false && (0,|x=2); let x; } x", 1),
+        ("let x; true ? 0 : (0,x=|missing)", 7),
+        ("if (true) {} else if (0,|undefined=1) {} 42", 9),
+        ("do {let x; break;} while (0,|x=1); 0", 1),
+        ("for (;false;0, |missing=1) {} 0", 7),
+    ] {
+        assert_error_at(source, ErrorKind::Unsupported, len);
+    }
+}
+
+#[test]
 fn lazy_left_operands_join_before_the_sequence_result() {
     for source in [
         "(false && true, 42)",
@@ -164,7 +237,14 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("{1,2|} 0", 1, Unsupported),
         ("1, 2; 3,|", 0, Malformed),
         ("let x; x=(1,2)\n|x", 1, Unsupported),
-        ("let x; (1,x|=2)", 1, Unsupported),
+        ("let x; 0, x|+=2", 2, Unsupported),
+        ("let x; if (0,x|??=2) {} x", 3, Unsupported),
+        ("let x; 0, -x|=2", 1, Unsupported),
+        ("let x; 0, 1+x|=2", 1, Unsupported),
+        ("let x; 0, (x)|=2", 1, Unsupported),
+        ("let x; 0, x=|, 1", 1, Malformed),
+        ("let x; 0, x=|", 0, Malformed),
+        ("let x; {0, x=1|} x", 1, Unsupported),
     ] {
         assert_error_at(source, kind, len);
     }
@@ -172,8 +252,21 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
 
 #[test]
 fn ungrouped_sequences_in_a_consequent_or_assignment_rhs_error_at_the_comma() {
-    assert_error_at("(true ? 1|, 2 : 3)", ErrorKind::Malformed, 1);
-    assert_error_at("let x; x = 1|, 2; x", ErrorKind::Unsupported, 1);
+    use ErrorKind::{Malformed, Unsupported};
+    assert_error_at("(true ? 1|, 2 : 3)", Malformed, 1);
+    assert_error_at("let x; (true ? 1|, x=2 : 3)", Malformed, 1);
+    for source in [
+        "let x; x=1|, 2; x",
+        "let x; x=1|, x=2; x",
+        "let x; (x=1|, x)",
+        "let x; (x=1|, x=2)",
+        "let x; (x+=1|, x=2)",
+        "let x; for (x=1|,x=2;;) {} x",
+        "let x; for (;false;x=1|,x=2) {} x",
+    ] {
+        assert_error_at(source, Unsupported, 1);
+    }
+    assert_error_at("let x=0, |x=1; x", Malformed, 1);
 }
 
 #[test]
@@ -222,6 +315,106 @@ fn each_sequence_comma_costs_one_token_one_byte_and_one_emission() {
         let error = parse_script_with_limits(source, limits).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::LimitExceeded(kind));
         assert_eq!(error.span(), Span { start, end });
+    }
+}
+
+#[test]
+fn sequence_assignment_links_have_the_same_cost_as_other_simple_prefixes() {
+    let plain = "let x;null,true,false";
+    let source = "let x;null,x=x=true,x=false";
+    let plain_limits = Limits {
+        max_source_bytes: plain.len(),
+        max_tokens: 8,
+        max_nesting_depth: 0,
+        // Two init instructions, three literal emissions, two discards.
+        max_work: plain.len() + 7,
+    };
+    let script = parse_script_with_limits(plain, plain_limits).unwrap();
+    assert_eq!(script.instruction_count(), 7);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(false)));
+
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: plain_limits.max_tokens + 3 * 2,
+        max_nesting_depth: 2,
+        // Each link adds a name marker, a pending push, a store, and
+        // a two-unit lookup. The comma itself adds nothing beyond Discard.
+        max_work: source.len() + 7 + 3 * 5,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 10);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(false)));
+
+    let first_comma = source.find(',').unwrap();
+    let first_equals = source.find('=').unwrap();
+    let second_equals = first_equals + 2;
+    let second_comma = source.rfind(',').unwrap();
+    let last_name = second_comma + 1;
+    for (limits, limit, start) in [
+        (
+            Limits {
+                max_nesting_depth: 1,
+                ..limits
+            },
+            Limit::NestingDepth,
+            second_equals,
+        ),
+        // Source bytes through the first comma, three emissions before Discard.
+        (
+            Limits {
+                max_work: first_comma + 1 + 3,
+                ..limits
+            },
+            Limit::Work,
+            first_comma,
+        ),
+        // Through the assignment token, four emissions and one name charge, before the push.
+        (
+            Limits {
+                max_work: first_equals + 1 + 5,
+                ..limits
+            },
+            Limit::Work,
+            first_equals,
+        ),
+        // At the second comma: five emissions, two names, two pushes, and two stores.
+        (
+            Limits {
+                max_work: second_comma + 1 + 11,
+                ..limits
+            },
+            Limit::Work,
+            second_comma,
+        ),
+        (
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+            Limit::Work,
+            last_name,
+        ),
+        (
+            Limits {
+                max_tokens: limits.max_tokens - 1,
+                ..limits
+            },
+            Limit::Tokens,
+            source.len() - "false".len(),
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit), "{error}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            },
+            "{error}"
+        );
     }
 }
 

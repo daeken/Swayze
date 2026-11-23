@@ -115,7 +115,6 @@ fn invalid_jumps_and_duplicates_are_checked_in_skipped_code() {
         ("a:{break a;const x=0;x=1;}42", Unsupported, "="),
         ("a:{break a;first;second;}42", Unsupported, "first"),
         ("a:{let x=0;break a;}x", Unsupported, "x"),
-        ("a:if(true){}42", Unsupported, "if"),
         ("a:42", Unsupported, "42"),
     ] {
         assert_error_at(source, kind, last);

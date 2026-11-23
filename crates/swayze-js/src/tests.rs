@@ -392,6 +392,28 @@ fn else_if_edges_go_directly_to_the_next_test_or_the_common_join() {
 }
 
 #[test]
+fn if_breaks_from_every_arm_share_the_direct_join() {
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement};
+
+    assert_postfix(
+        "aa:bb:if(true){break aa;}else if(false){break bb;}else{break aa;}true",
+        &[
+            Boolean(true),
+            JumpIfFalseStatement(4),
+            JumpStatement(9), // break aa
+            JumpStatement(9), // ordinary end of arm
+            Boolean(false),
+            JumpIfFalseStatement(8),
+            JumpStatement(9), // break bb
+            JumpStatement(9), // ordinary end of arm
+            JumpStatement(9), // break aa
+            Boolean(true),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn loop_jumps_resolve_to_their_own_test_and_exit_across_if_frames() {
     use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
 

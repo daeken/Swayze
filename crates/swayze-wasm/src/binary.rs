@@ -894,6 +894,8 @@ enum Instruction {
     Call(CallTarget),
     Unary(UnaryOp),
     Binary(BinaryOp),
+    I64Eqz,
+    I64Binary(I64BinaryOp),
     LoadI32 { kind: LoadKind, offset: u32 },
     StoreI32 { width: AccessWidth, offset: u32 },
     MemorySize,
@@ -926,6 +928,13 @@ impl Value {
             Self::I64(_) => unreachable!("validated i32 operand"),
         }
     }
+
+    fn as_i64(self) -> i64 {
+        match self {
+            Self::I64(value) => value,
+            Self::I32(_) => unreachable!("validated i64 operand"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -946,12 +955,7 @@ impl Conversion {
 
     fn apply(self, value: Value) -> Value {
         match self {
-            Self::WrapI64 => {
-                let Value::I64(value) = value else {
-                    unreachable!("validated i64 operand");
-                };
-                Value::I32(value as i32)
-            }
+            Self::WrapI64 => Value::I32(value.as_i64() as i32),
             Self::ExtendI32S => Value::I64(i64::from(value.as_i32())),
             Self::ExtendI32U => Value::I64(i64::from(value.as_i32() as u32)),
         }
@@ -1080,6 +1084,51 @@ impl BinaryOp {
             Self::Rotl => Ok((lhs as u32).rotate_left(shift) as i32),
             Self::Rotr => Ok((lhs as u32).rotate_right(shift) as i32),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I64BinaryOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+    Add,
+    Sub,
+    Mul,
+}
+
+impl I64BinaryOp {
+    fn result_type(self) -> ValType {
+        match self {
+            Self::Add | Self::Sub | Self::Mul => ValType::I64,
+            _ => ValType::I32,
+        }
+    }
+
+    fn apply(self, lhs: i64, rhs: i64) -> Value {
+        let comparison = match self {
+            Self::Eq => lhs == rhs,
+            Self::Ne => lhs != rhs,
+            Self::LtS => lhs < rhs,
+            Self::LtU => (lhs as u64) < (rhs as u64),
+            Self::GtS => lhs > rhs,
+            Self::GtU => (lhs as u64) > (rhs as u64),
+            Self::LeS => lhs <= rhs,
+            Self::LeU => (lhs as u64) <= (rhs as u64),
+            Self::GeS => lhs >= rhs,
+            Self::GeU => (lhs as u64) >= (rhs as u64),
+            Self::Add => return Value::I64(lhs.wrapping_add(rhs)),
+            Self::Sub => return Value::I64(lhs.wrapping_sub(rhs)),
+            Self::Mul => return Value::I64(lhs.wrapping_mul(rhs)),
+        };
+        Value::I32(i32::from(comparison))
     }
 }
 
@@ -1301,6 +1350,15 @@ pub(super) fn execute(
                 let lhs = frame.pop_i32();
                 frame.push_i32(op.apply(lhs, rhs).map_err(ExecutionError::Trap)?);
             }
+            Instruction::I64Eqz => {
+                let operand = frame.pop().as_i64();
+                frame.push_i32(i32::from(operand == 0));
+            }
+            Instruction::I64Binary(op) => {
+                let rhs = frame.pop().as_i64();
+                let lhs = frame.pop().as_i64();
+                frame.push(op.apply(lhs, rhs));
+            }
             Instruction::LoadI32 { kind, offset } => {
                 let address = frame.pop_i32();
                 let value = instance
@@ -1476,9 +1534,9 @@ impl OperandStack {
         Ok(())
     }
 
-    // All supported multi-operand consumers require i32s. Drop is the only
-    // consumer with no expected type. Check concrete operands above the floor;
-    // any remaining pops in a dead tail are implicit and consume no slots.
+    // Each consumer checks one common type for all its inputs, except drop,
+    // which accepts any type. Check concrete operands above the floor; any
+    // remaining pops in a dead tail are implicit and consume no slots.
     fn pop(
         &mut self,
         frame: ControlFrame,
@@ -1516,7 +1574,7 @@ fn validate_plain_stack(
     offset: usize,
     functions: &[FunctionType],
 ) -> Result<(), Error> {
-    use ValType::I32;
+    use ValType::{I32, I64};
     let i32_type = Some(I32);
     let (count, expected, result) = match instruction {
         Instruction::Nop => return Ok(()),
@@ -1545,6 +1603,8 @@ fn validate_plain_stack(
         | Instruction::LoadI32 { .. } => (1, i32_type, i32_type),
         Instruction::StoreI32 { .. } => (2, i32_type, None),
         Instruction::Binary(_) => (2, i32_type, i32_type),
+        Instruction::I64Eqz => (1, Some(I64), i32_type),
+        Instruction::I64Binary(op) => (2, Some(I64), Some(op.result_type())),
         Instruction::Unreachable
         | Instruction::JumpIfZero { .. }
         | Instruction::Jump { .. }
@@ -1682,6 +1742,17 @@ fn decode_plain(
         0x4d => Instruction::Binary(BinaryOp::LeU),
         0x4e => Instruction::Binary(BinaryOp::GeS),
         0x4f => Instruction::Binary(BinaryOp::GeU),
+        0x50 => Instruction::I64Eqz,
+        0x51 => Instruction::I64Binary(I64BinaryOp::Eq),
+        0x52 => Instruction::I64Binary(I64BinaryOp::Ne),
+        0x53 => Instruction::I64Binary(I64BinaryOp::LtS),
+        0x54 => Instruction::I64Binary(I64BinaryOp::LtU),
+        0x55 => Instruction::I64Binary(I64BinaryOp::GtS),
+        0x56 => Instruction::I64Binary(I64BinaryOp::GtU),
+        0x57 => Instruction::I64Binary(I64BinaryOp::LeS),
+        0x58 => Instruction::I64Binary(I64BinaryOp::LeU),
+        0x59 => Instruction::I64Binary(I64BinaryOp::GeS),
+        0x5a => Instruction::I64Binary(I64BinaryOp::GeU),
         0x67 => Instruction::Unary(UnaryOp::Clz),
         0x68 => Instruction::Unary(UnaryOp::Ctz),
         0x69 => Instruction::Unary(UnaryOp::Popcnt),
@@ -1700,6 +1771,9 @@ fn decode_plain(
         0x76 => Instruction::Binary(BinaryOp::ShrU),
         0x77 => Instruction::Binary(BinaryOp::Rotl),
         0x78 => Instruction::Binary(BinaryOp::Rotr),
+        0x7c => Instruction::I64Binary(I64BinaryOp::Add),
+        0x7d => Instruction::I64Binary(I64BinaryOp::Sub),
+        0x7e => Instruction::I64Binary(I64BinaryOp::Mul),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),

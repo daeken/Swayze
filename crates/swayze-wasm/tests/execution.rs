@@ -2249,8 +2249,9 @@ fn rejects_every_opcode_outside_the_slice() {
         ]
         .contains(&opcode)
             && !(0x2c..=0x2f).contains(&opcode)
-            && !(0x45..=0x4f).contains(&opcode)
+            && !(0x45..=0x5a).contains(&opcode)
             && !(0x67..=0x78).contains(&opcode)
+            && !(0x7c..=0x7e).contains(&opcode)
         {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],

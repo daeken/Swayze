@@ -456,6 +456,23 @@ fn fixtures() -> Vec<Fixture> {
     for (condition, expected) in [(0, 10), (1, 4)] {
         cases.push(Fixture::new(expected, &[condition], &void_exit));
     }
+    for body in [&[0x00][..], &[0x41, 9, 0x00, 0x1a, 0x6a][..]] {
+        cases.push(Fixture::with_outcome(
+            Err(WasmTrap::Unreachable),
+            &[],
+            &[0],
+            body,
+        ));
+    }
+    // The unreachable then arm supplies its result polymorphically.
+    let trap_or_answer = [0x20, 0, 0x04, 0x7f, 0x00, 0x05, 0x41, 42, 0x0b];
+    cases.push(Fixture::new(42, &[0], &trap_or_answer));
+    cases.push(Fixture::with_outcome(
+        Err(WasmTrap::Unreachable),
+        &[-1],
+        &[0],
+        &trap_or_answer,
+    ));
     cases
 }
 

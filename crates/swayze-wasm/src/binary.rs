@@ -20,7 +20,8 @@ pub struct Error {
 /// indicates an i32-result `if` closed by `end` without an `else`. The depth in
 /// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
 /// active frame's entry stack floor. The latter is reported at a delimiter if
-/// the depth differs from the frame's result arity (zero for void, one for i32).
+/// the depth differs from the frame's result arity (zero for void, one for i32),
+/// unless a missing result is supplied by an unreachable frame's implicit i32.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -118,7 +119,7 @@ pub enum Limit {
     /// Decoded operations across the whole body, including `if`, `else` and `br_if`,
     /// but not `block`, `loop`, or `end`.
     BodyInstructions,
-    /// Peak number of live i32 operands in the code body.
+    /// Peak number of explicitly stacked i32 operands during body validation.
     OperandStackDepth,
     /// Number of simultaneously open `block`, `loop`, and `if` frames, excluding the function frame.
     ControlDepth,
@@ -646,6 +647,7 @@ impl ResultArity {
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
+    Unreachable,
     Nop,
     Drop,
     Select,
@@ -794,7 +796,9 @@ impl BinaryOp {
 /// mutability, every stack effect, and the complete body frame. Block and if
 /// jump targets are strictly later decoded instruction indices or the
 /// one-past-last index. Block exits carry their target floor and result arity.
-/// Loop continues target an in-body index at or before the branch.
+/// Loop continues target an in-body index at or before the branch. Implicit
+/// operands are validation-only: execution traps at `unreachable`, and all
+/// transfers that bypass it still establish the target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -880,6 +884,7 @@ pub(super) fn execute(
         remaining_dispatches -= 1;
         frame.pc += 1;
         match instruction {
+            Instruction::Unreachable => return Err(InvokeError::Trap(Trap::Unreachable)),
             Instruction::Nop => {}
             Instruction::Drop => {
                 frame.pop();
@@ -992,23 +997,47 @@ struct ControlFrame {
     base: usize,
     result: ResultArity,
     kind: ControlKind,
+    unreachable: bool,
+}
+
+impl ControlFrame {
+    const FUNCTION: Self = Self {
+        base: 0,
+        result: ResultArity::I32,
+        kind: ControlKind::Function,
+        unreachable: false,
+    };
+
+    fn check_result_depth(self, depth: usize, offset: usize) -> Result<(), Error> {
+        let expected = self.result.count();
+        if depth == expected || (self.unreachable && depth < expected) {
+            Ok(())
+        } else {
+            Err(Error {
+                offset,
+                kind: ErrorKind::InvalidResultDepth { depth },
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ControlKind {
+    Function,
     Block { last_branch: Option<usize> },
     Loop { body_pc: usize },
     Then { if_pc: usize },
     Else { else_pc: usize },
 }
 
-fn check_result_depth(depth: usize, expected: usize, offset: usize) -> Result<(), Error> {
-    if depth == expected {
+fn check_operand_depth(depth: usize, offset: usize) -> Result<(), Error> {
+    let limit = Limit::OperandStackDepth;
+    if depth <= limit.maximum() {
         Ok(())
     } else {
         Err(Error {
             offset,
-            kind: ErrorKind::InvalidResultDepth { depth },
+            kind: ErrorKind::LimitExceeded { limit },
         })
     }
 }
@@ -1061,6 +1090,7 @@ fn decode_plain(
         Ok(Instruction::StoreI32 { width, offset })
     };
     Ok(match opcode {
+        0x00 => Instruction::Unreachable,
         0x01 => Instruction::Nop,
         0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
         0x1a => Instruction::Drop,
@@ -1196,21 +1226,20 @@ fn validate_body(
     let mut previous_branch = [None; Limit::BodyInstructions.maximum()];
     let mut count = 0;
     let mut depth = 0usize;
-    let mut frames = [ControlFrame {
-        base: 0,
-        result: ResultArity::Void,
-        kind: ControlKind::Block { last_branch: None },
-    }; Limit::ControlDepth.maximum()];
+    // Slot zero is the function frame, which does not count against the cap.
+    let mut frames = [ControlFrame::FUNCTION; Limit::ControlDepth.maximum() + 1];
     let mut nesting = 0;
     let end_offset = loop {
         let offset = body.position();
-        let frame = frames[..nesting].last().copied();
-        let base = frame.map_or(0, |frame| frame.base);
-        let result = frame.map_or(ResultArity::I32, |frame| frame.result);
-        let kind = frame.map(|frame| frame.kind);
+        let frame = frames[nesting];
+        let ControlFrame {
+            base,
+            result,
+            kind,
+            unreachable,
+        } = frame;
         let available = depth - base;
-        let requires_else =
-            result == ResultArity::I32 && matches!(kind, Some(ControlKind::Then { .. }));
+        let requires_else = result == ResultArity::I32 && matches!(kind, ControlKind::Then { .. });
         let opcode = body.byte().ok_or_else(|| {
             let expected = if requires_else { ELSE } else { END };
             body.error(ErrorKind::TruncatedByte { expected })
@@ -1222,12 +1251,16 @@ fn validate_body(
                     kind: ErrorKind::MissingElse,
                 });
             }
-            check_result_depth(available, result.count(), offset)?;
+            frame.check_result_depth(available, offset)?;
+            // Pop the frame and push its declared results onto the parent's stack,
+            // even if the frame could supply a result only by polymorphism.
+            depth = base + result.count();
+            check_operand_depth(depth, offset)?;
             // Forward edges target the next decoded slot, possibly the final
             // one-past-last index. All sources are in the decoded prefix.
             match kind {
-                Some(ControlKind::Loop { .. }) => {}
-                Some(ControlKind::Block { mut last_branch }) => {
+                ControlKind::Loop { .. } => {}
+                ControlKind::Block { mut last_branch } => {
                     while let Some(pc) = last_branch {
                         decoded[..count][pc] = Instruction::BranchIfNonzero {
                             target: count,
@@ -1237,14 +1270,14 @@ fn validate_body(
                         last_branch = previous_branch[pc];
                     }
                 }
-                Some(ControlKind::Else { else_pc }) => {
+                ControlKind::Else { else_pc } => {
                     decoded[..count][else_pc] = Instruction::Jump { target: count };
                 }
-                None => {
+                ControlKind::Function => {
                     body.finish(ErrorKind::TrailingBodyBytes)?;
                     break offset;
                 }
-                Some(ControlKind::Then { if_pc }) => {
+                ControlKind::Then { if_pc } => {
                     // The implicit empty else skips straight to the join.
                     decoded[..count][if_pc] = Instruction::JumpIfZero { target: count };
                 }
@@ -1265,13 +1298,16 @@ fn validate_body(
             count += 1;
         }
         let consume = |operands| {
-            available
-                .checked_sub(operands)
-                .map(|left| base + left)
-                .ok_or(Error {
+            // Consume concrete operands first. In a dead tail, pops at the
+            // current floor yield an implicit i32 without lowering the depth.
+            if operands <= available || unreachable {
+                Ok(base + available.saturating_sub(operands))
+            } else {
+                Err(Error {
                     offset,
                     kind: ErrorKind::StackUnderflow { depth: available },
                 })
+            }
         };
         match opcode {
             BLOCK | LOOP | IF => {
@@ -1281,7 +1317,7 @@ fn validate_body(
                 } else {
                     body.block_result()?
                 };
-                let next = frames.get_mut(nesting).ok_or(Error {
+                let next = frames.get_mut(nesting + 1).ok_or(Error {
                     offset,
                     kind: ErrorKind::LimitExceeded {
                         limit: Limit::ControlDepth,
@@ -1300,20 +1336,22 @@ fn validate_body(
                     base: depth,
                     result,
                     kind,
+                    unreachable: false,
                 };
                 nesting += 1;
             }
             ELSE => {
-                let Some(ControlKind::Then { if_pc }) = kind else {
+                let ControlKind::Then { if_pc } = kind else {
                     return Err(Error {
                         offset,
                         kind: ErrorKind::UnexpectedElse,
                     });
                 };
-                check_result_depth(available, result.count(), offset)?;
+                frame.check_result_depth(available, offset)?;
                 // Skip the then arm and its else jump on a zero condition.
                 decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
-                frames[nesting - 1].kind = ControlKind::Else { else_pc: pc };
+                frames[nesting].kind = ControlKind::Else { else_pc: pc };
+                frames[nesting].unreachable = false;
                 depth = base;
             }
             BR_IF => {
@@ -1321,9 +1359,10 @@ fn validate_body(
                 // function label is not a supported destination.
                 let label_offset = body.position();
                 let label = body.index(IntegerField::LabelIndex, nesting as u32)?;
-                let target = &mut frames[nesting - 1 - label as usize];
+                let target = &mut frames[nesting - label as usize];
                 // `consume` checks the active floor; only the taken edge uses
-                // the target floor. Fallthrough pops just the condition.
+                // the target floor. For fallthrough, push the target's result
+                // back if there is one, even if it was popped implicitly.
                 match &mut target.kind {
                     ControlKind::Block { last_branch } => {
                         let results = target.result.count();
@@ -1338,7 +1377,7 @@ fn validate_body(
                             floor: target.base,
                         };
                     }
-                    ControlKind::Then { .. } | ControlKind::Else { .. } => {
+                    ControlKind::Function | ControlKind::Then { .. } | ControlKind::Else { .. } => {
                         return Err(Error {
                             offset: label_offset,
                             kind: ErrorKind::InvalidIndex {
@@ -1360,6 +1399,10 @@ fn validate_body(
                     globals,
                 )?;
                 depth = match instruction {
+                    Instruction::Unreachable => {
+                        frames[nesting].unreachable = true;
+                        base
+                    }
                     Instruction::Nop => depth,
                     Instruction::Select => consume(3)? + 1,
                     Instruction::Const(_)
@@ -1384,17 +1427,10 @@ fn validate_body(
                         unreachable!("plain instructions do not create jumps")
                     }
                 };
-                if depth > Limit::OperandStackDepth.maximum() {
-                    return Err(Error {
-                        offset,
-                        kind: ErrorKind::LimitExceeded {
-                            limit: Limit::OperandStackDepth,
-                        },
-                    });
-                }
                 decoded[pc] = instruction;
             }
         }
+        check_operand_depth(depth, offset)?;
     };
     let mut instructions = Vec::new();
     instructions.try_reserve_exact(count).map_err(|_| Error {

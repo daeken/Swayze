@@ -44,7 +44,6 @@ fn ordinary_powers_coerce_primitives_including_unary_rhs() {
         ("(-2)**3", -8.0),
         ("2**-2", 0.25),
         ("(-2)**-3", -0.125),
-        ("2**(-2)**2", 16.0),
         ("4**4**-.5 * -2", -4.0),
         ("4**.5", 2.0),
         ("true**true", 1.0),
@@ -132,9 +131,12 @@ fn zero_and_infinite_base_signs_use_the_parity_of_the_represented_exponent() {
     }
     assert_number("(-1)**9007199254740991", -1.0);
     assert_number("(-1)**9007199254740993", 1.0);
+    assert_number("(-0) ** (2 ** 53 - 1)", -0.0);
+    assert_number("(-0) ** (2 ** 53)", 0.0);
     // Sign is applied to the magnitude even if the finite power over/underflows.
     assert_number("(-2)**2049", f64::NEG_INFINITY);
     assert_number("(-2)**-2049", -0.0);
+    assert_number("(-0.5) ** 1075", -0.0);
 }
 
 #[test]
@@ -144,7 +146,8 @@ fn grouping_controls_unary_bases_without_leaking_across_conditional_or_sequence_
         ("(+(2))**3", 8.0),
         ("(~1)**2", 4.0),
         ("(!0)**2", 1.0),
-        ("2**-(2**2)", 0.0625),
+        ("2 ** -(2 ** 2)", 0.0625),
+        ("2 ** (-2) ** 2", 16.0),
         ("true ? 2**-2 : 0, (-2)**2", 4.0),
         ("(0, -2)**2", 4.0),
         ("2**(false ? 3 : 1, -2)", 0.25),
@@ -162,7 +165,7 @@ fn grouping_controls_unary_bases_without_leaking_across_conditional_or_sequence_
         "void 2 @**@ 2",
         "void (2)@**@2",
         "-(2**2)@**@2",
-        "2**-2@**@2",
+        "2 ** -2 @**@ 2",
         "2*(-2 + +2@**@2)",
         "true ? 1 : -2@**@2",
         "false && void 2 @**@ 2",

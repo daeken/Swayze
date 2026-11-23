@@ -255,6 +255,14 @@ fn fixtures() -> Vec<String> {
             "let x = 42; x += undefined; x",
             "let i = -1; let out = 0; for (i += 1; i < 4; i += 1) { if (i === 1) { continue; } out += i; } out",
             "let x = 1; let out = 0; if (true) { let x = 21; x += x; out = x; } out - x",
+            "let x = false; x &&= 42; x",
+            "let x = 1; x &&= undefined; x",
+            "let x = -0; x ??= 42; x",
+            "let x = null; x ??= false; x",
+            "let x = 1; x ||= undefined; x",
+            "let x = 0 / 0; x ||= 42; x",
+            "let x = null; x ??= false || 42; x",
+            "let i = 0; let x = null; for (x ??= 1; i < 2; x &&= x + i) { i += 1; continue; } x",
         ]
         .map(str::to_owned),
     );

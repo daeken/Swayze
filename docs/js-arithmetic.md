@@ -15,10 +15,13 @@ signed exponents) with binary
 `+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and initialized
 `let` declarations initialize slots in source order, preserving the value type.
-Simple assignments and eager arithmetic or bitwise compound assignments
-update earlier `let` slots. A compound assignment reads the target once,
-evaluates the right operand, then applies the corresponding operator and
-stores the result. Assignments do not produce expression values in this subset.
+Simple and compound assignments update earlier `let` slots. Arithmetic and
+bitwise compound assignments read the target once, evaluate the right operand,
+apply the corresponding operator, and store the result. Logical assignments
+(`&&=`, `||=`, `??=`) read the target once and may skip both the right operand
+and the store, using the same tests as `&&`, `||`, and `??`. Skipped operands
+are still checked during parsing, and `const` targets are rejected even when
+no store would run. Assignments do not produce expression values in this subset.
 Declaration and assignment statements require an explicit semicolon; the
 final expression's semicolon is optional. Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global

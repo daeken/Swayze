@@ -165,6 +165,34 @@ fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
 }
 
 #[test]
+fn logical_assignment_tests_one_load_and_skips_past_the_store() {
+    use Instruction::{ShortCircuitStatement, StoreBinding};
+
+    assert_postfix(
+        "let x=0;let y=4;x||=y*(x+1);x",
+        &[
+            Number(0.0),
+            init_let(0),
+            Number(4.0),
+            init_let(1),
+            LoadBinding(0),
+            ShortCircuitStatement {
+                target: 12,
+                condition: crate::parser::ShortCircuitCondition::Truthy,
+            },
+            LoadBinding(1),
+            LoadBinding(0), // explicit read in the RHS
+            Number(1.0),
+            Add,
+            Multiply,
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        3,
+    );
+}
+
+#[test]
 fn nested_control_edges_target_their_own_tests_and_joins() {
     use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
 

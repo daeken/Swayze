@@ -140,7 +140,7 @@ fn target_is_resolved_before_rhs_reads_and_never_skips_a_shadow() {
 #[test]
 fn rejects_other_targets_operators_and_assignment_expressions() {
     use ErrorKind::{Malformed, Unsupported};
-    for op in ["&&=", "||=", "??=", "**=", "++", "--"] {
+    for op in ["**=", "++", "--"] {
         assert_diagnostic(&format!("let x=1;x@{op}@2;x"), Unsupported, "subset");
     }
     for (source, kind, message) in [
@@ -173,6 +173,155 @@ fn rejects_other_targets_operators_and_assignment_expressions() {
         ("let x=1;for(x+=0@)@{}x", Malformed, "between for clauses"),
     ] {
         assert_diagnostic(source, kind, message);
+    }
+}
+
+#[test]
+fn logical_assignments_select_and_preserve_primitive_values() {
+    use Value::{Boolean, Null, Number, Undefined};
+    for (initial, and, or, nullish) in [
+        ("true", Number(42.0), Boolean(true), Boolean(true)),
+        ("false", Boolean(false), Number(42.0), Boolean(false)),
+        ("2", Number(42.0), Number(2.0), Number(2.0)),
+        ("-0", Number(-0.0), Number(42.0), Number(-0.0)),
+        ("0/0", Number(f64::NAN), Number(42.0), Number(f64::NAN)),
+        ("null", Null, Number(42.0), Number(42.0)),
+        ("undefined", Undefined, Number(42.0), Number(42.0)),
+    ] {
+        for (op, expected) in [("&&=", and), ("||=", or), ("??=", nullish)] {
+            let source = format!("let x={initial};x{op}42;x");
+            let actual = parse_script(&source).unwrap().evaluate_value().unwrap();
+            match (actual, expected) {
+                (Number(actual), Number(expected)) if expected.is_nan() => {
+                    assert!(actual.is_nan(), "{source}");
+                }
+                (Number(actual), Number(expected)) => {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{source}");
+                }
+                _ => assert_eq!(actual, expected, "{source}"),
+            }
+        }
+    }
+    for (source, value) in [
+        ("let x=1;x&&=null;x", Null),
+        ("let x=false;x||=undefined;x", Undefined),
+        ("let x=null;x??=false;x", Boolean(false)),
+    ] {
+        assert_eq!(parse_script(source).unwrap().evaluate_value(), Ok(value));
+    }
+}
+
+#[test]
+fn logical_for_clauses_run_in_order_and_target_the_enclosing_scope() {
+    for (source, value) in [
+        (
+            "let i=0;let trace=0;
+             for(i||=1;i<5;i||=3){
+                 let j=undefined;
+                 j??=i;
+                 trace=trace*10+j;
+                 if(i===1){i=0;continue;}
+                 if(i===3){i=4;}else{break;}
+             }
+             trace*10+i",
+            1344.0,
+        ),
+        (
+            "const x=9;let out=0;
+             if(true){
+                 let x=null;
+                 for(x??=1;x<2;x&&=2){let x=0;x||=7;out=x;continue;}
+                 out=out*10+x;
+             }
+             out*10+x",
+            729.0,
+        ),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate(), Ok(value), "{source}");
+        assert_eq!(script.evaluate(), Ok(value), "{source}");
+    }
+}
+
+#[test]
+fn inactive_logical_assignments_still_validate_rhs_and_selected_targets() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, message) in [
+        (
+            "const x=0;x@&&=@missing;42",
+            Unsupported,
+            "assignment to const",
+        ),
+        ("const x=1;x@||=@2;42", Unsupported, "assignment to const"),
+        (
+            "let x=1;if(false){const x=false;x@??=@2;}42",
+            Unsupported,
+            "assignment to const",
+        ),
+        (
+            "let x=0;if(false){@x@&&=2;const x=1;}42",
+            Unsupported,
+            "before lexical binding initialization",
+        ),
+        ("@undefined@??=1;42", Unsupported, "unbound name"),
+        ("let x=1;x||=@missing@;x", Unsupported, "unbound name"),
+        ("let x=1;x||=@;@x", Malformed, "operand"),
+        (
+            "let i=0;for(;false;i&&=@j@){let j=1;}i",
+            Unsupported,
+            "unbound name",
+        ),
+        (
+            "let i=0;for(;;){break;i&&=@j@;let j=1;}i",
+            Unsupported,
+            "before lexical binding initialization",
+        ),
+    ] {
+        assert_diagnostic(source, kind, message);
+    }
+}
+
+#[test]
+fn logical_assignment_does_not_participate_in_rhs_precedence() {
+    for (source, expected) in [
+        ("let x=0;x||=null??2+3*4;x", 14.0),
+        ("let x=null;x??=false||true&&7;x", 7.0),
+        ("let x=1;x&&=null??false?2:x+8;x", 9.0),
+        ("let x=undefined;x??=null??(false||7);x", 7.0),
+    ] {
+        assert_eq!(parse_script(source).unwrap().evaluate(), Ok(expected));
+    }
+    for source in [
+        "let x=0;x&&=null??false@||@7;x",
+        "let x=1;x||=false&&null@??@7;x",
+    ] {
+        assert_diagnostic(source, ErrorKind::Malformed, "cannot be mixed");
+    }
+}
+
+#[test]
+fn logical_assignment_punctuators_require_statement_targets_and_explicit_delimiters() {
+    use ErrorKind::Unsupported;
+    for (op, split) in [("&&=", "&&"), ("||=", "||"), ("??=", "??")] {
+        for (source, message) in [
+            (format!("let x=1;(x)@{op}@2;x"), "assignment expressions"),
+            (format!("let x=1;(x@{op}@2)"), "assignment expressions"),
+            (format!("let x=1;x=x@{op}@2;x"), "assignment expressions"),
+            (
+                format!("let x=1;for(;x@{op}@2;){{}}x"),
+                "assignment expressions",
+            ),
+            (format!("let x@{op}@1;x"), "declarations"),
+            (format!("let x=1;x@.@p{op}2;x"), "token"),
+            (format!("let x=1;x{op}@=@2;x"), "assignment expressions"),
+            (
+                format!("let x=1;x{split}/**/@=@2;x"),
+                "assignment expressions",
+            ),
+            (format!("let x=1;x{op}2\n@x@"), "explicit semicolons"),
+        ] {
+            assert_diagnostic(&source, Unsupported, message);
+        }
     }
 }
 
@@ -216,6 +365,83 @@ fn compound_clauses_charge_each_token_emission_and_target_lookup() {
                 end: source.len()
             }
         );
+    }
+}
+
+#[test]
+fn logical_clauses_charge_single_tokens_and_resolve_each_target_once() {
+    let source = "let i=0;for(i||=1;false;i??=2){break;}i";
+    // Source bytes, three decimal conversions, one header and one frame,
+    // 17 instructions, a break patch, and three binding lookups at two units each.
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 22,
+        max_nesting_depth: 1,
+        max_work: source.len() + 29,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 17);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate(), Ok(1.0));
+    for (limit, limits) in [
+        (
+            Limit::Tokens,
+            Limits {
+                max_tokens: 21,
+                ..limits
+            },
+        ),
+        (
+            Limit::Work,
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+        assert_eq!(
+            error.span(),
+            Span {
+                start: source.len() - 1,
+                end: source.len()
+            }
+        );
+    }
+}
+
+#[test]
+fn skipped_logical_rhs_counts_at_the_prepared_instruction_ceiling() {
+    for (prefixes, expected) in [(4089, Ok(1.0)), (4090, Err(EvalError::LimitExceeded))] {
+        let source = format!("let x=1;x||={}2;x", "+ ".repeat(prefixes));
+        let limits = Limits {
+            max_tokens: 8192,
+            ..Limits::default()
+        };
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 7 + prefixes);
+        assert_eq!(script.evaluate(), expected);
+    }
+}
+
+#[test]
+fn skipped_logical_rhs_and_store_cost_no_dispatches_in_update() {
+    // Eight dispatches for the declarations and taken init, 1259 iterations at
+    // thirteen each (including the update's load and branch, but no RHS or
+    // store), four for the falsy test, one final load, and the final prefixes.
+    for (prefixes, expected) in [
+        (3, Ok(1.0)),
+        (4, Ok(1.0)),
+        (5, Err(EvalError::DispatchLimitExceeded)),
+    ] {
+        let source = format!(
+            "let x=0;let i=0;for(x||=1;i<1259;x||=+ + + + 2){{i+=1;continue;}}{}x",
+            "+ ".repeat(prefixes),
+        );
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.evaluate(), expected);
+        assert_eq!(script.evaluate(), expected);
     }
 }
 

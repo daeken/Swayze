@@ -37,6 +37,63 @@ fn the_expression_and_binding_preserve_the_same_tagged_value() {
 }
 
 #[test]
+fn grouped_eager_operators_keep_the_same_number_in_the_expression_and_binding() {
+    for (initial, assignment, expected) in [
+        ("true", "+=2*3", 7.0),
+        ("false", "-=true", -1.0),
+        ("null", "*=-2", -0.0),
+        ("8", "/=-0", f64::NEG_INFINITY),
+        ("-6", "%=(false || 3)", -0.0),
+        ("2", "**=3 ** 2", 512.0),
+        ("-0", "**=true ? 3 : 2", -0.0),
+        ("-1", "&=4294967298.9", 2.0),
+        ("6", "^=null ?? 3", 5.0),
+        ("undefined", "|=true", 1.0),
+        ("true", "<<=31", -2147483648.0),
+        ("-4", ">>=33", -2.0),
+        ("-1", ">>>=32", 4294967295.0),
+        ("0", "*=undefined", f64::NAN),
+    ] {
+        for tail in ["", "; x"] {
+            let source = format!("let x={initial}; (x/* before */{assignment}){tail}");
+            let Value::Number(actual) = parse_script(&source).unwrap().evaluate_value().unwrap()
+            else {
+                panic!("expected a Number: {source}");
+            };
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "{source}");
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{source}");
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_compounds_snapshot_the_target_and_evaluate_the_rhs_once() {
+    for (source, expected) in [
+        (
+            "let x=8, n=0; (x /= ((n+=1), (x=2))) * 100 + x*10 + n",
+            441.0,
+        ),
+        ("let x=8; (x -= (x=2) + x) * 10 + x", 44.0),
+        ("let x=2; (x **= (x += 1)) + x", 16.0),
+        (
+            "const x=7; let out=0; { let x=8; out=(x/=(x=2)); } out*10+x",
+            47.0,
+        ),
+        (
+            "let n=1,sum=0; for((n+=1); (n+=1)<6; (n+=1)) { (sum+=n); continue; } sum*10+n",
+            87.0,
+        ),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+    }
+}
+
+#[test]
 fn nested_writes_run_in_order_and_evaluate_the_rhs_only_once() {
     for (source, expected) in [
         ("let x; let y; const z=(x=(y=4)); x*100+y*10+z", 444.0),
@@ -123,6 +180,42 @@ fn skipped_write_checks_the_target_but_does_not_mutate_a_let() {
 }
 
 #[test]
+fn grouped_compounds_are_lazy_when_skipped_but_still_check_bindings() {
+    for (source, expected) in [
+        ("let x=8,y=0; false && (x/= (y=2)); x*10+y", 80.0),
+        ("let x=8; false ?? (x>>>=1); x", 8.0),
+        ("let x=8; true ? x : (x-=1)", 8.0),
+        ("let x=8,y=0; (x/=true ? (false || 2) : (y=2))*10+y", 40.0),
+        ("let x=8; for(;false;(x%=1)) { let x; } x", 8.0),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+
+    let tdz = "before lexical binding initialization";
+    for (marked, message) in [
+        (
+            "const x=0; true ? 0 : (x/*☃*/@>>>=@missing)",
+            "assignment to const",
+        ),
+        (
+            "let x=8; if(false) { const x=2; (x@/=@1); } x",
+            "assignment to const",
+        ),
+        ("let x=8; { true || (@x@**=missing); let x; } x", tdz),
+        ("let x = false ? (@x@*=2) : 0; x", tdz),
+        ("false && (@missing@+=unknown)", "unbound name"),
+        ("true || (@undefined@&=42)", "unbound name"),
+        ("let x; for(;false;(x|=@y@)) { let y=1; } x", "unbound name"),
+    ] {
+        assert_marked_error(marked, ErrorKind::Unsupported, message);
+    }
+}
+
+#[test]
 fn target_checks_are_deferred_and_apply_even_to_skipped_code() {
     let tdz = "before lexical binding initialization";
     let immutable = "assignment to const";
@@ -158,7 +251,56 @@ fn rejects_targets_and_positions_outside_the_slice() {
         ("let x;(x+1@=@2)", Unsupported, "assignment expressions"),
         ("let x;(x@.@p=1)", Unsupported, "token is outside"),
         ("(null@=@1)", Unsupported, "assignment expressions"),
-        ("let x;(x@+=@1)", Unsupported, "assignment expressions"),
+        ("let x;((x)@+=@1)", Unsupported, "assignment expressions"),
+        (
+            "let x;true || (x@&&=@1)",
+            Unsupported,
+            "assignment expressions",
+        ),
+        ("let x;(x@||=@1)", Unsupported, "assignment expressions"),
+        ("let x;(x@??=@1)", Unsupported, "assignment expressions"),
+        (
+            "let x;(@--@x)",
+            Unsupported,
+            "increment and decrement expressions",
+        ),
+        ("let x,y;(x+=y@*=@2)", Unsupported, "assignment expressions"),
+        (
+            "let x;false && (0,x@>>>=@1)",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x; if(x@+=@1){} x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x;while(x@**=@1){}x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x;do{}while(x@|=@1);x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x;for(;x@&=@1;){}x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x;false && (x += true?1:2@,@3)",
+            Unsupported,
+            "sequence in an assignment RHS",
+        ),
+        ("let x;(x**=@)@", Malformed, "expected an operand"),
+        (
+            "let x;true || (x**=1@@",
+            Malformed,
+            "expected a closing parenthesis",
+        ),
         (
             "let x;(x@++@)",
             Unsupported,
@@ -278,6 +420,77 @@ fn lookahead_and_store_have_exact_token_and_work_budgets() {
 }
 
 #[test]
+fn grouped_compound_work_charges_one_lookup_and_each_emission_at_its_span() {
+    let source = "let x;(x/*α*/\u{2028}>>>=true)";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 8,
+        max_nesting_depth: 1,
+        // All source bytes, six instruction emissions, a group marker and its
+        // assignment attachment, plus one candidate visit and name comparison.
+        max_work: source.len() + 10,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 6);
+    assert_eq!(script.max_stack_depth(), 2);
+    assert_eq!(script.evaluate_value(), Ok(Value::Number(0.0)));
+
+    let target = source.rfind('x').unwrap();
+    let operator = source.find(">>>=").unwrap();
+    let close = source.len() - 1;
+    let span = |start, len| Span {
+        start,
+        end: start + len,
+    };
+    for (limits, limit, expected) in [
+        (
+            Limits {
+                max_tokens: 7,
+                ..limits
+            },
+            Limit::Tokens,
+            span(close, 1),
+        ),
+        (
+            Limits {
+                max_work: operator + 4 + 4,
+                ..limits
+            },
+            Limit::Work,
+            span(target, 1),
+        ),
+        (
+            Limits {
+                max_work: source.len() + 6,
+                ..limits
+            },
+            Limit::Work,
+            span(operator, 4),
+        ),
+        (
+            Limits {
+                max_work: source.len() + 7,
+                ..limits
+            },
+            Limit::Work,
+            span(close, 1),
+        ),
+        (
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+            Limit::Work,
+            span(target, 1),
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+        assert_eq!(error.span(), expected);
+    }
+}
+
+#[test]
 fn grouped_identifier_lookahead_preserves_read_budgets() {
     let source = "let x;(x/*α*/\u{2028}==undefined)";
     let limits = Limits {
@@ -311,34 +524,46 @@ fn grouped_identifier_lookahead_preserves_read_budgets() {
 }
 
 #[test]
-fn nested_writes_use_one_group_entry_each_and_one_operand() {
+fn nested_writes_use_one_group_entry_each_and_only_compounds_save_lhs_operands() {
     let depth = 1000;
-    let source = format!("let x;{}null{}", "(x=".repeat(depth), ")".repeat(depth));
     let limits = Limits {
         max_nesting_depth: depth,
         ..Limits::default()
     };
-    let script = parse_script_with_limits(&source, limits).unwrap();
-    assert_eq!(script.max_stack_depth(), 1);
-    assert_eq!(script.instruction_count(), depth + 3);
-    assert_eq!(script.evaluate_value(), Ok(Value::Null));
-    let error = parse_script_with_limits(
-        &source,
-        Limits {
-            max_nesting_depth: depth - 1,
-            ..limits
-        },
-    )
-    .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
-    let start = "let x;".len() + (depth - 1) * "(x=".len();
-    assert_eq!(
-        error.span(),
-        Span {
-            start,
-            end: start + 1
-        }
-    );
+    for (decl, group, rhs, peak, instructions, result) in [
+        ("let x;", "(x=", "null", 1, depth + 3, Value::Null),
+        (
+            "let x=1;",
+            "(x+=",
+            "true",
+            depth + 1,
+            3 * depth + 3,
+            Value::Number(1001.0),
+        ),
+    ] {
+        let source = format!("{decl}{}{rhs}{}", group.repeat(depth), ")".repeat(depth));
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.max_stack_depth(), peak);
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.evaluate_value(), Ok(result));
+        let error = parse_script_with_limits(
+            &source,
+            Limits {
+                max_nesting_depth: depth - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+        let start = decl.len() + (depth - 1) * group.len();
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            }
+        );
+    }
 }
 
 #[test]
@@ -347,28 +572,36 @@ fn skipped_store_keep_counts_toward_prepared_instruction_limit() {
         max_tokens: 5000,
         ..Limits::default()
     };
-    let prefix = "!".repeat(4090);
-    let at_cap =
-        parse_script_with_limits(&format!("let x; true || (x={prefix}false)"), limits).unwrap();
-    assert_eq!(at_cap.instruction_count(), 4096);
-    assert_eq!(at_cap.evaluate_value(), Ok(Value::Boolean(true)));
-    let over_cap =
-        parse_script_with_limits(&format!("let x; true || (x={prefix}!false)"), limits).unwrap();
-    assert_eq!(over_cap.instruction_count(), 4097);
-    assert_eq!(over_cap.evaluate_value(), Err(EvalError::LimitExceeded));
+    // The compound needs two more instructions (target load and binary op).
+    for (op, unary_count) in [("=", 4090), ("|=", 4088)] {
+        let prefix = "!".repeat(unary_count);
+        let at_cap =
+            parse_script_with_limits(&format!("let x; true || (x{op}{prefix}false)"), limits)
+                .unwrap();
+        assert_eq!(at_cap.instruction_count(), 4096);
+        assert_eq!(at_cap.evaluate_value(), Ok(Value::Boolean(true)));
+        let over_cap =
+            parse_script_with_limits(&format!("let x; true || (x{op}{prefix}!false)"), limits)
+                .unwrap();
+        assert_eq!(over_cap.instruction_count(), 4097);
+        assert_eq!(over_cap.evaluate_value(), Err(EvalError::LimitExceeded));
+    }
 }
 
 #[test]
 fn each_reached_store_keep_dispatches_once() {
     // 2 initialization dispatches, 2046 taken iterations at 8 dispatches
     // each, 7 for the final (falsy) test, then 7 for the final expression.
-    let at_cap = "let n=0; while ((n=n+1)<2047) {} + + + + + +n";
-    let script = parse_script(at_cap).unwrap();
-    assert_eq!(script.evaluate(), Ok(2047.0));
-    assert_eq!(script.evaluate(), Ok(2047.0));
-    let over_cap = "let n=0; while ((n=n+1)<2047) {} + + + + + + +n";
-    assert_eq!(
-        parse_script(over_cap).unwrap().evaluate(),
-        Err(EvalError::DispatchLimitExceeded)
-    );
+    for update in ["(n=n+1)", "(n+=1)"] {
+        let loop_source = format!("let n=0; while ({update}<2047) {{}}");
+        let script = parse_script(&format!("{loop_source} + + + + + +n")).unwrap();
+        assert_eq!(script.evaluate(), Ok(2047.0));
+        assert_eq!(script.evaluate(), Ok(2047.0));
+        assert_eq!(
+            parse_script(&format!("{loop_source} + + + + + + +n"))
+                .unwrap()
+                .evaluate(),
+            Err(EvalError::DispatchLimitExceeded)
+        );
+    }
 }

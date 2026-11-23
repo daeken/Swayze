@@ -157,7 +157,7 @@ fn bitwise_operators_do_not_hide_mixing_of_nullish_and_logical_operators() {
 #[test]
 fn recognizes_whole_compounds_and_does_not_join_across_trivia() {
     for op in ["&=", "^=", "|=", "<<=", ">>=", ">>>=", "&&=", "||="] {
-        let prefix = "let x=1;(x\u{00a0}";
+        let prefix = "let x=1;(0,x\u{00a0}";
         let source = format!("{prefix}{op}2)");
         let error = parse_script(&source).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{source}");

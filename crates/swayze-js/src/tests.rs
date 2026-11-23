@@ -1454,6 +1454,30 @@ fn grouped_assignments_keep_the_rhs_in_stack_order_after_expression_joins() {
 }
 
 #[test]
+fn grouped_compound_loads_before_rhs_and_joins_at_the_binary_operation() {
+    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBindingKeep};
+    assert_postfix(
+        "let x=8;1+(x/=true?(x=2):4)",
+        &[
+            Number(8.0),
+            init_let(0),
+            Number(1.0),
+            LoadBinding(0),
+            Boolean(true),
+            JumpIfFalse(9),
+            Number(2.0),
+            StoreBindingKeep(0),
+            Jump(10),
+            Number(4.0),
+            Divide,
+            StoreBindingKeep(0),
+            Add,
+        ],
+        3,
+    );
+}
+
+#[test]
 fn initializerless_let_pushes_undefined_and_initializes_its_own_slot() {
     assert_postfix(
         "let first; let second=first; let third; second",
@@ -1536,7 +1560,7 @@ fn assignment_statements_require_explicit_semicolons() {
         ("let x=1; (x + x=2)", Unsupported, 15, 16),
         ("let x=1; let y=x=2; y", Unsupported, 16, 17),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
-        ("let x=1; (x**=2)", Unsupported, 11, 14),
+        ("let x=1; (x||=2)", Unsupported, 11, 14),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),
         ("let x=1; x/*🚧", Malformed, 10, 16),

@@ -131,6 +131,73 @@ fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
 }
 
 #[test]
+fn do_while_emits_body_first_and_patches_each_forward_loop_jump_once() {
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
+
+    let source = "do{continue;break;continue;break;}while(false);true";
+    assert_postfix(
+        source,
+        &[
+            JumpStatement(4), // continue
+            JumpStatement(7), // break
+            JumpStatement(4),
+            JumpStatement(7),
+            Boolean(false), // trailing test
+            JumpIfFalseStatement(7),
+            LoopBack(0), // body entry
+            Boolean(true),
+        ],
+        1,
+    );
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 17,
+        max_nesting_depth: 1,
+        // Source bytes, eight emissions, one frame, one parenthesis marker,
+        // two continue fixups and two break fixups.
+        max_work: source.len() + 14,
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits)
+            .unwrap()
+            .instruction_count(),
+        8
+    );
+    let final_expr = source.find("true").unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 16,
+            ..limits
+        },
+        Limit::Tokens,
+        final_expr,
+        final_expr + 1,
+    );
+    let close = source.find('}').unwrap();
+    for max_work in [close + 1 + 6, final_expr + 12] {
+        // Enough for the first but not the second continue/break fixup, respectively.
+        assert_limit(
+            source,
+            Limits { max_work, ..limits },
+            Limit::Work,
+            close,
+            close + 1,
+        );
+    }
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        final_expr,
+        source.len(),
+    );
+}
+
+#[test]
 fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
     use Instruction::{JumpIfFalseStatement, JumpStatement, LessThan, LoopBack, StoreBinding};
 

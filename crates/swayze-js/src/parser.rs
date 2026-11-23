@@ -243,7 +243,7 @@ pub(crate) enum Instruction {
     Jump(usize),
     // Unconditional statement transfers require an empty operand stack.
     JumpStatement(usize),
-    // The only backward edge; enter a loop test or update with an empty stack.
+    // The only backward edge; enter a loop test, update or body with an empty stack.
     LoopBack(usize),
 }
 
@@ -388,6 +388,7 @@ enum TokenKind {
     Else,
     While,
     For,
+    Do,
     Break,
     Continue,
     Assignment(Option<Operator>),
@@ -492,7 +493,7 @@ fn is_excluded_name(name: &str) -> bool {
         name,
         // Other keywords, reserved literals, future/strict reserved words, and `await`.
         "case" | "catch" | "class" | "debugger" | "default"
-            | "delete" | "do" | "enum" | "export" | "extends"
+            | "delete" | "enum" | "export" | "extends"
             | "finally" | "function" | "import" | "in" | "instanceof"
             | "new" | "return" | "super" | "switch" | "this" | "throw"
             | "try" | "typeof" | "var" | "void" | "with" | "await" | "yield"
@@ -659,6 +660,7 @@ impl Lexer<'_> {
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
             "for" => Ok(TokenKind::For),
+            "do" => Ok(TokenKind::Do),
             "break" => Ok(TokenKind::Break),
             "continue" => Ok(TokenKind::Continue),
             "true" => Ok(TokenKind::Boolean(true)),
@@ -1035,11 +1037,24 @@ enum StatementFrame {
         join: usize,
     },
     Loop {
-        continue_target: usize,
-        exit: usize,
+        layout: LoopLayout,
         enclosing_loop: Option<usize>,
         // Head of a list threaded through unpatched break instructions.
         break_head: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum LoopLayout {
+    PreTest {
+        continue_target: usize,
+        exit: usize,
+    },
+    PostTest {
+        body_start: usize,
+        // The trailing test has not been emitted. Thread pending continues
+        // through their forward jumps, separately from the breaks.
+        continue_head: usize,
     },
 }
 
@@ -1092,7 +1107,7 @@ impl Parser<'_> {
                     self.parse_declaration(kind)?;
                     continue;
                 }
-                TokenKind::If | TokenKind::While | TokenKind::For => {
+                TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Do => {
                     self.open_statement(first)?;
                     continue;
                 }
@@ -1194,13 +1209,23 @@ impl Parser<'_> {
                 let test = self.instructions.len();
                 let exit = self.parse_statement_test("expected '(' after 'while'")?;
                 (
-                    self.loop_frame(test, exit),
+                    self.loop_frame(LoopLayout::PreTest {
+                        continue_target: test,
+                        exit,
+                    }),
                     "expected '{' to open the while body",
                 )
             }
             TokenKind::For => (
                 self.parse_for_header()?,
                 "expected '{' to open the for body",
+            ),
+            TokenKind::Do => (
+                self.loop_frame(LoopLayout::PostTest {
+                    body_start: self.instructions.len(),
+                    continue_head: UNPATCHED,
+                }),
+                "expected '{' to open the do body",
             ),
             _ => unreachable!("not a control statement keyword"),
         };
@@ -1257,27 +1282,64 @@ impl Parser<'_> {
             }
             StatementFrame::IfElse { join } => self.patch_jump(join, close)?,
             StatementFrame::Loop {
-                continue_target,
-                exit,
+                layout,
                 enclosing_loop,
                 break_head,
             } => {
-                self.emit(Instruction::LoopBack(continue_target), close)?;
-                self.patch_jump(exit, close)?;
-                self.patch_breaks(break_head, close)?;
+                // A trailing test resolves names in the surrounding scope, not
+                // the just-closed body, even when entered by a continue.
+                self.statement_frames.pop();
                 self.innermost_loop = enclosing_loop;
+                let (back_target, exit, end) = match layout {
+                    LoopLayout::PreTest {
+                        continue_target,
+                        exit,
+                    } => (continue_target, exit, close),
+                    LoopLayout::PostTest {
+                        body_start,
+                        continue_head,
+                    } => {
+                        self.patch_loop_jumps(continue_head, close)?;
+                        let (exit, end) = self.parse_do_tail()?;
+                        (body_start, exit, end)
+                    }
+                };
+                self.emit(Instruction::LoopBack(back_target), end)?;
+                self.patch_jump(exit, end)?;
+                return self.patch_loop_jumps(break_head, close);
             }
         }
         self.statement_frames.pop();
         Ok(())
     }
 
-    fn loop_frame(&self, continue_target: usize, exit: usize) -> StatementFrame {
+    fn loop_frame(&self, layout: LoopLayout) -> StatementFrame {
         StatementFrame::Loop {
-            continue_target,
-            exit,
+            layout,
             enclosing_loop: self.innermost_loop,
             break_head: UNPATCHED,
+        }
+    }
+
+    fn parse_do_tail(&mut self) -> Result<(usize, Span), Error> {
+        let missing_while = "expected 'while' after the do body";
+        let keyword = self.require_token(missing_while)?;
+        if !matches!(keyword.kind, TokenKind::While) {
+            return Err(Error::malformed(keyword.span, missing_while));
+        }
+        let exit = self.parse_statement_test("expected '(' after 'while'")?;
+        let next = self.next_token()?;
+        match next {
+            Some(Token {
+                kind: TokenKind::Semicolon,
+                span,
+                ..
+            }) => Ok((exit, span)),
+            // JavaScript permits ASI here even without a line terminator.
+            _ => Err(Error::unsupported(
+                next.map_or(Span::at(self.lexer.offset), |token| token.span),
+                "do-while requires an explicit trailing semicolon",
+            )),
         }
     }
 
@@ -1336,7 +1398,10 @@ impl Parser<'_> {
         };
         self.nesting_depth -= 1;
         self.check_statement_boundary(close)?;
-        Ok(self.loop_frame(continue_target, exit))
+        Ok(self.loop_frame(LoopLayout::PreTest {
+            continue_target,
+            exit,
+        }))
     }
 
     fn parse_for_assignment(&mut self, first: Token, end: ExpressionEnd) -> Result<Span, Error> {
@@ -1385,7 +1450,9 @@ impl Parser<'_> {
         match first.kind {
             TokenKind::CloseBrace => self.close_block(first.span),
             TokenKind::Declaration(kind) => self.parse_declaration(kind),
-            TokenKind::If | TokenKind::While | TokenKind::For => self.open_statement(first),
+            TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Do => {
+                self.open_statement(first)
+            }
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
             TokenKind::Identifier => {
                 let operator =
@@ -1437,32 +1504,38 @@ impl Parser<'_> {
             );
         }
         let StatementFrame::Loop {
-            continue_target,
-            break_head,
-            ..
+            layout, break_head, ..
         } = &mut self.statement_frames[index].statement
         else {
             unreachable!("innermost loop index must refer to a loop frame");
         };
-        let instruction = if matches!(keyword.kind, TokenKind::Continue) {
-            Instruction::LoopBack(*continue_target)
+        let head = if matches!(keyword.kind, TokenKind::Continue) {
+            match layout {
+                LoopLayout::PreTest {
+                    continue_target, ..
+                } => {
+                    let target = *continue_target;
+                    return self.emit(Instruction::LoopBack(target), next.span);
+                }
+                LoopLayout::PostTest { continue_head, .. } => continue_head,
+            }
         } else {
-            let previous = std::mem::replace(break_head, self.instructions.len());
-            Instruction::JumpStatement(previous)
+            break_head
         };
-        self.emit(instruction, next.span)
+        let previous = std::mem::replace(head, self.instructions.len());
+        self.emit(Instruction::JumpStatement(previous), next.span)
     }
 
-    fn patch_breaks(&mut self, mut head: usize, close: Span) -> Result<(), Error> {
+    fn patch_loop_jumps(&mut self, mut head: usize, close: Span) -> Result<(), Error> {
         let target = self.instructions.len();
         while head != UNPATCHED {
-            // Each break is linked at emission and visited once at its loop's close.
+            // Each pending jump is linked at emission and visited once at its loop's close.
             self.lexer.charge(1, close)?;
             let Some(Instruction::JumpStatement(previous)) = self.instructions.get_mut(head) else {
-                return Err(Error::malformed(close, "invalid pending break"));
+                return Err(Error::malformed(close, "invalid pending loop jump"));
             };
             if *previous != UNPATCHED && *previous >= head {
-                return Err(Error::malformed(close, "invalid pending break link"));
+                return Err(Error::malformed(close, "invalid pending loop jump link"));
             }
             head = *previous;
             *previous = target;
@@ -1496,6 +1569,7 @@ impl Parser<'_> {
             | TokenKind::Else
             | TokenKind::While
             | TokenKind::For
+            | TokenKind::Do
             | TokenKind::Break
             | TokenKind::Continue => {
                 return Err(Error::unsupported(
@@ -1797,6 +1871,7 @@ impl Parser<'_> {
                     | TokenKind::Else
                     | TokenKind::While
                     | TokenKind::For
+                    | TokenKind::Do
                     | TokenKind::Break
                     | TokenKind::Continue,
                 ) => {
@@ -1951,7 +2026,7 @@ impl Parser<'_> {
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
                     // The statement test starts with its required '(' as the first group.
-                    // Stop at that group's close without consuming the block's '{'.
+                    // Stop at that group's close without consuming the next token.
                     if statement_test && self.pending.is_empty() {
                         break (span, false);
                     }

@@ -277,6 +277,12 @@ fn fixtures() -> Vec<String> {
             "9_007_199_254_740_993",
             "0x20_0000_0000_0003",
             "4.940_656_458_412_465_4e-3_24",
+            "let n = 0; do { n += 1; } while (false); n",
+            "let n = 0; do { n += 1; } while (n < 42); n",
+            "let n = 0; let sum = 0; do { n += 1; if (n < 3) { continue; } sum += n; } while (n < 5); sum",
+            "let n = 0; do { n += 1; break; } while (true); n",
+            "let n = 0; do { const n = 21; } while (n); n",
+            "let n = 0; do { for (;;) { n += 1; break; } } while (n < 3); n",
         ]
         .map(str::to_owned),
     );

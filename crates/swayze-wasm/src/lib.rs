@@ -18,6 +18,7 @@
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
 //! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
+//! `i64.div_s`, `i64.div_u`, `i64.rem_s`, `i64.rem_u`,
 //! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.clz`, `i32.ctz`, `i32.popcnt`,
 //! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
@@ -129,7 +130,7 @@
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
-//! `i64.add`, `i64.sub`, and `i64.mul` consume two i64s and push one i64.
+//! i64 arithmetic consumes two i64s and pushes one i64.
 //! i64 remains limited to internal operands: signatures, locals, globals,
 //! control labels, `select`, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
@@ -280,10 +281,10 @@
 //! comparisons do not trap and return an i32 `1` if true or `0` if false.
 //! Addition, subtraction, and multiplication wrap modulo 2³² for i32 and 2⁶⁴
 //! for i64. No i64 numeric operations beyond those listed above are supported.
-//! Signed i32 division truncates
-//! toward zero, and a nonzero signed remainder has the sign of the dividend.
-//! Unsigned i32 division and remainder interpret the operand bits as `u32`
-//! and preserve the result bits in the returned `i32` value.
+//! Signed division truncates toward zero, and a nonzero signed remainder
+//! has the sign of the dividend. Unsigned division and remainder interpret
+//! the operand bits as `u32` or `u64` at the input width and preserve the
+//! result bits in the returned value.
 //! The bit operations do not trap. `i32.clz` and `i32.ctz` count leading and
 //! trailing zero bits in a 32-bit value (both return 32 for zero); `i32.popcnt`
 //! counts set bits. `i32.and`, `i32.or`, and `i32.xor` operate independently on
@@ -300,9 +301,11 @@
 //! Narrow loads sign-extend (`_s`) or zero-extend (`_u`) to i32, and narrow
 //! stores write only the low 8 or 16 bits of the value.
 //!
-//! A zero right operand traps for all four division and remainder instructions.
-//! `i32::MIN / -1` traps for signed division; signed remainder for those operands
-//! returns zero. Executing `unreachable` immediately raises [`Trap::Unreachable`].
+//! A zero right operand raises [`Trap::IntegerDivideByZero`] for all division
+//! and remainder instructions at either width. Signed division of the minimum
+//! value by `-1` raises [`Trap::IntegerOverflow`]; signed remainder for those
+//! operands returns zero. Executing `unreachable` immediately raises
+//! [`Trap::Unreachable`].
 //! These are runtime outcomes, not validation errors. [`InvokeError::Trap`]
 //! or [`InstantiationError::StartTrap`] reports the first guest trap, skipping
 //! all remaining instructions, including in callers. Host resource limits are

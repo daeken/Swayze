@@ -1102,17 +1102,27 @@ enum I64BinaryOp {
     Add,
     Sub,
     Mul,
+    DivS,
+    DivU,
+    RemS,
+    RemU,
 }
 
 impl I64BinaryOp {
     fn result_type(self) -> ValType {
         match self {
-            Self::Add | Self::Sub | Self::Mul => ValType::I64,
+            Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::DivS
+            | Self::DivU
+            | Self::RemS
+            | Self::RemU => ValType::I64,
             _ => ValType::I32,
         }
     }
 
-    fn apply(self, lhs: i64, rhs: i64) -> Value {
+    fn apply(self, lhs: i64, rhs: i64) -> Result<Value, Trap> {
         let comparison = match self {
             Self::Eq => lhs == rhs,
             Self::Ne => lhs != rhs,
@@ -1124,11 +1134,39 @@ impl I64BinaryOp {
             Self::LeU => (lhs as u64) <= (rhs as u64),
             Self::GeS => lhs >= rhs,
             Self::GeU => (lhs as u64) >= (rhs as u64),
-            Self::Add => return Value::I64(lhs.wrapping_add(rhs)),
-            Self::Sub => return Value::I64(lhs.wrapping_sub(rhs)),
-            Self::Mul => return Value::I64(lhs.wrapping_mul(rhs)),
+            Self::Add => return Ok(Value::I64(lhs.wrapping_add(rhs))),
+            Self::Sub => return Ok(Value::I64(lhs.wrapping_sub(rhs))),
+            Self::Mul => return Ok(Value::I64(lhs.wrapping_mul(rhs))),
+            Self::DivS if rhs == 0 => return Err(Trap::IntegerDivideByZero),
+            Self::DivS => {
+                return lhs
+                    .checked_div(rhs)
+                    .map(Value::I64)
+                    .ok_or(Trap::IntegerOverflow);
+            }
+            // Same-width casts reinterpret the operands and preserve the result bits.
+            Self::DivU => {
+                return (lhs as u64)
+                    .checked_div(rhs as u64)
+                    .map(|value| Value::I64(value as i64))
+                    .ok_or(Trap::IntegerDivideByZero);
+            }
+            // Wasm remainder by -1 is zero even for i64::MIN, unlike checked_rem.
+            Self::RemS if rhs == -1 => return Ok(Value::I64(0)),
+            Self::RemS => {
+                return lhs
+                    .checked_rem(rhs)
+                    .map(Value::I64)
+                    .ok_or(Trap::IntegerDivideByZero);
+            }
+            Self::RemU => {
+                return (lhs as u64)
+                    .checked_rem(rhs as u64)
+                    .map(|value| Value::I64(value as i64))
+                    .ok_or(Trap::IntegerDivideByZero);
+            }
         };
-        Value::I32(i32::from(comparison))
+        Ok(Value::I32(i32::from(comparison)))
     }
 }
 
@@ -1357,7 +1395,7 @@ pub(super) fn execute(
             Instruction::I64Binary(op) => {
                 let rhs = frame.pop().as_i64();
                 let lhs = frame.pop().as_i64();
-                frame.push(op.apply(lhs, rhs));
+                frame.push(op.apply(lhs, rhs).map_err(ExecutionError::Trap)?);
             }
             Instruction::LoadI32 { kind, offset } => {
                 let address = frame.pop_i32();
@@ -1774,6 +1812,10 @@ fn decode_plain(
         0x7c => Instruction::I64Binary(I64BinaryOp::Add),
         0x7d => Instruction::I64Binary(I64BinaryOp::Sub),
         0x7e => Instruction::I64Binary(I64BinaryOp::Mul),
+        0x7f => Instruction::I64Binary(I64BinaryOp::DivS),
+        0x80 => Instruction::I64Binary(I64BinaryOp::DivU),
+        0x81 => Instruction::I64Binary(I64BinaryOp::RemS),
+        0x82 => Instruction::I64Binary(I64BinaryOp::RemU),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),

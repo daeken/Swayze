@@ -648,6 +648,32 @@ fn fixtures() -> Vec<Fixture> {
         Fixture::new(-1, &[], &[0x42, 0, 0x42, 1, 0x7d, 0xa7]),
         Fixture::new(42, &[], &[0x42, 6, 0x42, 7, 0x7e, 0xa7]),
     ]);
+    // Use an explicit i64 comparison where wrapping would hide high bits.
+    cases.extend([
+        Fixture::new(-3, &[], &[0x42, 0x79, 0x42, 2, 0x7f, 0xa7]),
+        Fixture::new(
+            1,
+            &[],
+            &[
+                0x42, 0x7f, 0x42, 2, 0x80, 0x42, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0, 0x51,
+            ],
+        ),
+        Fixture::new(-1, &[], &[0x42, 0x79, 0x42, 2, 0x81, 0xa7]),
+        Fixture::new(1, &[], &[0x42, 0x7f, 0x42, 2, 0x82, 0xa7]),
+        Fixture::with_outcome(
+            Err(WasmTrap::IntegerDivideByZero),
+            &[],
+            &[0],
+            &[0x42, 1, 0x42, 0, 0x80, 0xa7],
+        ),
+    ]);
+    for (op, expected) in [(0x7f, Err(WasmTrap::IntegerOverflow)), (0x81, Ok(0))] {
+        let mut expression = vec![0x42];
+        expression.extend([0x80; 9]);
+        expression.extend([0x7f, 0x42, 0x7f, op, 0xa7]); // i64::MIN and -1.
+        cases.push(Fixture::with_outcome(expected, &[], &[0], &expression));
+    }
     cases
 }
 

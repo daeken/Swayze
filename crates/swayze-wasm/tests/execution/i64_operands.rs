@@ -90,6 +90,21 @@ fn compares_full_width_i64_values_and_produces_exact_i32_booleans() {
     }
 }
 
+fn assert_i64_binary_result(opcode: u8, lhs: i64, rhs: i64, expected: i64) {
+    let mut body = vec![0];
+    push_i64(&mut body, lhs);
+    push_i64(&mut body, rhs);
+    body.push(opcode);
+    push_i64(&mut body, expected);
+    body.extend([0x51, 0x0b]); // Compare all 64 result bits before returning i32.
+    let module = exported_function(TYPE, &code_body(&body));
+    assert_eq!(
+        module.instantiate().unwrap().invoke_i32("answer"),
+        Ok(1),
+        "opcode {opcode:#x} with ({lhs}, {rhs}), expected {expected}",
+    );
+}
+
 #[test]
 fn each_i64_arithmetic_op_wraps_and_keeps_the_full_i64_result() {
     for (opcode, lhs, rhs, expected) in [
@@ -100,19 +115,110 @@ fn each_i64_arithmetic_op_wraps_and_keeps_the_full_i64_result() {
         (0x7e, i64::MAX, 2, -2),
         (0x7e, 1 << 32, 1 << 32, 0),
     ] {
-        let mut body = vec![0];
-        push_i64(&mut body, lhs);
-        push_i64(&mut body, rhs);
-        body.push(opcode);
-        push_i64(&mut body, expected);
-        body.extend([0x51, 0x0b]); // Compare all 64 result bits, not only i32.wrap_i64.
-        assert_body_result(&body, 1);
+        assert_i64_binary_result(opcode, lhs, rhs, expected);
     }
+}
+
+#[test]
+fn i64_division_and_remainder_preserve_sign_rules_and_full_width_results() {
+    for (opcode, lhs, rhs, expected) in [
+        (0x7f, -7, 3, -2),
+        (0x7f, 7, -3, -2),
+        (0x7f, -7, -3, 2),
+        (0x7f, i64::MIN, 2, -(1 << 62)),
+        (0x7f, i64::MIN, i64::MIN, 1),
+        (0x80, -1, 2, i64::MAX),
+        (0x80, i64::MIN, 1, i64::MIN),
+        (0x80, -1, i64::MIN, 1),
+        (0x80, i64::MIN, -1, 0),
+        (0x81, -7, 3, -1),
+        (0x81, 7, -3, 1),
+        (0x81, -7, -3, -1),
+        (0x81, -(1 << 40), i64::MAX, -(1 << 40)),
+        (0x81, i64::MIN, -1, 0),
+        (0x82, -1, i64::MIN, i64::MAX),
+        (0x82, i64::MIN, -1, i64::MIN),
+        (0x82, -1, 2, 1),
+    ] {
+        assert_i64_binary_result(opcode, lhs, rhs, expected);
+    }
+    for opcode in 0x7f..=0x82 {
+        assert_i64_binary_result(opcode, 0, i64::MIN, 0);
+    }
+}
+
+#[test]
+fn i64_division_and_remainder_trap_only_if_the_dispatch_is_available() {
+    let limit = ExecutionLimit::InstructionDispatches;
+    assert_eq!(limit.maximum(), 1024);
+    let cases = (0x7f..=0x82)
+        .map(|opcode| (opcode, 0, Trap::IntegerDivideByZero))
+        .chain([(0x7f, -1, Trap::IntegerOverflow)]);
+    for (opcode, rhs, trap) in cases {
+        // Five dispatches per iteration (--p0; continue if nonzero).
+        let mut body = b"\0\x03\x40\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b".to_vec();
+        body.push(0x01); // 204 * 5 + nop + two consts = 1023 before the op.
+        push_i64(&mut body, i64::MIN);
+        push_i64(&mut body, rhs);
+        let op_offset = body.len();
+        body.extend([opcode, 0x1a, 0x41, 42, 0x0b]);
+        let module = exported_function(&i32_type(1), &code_body(&body));
+        let instance = module.instantiate().unwrap();
+        for count in [1, 204] {
+            assert_eq!(
+                instance.invoke_i32_with_args("answer", &[count]),
+                Err(InvokeError::Trap(trap)),
+                "opcode {opcode:#x} with divisor {rhs} and {count} iterations",
+            );
+        }
+
+        body.insert(op_offset, 0x01); // No dispatch left for the trapping op.
+        let module = exported_function(&i32_type(1), &code_body(&body));
+        assert_eq!(
+            module
+                .instantiate()
+                .unwrap()
+                .invoke_i32_with_args("answer", &[204]),
+            Err(InvokeError::LimitExceeded { limit }),
+            "opcode {opcode:#x} with divisor {rhs}",
+        );
+    }
+}
+
+#[test]
+fn i64_traps_keep_prior_writes_skip_later_ones_and_allow_reinvocation() {
+    let mut body = b"\0\x41\x07\x24\0".to_vec(); // global[0] = 7.
+    push_i64(&mut body, i64::MIN);
+    body.extend(b"\x20\0\xac\x7f\x1a"); // Drop MIN / sign_extend(p0).
+    body.extend(b"\x42\x05\x20\x01\xad\x82\xa7\x24\0\x23\0\x0b"); // Store and return 5 % zero_extend(p1).
+    let validated = validate_module(&module(&[
+        (1, &i32_types(&[0, 2])),
+        (3, &[2, 0, 1]),
+        (6, &[1, 0x7f, 1, 0x41, 42, 0x0b]),
+        (7, &function_exports(&[(b"read", 0), (b"run", 1)])),
+        (10, &code_bodies(&[b"\0\x23\0\x0b", &body])),
+    ]))
+    .unwrap();
+    let instance = validated.instantiate().unwrap();
+    assert_eq!(instance.invoke_i32("read"), Ok(42));
+    for (args, trap) in [
+        ([-1, 0], Trap::IntegerOverflow), // The later unsigned remainder is not run.
+        ([2, 0], Trap::IntegerDivideByZero),
+    ] {
+        assert_eq!(
+            instance.invoke_i32_with_args("run", &args),
+            Err(InvokeError::Trap(trap)),
+        );
+        assert_eq!(instance.invoke_i32("read"), Ok(7));
+        assert_eq!(instance.invoke_i32_with_args("run", &[2, 3]), Ok(2));
+        assert_eq!(instance.invoke_i32("read"), Ok(2));
+    }
+    assert_eq!(validated.instantiate().unwrap().invoke_i32("read"), Ok(42));
 }
 
 fn numeric_ops() -> impl Iterator<Item = (u8, usize)> {
     (0x50..=0x5a)
-        .chain(0x7c..=0x7e)
+        .chain(0x7c..=0x82)
         .map(|opcode| (opcode, if opcode == 0x50 { 1 } else { 2 }))
 }
 
@@ -169,7 +275,7 @@ fn other_i64_numeric_and_memory_opcodes_remain_unsupported() {
     for opcode in [0x29, 0x37]
         .into_iter()
         .chain(0x79..=0x7b) // clz, ctz, popcnt
-        .chain(0x7f..=0x8a) // div/rem, bitwise, shifts/rotates
+        .chain(0x83..=0x8a) // bitwise, shifts/rotates
         .chain(0xc2..=0xc4)
     // post-Core-1.0 sign extensions
     {
@@ -443,7 +549,7 @@ fn i64_numeric_ops_share_the_exact_stack_limit_even_at_control_floors() {
             body.extend([if slot % 2 == 0 { 0x41 } else { 0x42 }, 0]);
         }
         body.extend(b"\x02\x40");
-        body.extend(b"\x42\0".repeat(arity));
+        body.extend(b"\x42\x01".repeat(arity));
         let peak = body.len();
         body.extend([op, 0x1a, 0x0b]);
         body.extend(std::iter::repeat_n(0x1a, prefix - 1));
@@ -466,7 +572,7 @@ fn every_i64_numeric_op_spends_exactly_one_dispatch() {
     assert_eq!(limit.maximum(), 1024);
     for (op, arity) in numeric_ops() {
         let mut base = b"\0\x41\x2a\x03\x40".to_vec();
-        base.extend(b"\x42\0".repeat(arity));
+        base.extend(b"\x42\x01".repeat(arity));
         base.extend([op, 0x1a]);
         base.extend(b"\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b");
         // One dispatch before the loop, seven plus arity per iteration.

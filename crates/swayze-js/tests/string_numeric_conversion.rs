@@ -640,6 +640,164 @@ fn binary_dispatch_precedes_conversion_at_the_exact_boundary() {
     }
 }
 
+const MIXED_COMPARISONS: [&str; 6] = ["<", "<=", ">", ">=", "==", "!="];
+
+#[test]
+fn mixed_comparisons_share_exact_conversion_credits_with_unary_and_binary_ops() {
+    let ws = " ".repeat(1024);
+    // 32 trips use all 65,536 pairs, split between equality and ordering.
+    let pairs = format!(
+        "const ws_pair = '{ws}'; let j = 0; \
+         while (j++ < 32) {{ ws_pair === ws_pair; ws_pair >= ws_pair; }} "
+    );
+    // 63 * 4,095 unary credits, then 3,894 or 3,895 more, then 1 for
+    // division. The comparison of ' -0 ' needs 5 + 256 + 3 = 264, no pairs.
+    let prefix = |padding: usize| {
+        format!(
+            "{pairs}const ws_num = '{}'; let i = 0; \
+             while (i++ < 63) {{ +ws_num; }} ~'{}'; '' / true; ",
+            " ".repeat(4094),
+            " ".repeat(padding),
+        )
+    };
+    let exact = prefix(3893);
+    let one_short = prefix(3894);
+    let credit_error = EvalError::StringNumericConversionLimitExceeded;
+    for (scalar, results) in [
+        ("0", [false, true, false, true, true, false]),
+        ("false", [false, true, false, true, true, false]),
+        ("null", [false, true, false, true, false, true]),
+        ("undefined", [false, false, false, false, false, true]),
+        ("(0 / 0)", [false, false, false, false, false, true]),
+    ] {
+        for (index, (op, expected)) in MIXED_COMPARISONS.into_iter().zip(results).enumerate() {
+            if index >= 4 && matches!(scalar, "null" | "undefined") {
+                continue; // Noncoercing paths are tested with exhausted credits below.
+            }
+            for (lhs, rhs) in [("' -0 '", scalar), (scalar, "' -0 '")] {
+                let expr = format!("{lhs} {op} {rhs}");
+                for (prefix, result) in [
+                    (&exact, Ok(Value::Boolean(expected))),
+                    (&one_short, Err(credit_error)),
+                ] {
+                    let script = parse_script(&format!("{prefix}{expr}")).unwrap();
+                    assert_eq!(script.evaluate_value(), result, "{expr}");
+                }
+                assert_eq!(
+                    parse_script(&format!("{exact}{expr}, +''"))
+                        .unwrap()
+                        .evaluate(),
+                    Err(credit_error),
+                    "{expr} must spend the last credit"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        parse_script(&format!("{exact}' -0 ' == 0; 'x' <= 'y'"))
+            .unwrap()
+            .evaluate_value(),
+        Err(EvalError::StringComparisonLimitExceeded)
+    );
+}
+
+#[test]
+fn noncoercing_and_skipped_comparisons_spend_no_conversion_credits() {
+    let exhausted = unary_budget_prefix(63);
+    for (expr, expected) in [
+        ("'01' == '1'", false),
+        ("'01' != '1'", true),
+        ("'01' === '1'", false),
+        ("'01' !== '1'", true),
+        ("'01' < '1'", true),
+        ("'01' <= '1'", true),
+        ("'01' > '1'", false),
+        ("'01' >= '1'", false),
+        ("false == 0 && null == undefined && 0 < true", true),
+    ] {
+        assert_eq!(
+            parse_script(&format!("{exhausted}{expr}"))
+                .unwrap()
+                .evaluate_value(),
+            Ok(Value::Boolean(expected)),
+            "{expr}"
+        );
+    }
+    for scalar in ["0", "false", "null", "undefined"] {
+        for (lhs, rhs) in [("''", scalar), (scalar, "''")] {
+            for (op, expected) in [("===", false), ("!==", true), ("==", false), ("!=", true)] {
+                if matches!(op, "==" | "!=") && !matches!(scalar, "null" | "undefined") {
+                    continue;
+                }
+                let expr = format!("{lhs} {op} {rhs}");
+                assert_eq!(
+                    parse_script(&format!("{exhausted}{expr}"))
+                        .unwrap()
+                        .evaluate_value(),
+                    Ok(Value::Boolean(expected)),
+                    "{expr}"
+                );
+            }
+        }
+    }
+    for op in MIXED_COMPARISONS {
+        assert_number(
+            &format!(
+                "{exhausted}let n = 0; \
+                 false && '' {op} (n++, 0); true || (n++, 0) {op} ''; \
+                 '' ?? '' {op} (n++, 0); if (false) {{ (n++, 0) {op} ''; }} \
+                 for (; false; '' {op} (n++, 0)) {{}} true ? n : (n++, 0) {op} ''"
+            ),
+            0.0,
+        );
+        assert_eq!(
+            parse_script(&format!("{exhausted}'' {op} (0 + '')"))
+                .unwrap()
+                .evaluate_value(),
+            Err(EvalError::UnsupportedStringOperation),
+            "{op}: the RHS fails before the comparison can try to convert the left operand"
+        );
+    }
+}
+
+#[test]
+fn mixed_comparison_dispatch_precedes_conversion_at_the_exact_boundary() {
+    for (padding, succeeds) in [(62, true), (63, false)] {
+        let prefix = format!(
+            "{}let k = 0; while (k++ < 3170) {{}} ",
+            unary_budget_prefix(padding)
+        );
+        // The scalar statement and comparison take the remaining five dispatches.
+        for (op, expected) in MIXED_COMPARISONS
+            .into_iter()
+            .zip([false, true, false, true, true, false])
+        {
+            for (lhs, rhs) in [("''", "0"), ("0", "''")] {
+                let expr = format!("{lhs} {op} {rhs}");
+                for (pad, expected) in [
+                    (
+                        "0",
+                        if succeeds {
+                            Ok(Value::Boolean(expected))
+                        } else {
+                            Err(EvalError::StringNumericConversionLimitExceeded)
+                        },
+                    ),
+                    ("+0", Err(EvalError::DispatchLimitExceeded)),
+                ] {
+                    assert_eq!(
+                        parse_script(&format!("{prefix}{pad}; {expr}"))
+                            .unwrap()
+                            .evaluate_value(),
+                        expected,
+                        "{pad}; {expr}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn sign_only_candidate_must_pay_the_surcharge_before_returning_nan() {
     // The loop spends 63 * 4095 credits. The next base-only conversion

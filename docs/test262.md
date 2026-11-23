@@ -70,14 +70,13 @@ typed parse diagnostic matching the expected type can pass. Parse success, a
 wrong typed error, or generic `Malformed` fails. Generic `Unsupported` and
 non-allocation limits are unsupported, not passes; allocation is infrastructure.
 
-The first frontier is `test/language/comments/hashbang/preceding-whitespace.js`
+The first required parse negative is `test/language/comments/hashbang/preceding-whitespace.js`
 (pinned blob `03afd1b8728d23ea93f4fbef0e75754ae3895d7a`, 494 bytes). Its
 leading space before `#!` must not be removed; it expects parse `SyntaxError`
-and ends with a throw that must never be evaluated. With the unchanged engine
-it reaches the lexer but returns untyped `Unsupported`. The baseline in each
-profile is 18 passes (14 adapted, four raw positive, zero raw-negative),
-15 unsupported (14 strict not run and one attempted raw-negative), and zero
-failures or infrastructure errors.
+and ends with a throw that is never evaluated. The engine originally returned
+untyped `Unsupported`; it now independently classifies this initial misplaced
+hashbang as `SyntaxError` during parsing. The runner checks that type and does
+not use the coarse kind, source pattern, or error text as a substitute.
 
 The required adapted sloppy-mode cases cover numeric separators in integer,
 fraction and exponent positions; U+2028, U+2029 and U+180E in Strings; unary

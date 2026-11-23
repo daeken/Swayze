@@ -15,8 +15,8 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 use swayze_engine::{
-    JsErrorKind, JsEvalError, JsEvalScratch, JsLimit, JsParseError, JsPrimitiveValue, JsValue,
-    parse_script, parse_script_for_completion,
+    JsErrorKind, JsEvalError, JsEvalScratch, JsLimit, JsParseError, JsParseErrorType,
+    JsPrimitiveValue, JsValue, parse_script, parse_script_for_completion,
 };
 
 const PIN: &str = "2a1ade303f72d3de80565c921d685222405c32ce";
@@ -503,6 +503,9 @@ fn same_value(lhs: JsPrimitiveValue<'_>, rhs: JsPrimitiveValue<'_>) -> bool {
 fn evaluate(sources: (&str, Option<&str>)) -> Outcome {
     fn parse_error(error: JsParseError) -> Outcome {
         match error.kind() {
+            JsErrorKind::Unsupported if error.parse_error_type().is_some() => {
+                Outcome::Fail(error.message())
+            }
             JsErrorKind::Unsupported => Outcome::Unsupported(error.message()),
             JsErrorKind::LimitExceeded(JsLimit::Allocation) => Outcome::Infra(error.message()),
             JsErrorKind::LimitExceeded(_) => Outcome::Unsupported(error.message()),
@@ -552,10 +555,10 @@ fn evaluate(sources: (&str, Option<&str>)) -> Outcome {
     result.unwrap_or_else(|outcome| outcome)
 }
 
-// Baseline has no typed parse errors. Wire only the engine's typed accessor
-// here, never a kind, message, span or pattern from the guest source.
-fn recognized_negative_type(_error: &JsParseError) -> Option<ErrorType> {
-    None
+fn recognized_negative_type(error: &JsParseError) -> Option<ErrorType> {
+    error.parse_error_type().map(|kind| match kind {
+        JsParseErrorType::SyntaxError => ErrorType::SyntaxError,
+    })
 }
 
 fn classify_negative_error(
@@ -812,6 +815,13 @@ fn self_test_raw_negative() {
     // The parse-negative result must be failure, not an evaluation outcome.
     let script = |header| format!("/*---\n{header}\n---*/\nfalse.length;");
     let source = script(header);
+    let typed = format!(" #!\n{source}");
+    assert_eq!(raw_negative(&typed), ("parse", Outcome::Pass));
+    assert_eq!(
+        raw_negative(&typed.replace("type: SyntaxError", "type: TypeError")),
+        ("parse", Outcome::Fail("wrong typed parse error"))
+    );
+    assert!(matches!(evaluate((&typed, None)), Outcome::Fail(_)));
     assert_eq!(
         raw_negative(&source),
         (

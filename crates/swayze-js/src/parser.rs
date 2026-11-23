@@ -82,10 +82,17 @@ pub enum ErrorKind {
     LimitExceeded(Limit),
 }
 
+/// A JavaScript error type established during parsing, independent of [`ErrorKind`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseErrorType {
+    SyntaxError,
+}
+
 /// A parse diagnostic that does not retain or print the source text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
+    parse_error_type: Option<ParseErrorType>,
     span: Span,
     message: &'static str,
 }
@@ -93,6 +100,12 @@ pub struct Error {
 impl Error {
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    /// Returns the JavaScript error type when this diagnostic establishes one.
+    /// `None` makes no claim about JavaScript validity.
+    pub fn parse_error_type(&self) -> Option<ParseErrorType> {
+        self.parse_error_type
     }
 
     pub fn span(&self) -> Span {
@@ -106,6 +119,7 @@ impl Error {
     fn malformed(span: Span, message: &'static str) -> Self {
         Self {
             kind: ErrorKind::Malformed,
+            parse_error_type: None,
             span,
             message,
         }
@@ -114,6 +128,7 @@ impl Error {
     fn unsupported(span: Span, message: &'static str) -> Self {
         Self {
             kind: ErrorKind::Unsupported,
+            parse_error_type: None,
             span,
             message,
         }
@@ -136,6 +151,7 @@ impl Error {
         };
         Self {
             kind: ErrorKind::LimitExceeded(limit),
+            parse_error_type: None,
             span,
             message,
         }
@@ -720,6 +736,7 @@ impl Lexer<'_> {
     }
 
     fn next(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {
+        let at_script_start = self.offset == 0;
         let after_line_break = self.skip_trivia()?;
         let Some(c) = self.peek() else {
             return Ok(None);
@@ -779,7 +796,19 @@ impl Lexer<'_> {
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
             '+' | '-' | '*' | '/' | '%' => self.operator(c)?,
-            _ => return Err(unsupported_token(first)),
+            _ => {
+                let mut error = unsupported_token(first);
+                // Only classify the first nontrivia token; '#' was already
+                // charged, and the adjacent '!' is only probed, not consumed.
+                if at_script_start
+                    && start != 0
+                    && c == '#'
+                    && self.rest().as_bytes().first() == Some(&b'!')
+                {
+                    error.parse_error_type = Some(ParseErrorType::SyntaxError);
+                }
+                return Err(error);
+            }
         };
         Ok(Some(Token {
             kind,

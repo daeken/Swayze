@@ -209,6 +209,11 @@ pattern is promised.
 At byte zero, `#!` starts a metered comment through LF, CR, LS, PS or EOF,
 with no token emitted. A BOM, whitespace, or any other preceding bytes prevent
 it from being a hashbang. The ordinary source and parse work limits still apply.
+If adjacent `#!` is the first nontrivia token at a nonzero byte offset, the
+parse error carries `ParseErrorType::SyntaxError` (`JsParseErrorType` in the
+facade) in addition to its existing coarse `Unsupported` category. The type
+is optional: an untyped error is not evidence that the source is invalid
+JavaScript. This classification does not cover `#!` after another token.
 
 `parse_script_for_completion` and its `_with_limits` variant allow EOF after
 complete statements, including an empty or comment-only source. Execute the

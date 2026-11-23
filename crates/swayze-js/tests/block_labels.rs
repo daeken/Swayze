@@ -45,6 +45,26 @@ fn a_block_exit_stays_inside_the_loop_and_unlabeled_jumps_ignore_block_targets()
 }
 
 #[test]
+fn breaking_to_a_block_from_an_inner_loop_can_be_followed_by_an_outer_continue() {
+    let source = "let trace=0;
+         for (let i=1; i<=3; i++) {
+             done: {
+                 while (true) {
+                     inside: { trace=trace*10+i; break done; }
+                     trace=999;
+                 }
+                 trace=999;
+             }
+             trace=trace*10+4;
+             next: { continue; trace=999; }
+             trace=999;
+         }
+         trace";
+    // Named break lands after done, then unlabeled continue in next runs the for update.
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(142434.0));
+}
+
+#[test]
 fn labels_share_a_separate_namespace_and_may_be_reused_after_close() {
     let source = "let name=0;
          if (false) { name: { break name; } }
@@ -166,8 +186,9 @@ fn a_label_uses_only_its_blocks_statement_frame_and_no_expression_nesting() {
 fn mixed_target_traversal_and_block_break_fixups_are_metered_exactly() {
     let source = "a0:{while(false){{a1:{break a0;}}}}0";
     // Source bytes, 1 decimal byte, 1 group, 4 frames, 5 emissions, 1 break
-    // fixup, 4 units to check a1 (loop + a0), and 7 to find a0 (a1 + loop
-    // + a0). The unlabeled bare block isn't visited by either search.
+    // fixup, 4 units to check a1 (loop + a0), and 7 to find a0: 3 for the
+    // intervening labeled block a1, 1 for the unlabeled loop, 3 for a0.
+    // The bare block isn't visited by either search.
     let limits = Limits {
         max_source_bytes: source.len(),
         max_tokens: 20,
@@ -262,6 +283,42 @@ fn mixed_target_traversal_and_block_break_fixups_are_metered_exactly() {
             Span {
                 start,
                 end: start + 1
+            }
+        );
+    }
+}
+
+#[test]
+fn unlabeled_jumps_charge_no_work_to_bypass_labeled_blocks() {
+    for (source, label_checks) in [
+        ("while(false){{{break;continue;}}}0", 0),
+        ("while(false){a:{bb:{break;continue;}}}0", 3),
+    ] {
+        // Beyond source bytes: 1 decimal byte, 1 group, 3 frames, 6 emissions,
+        // 1 break fixup. Only the duplicate checks add non-byte work: a visits
+        // the loop, bb visits a and the loop, and no name lengths match.
+        let max_work = source.len() + 12 + label_checks;
+        let limits = Limits {
+            max_work,
+            ..Limits::default()
+        };
+        let script = parse_script_with_limits(source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 6);
+        assert_eq!(script.evaluate(), Ok(0.0));
+        let error = parse_script_with_limits(
+            source,
+            Limits {
+                max_work: max_work - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(
+            error.span(),
+            Span {
+                start: source.len() - 1,
+                end: source.len()
             }
         );
     }

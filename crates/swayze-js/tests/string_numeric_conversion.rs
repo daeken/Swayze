@@ -759,14 +759,15 @@ fn runtime_subtraction_charges_both_aliases_and_shares_credits() {
 #[test]
 fn rhs_errors_precede_coercion_and_skipped_binary_operators_do_not_convert() {
     let exhausted = unary_budget_prefix(63);
+    let wide = "x".repeat(4094);
     for op in BINARY_OPS.into_iter().chain(BITWISE_OPS.map(|(op, _)| op)) {
         for source in [
-            format!("{exhausted}'' {op} ('' + 1)"),
-            format!("{exhausted}let x = ''; x {op}= ('' + 1); x"),
+            format!("{exhausted}'' {op} ('{wide}' + 1)"),
+            format!("{exhausted}let x = ''; x {op}= ('{wide}' + 1); x"),
         ] {
             assert_eq!(
                 parse_script(&source).unwrap().evaluate(),
-                Err(EvalError::UnsupportedStringOperation),
+                Err(EvalError::StringConcatenationLengthLimitExceeded),
                 "{op}: the RHS fails before coercing the left operand"
             );
         }
@@ -932,6 +933,7 @@ fn noncoercing_and_skipped_comparisons_spend_no_conversion_credits() {
             }
         }
     }
+    let wide = "x".repeat(4094);
     for op in MIXED_COMPARISONS {
         assert_number(
             &format!(
@@ -943,10 +945,10 @@ fn noncoercing_and_skipped_comparisons_spend_no_conversion_credits() {
             0.0,
         );
         assert_eq!(
-            parse_script(&format!("{exhausted}'' {op} (0 + '')"))
+            parse_script(&format!("{exhausted}'' {op} (0 + '{wide}')"))
                 .unwrap()
                 .evaluate_value(),
-            Err(EvalError::UnsupportedStringOperation),
+            Err(EvalError::StringConcatenationLengthLimitExceeded),
             "{op}: the RHS fails before the comparison can try to convert the left operand"
         );
     }

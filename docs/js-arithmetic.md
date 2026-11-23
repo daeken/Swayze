@@ -221,16 +221,25 @@ is false. Mixed ordering treats `null` as `+0` and `undefined` as NaN; a NaN
 operand makes all four relations false. Mixed comparisons spend no code-unit
 pairs.
 
-Binary `+` and `+=` concatenate two Strings in left-to-right UTF-16 order,
-without normalizing code units. Their result may have at most 4,094 code
-units; each evaluation may append at most 32,768 code units, including
-intermediate results that are overwritten or discarded. These inclusive caps
+Binary `+` and `+=` concatenate when either operand is a String, in
+left-to-right UTF-16 order without normalizing code units. Booleans, `null`,
+and `undefined` use their literal spellings. Numbers use the shortest
+round-tripping decimal, choosing the closest and then the even significand
+on an exact tie. Both zeros print `0`; `NaN` and signed infinities have
+fixed spellings. The notation uses fixed form for decimal exponents −6
+through 20 and lowercase `e` with a signed exponent otherwise. The private
+formatter uses at most 25 UTF-16 units of stack scratch per reached Add;
+it does not use String-to-Number credits or a separate formatter meter.
+When neither operand is a String, `+` and `+=` still perform numeric addition.
+
+The result may have at most 4,094 code units; each evaluation may append
+at most 32,768 code units, including scalar spellings and intermediate
+results that are overwritten or discarded. These inclusive caps
 produce `StringConcatenationLengthLimitExceeded` and
 `StringConcatenationBudgetExceeded`, respectively, and are independent of
 dispatch, comparison, and conversion budgets. Reached, nonempty concatenations
 may grow the scratch allocation fallibly. Empty or skipped concatenations do
-not allocate String storage. This scratch is not a GC heap. Mixed String/scalar
-`+` and `+=` remain unsupported only when executed.
+not allocate String storage. This scratch is not a GC heap.
 
 Unary `+`, `-`, and `~` and binary `-`, `*`, `/`, `%`, `**`, `&`, `^`, `|`,
 `<<`, `>>`, and `>>>` (including their compound assignments) convert Strings to

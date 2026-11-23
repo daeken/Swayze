@@ -75,10 +75,12 @@ Neither a Cargo dependency nor upstream's separate float renderer is used.
   25 UTF-16 code units. The caller supplies that fixed stack buffer; there is
   no rendering allocation or float `Display` conversion.
 
-Canonical, boundary, round-trip, and independent differential fixtures are
-regression evidence, not a proof of the adapted implementation. At this
-increment everything is private to the crate's test build, with no JS
-operator, parser, value representation, or host API change.
+The evaluator uses this private formatter for the Number in mixed String/Number
+`+` and `+=`, after checking the String range and before checking the exact
+emitted length. Purely numeric addition and updates do not call it. The
+formatter does not inspect source text. The table checks, canonical,
+boundary, round-trip, and independent differential fixtures are test-only and
+provide regression evidence, not a proof of the adapted implementation.
 
 ## Optional differential check
 

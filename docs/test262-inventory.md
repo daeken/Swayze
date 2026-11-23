@@ -74,19 +74,20 @@ sorted order and is not subject to this group limit.
 **Selected** means the committed TSV names that standalone path, not that it
 ran, passed, or is runnable. **Not selected** is the rest of the standalone
 paths in the requested directory, not an unsupported or failed count. The
-report breaks selections down by `adapted`/`raw` and `required`/`frontier`. It
-fails on malformed path rows, duplicate paths, or membership in fixtures,
-unknowns, or paths missing from the pin. It does not validate assertion spans
-or predict runner eligibility. Even for a narrow prefix, it reconciles the
+report breaks selections down by `adapted`, `raw`, or `raw-negative`, and by
+`required` or `frontier`. It fails on malformed path rows, duplicate paths, or
+membership in fixtures, unknowns, or paths missing from the pin. It does not
+validate assertion spans or negative metadata and does not predict eligibility. Even for a narrow prefix, it reconciles the
 whole committed manifest before reporting that subtree's counts. On a manifest
 error, the tree inventory and requested audit are still shown, all selection
 counts are withheld, and the tool exits 2.
 
-At `6aeb41f` the manifest selects 15 paths (11 required adapted, three adapted
-frontier, one raw frontier); 53,787 standalone paths are not selected. The
-[opt-in runner](test262.md) reports what actually ran. Adapted evidence is
-**not** an official Test262 pass, and a `raw` selection is not itself a pass.
-This inventory emits no variant total: strict/sloppy, module, raw, and other
-execution requirements depend on metadata and harness behavior rather than
-path counts. A conformance tally needs a runner that records actual outcomes
-under those conditions.
+With `preceding-whitespace.js` enrolled as the first raw-negative frontier,
+the manifest selects 19 paths (14 required adapted, four required raw
+positives, one raw-negative frontier); 53,783 standalone paths are not
+selected. The [opt-in runner](test262.md) reports what actually ran. Adapted
+evidence is **not** an official Test262 pass, and neither a `raw` nor a
+`raw-negative` selection is itself a pass. This inventory emits no variant
+total: strict/sloppy, module, raw, and other execution requirements depend on
+metadata and harness behavior rather than path counts. A conformance tally
+needs a runner that records actual outcomes under those conditions.

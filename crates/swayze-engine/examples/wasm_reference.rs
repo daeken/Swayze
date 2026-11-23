@@ -430,6 +430,18 @@ fn fixtures() -> Vec<Fixture> {
             &outer_continue,
         ));
     }
+    // Drop a scratch operand, then select between two candidates.
+    let select = [0x41, 9, 0x1a, 0x01, 0x41, 42, 0x41, 7, 0x20, 0, 0x1b];
+    for (predicate, expected) in [(0, 7), (1, 42), (i32::MIN, 42)] {
+        cases.push(Fixture::new(expected, &[predicate], &select));
+    }
+    // Even an unselected candidate is evaluated and can trap.
+    cases.push(Fixture::with_outcome(
+        Err(WasmTrap::IntegerDivideByZero),
+        &[],
+        &[0],
+        &[0x41, 42, 0x41, 1, 0x41, 0, 0x6d, 0x41, 1, 0x1b],
+    ));
     cases
 }
 

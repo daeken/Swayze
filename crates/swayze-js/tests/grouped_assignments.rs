@@ -72,6 +72,7 @@ fn grouped_eager_operators_keep_the_same_number_in_the_expression_and_binding() 
 #[test]
 fn grouped_compounds_snapshot_the_target_and_evaluate_the_rhs_once() {
     for (source, expected) in [
+        ("let x = 10; (x -= (x = 3))", 7.0),
         (
             "let x=8, n=0; (x /= ((n+=1), (x=2))) * 100 + x*10 + n",
             441.0,
@@ -91,6 +92,19 @@ fn grouped_compounds_snapshot_the_target_and_evaluate_the_rhs_once() {
         assert_eq!(script.evaluate(), Ok(expected), "{source}");
         assert_eq!(script.evaluate(), Ok(expected), "{source}");
     }
+}
+
+#[test]
+fn grouped_compound_retains_and_stores_negative_zero_in_the_same_run() {
+    // Strict equality treats signed zeros as equal; their reciprocals distinguish them.
+    let script = parse_script(
+        "let x = 0;
+         const retained = (x *= -1);
+         const negativeInfinity = -1 / 0;
+         1 / retained === negativeInfinity && 1 / x === negativeInfinity",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(true)));
 }
 
 #[test]

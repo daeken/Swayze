@@ -481,6 +481,10 @@ fn fixtures() -> Vec<String> {
             "false ? 'unreached' + 1 : 'kept'",
             "void 'literal'",
             "1; 'use strict'; 'not a directive'",
+            r#"'💡' < '\uE000'"#,
+            r#"'a' < 'a\0' && '' <= '' && 'ab' >= 'a'"#,
+            r#"'\uD800' > '\uD7FF' && '\uDFFF' < '\uE000'"#,
+            "let n=0; ((n = n*10+1), 'a') < ((n = n*10+2), 'b') && n === 12",
         ]
         .map(str::to_owned),
     );

@@ -202,14 +202,17 @@ matches must handle `StringLiteralBytes` and `StringLiteralUnits`; the
 caller-configurable `Limits`/`JsLimits` fields did not change. Evaluation
 allocates no String storage and moves only private checked ranges.
 
-Only the empty String is falsy, and every String is non-nullish. Same-tag
-String equality compares code units, without normalization, and charges the
-full length of each equal-length pair before comparing, even on early mismatch.
-Each evaluation allows 65,536 such code-unit pairs, separate from the dispatch
-budget. Strings compare strictly unequal to other types and loosely unequal to
-`null` and `undefined`. Mixed loose equality with Numbers or Booleans, ordering,
-concatenation, numeric coercion and updates on Strings are unsupported. An
-unsupported String operation is an evaluation error only when it executes.
+Only the empty String is falsy, and every String is non-nullish. String
+equality and ordering compare UTF-16 code units without normalization. For
+ordering, a proper prefix sorts before the longer String. Both comparisons
+share a budget of 65,536 code-unit pairs per evaluation, separate from the
+dispatch budget. Equality charges the full length for equal-length Strings
+and zero otherwise; ordering charges the shorter length. Both charge before
+comparing, even on an early mismatch. Strings compare strictly unequal to
+other types and loosely unequal to `null` and `undefined`. Mixed loose equality
+with Numbers or Booleans, mixed String/scalar ordering, concatenation, numeric
+coercion and updates on Strings are unsupported. An unsupported String
+operation is an evaluation error only when it executes.
 
 ## Evidence and limits
 

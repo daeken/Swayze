@@ -4,7 +4,7 @@ Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, des
 
 Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current implementation makes no security-proof claim.
 
-`Script::evaluate_primitive()` returns a `JsPrimitiveValue`: either an existing scalar `JsValue` or a borrowed UTF-16 slice, including any lone surrogates. `evaluate_value()` remains scalar-only and `evaluate()` remains Number-only. Strings support assignment, truthiness and equality within the documented subset, but not concatenation or numeric coercion. Exhaustive `JsLimit` matches need two new arms for literal bytes and aggregate UTF-16 units; `JsLimits` is unchanged.
+`Script::evaluate_primitive()` returns a `JsPrimitiveValue`: either an existing scalar `JsValue` or a borrowed UTF-16 slice, including any lone surrogates. `evaluate_value()` remains scalar-only and `evaluate()` remains Number-only. Strings support assignment, truthiness, equality and UTF-16 code-unit ordering within the documented subset, but not concatenation or numeric coercion. Exhaustive `JsLimit` matches need two new arms for literal bytes and aggregate UTF-16 units; `JsLimits` is unchanged.
 
 | Path | Responsibility today |
 | --- | --- |

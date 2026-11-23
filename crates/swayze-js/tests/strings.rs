@@ -381,7 +381,7 @@ fn mixed_string_relations_use_numeric_order_in_both_directions() {
     let greater = [false, false, true, true];
     let unordered = [false; 4];
     for (string, scalar, expected) in [
-        ("'2'", "10", less), // Unlike the String/String comparison.
+        ("'10'", "2", greater), // In contrast to the String/String comparison below.
         ("' -0 '", "0", equal),
         ("'0x10'", "15", greater),
         ("'0.5'", "true", less),
@@ -406,7 +406,7 @@ fn mixed_string_relations_use_numeric_order_in_both_directions() {
             }
         }
     }
-    assert_scalar("'2' > '10'", Value::Boolean(true));
+    assert_scalar("'10' < '2'", Value::Boolean(true));
 }
 
 #[test]

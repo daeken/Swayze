@@ -90,10 +90,11 @@ fn compares_full_width_i64_values_and_produces_exact_i32_booleans() {
     }
 }
 
-fn assert_i64_binary_result(opcode: u8, lhs: i64, rhs: i64, expected: i64) {
+fn assert_i64_result(opcode: u8, operands: &[i64], expected: i64) {
     let mut body = vec![0];
-    push_i64(&mut body, lhs);
-    push_i64(&mut body, rhs);
+    for &operand in operands {
+        push_i64(&mut body, operand);
+    }
     body.push(opcode);
     push_i64(&mut body, expected);
     body.extend([0x51, 0x0b]); // Compare all 64 result bits before returning i32.
@@ -101,7 +102,7 @@ fn assert_i64_binary_result(opcode: u8, lhs: i64, rhs: i64, expected: i64) {
     assert_eq!(
         module.instantiate().unwrap().invoke_i32("answer"),
         Ok(1),
-        "opcode {opcode:#x} with ({lhs}, {rhs}), expected {expected}",
+        "opcode {opcode:#x} with {operands:x?}, expected {expected:#018x}",
     );
 }
 
@@ -115,7 +116,7 @@ fn each_i64_arithmetic_op_wraps_and_keeps_the_full_i64_result() {
         (0x7e, i64::MAX, 2, -2),
         (0x7e, 1 << 32, 1 << 32, 0),
     ] {
-        assert_i64_binary_result(opcode, lhs, rhs, expected);
+        assert_i64_result(opcode, &[lhs, rhs], expected);
     }
 }
 
@@ -140,10 +141,10 @@ fn i64_division_and_remainder_preserve_sign_rules_and_full_width_results() {
         (0x82, i64::MIN, -1, i64::MIN),
         (0x82, -1, 2, 1),
     ] {
-        assert_i64_binary_result(opcode, lhs, rhs, expected);
+        assert_i64_result(opcode, &[lhs, rhs], expected);
     }
     for opcode in 0x7f..=0x82 {
-        assert_i64_binary_result(opcode, 0, i64::MIN, 0);
+        assert_i64_result(opcode, &[0, i64::MIN], 0);
     }
 }
 
@@ -216,10 +217,82 @@ fn i64_traps_keep_prior_writes_skip_later_ones_and_allow_reinvocation() {
     assert_eq!(validated.instantiate().unwrap().invoke_i32("read"), Ok(42));
 }
 
+#[test]
+fn counts_leading_zeros_trailing_zeros_and_ones_in_i64_bits() {
+    for (operand, expected) in [
+        (0, [64, 64, 0]),
+        (1, [63, 0, 1]),
+        (i64::MIN, [0, 63, 1]),
+        (-1, [0, 0, 64]),
+        ((1 << 60) | (1 << 40), [3, 40, 2]),
+    ] {
+        for (opcode, result) in (0x79..=0x7b).zip(expected) {
+            assert_i64_result(opcode, &[operand], result);
+        }
+    }
+}
+
+#[test]
+fn applies_distinct_bitwise_operations_to_i64_patterns() {
+    let high = (1 << 62) | i64::MIN;
+    let common = 1 << 40;
+    for (operands, expected) in [
+        ([0, i64::MIN], [0, i64::MIN, i64::MIN]),
+        ([-1, i64::MIN], [i64::MIN, -1, i64::MAX]),
+        ([-1, -1], [-1, -1, 0]),
+        (
+            [i64::MIN | common | 0x5a, (1 << 62) | common | 0xb5],
+            [common | 0x10, high | common | 0xff, high | 0xef],
+        ),
+    ] {
+        for (opcode, result) in (0x83..=0x85).zip(expected) {
+            assert_i64_result(opcode, &operands, result);
+        }
+    }
+}
+
+#[test]
+fn shifts_and_rotates_by_only_the_low_six_count_bits() {
+    // Columns: shl, shr_s, shr_u, rotl, rotr. At 63 all five differ.
+    let lhs = i64::MIN | 5;
+    let sign_filled = -(1 << 62) + 2;
+    let by_one = [10, sign_filled, (1 << 62) + 2, 11, sign_filled];
+    let by_63 = [i64::MIN, -1, 1, sign_filled, 11];
+    let rotated_by_32 = (5 << 32) | (1 << 31);
+    for (operands, expected) in [
+        ([lhs, -1], by_63),
+        ([lhs, 0], [lhs; 5]),
+        ([lhs, 1], by_one),
+        (
+            [lhs, 32],
+            [5 << 32, -(1 << 31), 1 << 31, rotated_by_32, rotated_by_32],
+        ),
+        ([lhs, 63], by_63),
+        ([lhs, 64], [lhs; 5]),
+        ([lhs, 65], by_one),
+        ([lhs, i64::MIN], [lhs; 5]),
+        ([lhs, i64::MIN + 1], by_one),
+        ([5, 1], [10, 2, 2, 10, i64::MIN | 2]),
+        ([0, 63], [0; 5]),
+        ([-1, 63], [i64::MIN, -1, 1, -1, -1]),
+    ] {
+        for (opcode, result) in (0x86..=0x8a).zip(expected) {
+            assert_i64_result(opcode, &operands, result);
+        }
+    }
+}
+
 fn numeric_ops() -> impl Iterator<Item = (u8, usize)> {
-    (0x50..=0x5a)
-        .chain(0x7c..=0x82)
-        .map(|opcode| (opcode, if opcode == 0x50 { 1 } else { 2 }))
+    (0x50..=0x5a).chain(0x79..=0x8a).map(|opcode| {
+        (
+            opcode,
+            if matches!(opcode, 0x50 | 0x79..=0x7b) {
+                1
+            } else {
+                2
+            },
+        )
+    })
 }
 
 #[test]
@@ -250,15 +323,20 @@ fn i64_numeric_ops_check_live_and_dead_concrete_inputs_at_the_opcode() {
 }
 
 #[test]
-fn i64_numeric_ops_accept_polymorphic_inputs_but_push_concrete_results() {
+fn i64_numeric_ops_check_concrete_results_even_with_polymorphic_inputs() {
     for (op, arity) in numeric_ops() {
-        let (consumer, wrong_consumer, mismatch) = if op >= 0x7c {
+        let (consumer, wrong_consumer, mismatch) = if op >= 0x79 {
             (0xa7, 0x45, NEED_I32)
         } else {
             (0x45, 0xa7, NEED_I64)
         };
-        for concrete in 0..arity {
-            // Skip a dead tail whose i64 inputs can be partly or wholly implicit.
+        let mut live = vec![0];
+        live.extend(b"\x42\0".repeat(arity));
+        live.extend([op, wrong_consumer, 0x0b]);
+        bad_body(&live, live.len() - 2, mismatch);
+
+        for concrete in 0..=arity {
+            // Skip a dead tail whose i64 inputs can be concrete or implicit.
             let mut body = b"\0\x02\x7f\x41\x2a\x0c\0".to_vec();
             body.extend(b"\x42\0".repeat(concrete));
             body.extend([op, consumer, 0x0b, 0x0b]);
@@ -272,13 +350,8 @@ fn i64_numeric_ops_accept_polymorphic_inputs_but_push_concrete_results() {
 
 #[test]
 fn other_i64_numeric_and_memory_opcodes_remain_unsupported() {
-    for opcode in [0x29, 0x37]
-        .into_iter()
-        .chain(0x79..=0x7b) // clz, ctz, popcnt
-        .chain(0x83..=0x8a) // bitwise, shifts/rotates
-        .chain(0xc2..=0xc4)
-    // post-Core-1.0 sign extensions
-    {
+    // i64.load, i64.store, and post-Core-1.0 i64 sign extensions.
+    for opcode in [0x29, 0x37, 0xc2, 0xc3, 0xc4] {
         bad_body(
             &[0, 0x00, opcode, 0x0b],
             2,

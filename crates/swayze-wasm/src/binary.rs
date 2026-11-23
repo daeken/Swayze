@@ -895,6 +895,7 @@ enum Instruction {
     Unary(UnaryOp),
     Binary(BinaryOp),
     I64Eqz,
+    I64Unary(I64UnaryOp),
     I64Binary(I64BinaryOp),
     LoadI32 { kind: LoadKind, offset: u32 },
     StoreI32 { width: AccessWidth, offset: u32 },
@@ -1088,6 +1089,24 @@ impl BinaryOp {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum I64UnaryOp {
+    Clz,
+    Ctz,
+    Popcnt,
+}
+
+impl I64UnaryOp {
+    fn apply(self, operand: i64) -> i64 {
+        let bits = operand as u64;
+        i64::from(match self {
+            Self::Clz => bits.leading_zeros(),
+            Self::Ctz => bits.trailing_zeros(),
+            Self::Popcnt => bits.count_ones(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum I64BinaryOp {
     Eq,
     Ne,
@@ -1106,6 +1125,14 @@ enum I64BinaryOp {
     DivU,
     RemS,
     RemU,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrS,
+    ShrU,
+    Rotl,
+    Rotr,
 }
 
 impl I64BinaryOp {
@@ -1117,12 +1144,31 @@ impl I64BinaryOp {
             | Self::DivS
             | Self::DivU
             | Self::RemS
-            | Self::RemU => ValType::I64,
-            _ => ValType::I32,
+            | Self::RemU
+            | Self::And
+            | Self::Or
+            | Self::Xor
+            | Self::Shl
+            | Self::ShrS
+            | Self::ShrU
+            | Self::Rotl
+            | Self::Rotr => ValType::I64,
+            Self::Eq
+            | Self::Ne
+            | Self::LtS
+            | Self::LtU
+            | Self::GtS
+            | Self::GtU
+            | Self::LeS
+            | Self::LeU
+            | Self::GeS
+            | Self::GeU => ValType::I32,
         }
     }
 
     fn apply(self, lhs: i64, rhs: i64) -> Result<Value, Trap> {
+        // Mask to six bits before shifting, including for negative counts.
+        let shift = (rhs & 63) as u32;
         let comparison = match self {
             Self::Eq => lhs == rhs,
             Self::Ne => lhs != rhs,
@@ -1165,6 +1211,14 @@ impl I64BinaryOp {
                     .map(|value| Value::I64(value as i64))
                     .ok_or(Trap::IntegerDivideByZero);
             }
+            Self::And => return Ok(Value::I64(lhs & rhs)),
+            Self::Or => return Ok(Value::I64(lhs | rhs)),
+            Self::Xor => return Ok(Value::I64(lhs ^ rhs)),
+            Self::Shl => return Ok(Value::I64(((lhs as u64) << shift) as i64)),
+            Self::ShrS => return Ok(Value::I64(lhs >> shift)),
+            Self::ShrU => return Ok(Value::I64(((lhs as u64) >> shift) as i64)),
+            Self::Rotl => return Ok(Value::I64(lhs.rotate_left(shift))),
+            Self::Rotr => return Ok(Value::I64(lhs.rotate_right(shift))),
         };
         Ok(Value::I32(i32::from(comparison)))
     }
@@ -1391,6 +1445,10 @@ pub(super) fn execute(
             Instruction::I64Eqz => {
                 let operand = frame.pop().as_i64();
                 frame.push_i32(i32::from(operand == 0));
+            }
+            Instruction::I64Unary(op) => {
+                let result = op.apply(frame.pop().as_i64());
+                frame.push(Value::I64(result));
             }
             Instruction::I64Binary(op) => {
                 let rhs = frame.pop().as_i64();
@@ -1642,6 +1700,7 @@ fn validate_plain_stack(
         Instruction::StoreI32 { .. } => (2, i32_type, None),
         Instruction::Binary(_) => (2, i32_type, i32_type),
         Instruction::I64Eqz => (1, Some(I64), i32_type),
+        Instruction::I64Unary(_) => (1, Some(I64), Some(I64)),
         Instruction::I64Binary(op) => (2, Some(I64), Some(op.result_type())),
         Instruction::Unreachable
         | Instruction::JumpIfZero { .. }
@@ -1809,6 +1868,9 @@ fn decode_plain(
         0x76 => Instruction::Binary(BinaryOp::ShrU),
         0x77 => Instruction::Binary(BinaryOp::Rotl),
         0x78 => Instruction::Binary(BinaryOp::Rotr),
+        0x79 => Instruction::I64Unary(I64UnaryOp::Clz),
+        0x7a => Instruction::I64Unary(I64UnaryOp::Ctz),
+        0x7b => Instruction::I64Unary(I64UnaryOp::Popcnt),
         0x7c => Instruction::I64Binary(I64BinaryOp::Add),
         0x7d => Instruction::I64Binary(I64BinaryOp::Sub),
         0x7e => Instruction::I64Binary(I64BinaryOp::Mul),
@@ -1816,6 +1878,14 @@ fn decode_plain(
         0x80 => Instruction::I64Binary(I64BinaryOp::DivU),
         0x81 => Instruction::I64Binary(I64BinaryOp::RemS),
         0x82 => Instruction::I64Binary(I64BinaryOp::RemU),
+        0x83 => Instruction::I64Binary(I64BinaryOp::And),
+        0x84 => Instruction::I64Binary(I64BinaryOp::Or),
+        0x85 => Instruction::I64Binary(I64BinaryOp::Xor),
+        0x86 => Instruction::I64Binary(I64BinaryOp::Shl),
+        0x87 => Instruction::I64Binary(I64BinaryOp::ShrS),
+        0x88 => Instruction::I64Binary(I64BinaryOp::ShrU),
+        0x89 => Instruction::I64Binary(I64BinaryOp::Rotl),
+        0x8a => Instruction::I64Binary(I64BinaryOp::Rotr),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),

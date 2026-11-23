@@ -19,6 +19,8 @@
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
 //! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
 //! `i64.div_s`, `i64.div_u`, `i64.rem_s`, `i64.rem_u`,
+//! `i64.clz`, `i64.ctz`, `i64.popcnt`, `i64.and`, `i64.or`, `i64.xor`, `i64.shl`,
+//! `i64.shr_s`, `i64.shr_u`, `i64.rotl`, `i64.rotr`,
 //! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.clz`, `i32.ctz`, `i32.popcnt`,
 //! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
@@ -130,7 +132,8 @@
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
-//! i64 arithmetic consumes two i64s and pushes one i64.
+//! i64 arithmetic and binary bit operations consume two i64s and push one i64.
+//! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
 //! i64 remains limited to internal operands: signatures, locals, globals,
 //! control labels, `select`, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
@@ -285,14 +288,15 @@
 //! has the sign of the dividend. Unsigned division and remainder interpret
 //! the operand bits as `u32` or `u64` at the input width and preserve the
 //! result bits in the returned value.
-//! The bit operations do not trap. `i32.clz` and `i32.ctz` count leading and
-//! trailing zero bits in a 32-bit value (both return 32 for zero); `i32.popcnt`
-//! counts set bits. `i32.and`, `i32.or`, and `i32.xor` operate independently on
-//! each pair of bits. Shifts and rotates use only the low five bits of the
-//! right operand, even for negative counts. `i32.shl` shifts left, drops bits
-//! above bit 31, and fills with zeros. `i32.shr_s` fills with the sign bit and
-//! `i32.shr_u` fills with zeros. `i32.rotl` and `i32.rotr` wrap the shifted-out
-//! bits to the opposite end in the indicated direction.
+//! The bit operations do not trap. At either width, `clz` and `ctz` count leading
+//! and trailing zero bits (both return the input width for zero); `popcnt`
+//! counts set bits. `and`, `or`, and `xor` operate independently on each pair of
+//! bits. Shifts and rotates use only the low five bits of the i32 right operand
+//! or the low six bits of the i64 right operand, even for negative counts. `shl`
+//! shifts left, discards bits shifted out of the input width, and fills with
+//! zeros. `shr_s` fills with the sign bit and `shr_u` fills with zeros. `rotl`
+//! and `rotr` wrap the shifted-out bits to the opposite end in the indicated
+//! direction.
 //! Loads and stores add the base bits interpreted as `u32` and the `u32` offset
 //! in `u64`, without wrapping at 32 bits. The entire 1-, 2-, or 4-byte range
 //! must be in bounds, or the instruction returns [`Trap::MemoryOutOfBounds`]
@@ -377,6 +381,10 @@
 //! result types in polymorphic tails. Boundary tests cover the shared 32-slot
 //! stack (including frozen prefixes) and one dispatch per i64 opcode at the
 //! 1024-dispatch limit.
+//! i64 bit-operation tests compare full-width results using `i64.eq`. They
+//! distinguish high-bit patterns and sign filling, check count endpoints and
+//! low-six-bit masking (including negative counts), and exercise typed input and
+//! result checks, dead-tail polymorphism, and exact dispatch charging per opcode.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor

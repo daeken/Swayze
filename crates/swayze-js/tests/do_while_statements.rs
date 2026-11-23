@@ -126,7 +126,6 @@ fn requires_braces_and_a_complete_tail_with_explicit_semicolon() {
         ("do{}while(false) 0", Unsupported),
         ("if(true){do{}while(false)}0", Unsupported),
         ("do{}while(false);", Unsupported),
-        ("do{}while(false);;0", Unsupported),
         ("do{}while(false);0;1", Unsupported),
         ("do{}while(false);continue;0", Malformed),
         ("0;do{}while(false);", Unsupported),

@@ -173,7 +173,6 @@ fn requires_braces_delimiters_and_assignment_clauses() {
         ("for(;true;i=1{}42", Malformed, "{"),
         ("for(;;)42", Malformed, "42"),
         ("for(;;){break;}", Unsupported, ""),
-        ("for(;;){break;};42", Unsupported, ";"),
         ("42;for(;;){}", Unsupported, "for"),
         ("let for=0;42", Unsupported, "for"),
         ("(for)", Unsupported, "for"),

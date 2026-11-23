@@ -1041,10 +1041,11 @@ enum ExpressionEnd {
 const STORE_STATEMENT_END: ExpressionEnd =
     ExpressionEnd::Semicolon("assignments require explicit semicolons");
 
-// One frame per active statement, including across both arms of an if.
-// Every test starts and every arm enters and joins at operand depth zero.
+// One frame per active bare block or control statement, including across both arms of an if.
+// Every test starts and every block enters and joins at operand depth zero.
 #[derive(Clone, Copy)]
 enum StatementFrame {
+    Bare,
     IfThen {
         branch: usize,
     },
@@ -1087,7 +1088,7 @@ struct Parser<'s> {
     nesting_depth: usize,
     pending: Vec<(Pending, Span)>,
     statement_frames: Vec<BlockFrame>,
-    // Index into statement_frames; opening or closing an if does not change it.
+    // Index into statement_frames; non-loop frames do not change it.
     innermost_loop: Option<usize>,
     instructions: Vec<Instruction>,
     // Parse-only scope, declaration (in slot order), and access tables.
@@ -1101,6 +1102,7 @@ struct Parser<'s> {
 impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
         self.add_scope(None, Span::at(0))?;
+        let mut saw_statement = false;
         loop {
             if !self.statement_frames.is_empty() {
                 self.parse_block_item()?;
@@ -1109,20 +1111,28 @@ impl Parser<'_> {
             let first = self.next_token()?.ok_or_else(|| {
                 Error::unsupported(
                     Span::at(self.lexer.offset),
-                    if self.instructions.is_empty() {
-                        "empty scripts are outside the arithmetic subset"
-                    } else {
+                    if saw_statement {
                         "a final expression is required after statements"
+                    } else {
+                        "empty scripts are outside the arithmetic subset"
                     },
                 )
             })?;
             self.check_statement_boundary(first.span)?;
+            // Reaching this loop's EOF check again means a statement was parsed,
+            // even if it emitted nothing. The final expression exits the loop.
+            saw_statement = true;
             match first.kind {
+                TokenKind::Semicolon => continue,
                 TokenKind::Declaration(kind) => {
                     self.parse_declaration(kind)?;
                     continue;
                 }
-                TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Do => {
+                TokenKind::OpenBrace
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Do => {
                     self.open_statement(first)?;
                     continue;
                 }
@@ -1207,14 +1217,15 @@ impl Parser<'_> {
         Ok(id)
     }
 
-    fn open_statement(&mut self, keyword: Token) -> Result<(), Error> {
+    fn open_statement(&mut self, first: Token) -> Result<(), Error> {
         if self.statement_frames.len() == MAX_STATEMENT_FRAMES {
             return Err(Error {
                 message: "statement nesting ceiling exceeded",
-                ..Error::limit(keyword.span, Limit::NestingDepth)
+                ..Error::limit(first.span, Limit::NestingDepth)
             });
         }
-        let (frame, missing_brace) = match keyword.kind {
+        let (frame, missing_brace) = match first.kind {
+            TokenKind::OpenBrace => return self.open_block(StatementFrame::Bare, first.span),
             TokenKind::If => {
                 let branch = self.parse_statement_test("expected '(' after 'if'")?;
                 (
@@ -1244,9 +1255,13 @@ impl Parser<'_> {
                 }),
                 "expected '{' to open the do body",
             ),
-            _ => unreachable!("not a control statement keyword"),
+            _ => unreachable!("not a block or control statement"),
         };
         let brace = self.require_block_open(missing_brace)?;
+        self.open_block(frame, brace)
+    }
+
+    fn open_block(&mut self, frame: StatementFrame, brace: Span) -> Result<(), Error> {
         self.lexer.charge(1, brace)?;
         let index = self.statement_frames.len();
         let scope = self.add_scope(Some(self.current_scope()), brace)?;
@@ -1271,6 +1286,7 @@ impl Parser<'_> {
             .checked_sub(1)
             .ok_or_else(|| Error::malformed(close, "unmatched closing brace"))?;
         match self.statement_frames[index].statement {
+            StatementFrame::Bare => {}
             StatementFrame::IfThen { branch } => {
                 // Only this freshly closed then-arm can take the next `else`.
                 // In particular, a `}` belongs to the parent, so leave it cached.
@@ -1500,10 +1516,13 @@ impl Parser<'_> {
         self.check_statement_boundary(first.span)?;
         match first.kind {
             TokenKind::CloseBrace => self.close_block(first.span),
+            TokenKind::Semicolon => Ok(()),
             TokenKind::Declaration(kind) => self.parse_declaration(kind),
-            TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Do => {
-                self.open_statement(first)
-            }
+            TokenKind::OpenBrace
+            | TokenKind::If
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::Do => self.open_statement(first),
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
             TokenKind::Identifier | TokenKind::Update(_) => self
                 .parse_required_store(
@@ -1514,7 +1533,7 @@ impl Parser<'_> {
                 .map(|_| ()),
             _ => Err(Error::unsupported(
                 first.span,
-                "only declarations, assignments, increments, decrements and supported control statements are allowed in these blocks",
+                "expected a supported statement; general expression statements are outside the subset",
             )),
         }
     }
@@ -1951,7 +1970,6 @@ impl Parser<'_> {
             _ => None,
         };
         let mut needs_operand = true;
-        let mut seen_token = false;
         let mut next = Some(first);
         let (end, at_eof) = loop {
             let Some(token) = next else {
@@ -2027,10 +2045,7 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, message));
                 }
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
-                    return Err(Error::unsupported(
-                        span,
-                        "braces are only supported around if branches and loop bodies",
-                    ));
+                    return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
                 (true, TokenKind::Number(value)) => {
                     self.emit(Instruction::Number(value), span)?;
@@ -2069,14 +2084,6 @@ impl Parser<'_> {
                     };
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Pending::Op(prefix), span)?;
-                }
-                (true, TokenKind::Semicolon)
-                    if matches!(end_kind, ExpressionEnd::Script) && !seen_token =>
-                {
-                    return Err(Error::unsupported(
-                        span,
-                        "empty statements are outside the arithmetic subset",
-                    ));
                 }
                 (true, TokenKind::Close)
                     if matches!(self.pending.last(), Some((Pending::Group, _))) =>
@@ -2193,7 +2200,6 @@ impl Parser<'_> {
                 }
                 (false, TokenKind::Semicolon) => break (span, false),
             }
-            seen_token = true;
             next = self.next_token()?;
         };
         self.reduce_expression()?;

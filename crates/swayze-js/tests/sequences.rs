@@ -73,6 +73,86 @@ fn simple_assignments_in_later_operands_keep_the_rhs_tag_and_store_in_order() {
 }
 
 #[test]
+fn grouped_assignment_sequences_finish_the_first_write_before_later_operands() {
+    for (source, expected) in [
+        ("let x,a=2,b=40; (x=a,b)+x", 42.0),
+        ("let x,y,z,n=2; (x=n++, y=x+n, z=y+1, x*100+y*10+z)", 256.0),
+        ("let x=8,y; (x/=y=true ? (x=2) : 100, x*10+y)", 42.0),
+        ("let x,y=7,z=1; (x=false ? y=2 : z=3, x*100+y*10+z)", 373.0),
+        ("let x=1; (x=x++, x)", 1.0),
+        ("let x=8,y; x+=(x=3, y=x+1); x*10+y", 124.0),
+        ("let x; const a=(x=2,x+1), b=x+a; b", 5.0),
+        ("let x,y; if ((x=y=1, true)) { x+=y; } x", 2.0),
+        (
+            "let x=0,n=0; for ((x+=1,0); (x+=1,x)<5; (x+=1,n++)) {} n*10+x",
+            26.0,
+        ),
+    ] {
+        assert_value(source, Value::Number(expected));
+    }
+}
+
+#[test]
+fn grouped_assignment_sequences_preserve_stored_bits_and_the_last_operand_tag() {
+    use Value::{Boolean, Null, Undefined};
+    for (source, expected) in [
+        ("let x; (x=42, null)", Null),
+        ("let x=1; (x+=1, undefined)", Undefined),
+        ("let x=0; (x=void x, x===undefined)", Boolean(true)),
+    ] {
+        assert_value(source, expected);
+    }
+    for source in [
+        "let x; (x=-0,x)",
+        "let x=0; (x*=-1,x)",
+        "let x; (x=null,-0)",
+    ] {
+        let value = parse_script(source).unwrap().evaluate().unwrap();
+        assert_eq!(value.to_bits(), (-0.0f64).to_bits(), "{source}");
+    }
+}
+
+#[test]
+fn grouped_logical_assignment_sequences_run_later_operands_on_both_paths() {
+    use Value::{Boolean, Null, Number, Undefined};
+    for (op, initial, rhs, stored, taken) in [
+        ("||=", "true", "null", Boolean(true), false),
+        ("||=", "false", "null", Null, true),
+        ("&&=", "null", "true", Null, false),
+        ("&&=", "true", "undefined", Undefined, true),
+        ("??=", "false", "true", Boolean(false), false),
+        ("??=", "undefined", "false", Boolean(false), true),
+    ] {
+        let body = format!(
+            "let x={initial}, n=0, seen;\n             const result=(x{op}((n+=1),{rhs}), n=n+10, seen=x, null);"
+        );
+        for (tail, expected) in [
+            ("x", stored),
+            ("seen", stored),
+            ("n", Number(if taken { 11.0 } else { 10.0 })),
+            ("result", Null),
+        ] {
+            assert_value(&format!("{body} {tail}"), expected);
+        }
+    }
+}
+
+#[test]
+fn grouped_assignment_sequence_checks_all_targets_even_when_skipped() {
+    for (source, len) in [
+        ("const x=1; (x/*☃*/|+=missing,0)", 2),
+        ("const x=true; (x|||=missing,0)", 3),
+        ("let x=0; { false && (|x+=1,0); let x; } x", 1),
+        ("false && (|missing=1,0)", 7),
+        ("false && (|undefined??=1,0)", 9),
+        ("let x=false; (x &&= |missing,0)", 7),
+        ("let x; const y=1; false && (x=2, y|=3,0)", 1),
+    ] {
+        assert_error_at(source, ErrorKind::Unsupported, len);
+    }
+}
+
+#[test]
 fn existing_sequence_contexts_admit_simple_chains_after_a_comma() {
     for (source, expected) in [
         ("let x=1; if (true, x=0) { x=99; } x", 0.0),
@@ -242,6 +322,17 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("let x; 0, -x|=2", 1, Unsupported),
         ("let x; 0, 1+x|=2", 1, Unsupported),
         ("let x; 0, (x)|=2", 1, Unsupported),
+        ("let x,y; (x=1, y|+=2)", 2, Unsupported),
+        ("let x; ((x)|=1,2)", 1, Unsupported),
+        ("let x; (1+x|=1,2)", 1, Unsupported),
+        ("let x; (x=|,b)", 1, Malformed),
+        ("let x; (x+=1,|)", 1, Malformed),
+        ("let x; (x=1,|,2)", 1, Malformed),
+        ("let x; (x&&=1,|", 0, Malformed),
+        ("let x; (x=1,2|", 0, Malformed),
+        ("let x; (x=1,2|;", 1, Malformed),
+        ("let x; (x=1,2|:3)", 1, Malformed),
+        ("let x; (x=1,2)|)", 1, Malformed),
         ("let x; 0, x=|, 1", 1, Malformed),
         ("let x; 0, x=|", 0, Malformed),
         ("let x; {0, x=1|} x", 1, Unsupported),
@@ -255,12 +346,11 @@ fn ungrouped_sequences_in_a_consequent_or_assignment_rhs_error_at_the_comma() {
     use ErrorKind::{Malformed, Unsupported};
     assert_error_at("(true ? 1|, 2 : 3)", Malformed, 1);
     assert_error_at("let x; (true ? 1|, x=2 : 3)", Malformed, 1);
+    assert_error_at("let x,y; (x=true ? y=1|, 2 : 3)", Malformed, 1);
+    assert_error_at("let x,y; (x=0,y=true ? 1|,2 : 3)", Malformed, 1);
     for source in [
         "let x; x=1|, 2; x",
         "let x; x=1|, x=2; x",
-        "let x; (x=1|, x)",
-        "let x; (x=1|, x=2)",
-        "let x; (x+=1|, x=2)",
         "let x; for (x=1|,x=2;;) {} x",
         "let x; for (;false;x=1|,x=2) {} x",
     ] {
@@ -414,6 +504,167 @@ fn sequence_assignment_links_have_the_same_cost_as_other_simple_prefixes() {
                 end: start + 1
             },
             "{error}"
+        );
+    }
+}
+
+#[test]
+fn opening_the_sequence_keeps_the_group_and_only_adds_normal_comma_costs() {
+    for (operator, instructions, stack, before_binary_or_store) in
+        [("=", 8, 1, 5), ("+=", 10, 2, 6), ("||=", 10, 1, 7)]
+    {
+        let source = format!("let x;(x{operator}true,null,false)");
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 12,
+            max_nesting_depth: 1,
+            // All instruction emissions, a group marker and its assignment
+            // attachment, and a two-unit lookup for the single write site.
+            max_work: source.len() + instructions + 4,
+        };
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions, "{source}");
+        assert_eq!(script.max_stack_depth(), stack, "{source}");
+        assert_eq!(
+            script.evaluate_value(),
+            Ok(Value::Boolean(false)),
+            "{source}"
+        );
+
+        let comma = source.find(',').unwrap();
+        let at_assignment_end = comma + 1 + before_binary_or_store;
+        let store = at_assignment_end + usize::from(operator == "+=");
+        let span = |start, len| Span {
+            start,
+            end: start + len,
+        };
+        let mut cases = vec![
+            (
+                Limits {
+                    max_work: store,
+                    ..limits
+                },
+                Limit::Work,
+                span(comma, 1),
+            ),
+            (
+                Limits {
+                    max_work: store + 1,
+                    ..limits
+                },
+                Limit::Work,
+                span(comma, 1),
+            ),
+            (
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+                Limit::Work,
+                span(7, 1),
+            ),
+            (
+                Limits {
+                    max_tokens: 11,
+                    ..limits
+                },
+                Limit::Tokens,
+                span(source.len() - 1, 1),
+            ),
+        ];
+        if operator == "+=" {
+            cases.push((
+                Limits {
+                    max_work: at_assignment_end,
+                    ..limits
+                },
+                Limit::Work,
+                span(8, 2),
+            ));
+        }
+        for (limits, limit, expected) in cases {
+            let error = parse_script_with_limits(&source, limits).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::LimitExceeded(limit),
+                "{source}: {error}"
+            );
+            assert_eq!(error.span(), expected, "{source}: {error}");
+        }
+    }
+}
+
+#[test]
+fn the_outer_group_counts_against_the_nesting_cap_after_the_first_comma() {
+    for (source, opener) in [("let x;(x=1,(null))", "(null"), ("let x;(x=1,x=2)", "=2")] {
+        let limits = Limits {
+            max_nesting_depth: 2,
+            ..Limits::default()
+        };
+        let script = parse_script_with_limits(source, limits).unwrap();
+        assert_eq!(script.max_stack_depth(), 1, "{source}");
+        let error = parse_script_with_limits(
+            source,
+            Limits {
+                max_nesting_depth: 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ErrorKind::LimitExceeded(Limit::NestingDepth),
+            "{source}"
+        );
+        let start = source.find(opener).unwrap();
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            },
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_skipped_grouped_assignment_still_counts_toward_the_prepared_ceiling() {
+    let tail = ",null".repeat(2045);
+    let limits = Limits {
+        max_tokens: 4100,
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for (prefix, instructions, result) in [
+        ("", 4096, Ok(Value::Null)),
+        ("!", 4097, Err(EvalError::LimitExceeded)),
+    ] {
+        let source = format!("let x;(x&&={prefix}true{tail})");
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(script.evaluate_value(), result);
+    }
+}
+
+#[test]
+fn grouped_logical_assignment_sequences_obey_the_dispatch_ceiling_on_both_paths() {
+    // Four initialization dispatches, then on each iteration four for the test,
+    // two for the load and branch, two extra on take for the RHS and store,
+    // one for each Discard (comma and semicolon), one update and one back edge.
+    // The final failed test costs four. Pad the final expression to 16,384.
+    for (initial, iterations, prefix_count) in [(true, 1637, 5), (false, 1364, 7)] {
+        let evaluate = |prefix_count| {
+            let prefix = "+ ".repeat(prefix_count);
+            let source =
+                format!("let x={initial},n=0; while(n<{iterations}){{(x||=false,n++);}} {prefix}n");
+            parse_script(&source).unwrap().evaluate()
+        };
+        assert_eq!(evaluate(prefix_count), Ok(f64::from(iterations)));
+        assert_eq!(
+            evaluate(prefix_count + 1),
+            Err(EvalError::DispatchLimitExceeded)
         );
     }
 }

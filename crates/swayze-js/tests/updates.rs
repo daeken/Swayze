@@ -441,7 +441,7 @@ fn expression_updates_require_one_bare_name_and_do_not_relax_assignment_grammar(
         ("let x=0;let y=++x@+=@2;y", "assignment expressions"),
         ("let x=0;if(0,x++@=@1){}0", "assignment expressions"),
         ("let x=0;(0, ++x@=@1)", "assignment expressions"),
-        ("let x=0;(x = x++@,@0)", "sequence in an assignment RHS"),
+        ("let x=0;x = x++@,@0; x", "sequence in an assignment RHS"),
     ] {
         assert_error(source, Unsupported, message);
     }

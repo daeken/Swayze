@@ -2251,6 +2251,23 @@ impl Parser<'_> {
         Ok(())
     }
 
+    fn finish_group_assignment(&mut self, end: Span) -> Result<(), Error> {
+        if let Some((pending, operator)) = self.pending.last_mut()
+            && let Pending::AssignmentGroup {
+                access,
+                tail,
+                rhs_base_depth,
+            } = *pending
+        {
+            // The assignment ends here, but only ')' can close the group.
+            // Reuse the marker and its nesting slot for the rest of the sequence.
+            *pending = Pending::Group;
+            let operator = *operator;
+            self.finish_expression_assignment(access, tail, rhs_base_depth, operator, end)?;
+        }
+        Ok(())
+    }
+
     fn finish_expression_assignment(
         &mut self,
         access: usize,
@@ -2274,7 +2291,6 @@ impl Parser<'_> {
             // the old value on skip, or the RHS after the store.
             self.patch_jump(skip, end)?;
         }
-        self.nesting_depth -= 1;
         Ok(())
     }
 
@@ -2648,6 +2664,7 @@ impl Parser<'_> {
                     // Comma is looser than ?: and =. Finish the RHS before
                     // deciding which surrounding grammar production owns the comma.
                     self.reduce_expression(span)?;
+                    self.finish_group_assignment(span)?;
                     match self.pending.last() {
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(span, "expected ':' before ','"));
@@ -2709,6 +2726,7 @@ impl Parser<'_> {
                 }
                 (false, TokenKind::Close) => {
                     self.reduce_expression(span)?;
+                    self.finish_group_assignment(span)?;
                     match self.pending.pop() {
                         Some((Pending::StatementTest, _)) => {
                             self.nesting_depth -= 1;
@@ -2716,22 +2734,6 @@ impl Parser<'_> {
                             break (span, Some(kind));
                         }
                         Some((Pending::Group, _)) => self.nesting_depth -= 1,
-                        Some((
-                            Pending::AssignmentGroup {
-                                access,
-                                tail,
-                                rhs_base_depth,
-                            },
-                            operator,
-                        )) => {
-                            self.finish_expression_assignment(
-                                access,
-                                tail,
-                                rhs_base_depth,
-                                operator,
-                                span,
-                            )?;
-                        }
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(
                                 span,
@@ -2943,6 +2945,7 @@ impl Parser<'_> {
                         span,
                         end,
                     )?;
+                    self.nesting_depth -= 1;
                 }
                 _ => break,
             }

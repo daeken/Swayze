@@ -1,6 +1,40 @@
 use crate::{InstantiationError, Trap};
 use std::{cell::Cell, fmt};
 
+pub(super) const MEMORY_PAGE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AccessWidth {
+    Byte = 1,
+    Halfword = 2,
+    Word = 4,
+}
+
+impl AccessWidth {
+    pub(super) const fn alignment_exponent(self) -> u32 {
+        (self as u32).trailing_zeros()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LoadKind {
+    Full,
+    ByteSigned,
+    ByteUnsigned,
+    HalfwordSigned,
+    HalfwordUnsigned,
+}
+
+impl LoadKind {
+    pub(super) const fn width(self) -> AccessWidth {
+        match self {
+            Self::Full => AccessWidth::Word,
+            Self::ByteSigned | Self::ByteUnsigned => AccessWidth::Byte,
+            Self::HalfwordSigned | Self::HalfwordUnsigned => AccessWidth::Halfword,
+        }
+    }
+}
+
 pub(super) struct DataSegment {
     // The bit pattern decoded from the signed LEB32 constant.
     pub(super) offset: u32,
@@ -50,25 +84,47 @@ impl LinearMemory {
         Ok(Self(bytes))
     }
 
-    fn word(&self, base: i32, offset: u32) -> Result<&[Cell<u8>], Trap> {
+    pub(super) fn size_in_pages(&self) -> i32 {
+        (self.0.len() / MEMORY_PAGE_BYTES) as i32
+    }
+
+    fn access(&self, base: i32, offset: u32, width: AccessWidth) -> Result<&[Cell<u8>], Trap> {
         // Each input has at most 32 bits. Both the unsigned effective address
         // and its exclusive end fit in u64 without wrapping. Only narrow after
         // checking the entire range against the actual allocation length.
         let start = u64::from(base as u32) + u64::from(offset);
-        let end = start + 4;
+        let end = start + width as u64;
         if end > self.0.len() as u64 {
             return Err(Trap::MemoryOutOfBounds);
         }
         Ok(&self.0[start as usize..end as usize])
     }
 
-    pub(super) fn load_i32(&self, base: i32, offset: u32) -> Result<i32, Trap> {
-        let bytes = self.word(base, offset)?;
-        Ok(i32::from_le_bytes(std::array::from_fn(|i| bytes[i].get())))
+    pub(super) fn load_i32(&self, base: i32, offset: u32, kind: LoadKind) -> Result<i32, Trap> {
+        let bytes = self.access(base, offset, kind.width())?;
+        let mut le = [0; 4];
+        for (dst, byte) in le.iter_mut().zip(bytes) {
+            *dst = byte.get();
+        }
+        let value = i32::from_le_bytes(le);
+        // The zero padding already handles unsigned extension.
+        Ok(match kind {
+            LoadKind::ByteSigned => i32::from(value as i8),
+            LoadKind::HalfwordSigned => i32::from(value as i16),
+            LoadKind::Full | LoadKind::ByteUnsigned | LoadKind::HalfwordUnsigned => value,
+        })
     }
 
-    pub(super) fn store_i32(&self, base: i32, offset: u32, value: i32) -> Result<(), Trap> {
-        let bytes = self.word(base, offset)?;
+    pub(super) fn store_i32(
+        &self,
+        base: i32,
+        offset: u32,
+        width: AccessWidth,
+        value: i32,
+    ) -> Result<(), Trap> {
+        // The range is checked before setting any cell. Zipping with the slice
+        // writes only the low bytes of the i32.
+        let bytes = self.access(base, offset, width)?;
         for (byte, value) in bytes.iter().zip(value.to_le_bytes()) {
             byte.set(value);
         }

@@ -16,10 +16,12 @@
 //! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
 //! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
-//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `i32.load`, `i32.store`, `call`,
-//! `if (result i32) ... else ... end`, `block (result i32) ... end`,
-//! `loop ... end`, and `br_if 0`. Local indices start at zero and address
-//! parameters first, then locals in declaration order. Both can be assigned.
+//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `i32.load`, `i32.load8_s`,
+//! `i32.load8_u`, `i32.load16_s`, `i32.load16_u`, `i32.store`, `i32.store8`,
+//! `i32.store16`, `memory.size`, `call`, `if (result i32) ... else ... end`,
+//! `block (result i32) ... end`, `loop ... end`, and `br_if 0`. Local indices
+//! start at zero and address parameters first, then locals in declaration order.
+//! Both can be assigned.
 //! `call` takes an unsigned LEB32 index into the exact function declarations,
 //! including forward and self references. The control constructs may nest
 //! together. `if` and `block` accept only block type byte `0x7f` (one i32 result,
@@ -35,10 +37,13 @@
 //! (minimum only) or `0x01` (minimum and maximum), followed by unsigned LEB32
 //! page counts. The minimum and any explicit maximum must be zero or one
 //! 64-KiB page, and the maximum must not be less than the minimum. The minimum
-//! is the fixed instance size; there is no growth or `memory.size` instruction.
-//! `i32.load` and `i32.store` require a defined memory (even zero pages) and
-//! take an unsigned LEB32 alignment exponent of 0, 1, or 2 and an unsigned
-//! LEB32 byte offset. Other memory instructions are unsupported.
+//! is the fixed instance size. Loads, stores, and `memory.size` require a
+//! defined memory, which may have zero pages. Loads and stores take an unsigned
+//! LEB32 alignment exponent and an unsigned LEB32 byte offset. The exponent
+//! must be 0 for byte accesses, at most 1 for 16-bit accesses, and at most 2 for
+//! 32-bit accesses.
+//! `memory.size` takes a literal reserved byte `0x00`, not a general LEB32 index.
+//! Other memory instructions, including `memory.grow`, are unsupported.
 //!
 //! The optional data section (ID 11) follows code, if present, and any memory
 //! section. It may contain zero to eight active segments with at most 64 KiB of
@@ -64,9 +69,9 @@
 //! `i32.eqz` consumes one and pushes one, and the binary operators consume two
 //! and push one. `call` consumes as many i32s as the target function's type has
 //! parameters (the top operand is the last parameter) and pushes one result.
-//! `i32.load` consumes an i32 base address and pushes the loaded i32.
-//! `i32.store` consumes an i32 address followed by an i32 value from the stack
-//! (value on top) and produces no result.
+//! Loads consume an i32 base address and push an i32. Stores consume an i32
+//! address and an i32 value (value on top) and produce no result. `memory.size`
+//! takes no operands and pushes the instance's actual page count (0 or 1).
 //! `if` consumes an i32 condition from above the enclosing frame's operand floor
 //! and saves the remaining depth as the floor for both arms. `else` checks for
 //! exactly one new result and resets validation to the saved depth, and the
@@ -127,11 +132,13 @@
 //! division truncates toward zero, and a nonzero signed remainder has the sign
 //! of the dividend. Unsigned division and remainder interpret the operand bits
 //! as `u32` and preserve the result bits in the returned `i32` value.
-//! Memory instructions add the base bits interpreted as `u32` and the `u32`
-//! offset in `u64`, without wrapping at 32 bits. The entire four-byte range
+//! Loads and stores add the base bits interpreted as `u32` and the `u32` offset
+//! in `u64`, without wrapping at 32 bits. The entire 1-, 2-, or 4-byte range
 //! must be in bounds, or the instruction returns [`Trap::MemoryOutOfBounds`]
 //! without reading or writing any bytes. Accesses are little-endian and may
 //! be unaligned; validated alignment annotations do not constrain addresses.
+//! Narrow loads sign-extend (`_s`) or zero-extend (`_u`) to i32, and narrow
+//! stores write only the low 8 or 16 bits of the value.
 //!
 //! A zero right operand traps for all four division and remainder instructions.
 //! `i32::MIN / -1` traps for signed division; signed remainder for those operands
@@ -141,11 +148,11 @@
 //! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
-//! including a memory access, a `call`, an `if` test, an executed `else` jump,
-//! or a `br_if` with either outcome. Skipped instructions, `block`, `loop`, and
-//! `end` delimiters, and returning from frames cost nothing. A continue does
-//! not reset the budget:
-//! all loop iterations and calls share it, including recursive guest calls.
+//! including a memory instruction, a `call`, an `if` test, an executed `else`
+//! jump, or a `br_if` with either outcome. Skipped instructions, `block`,
+//! `loop`, and `end` delimiters, and returning from frames cost nothing. A
+//! continue does not reset the budget: all loop iterations and calls share it,
+//! including recursive guest calls.
 //! An invocation can return just after its last allowed dispatch. If the next
 //! instruction would exceed the dispatch budget, that limit takes precedence
 //! over executing it.
@@ -192,13 +199,15 @@
 //! stack prefix, different taken and fallthrough stack effects, full body
 //! validation, shared caps, and the exact dispatch boundary in a called loop
 //! and instance reuse after hitting the limit.
-//! Memory tests cover exact limits and memarg decoding within section and body
-//! frames, ordering and unsupported features, operand floors (including untaken
-//! arms), unexported bodies, zero pages and zero initialization, overlapping
-//! little-endian and unaligned accesses, the last complete word, partial-store
-//! prevention, widened address arithmetic, independent instances, and sharing
-//! across calls and exports. They also check store persistence and suppression
-//! of later stores after guest traps or dispatch exhaustion.
+//! Memory tests cover exact limits, width-specific alignment and framed memarg
+//! decoding, actual page counts and the reserved `memory.size` byte, absent and
+//! zero-page memory, ordering and unsupported features, operand floors and
+//! validation in untaken arms and unexported bodies, and zero initialization.
+//! They exercise narrow-load sign boundaries, truncating stores, overlapping
+//! little-endian and unaligned accesses, end-of-page accesses and straddles,
+//! partial-store prevention, widened address arithmetic, independent instances,
+//! and sharing across calls and exports. They also check store persistence
+//! and suppression of later stores after guest traps or dispatch exhaustion.
 //! Data tests cover section order and framing, index and offset encodings, the
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap

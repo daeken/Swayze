@@ -8,6 +8,15 @@ const ONE_PAGE: &[u8] = &[1, 0, 1];
 const TWO_BOUNDS: &[u8] = &[1, 1, 1, 1];
 const LOAD: u8 = 0x28;
 const STORE: u8 = 0x36;
+const LOAD8_S: u8 = 0x2c;
+const LOAD8_U: u8 = 0x2d;
+const LOAD16_S: u8 = 0x2e;
+const LOAD16_U: u8 = 0x2f;
+const STORE8: u8 = 0x3a;
+const STORE16: u8 = 0x3b;
+const SIZE: u8 = 0x3f;
+const LOADS: [u8; 5] = [LOAD, LOAD8_S, LOAD8_U, LOAD16_S, LOAD16_U];
+const STORES: [u8; 3] = [STORE, STORE8, STORE16];
 const READ: &[u8] = &[0, 0x20, 0, LOAD, 2, 0, 0x0b];
 const WRITE: &[u8] = &[0, 0x20, 0, 0x20, 1, STORE, 2, 0, 0x41, 42, 0x0b];
 const OOB: InvokeError = InvokeError::Trap(Trap::MemoryOutOfBounds);
@@ -29,6 +38,34 @@ fn memory_functions(
         (10, &code_bodies(bodies)),
     ]))
     .unwrap()
+}
+
+fn all_widths(memory: &[u8]) -> Module {
+    memory_functions(
+        memory,
+        &[1, 2],
+        &[0, 1, 0, 0, 0, 0, 1, 1],
+        &[
+            (b"read", 0),
+            (b"write", 1),
+            (b"read8_s", 2),
+            (b"read8_u", 3),
+            (b"read16_s", 4),
+            (b"read16_u", 5),
+            (b"write8", 6),
+            (b"write16", 7),
+        ],
+        &[
+            READ,
+            WRITE,
+            &[0, 0x20, 0, LOAD8_S, 0, 0, 0x0b],
+            &[0, 0x20, 0, LOAD8_U, 0, 0, 0x0b],
+            &[0, 0x20, 0, LOAD16_S, 1, 0, 0x0b],
+            &[0, 0x20, 0, LOAD16_U, 0, 0, 0x0b],
+            &[0, 0x20, 0, 0x20, 1, STORE8, 0, 0, 0x41, 42, 0x0b],
+            &[0, 0x20, 0, 0x20, 1, STORE16, 1, 0, 0x41, 42, 0x0b],
+        ],
+    )
 }
 
 fn bad_memory_body(memory: &[u8], body: &[u8], offset: usize, kind: ErrorKind) {
@@ -194,7 +231,7 @@ fn rejects_memory_exports_and_other_memory_features() {
         }
         expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id });
     }
-    for opcode in [0x3f, 0x40, 0xfc] {
+    for opcode in [0x29, 0x30, 0x37, 0x3c, 0x40, 0xfc] {
         bad_memory_body(
             ONE_PAGE,
             &[0, 0x41, 0, opcode, 0, 0x0b],
@@ -208,7 +245,16 @@ fn rejects_memory_exports_and_other_memory_features() {
 fn checks_memory_presence_and_framed_memarg_immediates() {
     use IntegerField::{MemoryAlignment, MemoryOffset};
 
-    for opcode in [LOAD, STORE] {
+    for (opcode, natural) in [
+        (LOAD, 2),
+        (STORE, 2),
+        (LOAD8_S, 0),
+        (LOAD8_U, 0),
+        (STORE8, 0),
+        (LOAD16_S, 1),
+        (LOAD16_U, 1),
+        (STORE16, 1),
+    ] {
         let body = [0, 0x41, 0, 0x41, 0, opcode, 0, 0, 0x0b];
         bad_body(&body, 5, ErrorKind::MissingMemory);
         bad_memory_body(&[0], &body, 5, ErrorKind::MissingMemory);
@@ -235,12 +281,14 @@ fn checks_memory_presence_and_framed_memarg_immediates() {
             }
         }
         let mut bad_alignment = body;
-        bad_alignment[6] = 3;
+        bad_alignment[6] = natural + 1;
         bad_memory_body(
             ONE_PAGE,
             &bad_alignment,
             6,
-            ErrorKind::InvalidMemoryAlignment { exponent: 3 },
+            ErrorKind::InvalidMemoryAlignment {
+                exponent: u32::from(natural + 1),
+            },
         );
         let max_exponent = [&body[..6], &[0xff, 0xff, 0xff, 0xff, 0x0f], &body[7..]].concat();
         bad_memory_body(
@@ -260,11 +308,7 @@ fn checks_load_and_store_stack_effects_above_each_control_floor() {
     const THEN: &[u8] = &[0, 0x41, 0, 0x41, 0, 0x04, 0x7f];
     const ELSE: &[u8] = &[0, 0x41, 0, 0x41, 1, 0x04, 0x7f, 0x41, 0, 0x05];
     for prefix in [&[0][..], BLOCK, LOOP, THEN, ELSE] {
-        for (code, depth) in [
-            (&[LOAD, 0, 0][..], 0),
-            (&[STORE, 0, 0][..], 0),
-            (&[0x41, 1, STORE, 0, 0][..], 1),
-        ] {
+        let underflow = |code: &[u8], depth| {
             let body = [prefix, code].concat();
             bad_memory_body(
                 ONE_PAGE,
@@ -272,15 +316,23 @@ fn checks_load_and_store_stack_effects_above_each_control_floor() {
                 body.len() - 3,
                 ErrorKind::StackUnderflow { depth },
             );
+        };
+        for opcode in LOADS.into_iter().chain(STORES) {
+            underflow(&[opcode, 0, 0], 0);
+        }
+        for opcode in STORES {
+            underflow(&[0x41, 1, opcode, 0, 0], 1);
         }
     }
     // A successful store has no result.
-    bad_memory_body(
-        ONE_PAGE,
-        &[0, 0x41, 0, 0x41, 1, STORE, 0, 0, 0x0b],
-        8,
-        ErrorKind::InvalidResultDepth { depth: 0 },
-    );
+    for opcode in STORES {
+        bad_memory_body(
+            ONE_PAGE,
+            &[0, 0x41, 0, 0x41, 1, opcode, 0, 0, 0x0b],
+            8,
+            ErrorKind::InvalidResultDepth { depth: 0 },
+        );
+    }
 }
 
 #[test]
@@ -298,17 +350,131 @@ fn validates_an_unexported_body_and_its_tail_even_after_a_trapping_load() {
 #[test]
 fn a_defined_zero_page_memory_validates_but_every_access_traps() {
     for memory in [&[1, 0, 0][..], &[1, 1, 0, 0], &[1, 1, 0, 1]] {
-        let module = memory_functions(
-            memory,
-            &[1, 2],
-            &[0, 1],
-            &[(b"read", 0), (b"write", 1)],
-            &[READ, WRITE],
-        );
+        let module = all_widths(memory);
         let instance = module.instantiate().unwrap();
-        assert_eq!(instance.invoke_i32_with_args("read", &[0]), Err(OOB));
-        assert_eq!(instance.invoke_i32_with_args("write", &[0, 42]), Err(OOB));
+        for name in ["read", "read8_s", "read8_u", "read16_s", "read16_u"] {
+            assert_eq!(instance.invoke_i32_with_args(name, &[0]), Err(OOB));
+        }
+        for name in ["write", "write8", "write16"] {
+            assert_eq!(instance.invoke_i32_with_args(name, &[0, 42]), Err(OOB));
+        }
     }
+}
+
+#[test]
+fn memory_size_pushes_the_actual_page_count_not_the_maximum() {
+    for (limits, expected) in [
+        (&[1, 0, 0][..], 0),
+        (&[1, 1, 0, 0][..], 0),
+        (&[1, 1, 0, 1][..], 0),
+        (ONE_PAGE, 1),
+        (TWO_BOUNDS, 1),
+    ] {
+        let module = memory_functions(limits, &[0], &[0], &[(b"size", 0)], &[&[0, SIZE, 0, 0x0b]]);
+        assert_eq!(
+            module.instantiate().unwrap().invoke_i32("size"),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn memory_size_push_counts_toward_the_operand_limit() {
+    let limit = Limit::OperandStackDepth;
+    let body = |prefix_depth| {
+        let mut body = vec![0];
+        body.extend([0x41, 1].repeat(prefix_depth));
+        body.extend([SIZE, 0]);
+        body.extend(std::iter::repeat_n(0x6a, prefix_depth)); // reduce to one result
+        body.push(0x0b);
+        body
+    };
+    let cap = limit.maximum();
+    let module = memory_functions(ONE_PAGE, &[0], &[0], &[(b"sum", 0)], &[&body(cap - 1)]);
+    assert_eq!(
+        module.instantiate().unwrap().invoke_i32("sum"),
+        Ok(cap as i32)
+    );
+    bad_memory_body(
+        ONE_PAGE,
+        &body(cap),
+        1 + 2 * cap,
+        ErrorKind::LimitExceeded { limit },
+    );
+}
+
+#[test]
+fn memory_size_requires_defined_memory_and_a_literal_zero_byte_even_in_untaken_code() {
+    // The second prefix is the start of an untaken then arm.
+    for prefix in [&[0][..], &[0, 0x41, 0, 0x04, 0x7f]] {
+        let body = [prefix, &[SIZE, 0]].concat();
+        bad_body(&body, prefix.len(), ErrorKind::MissingMemory);
+        bad_memory_body(&[0], &body, prefix.len(), ErrorKind::MissingMemory);
+        bad_memory_body(
+            ONE_PAGE,
+            &body[..body.len() - 1],
+            prefix.len() + 1,
+            ErrorKind::TruncatedByte { expected: 0 },
+        );
+        // Nonzero indices and the padded LEB32 encoding of zero are invalid.
+        for found in [1, 0x80, 0xff] {
+            bad_memory_body(
+                ONE_PAGE,
+                &[prefix, &[SIZE, found, 0, 0x0b]].concat(),
+                prefix.len() + 1,
+                ErrorKind::UnexpectedByte { expected: 0, found },
+            );
+        }
+    }
+}
+
+#[test]
+fn narrow_loads_extend_at_sign_boundaries_and_stores_truncate_in_little_endian_order() {
+    let module = all_widths(ONE_PAGE);
+    let instance = module.instantiate().unwrap();
+    let read = |name, address| instance.invoke_i32_with_args(name, &[address]);
+    let write = |name, address, value| instance.invoke_i32_with_args(name, &[address, value]);
+    assert_eq!(write("write", 0, 0x4433_2211), Ok(42));
+    // Address 1 is unaligned for 16 bits even with the natural alignment hint.
+    for (value, signed) in [(0x7fff, 32767), (0x8000, -32768), (0xffff, -1)] {
+        assert_eq!(write("write16", 1, 0x1234_0000 | value), Ok(42));
+        assert_eq!(read("read16_s", 1), Ok(signed));
+        assert_eq!(read("read16_u", 1), Ok(value));
+        assert_eq!(read("read", 0), Ok(0x4400_0011 | (value << 8)));
+        assert_eq!(read("read8_u", 1), Ok(value & 0xff));
+        assert_eq!(read("read8_u", 2), Ok(value >> 8));
+    }
+    for (value, signed) in [(0x7f, 127), (0x80, -128), (0xff, -1)] {
+        assert_eq!(write("write8", 2, 0x1234_5600 | value), Ok(42));
+        assert_eq!(read("read8_s", 2), Ok(signed));
+        assert_eq!(read("read8_u", 2), Ok(value));
+        assert_eq!(read("read16_u", 2), Ok(0x4400 | value));
+        assert_eq!(read("read", 0), Ok(0x4400_ff11 | (value << 16)));
+    }
+}
+
+#[test]
+fn narrow_accesses_check_their_full_width_at_the_end_of_memory() {
+    let module = all_widths(ONE_PAGE);
+    let instance = module.instantiate().unwrap();
+    let read = |name, address| instance.invoke_i32_with_args(name, &[address]);
+    let write = |name, address, value| instance.invoke_i32_with_args(name, &[address, value]);
+    assert_eq!(write("write", PAGE - 4, 0x4433_2211), Ok(42));
+    assert_eq!(write("write16", PAGE - 2, 0x0123_89ab), Ok(42));
+    assert_eq!(read("read16_s", PAGE - 2), Ok(-30293));
+    assert_eq!(read("read16_u", PAGE - 2), Ok(0x89ab));
+    assert_eq!(write("write8", PAGE - 1, 0x0123_45fe), Ok(42));
+    assert_eq!(read("read8_s", PAGE - 1), Ok(-2));
+    assert_eq!(read("read8_u", PAGE - 1), Ok(254));
+    for name in ["read16_s", "read16_u"] {
+        assert_eq!(read(name, PAGE - 1), Err(OOB));
+    }
+    for name in ["read8_s", "read8_u"] {
+        assert_eq!(read(name, PAGE), Err(OOB));
+    }
+    assert_eq!(write("write16", PAGE - 1, -1), Err(OOB));
+    assert_eq!(write("write8", PAGE, -1), Err(OOB));
+    assert_eq!(read("read", PAGE - 4), Ok(0xfeab_2211u32 as i32));
 }
 
 #[test]
@@ -374,43 +540,54 @@ fn checks_the_last_word_and_never_writes_part_of_an_out_of_bounds_store() {
 
 #[test]
 fn effective_addresses_do_not_wrap_at_32_bits() {
-    let read_plus_1 = &[0, 0x20, 0, LOAD, 2, 1, 0x0b];
-    let write_plus_1 = &[0, 0x20, 0, 0x20, 1, STORE, 2, 1, 0x41, 42, 0x0b];
-    let read_max = &[0, 0x20, 0, LOAD, 2, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b];
-    let write_max = &[
-        0, 0x20, 0, 0x20, 1, STORE, 2, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x41, 42, 0x0b,
-    ];
-    let module = memory_functions(
-        ONE_PAGE,
-        &[1, 2],
-        &[0, 1, 0, 1, 0],
-        &[
-            (b"read1", 0),
-            (b"write1", 1),
-            (b"read_max", 2),
-            (b"write_max", 3),
-            (b"read", 4),
-        ],
-        &[read_plus_1, write_plus_1, read_max, write_max, READ],
-    );
-    let instance = module.instantiate().unwrap();
-    // Each sum would hit an in-bounds address if base+offset were wrapping u32.
-    // For (-1, 1), adding the base as a signed i32 would also get this wrong.
-    for (read, write, base) in [
-        ("read1", "write1", -1),
-        ("read_max", "write_max", 1),
-        ("read_max", "write_max", PAGE),
+    for (load, store, width) in [
+        (LOAD, STORE, 4),
+        (LOAD8_U, STORE8, 1),
+        (LOAD16_S, STORE16, 2),
     ] {
-        assert_eq!(instance.invoke_i32_with_args(read, &[base]), Err(OOB));
-        assert_eq!(instance.invoke_i32_with_args(write, &[base, 123]), Err(OOB));
+        let read_plus_1 = &[0, 0x20, 0, load, 0, 1, 0x0b];
+        let write_plus_1 = &[0, 0x20, 0, 0x20, 1, store, 0, 1, 0x41, 42, 0x0b];
+        let read_max = &[0, 0x20, 0, load, 0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b];
+        let write_max = &[
+            0, 0x20, 0, 0x20, 1, store, 0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x41, 42, 0x0b,
+        ];
+        let module = memory_functions(
+            ONE_PAGE,
+            &[1, 2],
+            &[0, 1, 0, 1, 0],
+            &[
+                (b"read1", 0),
+                (b"write1", 1),
+                (b"read_max", 2),
+                (b"write_max", 3),
+                (b"read", 4),
+            ],
+            &[read_plus_1, write_plus_1, read_max, write_max, READ],
+        );
+        let instance = module.instantiate().unwrap();
+        // Each sum would wrap to an in-bounds address in u32. The base -1
+        // must also be treated as unsigned before addition.
+        for (read, write, base) in [
+            ("read1", "write1", -1),
+            ("read_max", "write_max", 1),
+            ("read_max", "write_max", PAGE - width + 1),
+        ] {
+            assert_eq!(instance.invoke_i32_with_args(read, &[base]), Err(OOB));
+            assert_eq!(instance.invoke_i32_with_args(write, &[base, 123]), Err(OOB));
+        }
+        assert_eq!(instance.invoke_i32_with_args("read", &[0]), Ok(0));
+        assert_eq!(instance.invoke_i32_with_args("read", &[PAGE - 4]), Ok(0));
+        let last = PAGE - width - 1;
+        assert_eq!(
+            instance.invoke_i32_with_args("write1", &[last, 123]),
+            Ok(42)
+        );
+        assert_eq!(instance.invoke_i32_with_args("read1", &[last]), Ok(123));
+        assert_eq!(
+            instance.invoke_i32_with_args("read1", &[last + 1]),
+            Err(OOB)
+        );
     }
-    assert_eq!(instance.invoke_i32_with_args("read", &[0]), Ok(0));
-    assert_eq!(instance.invoke_i32_with_args("read", &[PAGE - 4]), Ok(0));
-    assert_eq!(instance.invoke_i32_with_args("read1", &[PAGE - 5]), Ok(0));
-    assert_eq!(
-        instance.invoke_i32_with_args("read1", &[PAGE - 4]),
-        Err(OOB)
-    );
 }
 
 #[test]

@@ -242,6 +242,19 @@ fn validates_untaken_else_if_tests_and_rejects_arm_local_accesses() {
             "{source}"
         );
     }
+    // The same isolation holds between two consecutive else-if arms.
+    let source = "if (true) {} else if (false) { let prior=1; } else if (prior) {} 42";
+    let start = source.rfind("prior").unwrap();
+    let error = parse_script(source).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        error.span(),
+        Span {
+            start,
+            end: start + "prior".len(),
+        }
+    );
+
     for (source, name) in [
         (
             "if (true) {} else if (false) { let hidden=1; } hidden",
@@ -348,23 +361,12 @@ fn else_if_counts_each_tested_arm_against_the_shared_frame_cap() {
         assert_eq!(script.evaluate(), Ok(42.0));
     }
     let prefix = format!("{chain}else ");
-    // An enclosing loop and bare block leave room for only 126 tested arms.
-    let nested = format!(
-        "while(false){{{{if(false){{}}{}",
-        "else if(false){}".repeat(125)
-    );
-    assert!(parse_script_with_limits(&format!("{nested}}}}}42"), limits).is_ok());
     for (source, start, len) in [
         (format!("{prefix}if(true){{}}42"), prefix.len(), 2),
         (
             format!("{chain}else{{{{}}}}42"),
             chain.len() + "else{".len(),
             1,
-        ),
-        (
-            format!("{nested}else if(true){{}}}}}}42"),
-            nested.len() + "else ".len(),
-            2,
         ),
     ] {
         let error = parse_script_with_limits(&source, limits).unwrap_err();
@@ -381,19 +383,66 @@ fn else_if_counts_each_tested_arm_against_the_shared_frame_cap() {
 }
 
 #[test]
-fn else_if_meters_all_frames_tests_and_fixups_once() {
-    for arms in [2, 128] {
+fn else_if_shares_the_frame_cap_with_bare_blocks_and_loops() {
+    // The outer while and a bare block leave room for 126 tested arms. The
+    // final else reuses the deepest frame, and break still finds the while.
+    let prefix = format!(
+        "let x=0;while(true){{{{if(false){{}}{}else ",
+        "else if(false){}".repeat(125)
+    );
+    let suffix = "}break;}x";
+    let limits = Limits {
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    let source = format!("{prefix}{{x=42;}}{suffix}");
+    assert_eq!(
+        parse_script_with_limits(&source, limits)
+            .unwrap()
+            .evaluate(),
+        Ok(42.0)
+    );
+    for (arm, offset, len) in [
+        ("if(true){}", 0, 2),
+        ("{{}}", 1, 1),
+        ("{while(false){}}", 1, 5),
+    ] {
+        let source = format!("{prefix}{arm}{suffix}");
+        let error = parse_script_with_limits(&source, limits).unwrap_err();
+        let start = prefix.len() + offset;
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + len
+            },
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn if_work_budgets_include_every_jump_fixup() {
+    // Beyond source bytes: each test uses a paren marker, frame, two
+    // emissions and a false-edge fixup. Each alternate requires a jump to
+    // the join and its fixup. The final Boolean costs one more emission.
+    for (arms, fallback, work_beyond_source) in [
+        (1, "", 6),
+        (1, "else{}", 8),
+        (3, "", 20),
+        (3, "else{}", 22),
+        (128, "else{}", 897),
+    ] {
         let source = format!(
-            "if(true){{}}{}else{{}}true",
+            "if(true){{}}{}{fallback}true",
             "else if(false){}".repeat(arms - 1)
         );
         let limits = Limits {
             max_source_bytes: source.len(),
-            max_tokens: 6 + (arms - 1) * 7 + 3 + 1,
+            max_tokens: 6 + (arms - 1) * 7 + usize::from(!fallback.is_empty()) * 3 + 1,
             max_nesting_depth: 1,
-            // Per tested arm: a paren marker, a frame, three emissions,
-            // and two jump patches. Finally, one result emission.
-            max_work: source.len() + 7 * arms + 1,
+            max_work: source.len() + work_beyond_source,
         };
         assert_eq!(
             parse_script_with_limits(&source, limits)
@@ -401,9 +450,12 @@ fn else_if_meters_all_frames_tests_and_fixups_once() {
                 .evaluate_value(),
             Ok(Value::Boolean(true))
         );
-        // Exhaust the work meter at the last join patch, not while emitting
-        // an instruction or scanning the following expression.
         let close = source.rfind('}').unwrap();
+        let result_start = close + 1;
+        // Just enough work to arrive at the final fixup, which has not run
+        // yet. Without a final else, lookahead has already scanned `true`.
+        let work_before_final_fixup =
+            limits.max_work - 2 - if fallback.is_empty() { 0 } else { "true".len() };
         for (kind, span, limits) in [
             (
                 Limit::Work,
@@ -412,15 +464,26 @@ fn else_if_meters_all_frames_tests_and_fixups_once() {
                     end: close + 1,
                 },
                 Limits {
-                    max_work: close + 7 * arms,
+                    max_work: work_before_final_fixup,
+                    ..limits
+                },
+            ),
+            (
+                Limit::Work,
+                Span {
+                    start: result_start,
+                    end: source.len(),
+                },
+                Limits {
+                    max_work: limits.max_work - 1,
                     ..limits
                 },
             ),
             (
                 Limit::Tokens,
                 Span {
-                    start: close + 1,
-                    end: close + 2,
+                    start: result_start,
+                    end: result_start + 1,
                 },
                 Limits {
                     max_tokens: limits.max_tokens - 1,
@@ -430,7 +493,22 @@ fn else_if_meters_all_frames_tests_and_fixups_once() {
         ] {
             let error = parse_script_with_limits(&source, limits).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::LimitExceeded(kind));
-            assert_eq!(error.span(), span);
+            assert_eq!(error.span(), span, "{arms} tests, fallback {fallback:?}");
+        }
+        if let Some(start) = source.find("else") {
+            // At the first else the source through that token has been
+            // scanned, with one marker, one frame and three emissions paid.
+            let end = start + "else".len();
+            let error = parse_script_with_limits(
+                &source,
+                Limits {
+                    max_work: end + 5,
+                    ..limits
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+            assert_eq!(error.span(), Span { start, end });
         }
     }
 }

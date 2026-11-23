@@ -36,6 +36,27 @@ impl Value {
         }
     }
 
+    fn to_uint32(self) -> u32 {
+        const MODULUS: f64 = 4_294_967_296.0; // 2^32
+        let number = self.to_number();
+        if !number.is_finite() {
+            return 0;
+        }
+        // Reduce the represented Number, not its source literal. The truncated
+        // integer's remainder is exact: the modulus is a power of two, and
+        // both the remainder and its nonnegative residue fit exactly in f64.
+        let remainder = number.trunc() % MODULUS;
+        (if remainder < 0.0 {
+            remainder + MODULUS
+        } else {
+            remainder
+        }) as u32
+    }
+
+    fn to_int32(self) -> i32 {
+        self.to_uint32() as i32 // Interpret the same bits as a signed integer.
+    }
+
     fn to_boolean(self) -> bool {
         match self {
             Self::Number(value) => value != 0.0 && !value.is_nan(),
@@ -107,6 +128,11 @@ impl Script {
     /// `true` to `1`, `false` and `null` to `+0`, and `undefined` to NaN.
     /// Arithmetic returns a Number; relational
     /// operators return a Boolean, always `false` if either operand is NaN.
+    /// Bitwise operators also use this conversion, then truncate and wrap to 32
+    /// bits (nonfinite values and signed zeros become zero). Shifts use the
+    /// low five bits of the converted count. Bitwise results are Numbers
+    /// representing signed 32-bit integers, except for zero-fill right shift
+    /// (`>>>`), which returns an unsigned 32-bit result.
     /// Strict equality and inequality compare tags and values without coercion
     /// and return a Boolean.
     ///
@@ -248,6 +274,19 @@ fn evaluate(
             Instruction::Divide => apply_arithmetic(&mut stack, |lhs, rhs| lhs / rhs)?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
             Instruction::Remainder => apply_arithmetic(&mut stack, |lhs, rhs| lhs % rhs)?,
+            Instruction::BitwiseAnd => apply_bitwise(&mut stack, |lhs, rhs| lhs & rhs)?,
+            Instruction::BitwiseXor => apply_bitwise(&mut stack, |lhs, rhs| lhs ^ rhs)?,
+            Instruction::BitwiseOr => apply_bitwise(&mut stack, |lhs, rhs| lhs | rhs)?,
+            // Rust's wrapping shifts use only the low five count bits for i32/u32.
+            Instruction::ShiftLeft => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Number(f64::from(lhs.to_int32().wrapping_shl(rhs.to_uint32())))
+            })?,
+            Instruction::ShiftRight => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Number(f64::from(lhs.to_int32().wrapping_shr(rhs.to_uint32())))
+            })?,
+            Instruction::ShiftRightUnsigned => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Number(f64::from(lhs.to_uint32().wrapping_shr(rhs.to_uint32())))
+            })?,
             Instruction::StrictEqual => apply_binary(&mut stack, |lhs, rhs| {
                 Value::Boolean(lhs.strictly_equals(rhs))
             })?,
@@ -267,6 +306,11 @@ fn evaluate(
             }
             Instruction::Not => {
                 apply_unary(&mut stack, |value| Value::Boolean(!value.to_boolean()))?;
+            }
+            Instruction::BitwiseNot => {
+                apply_unary(&mut stack, |value| {
+                    Value::Number(f64::from(!value.to_int32()))
+                })?;
             }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
                 let target = check_forward_target(ip, target, ops.len())?;
@@ -363,6 +407,15 @@ fn apply_arithmetic(
     })
 }
 
+fn apply_bitwise(
+    stack: &mut Vec<Value>,
+    op: impl FnOnce(i32, i32) -> i32,
+) -> Result<(), EvalError> {
+    apply_binary(stack, |lhs, rhs| {
+        Value::Number(f64::from(op(lhs.to_int32(), rhs.to_int32())))
+    })
+}
+
 fn apply_relational(
     stack: &mut Vec<Value>,
     op: impl FnOnce(f64, f64) -> bool,
@@ -395,6 +448,13 @@ mod tests {
             (&[Instruction::Positive, one][..], 1),
             (&[Instruction::Negate, one][..], 1),
             (&[Instruction::Not, one][..], 1),
+            (&[Instruction::BitwiseNot, one][..], 1),
+            (&[one, Instruction::BitwiseAnd][..], 1),
+            (&[one, Instruction::BitwiseXor][..], 1),
+            (&[one, Instruction::BitwiseOr][..], 1),
+            (&[one, Instruction::ShiftLeft][..], 1),
+            (&[one, Instruction::ShiftRight][..], 1),
+            (&[one, Instruction::ShiftRightUnsigned][..], 1),
             (&[one, Instruction::Divide][..], 1),
             (&[one, Instruction::Remainder][..], 1),
             (&[Instruction::StrictEqual][..], 1),

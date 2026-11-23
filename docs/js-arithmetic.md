@@ -23,10 +23,17 @@ calls or objects.
 
 Arithmetic and relational comparisons (`<`, `<=`, `>`, `>=`) convert `true`
 to `1`, `false` and `null` to `+0`, and `undefined` to NaN. Every relational
-comparison involving NaN is false. Strict equality (`===`, `!==`) compares types without coercion: signed
-zeros compare equal, while NaN is unequal to itself. Comparisons return
-Booleans. Arithmetic binds more tightly than relational comparisons, which
-bind more tightly than equality.
+comparison involving NaN is false. Strict equality (`===`, `!==`) compares
+types without coercion: signed zeros compare equal, while NaN is unequal to
+itself. Comparisons return Booleans.
+
+Bitwise operations (`~`, `&`, `^`, `|`, `<<`, `>>`, `>>>`) convert operands to
+32-bit integers by truncating and reducing modulo 2³². Nonfinite values and
+signed zeros become zero. Shifts use the low five bits of the count. Results
+are signed 32-bit integers represented as Numbers, except `>>>`, which returns
+an unsigned result. From tighter to looser, binary precedence is arithmetic,
+shifts, relational comparisons, strict equality, `&`, `^`, `|`, then logical
+operators.
 
 Conditional expressions (`test ? consequent : alternate`) evaluate only the
 selected arm, preserving its value type. Boolean tests use their own value.
@@ -34,9 +41,9 @@ For numeric tests, either signed zero and NaN are false; other numbers are
 true. `null` and `undefined` are also false in tests. The same truthiness drives
 `!`, `&&`, and `||`. `!` returns a Boolean;
 `&&` and `||` short-circuit and return the selected operand without coercion.
-Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
+`&&` binds tighter than `||`, and both bind tighter than the right-associative `?:`.
 `??` evaluates its right operand only when the left is `null` or `undefined`.
-It is left-associative, binds between equality and `?:`, and cannot mix with
+It is left-associative, binds between bitwise OR and `?:`, and cannot mix with
 `&&` or `||` without parentheses at the same expression level. All operands
 and arms must use supported syntax and bindings.
 

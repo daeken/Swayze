@@ -212,6 +212,13 @@ pub(crate) enum Instruction {
     Positive,
     Negate,
     Not,
+    BitwiseNot,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
     StrictEqual,
     StrictNotEqual,
     LessThan,
@@ -280,12 +287,18 @@ enum Operator {
     Coalesce,
     LogicalOr,
     LogicalAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAnd,
     StrictEqual,
     StrictNotEqual,
     LessThan,
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
     Add,
     Subtract,
     Multiply,
@@ -294,6 +307,7 @@ enum Operator {
     Positive,
     Negate,
     Not,
+    BitwiseNot,
 }
 
 impl Operator {
@@ -302,14 +316,18 @@ impl Operator {
             // Mixing `??` with either logical operator at this level is forbidden.
             Self::Coalesce | Self::LogicalOr => 1,
             Self::LogicalAnd => 2,
-            Self::StrictEqual | Self::StrictNotEqual => 3,
+            Self::BitwiseOr => 3,
+            Self::BitwiseXor => 4,
+            Self::BitwiseAnd => 5,
+            Self::StrictEqual | Self::StrictNotEqual => 6,
             Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
-            | Self::GreaterThanOrEqual => 4,
-            Self::Add | Self::Subtract => 5,
-            Self::Multiply | Self::Divide | Self::Remainder => 6,
-            Self::Positive | Self::Negate | Self::Not => 7,
+            | Self::GreaterThanOrEqual => 7,
+            Self::ShiftLeft | Self::ShiftRight | Self::ShiftRightUnsigned => 8,
+            Self::Add | Self::Subtract => 9,
+            Self::Multiply | Self::Divide | Self::Remainder => 10,
+            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot => 11,
         }
     }
 
@@ -323,6 +341,12 @@ impl Operator {
                     _ => ShortCircuitCondition::NonNullish,
                 },
             },
+            Self::BitwiseOr => Instruction::BitwiseOr,
+            Self::BitwiseXor => Instruction::BitwiseXor,
+            Self::BitwiseAnd => Instruction::BitwiseAnd,
+            Self::ShiftLeft => Instruction::ShiftLeft,
+            Self::ShiftRight => Instruction::ShiftRight,
+            Self::ShiftRightUnsigned => Instruction::ShiftRightUnsigned,
             Self::StrictEqual => Instruction::StrictEqual,
             Self::StrictNotEqual => Instruction::StrictNotEqual,
             Self::LessThan => Instruction::LessThan,
@@ -337,6 +361,7 @@ impl Operator {
             Self::Positive => Instruction::Positive,
             Self::Negate => Instruction::Negate,
             Self::Not => Instruction::Not,
+            Self::BitwiseNot => Instruction::BitwiseNot,
         }
     }
 }
@@ -506,7 +531,8 @@ impl Lexer<'_> {
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
-            '&' | '|' => self.logical(c, start)?,
+            '&' | '|' | '^' => self.bitwise_or_logical(c, start)?,
+            '~' => TokenKind::Operator(Operator::BitwiseNot),
             // Annex B HTML-like comments remain outside the subset.
             '<' if self.rest().starts_with("!--") => {
                 return Err(Error::unsupported(
@@ -514,7 +540,7 @@ impl Lexer<'_> {
                     "HTML comments are outside the subset",
                 ));
             }
-            '<' | '>' => self.relational(c, start)?,
+            '<' | '>' => self.relational_or_shift(c, start)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             '{' => TokenKind::OpenBrace,
@@ -609,46 +635,53 @@ impl Lexer<'_> {
         ))
     }
 
-    fn logical(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
-        let doubled = self.peek() == Some(first);
+    fn bitwise_or_logical(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        let doubled = matches!(first, '&' | '|') && self.peek() == Some(first);
         if doubled {
             self.consume(first)?;
         }
         if self.peek() == Some('=') {
             self.consume('=')?;
-        } else if doubled {
-            return Ok(TokenKind::Operator(if first == '&' {
-                Operator::LogicalAnd
-            } else {
-                Operator::LogicalOr
-            }));
-        }
-        Err(Error::unsupported(
-            Span {
-                start,
-                end: self.offset,
-            },
-            "bitwise operators and compound assignments are outside the subset",
-        ))
-    }
-
-    fn relational(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
-        if self.peek() == Some(first) {
-            // Recognize the whole shift punctuator, with optional third '>' and '='.
-            self.consume(first)?;
-            if first == '>' && self.peek() == Some('>') {
-                self.consume('>')?;
-            }
-            if self.peek() == Some('=') {
-                self.consume('=')?;
-            }
             return Err(Error::unsupported(
                 Span {
                     start,
                     end: self.offset,
                 },
-                "shift operators are outside the subset",
+                "compound assignments are outside the subset",
             ));
+        }
+        Ok(TokenKind::Operator(match (first, doubled) {
+            ('&', false) => Operator::BitwiseAnd,
+            ('^', false) => Operator::BitwiseXor,
+            ('|', false) => Operator::BitwiseOr,
+            ('&', true) => Operator::LogicalAnd,
+            ('|', true) => Operator::LogicalOr,
+            _ => unreachable!("not a bitwise or logical operator"),
+        }))
+    }
+
+    fn relational_or_shift(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+        if self.peek() == Some(first) {
+            self.consume(first)?;
+            let op = if first == '<' {
+                Operator::ShiftLeft
+            } else if self.peek() == Some('>') {
+                self.consume('>')?;
+                Operator::ShiftRightUnsigned
+            } else {
+                Operator::ShiftRight
+            };
+            if self.peek() == Some('=') {
+                self.consume('=')?;
+                return Err(Error::unsupported(
+                    Span {
+                        start,
+                        end: self.offset,
+                    },
+                    "compound assignments are outside the subset",
+                ));
+            }
+            return Ok(TokenKind::Operator(op));
         }
         let inclusive = self.peek() == Some('=');
         if inclusive {
@@ -1506,6 +1539,7 @@ impl Parser<'_> {
                         Operator::Add => Operator::Positive,
                         Operator::Subtract => Operator::Negate,
                         Operator::Not => Operator::Not,
+                        Operator::BitwiseNot => Operator::BitwiseNot,
                         Operator::Divide => {
                             // In operand position a slash could begin a regexp, not division.
                             return Err(Error::unsupported(
@@ -1556,6 +1590,12 @@ impl Parser<'_> {
                     return Err(Error::unsupported(
                         span,
                         "'!' is only supported as a prefix operator",
+                    ));
+                }
+                (false, TokenKind::Operator(Operator::BitwiseNot)) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "'~' is only supported as a prefix operator",
                     ));
                 }
                 (false, TokenKind::Operator(op)) => {
@@ -1652,10 +1692,11 @@ impl Parser<'_> {
 
     fn push_infix(&mut self, op: Operator, span: Span) -> Result<(), Error> {
         let pending = if let branch @ Instruction::ShortCircuit { .. } = op.instruction() {
-            // First expose the closest pending short circuit without reducing it.
+            // Reduce the tighter operators (starting at bitwise OR precedence)
+            // to expose the closest pending short circuit without reducing it.
             // All earlier short circuits in this region have already agreed on
             // the family. A Group or conditional arm marker ends the region.
-            self.reduce_operators(Operator::StrictEqual.precedence())?;
+            self.reduce_operators(Operator::BitwiseOr.precedence())?;
             if let Some((Pending::ShortCircuit { op: previous, .. }, _)) = self.pending.last()
                 && matches!(previous, Operator::Coalesce) != matches!(op, Operator::Coalesce)
             {
@@ -1815,12 +1856,21 @@ impl Parser<'_> {
             Instruction::Jump(_) | Instruction::JumpStatement(_) | Instruction::LoopBack(_) => {
                 (0, 0)
             }
-            Instruction::Positive | Instruction::Negate | Instruction::Not => (1, 1),
+            Instruction::Positive
+            | Instruction::Negate
+            | Instruction::Not
+            | Instruction::BitwiseNot => (1, 1),
             Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply
             | Instruction::Divide
             | Instruction::Remainder
+            | Instruction::BitwiseAnd
+            | Instruction::BitwiseXor
+            | Instruction::BitwiseOr
+            | Instruction::ShiftLeft
+            | Instruction::ShiftRight
+            | Instruction::ShiftRightUnsigned
             | Instruction::StrictEqual
             | Instruction::StrictNotEqual
             | Instruction::LessThan

@@ -15,6 +15,8 @@ mod call_indirect;
 mod function_exit;
 #[path = "execution/globals.rs"]
 mod globals;
+#[path = "execution/i64_locals.rs"]
+mod i64_locals;
 #[path = "execution/i64_operands.rs"]
 mod i64_operands;
 #[path = "execution/if_branch.rs"]
@@ -1046,8 +1048,8 @@ fn bounds_total_declared_locals_independently_of_parameters() {
 #[test]
 fn zero_count_groups_use_body_bytes_but_not_local_slots() {
     let mut body = vec![126];
-    for _ in 0..126 {
-        body.extend([0, 0x7f]);
+    for ty in [0x7f, 0x7e].into_iter().cycle().take(126) {
+        body.extend([0, ty]);
     }
     body.extend([0x41, 9, 0x0b]);
     assert_eq!(body.len(), Limit::CodeBodyBytes.maximum());
@@ -1058,11 +1060,11 @@ fn zero_count_groups_use_body_bytes_but_not_local_slots() {
 fn validates_all_local_group_types_even_for_zero_counts() {
     for count in [0, 1] {
         bad_body(
-            &[2, 1, 0x7f, count, 0x7e, 0x41, 1, 0x0b],
+            &[2, 1, 0x7f, count, 0x7d, 0x41, 1, 0x0b],
             4,
             ErrorKind::UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7e,
+                found: 0x7d,
             },
         );
     }

@@ -529,7 +529,7 @@ fn memory_and_globals_do_not_accept_i64_operands_even_in_dead_code() {
 }
 
 #[test]
-fn i64_value_types_and_initializers_remain_unsupported_outside_operands() {
+fn i64_remains_unsupported_in_signatures_globals_and_control_labels() {
     for (id, payload, offset, expected) in [
         (1, &b"\x01\x60\x01\x7e\0"[..], 3, 0x7f), // Parameter.
         (1, b"\x01\x60\0\x01\x7e", 4, 0x7f),      // Result.
@@ -547,10 +547,9 @@ fn i64_value_types_and_initializers_remain_unsupported_outside_operands() {
         );
     }
     for (body, offset, expected) in [
-        (&b"\x01\x01\x7e\x0b"[..], 2, 0x7f), // Local.
-        (b"\0\x02\x7e\x0b", 2, 0x7f),        // Block result.
-        (b"\0\x03\x7e\x0b", 2, 0x40),        // Loop result.
-        (b"\0\x41\0\x04\x7e\x0b", 4, 0x7f),  // If result.
+        (&b"\0\x02\x7e\x0b"[..], 2, 0x7f),  // Block result.
+        (b"\0\x03\x7e\x0b", 2, 0x40),       // Loop result.
+        (b"\0\x41\0\x04\x7e\x0b", 4, 0x7f), // If result.
     ] {
         bad_body(
             body,

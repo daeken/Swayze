@@ -10,9 +10,10 @@
 //! to four `i32` parameters and either no result (void) or one `i32` result,
 //! even if unused.
 //! Every function declares its own zero-based index into the type table; types
-//! may be shared. Each body may declare up to 16 `i32` locals in total. The
-//! number of groups and each group's local count are unsigned LEB32; zero-count
-//! groups are allowed but must still specify `i32`.
+//! may be shared. Each body may declare up to 16 locals in total, in addition
+//! to its parameters. The number of groups and each group's local count are
+//! unsigned LEB32. Every group, even a zero-count group, must specify `i32`
+//! (`0x7f`) or `i64` (`0x7e`).
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
@@ -123,18 +124,20 @@
 //! are rejected, even when empty.
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
-//! stack and checks each stack effect: `local.get`, `global.get`, and `i32.const`
-//! push one i32; `local.set` and `global.set` pop one, and `local.tee` requires
-//! and leaves the top i32 operand. `i64.const` pushes one i64 and accepts valid
-//! padding within ten signed LEB128 bytes. In a ten-byte encoding the terminal
-//! byte must be `0x00` or `0x7f` to match the sign bit. The immediate cannot read
-//! beyond its body frame. The two extensions pop an i32 and push an i64,
+//! stack and checks each stack effect: `local.get` pushes the indexed slot's
+//! declared type (`i32` for parameters); `local.set` consumes a value of that
+//! type, and `local.tee` writes and leaves a value of that type on the stack.
+//! `global.get` and `i32.const` push one i32; `global.set` consumes one i32.
+//! `i64.const` pushes one i64 and accepts valid padding within ten signed LEB128
+//! bytes. In a ten-byte encoding the terminal byte must be `0x00` or `0x7f` to
+//! match the sign bit. The immediate cannot read beyond its body frame.
+//! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
-//! i64 remains limited to internal operands: signatures, locals, globals,
+//! i64 is limited to internal operands and declared locals: signatures, globals,
 //! control labels, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
@@ -166,11 +169,13 @@
 //! operands above the active floor and mark only that frame unreachable, after
 //! checking any required operands. A pop at the floor of an unreachable frame
 //! supplies an implicit operand of the required type without reducing the depth.
-//! In a dead tail, any known candidate type determines the `select` result;
-//! mismatched known candidates still fail at `select`. Without a known candidate
-//! type, the result is unknown and can satisfy either type. Every push, including
-//! an unknown result, occupies a slot and counts against the stack cap. No operand
-//! access crosses the active floor. At `else` or `end`, an unreachable frame may
+//! For example, a `local.tee` at that floor still pushes a concrete operand of
+//! the local's declared type. In a dead tail, any known candidate type determines
+//! the `select` result; mismatched known candidates still fail at `select`.
+//! Without a known candidate type, the result is unknown and can satisfy either
+//! type. Every push, including an unknown result, occupies a slot and counts
+//! against the stack cap. No operand access crosses the active floor.
+//! At `else` or `end`, an unreachable frame may
 //! supply a missing i32 result implicitly, but a known result of the wrong type or
 //! any excess operands are still rejected. Every new frame starts reachable,
 //! even inside an unreachable frame. `else` checks the then result and starts
@@ -207,10 +212,11 @@
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
 //! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
-//! with private decoded bodies, their signatures, named export entries, an
-//! optional start index, the table size and declared memory limits (if defined),
-//! global initial values, and active element and data segments. It does not
-//! allocate linear memory. A separate fallible [`Module::instantiate`] step
+//! with private decoded bodies (including signatures and local types), named
+//! export entries, an optional start index, the table size and declared memory
+//! limits (if defined), global initial values, and active element and data
+//! segments. Validation does not allocate linear memory.
+//! A separate fallible [`Module::instantiate`] step
 //! checks all segment ranges against the initial sizes, before initializing
 //! either table or memory. Growth cannot make an out-of-bounds active data
 //! segment valid. The first out-of-bounds element segment takes precedence over
@@ -266,12 +272,12 @@
 //! it. Validation retains decoded code only after all edges have been resolved
 //! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
-//! Each active call frame has its own fixed operand stack of tagged i32/i64 values
-//! and separate i32 local storage.
-//! Parameters are copied from the supplied arguments or caller's operands, and
-//! declared locals start at zero for every frame. A callee starts with no
-//! operands. A callee returning i32 pushes that value onto the caller's
-//! remaining operands; a void callee leaves them unchanged.
+//! Each active call frame has its own fixed operand stack and separate fixed
+//! local storage, both holding tagged i32/i64 values. Parameters are copied
+//! from the supplied arguments or caller's operands, and each declared local
+//! starts at zero of its own type for every frame, including reused frame
+//! slots. A callee starts with no operands. A callee returning i32 pushes that
+//! value onto the caller's remaining operands; a void callee leaves them unchanged.
 //! `call_indirect` interprets the selector as `u32` and traps with
 //! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
 //! [`Trap::UninitializedElement`] for a null entry, or
@@ -321,7 +327,7 @@
 //! [`InstantiationError::StartLimitExceeded`] stops the execution before it
 //! would exceed either 16 live frames (including the entry function) or 1024
 //! total instruction dispatches. Every executed decoded instruction costs one dispatch,
-//! including `unreachable`, `nop`, `drop`, `select`, memory and global
+//! including `unreachable`, `nop`, `drop`, `select`, local, memory, and global
 //! instructions, either kind of call, an `if` test, an executed `else` jump,
 //! a `br`, a `br_if` with either outcome, a `br_table` regardless of its length
 //! or selected target, or a `return`.
@@ -389,6 +395,11 @@
 //! result types in polymorphic tails. Boundary tests cover the shared 32-slot
 //! stack (including frozen prefixes) and one dispatch per i64 opcode at the
 //! 1024-dispatch limit.
+//! Mixed-local tests check parameter-first slot order across typed and empty
+//! groups, exact count and index bounds, full-width reads and writes, and
+//! concrete types in reachable and polymorphic code. They exercise fresh
+//! zero-initialization and frame isolation on repeated direct and indirect
+//! calls, and one dispatch per local instruction at the fuel boundary.
 //! i64 bit-operation tests compare full-width results using `i64.eq`. They
 //! distinguish high-bit patterns and sign filling, check count endpoints and
 //! low-six-bit masking (including negative counts), and exercise typed input and

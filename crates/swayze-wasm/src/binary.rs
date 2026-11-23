@@ -1564,6 +1564,8 @@ enum FloatBinaryOp {
     Min,
     Max,
     Copysign,
+    Add,
+    Sub,
     Mul,
     Div,
 }
@@ -1592,6 +1594,14 @@ impl FloatBinaryOp {
             FloatWidth::F64 => (F64_SIGN, F64_INFINITY, F64_CANONICAL_NAN, 52, 1023),
         };
         let min = match self {
+            Self::Add | Self::Sub => {
+                let rhs = if matches!(self, Self::Sub) {
+                    rhs ^ sign
+                } else {
+                    rhs
+                };
+                return add_bits(lhs, rhs, sign, infinity, canonical_nan, fraction_bits, bias);
+            }
             Self::Mul => {
                 return mul_bits(lhs, rhs, sign, infinity, canonical_nan, fraction_bits, bias);
             }
@@ -1613,6 +1623,100 @@ impl FloatBinaryOp {
             (Some(Equal), false) => lhs & rhs,
         }
     }
+}
+
+// Subtraction has already flipped the right operand's sign bit.
+fn add_bits(
+    lhs: u64,
+    rhs: u64,
+    sign_mask: u64,
+    infinity: u64,
+    canonical_nan: u64,
+    fraction_bits: u32,
+    bias: i32,
+) -> u64 {
+    let lhs_magnitude = lhs & !sign_mask;
+    let rhs_magnitude = rhs & !sign_mask;
+    if lhs_magnitude > infinity || rhs_magnitude > infinity {
+        return canonical_nan;
+    }
+
+    // The unsigned encodings order magnitudes, so only A can determine the
+    // sign of a nonzero result with opposite effective operand signs.
+    let (a, b, sign) = if lhs_magnitude >= rhs_magnitude {
+        (lhs_magnitude, rhs_magnitude, lhs & sign_mask)
+    } else {
+        (rhs_magnitude, lhs_magnitude, rhs & sign_mask)
+    };
+    let opposite = (lhs ^ rhs) & sign_mask != 0;
+    if a == infinity {
+        return if opposite && b == infinity {
+            canonical_nan
+        } else {
+            sign | infinity
+        };
+    }
+    if opposite && a == b {
+        return 0; // Mixed effective zeros and exact cancellation give +0.
+    }
+    if b == 0 {
+        return sign | a; // Includes two same-sign effective zeros.
+    }
+
+    // Decode M * 2^(e-bias-h), where h is the fraction width and e is
+    // the exponent field clamped to 1. Subnormals have no implicit bit.
+    let implicit = 1 << fraction_bits;
+    let a_field = (a >> fraction_bits) as i32;
+    let b_field = (b >> fraction_bits) as i32;
+    let a_e = a_field.max(1);
+    let b_e = b_field.max(1);
+    let gap = a_e - b_e;
+    let h = fraction_bits as i32;
+    if gap >= h + 3 {
+        // In units U = 2^(a_e-bias-h) of A's significand, B is strictly
+        // below 2^(h+1-gap) <= 1/4. A is normal here. Outward spacing is
+        // U (counting the hypothetical next binade above max finite);
+        // inward spacing is U except at a power of two above the least
+        // normal, where it is U/2. Either direction is strictly short of
+        // its midpoint. Finish here: no jammed bits enter the exact path.
+        return sign | a;
+    }
+
+    let significand =
+        |magnitude, field| (magnitude & (implicit - 1)) | if field == 0 { 0 } else { implicit };
+    let aligned_a = u128::from(significand(a, a_field)) << gap;
+    let aligned_b = u128::from(significand(b, b_field));
+    // gap <= h+2, so even a sum needs at most 2h+4 <= 108 bits.
+    // Alignment loses nothing, even if subtracting cancels leading bits.
+    let exact = if opposite {
+        aligned_a - aligned_b
+    } else {
+        aligned_a + aligned_b
+    };
+    let top = exact.ilog2() as i32; // Nonzero: opposite equal magnitudes exited.
+    let exponent = b_e - bias + top - h;
+    if exponent > bias {
+        return sign | infinity;
+    }
+
+    // Target units are 2^(max(exponent, 1-bias)-h). The clamped shift is
+    // in -h..=h+3. Left shifts are exact; all subnormal results are exact
+    // too, since the inputs are integer multiples of the least subnormal.
+    // The retained magnitude has at most h+1 bits, so it and any rounding
+    // carry fit in u64.
+    let shift = (top - h).max(1 - b_e);
+    let rounded = if shift <= 0 {
+        (exact << -shift) as u64
+    } else {
+        let midpoint = 1_u128 << (shift - 1);
+        let remainder = exact & ((midpoint << 1) - 1);
+        let retained = exact >> shift;
+        let up = remainder > midpoint || (remainder == midpoint && retained & 1 != 0);
+        retained as u64 + u64::from(up)
+    };
+    // The packer propagates a rounding carry, including from the odd max
+    // finite significand at the tie with the hypothetical even endpoint.
+    sign | pack_rounded_finite(rounded, exponent, fraction_bits, bias)
 }
 
 fn mul_bits(
@@ -2961,6 +3065,8 @@ fn decode_plain(
             Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
         0x91 => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Sqrt),
+        0x92 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Add),
+        0x93 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Sub),
         0x94 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Mul),
         0x95 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Div),
         0x96 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Min),
@@ -2975,6 +3081,8 @@ fn decode_plain(
             Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
         0x9f => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Sqrt),
+        0xa0 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Add),
+        0xa1 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Sub),
         0xa2 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Mul),
         0xa3 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Div),
         0xa4 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Min),

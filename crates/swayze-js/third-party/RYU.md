@@ -87,17 +87,17 @@ The independent `tools/number-format-oracle.mjs` lane (`d67b8c3`) supplies
 that tool, run from the repository root:
 
 ```sh
-fixtures=$(mktemp)
+fixtures=$(mktemp) || exit 1
 trap 'rm -f "$fixtures"' EXIT
 node tools/number-format-oracle.mjs --tsv > "$fixtures" && \
-  SWAYZE_NUMBER_FORMAT_TSV="$fixtures" cargo test -p swayze-js --lib --frozen \
-  number_format::tests::node_oracle_tsv -- --ignored && \
-  SWAYZE_NUMBER_FORMAT_TSV="$fixtures" cargo test -p swayze-js --lib --frozen --release \
-  number_format::tests::node_oracle_tsv -- --ignored
+  SWAYZE_NUMBER_FORMAT_ORACLE_TSV="$fixtures" cargo test -p swayze-js --lib --frozen \
+  number_format::tests::node_oracle_tsv -- --ignored --exact && \
+  SWAYZE_NUMBER_FORMAT_ORACLE_TSV="$fixtures" cargo test -p swayze-js --lib --frozen --release \
+  number_format::tests::node_oracle_tsv -- --ignored --exact
 ```
 
 The file contains lowercase 16-digit raw hex bits, a tab, and the ASCII
-expected spelling on each line. The reader requires all 6,212 rows and caps
-each spelling at 25 bytes and the file at 267,116 bytes. It is ignored by
+expected spelling on each line. The reader requires exactly 6,212 unique
+keys and caps each nonempty spelling at 25 bytes and the file at 267,116 bytes. It is ignored by
 default; the pinned Cargo gate neither uses Node nor requires generated
 files.

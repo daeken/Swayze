@@ -151,13 +151,14 @@ fn deterministic_raw_bit_round_trips() {
 }
 
 #[test]
-#[ignore = "opt-in: supply a Node-verified SWAYZE_NUMBER_FORMAT_TSV file"]
+#[ignore = "opt-in: supply a Node-verified SWAYZE_NUMBER_FORMAT_ORACLE_TSV file"]
 fn node_oracle_tsv() {
-    use std::{fs::File, io::Read};
+    use std::{collections::HashSet, fs::File, io::Read};
 
     const ROWS: usize = 6_212;
     const MAX_BYTES: usize = ROWS * (16 + 1 + MAX_UNITS + 1);
-    let path = std::env::var_os("SWAYZE_NUMBER_FORMAT_TSV").expect("set SWAYZE_NUMBER_FORMAT_TSV");
+    const FIXTURE_ENV: &str = "SWAYZE_NUMBER_FORMAT_ORACLE_TSV";
+    let path = std::env::var_os(FIXTURE_ENV).unwrap_or_else(|| panic!("set {FIXTURE_ENV}"));
     let mut fixtures = String::new();
     // The extra byte distinguishes a valid full-size file from a prefix.
     File::open(path)
@@ -172,6 +173,7 @@ fn node_oracle_tsv() {
     );
     let lines = fixtures.split_terminator('\n');
     assert_eq!(lines.clone().count(), ROWS, "unexpected oracle row count");
+    let mut seen = HashSet::with_capacity(ROWS);
     for line in lines {
         let (hex, expected) = line.split_once('\t').expect("bits<TAB>text");
         assert!(
@@ -180,11 +182,13 @@ fn node_oracle_tsv() {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
+        let bits = u64::from_str_radix(hex, 16).unwrap();
+        assert!(seen.insert(bits), "duplicate oracle key {bits:016x}");
         assert!(
             (1..=MAX_UNITS).contains(&expected.len())
-                && expected.is_ascii()
-                && !expected.contains('\t')
+                && expected.bytes().all(|b| b.is_ascii_graphic()),
+            "{bits:016x}: invalid oracle spelling"
         );
-        assert_format(u64::from_str_radix(hex, 16).unwrap(), expected);
+        assert_format(bits, expected);
     }
 }

@@ -1187,6 +1187,7 @@ impl FloatWidth {
 enum FloatUnaryOp {
     Abs,
     Neg,
+    Round(FloatRounding),
 }
 
 impl FloatUnaryOp {
@@ -1196,7 +1197,74 @@ impl FloatUnaryOp {
             (FloatWidth::F32, Self::Neg) => Operand::F32(value.f32_bits() ^ F32_SIGN),
             (FloatWidth::F64, Self::Abs) => Operand::F64(value.f64_bits() & !F64_SIGN),
             (FloatWidth::F64, Self::Neg) => Operand::F64(value.f64_bits() ^ F64_SIGN),
+            (FloatWidth::F32, Self::Round(mode)) => Operand::F32(mode.round_bits(
+                u64::from(value.f32_bits()),
+                u64::from(F32_SIGN),
+                u64::from(F32_INFINITY),
+                23,
+                127,
+            ) as u32),
+            (FloatWidth::F64, Self::Round(mode)) => {
+                Operand::F64(mode.round_bits(value.f64_bits(), F64_SIGN, F64_INFINITY, 52, 1023))
+            }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FloatRounding {
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
+}
+
+impl FloatRounding {
+    fn round_bits(
+        self,
+        bits: u64,
+        sign_mask: u64,
+        infinity: u64,
+        fraction_bits: u32,
+        bias: u32,
+    ) -> u64 {
+        let sign = bits & sign_mask;
+        let magnitude = bits & !sign_mask;
+        let implicit_bit = 1 << fraction_bits;
+        if magnitude > infinity {
+            // All NaNs map to the positive canonical quiet NaN, not a payload-preserving result.
+            return infinity | (implicit_bit >> 1);
+        }
+        let exponent = (magnitude >> fraction_bits) as u32;
+        if magnitude == 0 || exponent >= bias + fraction_bits {
+            // Both zero signs, infinities, and finite values with no fractional bits.
+            return bits;
+        }
+        let outward = matches!((self, sign == 0), (Self::Ceil, true) | (Self::Floor, false));
+        if exponent < bias {
+            // Below one, nearest rounds away from zero only strictly above half;
+            // a tie at half rounds to the even integer zero, with the original sign.
+            let half = u64::from(bias - 1) << fraction_bits;
+            let one = u64::from(bias) << fraction_bits;
+            let up = outward || (matches!(self, Self::Nearest) && magnitude > half);
+            return sign | if up { one } else { 0 };
+        }
+
+        // The exponent locates the units bit. The implicit leading one is
+        // needed to test parity when the magnitude is in [1, 2).
+        let unit = 1 << (fraction_bits - (exponent - bias));
+        let fraction = magnitude & (unit - 1);
+        if fraction == 0 {
+            return bits;
+        }
+        let whole = magnitude - fraction;
+        let half = unit >> 1;
+        let significand = implicit_bit | (magnitude & (implicit_bit - 1));
+        let odd = significand & unit != 0;
+        let up = outward
+            || (matches!(self, Self::Nearest) && (fraction > half || (fraction == half && odd)));
+        // Adding one unit to the truncated encoding can carry into the exponent.
+        sign | (whole + if up { unit } else { 0 })
     }
 }
 
@@ -2392,9 +2460,21 @@ fn decode_plain(
         0x8a => Instruction::I64Binary(I64BinaryOp::Rotr),
         0x8b => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Abs),
         0x8c => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Neg),
+        0x8d => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Ceil)),
+        0x8e => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Floor)),
+        0x8f => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Trunc)),
+        0x90 => {
+            Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Nearest))
+        }
         0x98 => Instruction::FloatCopysign(FloatWidth::F32),
         0x99 => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Abs),
         0x9a => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Neg),
+        0x9b => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Ceil)),
+        0x9c => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Floor)),
+        0x9d => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Trunc)),
+        0x9e => {
+            Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Nearest))
+        }
         0xa6 => Instruction::FloatCopysign(FloatWidth::F64),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),

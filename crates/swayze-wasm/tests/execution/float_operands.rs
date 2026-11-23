@@ -561,7 +561,7 @@ fn float_loop_results_and_other_numeric_ops_stay_unsupported() {
         bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
     }
     bad_payload(6, &[1, 0x7f, 0, F32_CONST], 3, unexpected(0x41, F32_CONST));
-    for opcode in [0x92, 0xa0, 0xa8, 0xb2, 0x1c] {
+    for opcode in [0x91, 0x92, 0x9f, 0xa0, 0xa8, 0xb2, 0x1c] {
         bad_body(
             &[0, 0, opcode, 0x0b],
             2,

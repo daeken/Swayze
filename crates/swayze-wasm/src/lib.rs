@@ -4,7 +4,7 @@
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
 //! custom sections within [`Limit`], and optional table, memory, global,
-//! element, and data sections. Modules with functions must have one to eight
+//! start, element, and data sections. Modules with functions must have one to eight
 //! types, one to eight function declarations, and exactly as many code bodies
 //! as function declarations, in that section order. Each type must have zero
 //! to four `i32` parameters and either no result (void) or one `i32` result,
@@ -46,9 +46,9 @@
 //! Other block types and typed `select` are unsupported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
-//! any memory, global, export, element, and code sections. It may be empty (a
-//! zero-length vector) or declare one private `funcref` table, using literal
-//! element type byte `0x70`. Its limits use flag byte `0x00` (minimum only) or
+//! any memory, global, export, start, element, and code sections. It may be
+//! empty (a zero-length vector) or declare one private `funcref` table, using
+//! literal element type byte `0x70`. Its limits use flag byte `0x00` (minimum only) or
 //! `0x01` (minimum and maximum), followed by unsigned LEB32 entry counts. The
 //! minimum and any explicit maximum are at most 16, and the maximum must not
 //! be less than the minimum. The minimum is the fixed instance size, which may
@@ -56,8 +56,8 @@
 //! instantiation. Guest code can only use it as the target of `call_indirect`.
 //!
 //! If present, the memory section follows any function and table sections and
-//! precedes any global, export, element, and code sections. It may be empty (a
-//! zero-length vector) or declare one private, unshared memory32. The limits use
+//! precedes any global, export, start, element, and code sections. It may be
+//! empty (a zero-length vector) or declare one private, unshared memory32. The limits use
 //! flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
 //! unsigned LEB32 page counts. The minimum and any explicit maximum must be zero
 //! or one 64-KiB page, and the maximum must not be less than the minimum. The minimum
@@ -70,17 +70,23 @@
 //! Other memory instructions, including `memory.grow`, are unsupported.
 //!
 //! The optional global section (ID 6) follows any type, function, table, and
-//! memory sections and precedes any export, element, and code sections. It may
-//! contain zero to eight defined `i32` globals, indexed from zero in declaration
+//! memory sections and precedes any export, start, element, and code sections.
+//! It may contain zero to eight defined `i32` globals, indexed from zero in declaration
 //! order. Each declaration uses value type byte `0x7f`, literal mutability byte
 //! `0x00` (immutable) or `0x01` (mutable), and exactly `i32.const <signed LEB32> end`.
 //! Every body can read either kind and can set only mutable globals, including
 //! globals at later indices. Global imports, exports, and initializer reads
 //! are unsupported.
 //!
-//! The optional element section (ID 9) follows any table, memory, global, and
-//! export sections and precedes any code and data sections. It may contain zero
-//! to eight active segments, retaining at most 64 function indices total,
+//! The optional start section (ID 8) comes after any exports and before any
+//! elements, code, and data. Its entire payload is one unsigned LEB32 index
+//! (valid padding is allowed) into the defined function declarations. The
+//! referenced function must take no parameters and return no value; it may be
+//! private or exported.
+//!
+//! The optional element section (ID 9) follows any table, memory, global,
+//! export, and start sections and precedes any code and data sections. It may
+//! contain zero to eight active segments, retaining at most 64 function indices total,
 //! counting repeats and overlaps. Each segment requires a defined table and
 //! encodes the Core 1.0 table index zero as unsigned LEB32, exactly
 //! `i32.const <signed LEB32> end`, and an unsigned LEB32 count followed by that
@@ -90,24 +96,23 @@
 //! a segment with no function indices still does. Passive and declarative
 //! segments, element expressions, and global offsets are unsupported.
 //!
-//! The optional data section (ID 11) follows any memory, global, export, and
-//! code sections. It may contain zero to eight active segments with at most 64 KiB of
-//! payload bytes total, counting overlaps. Each segment requires a defined
+//! The optional data section (ID 11) follows any memory, global, export, start,
+//! and code sections. It may contain zero to eight active segments with at most
+//! 64 KiB of payload bytes total, counting overlaps. Each segment requires a defined
 //! memory and encodes the Core 1.0 memory index zero as unsigned LEB32, exactly
 //! `i32.const <signed LEB32> end`, and a length-prefixed vector of raw bytes.
 //! An empty segment vector does not require memory. Passive segments, bulk
 //! memory, and global offsets are unsupported.
 //!
-//! An optional export section between function and code (after table, memory,
-//! and globals and before elements, if present) may contain zero to eight
-//! function exports. Tables, memory, and globals cannot be exported. Name
+//! An optional export section after any table, memory, and globals and before
+//! any start, elements, and code may contain zero to eight function exports. Tables, memory, and globals cannot be exported. Name
 //! matching is exact (no Unicode normalization), and duplicate export names
 //! are rejected. Each export refers to a defined function (void or i32-result)
 //! by its zero-based declaration index. Distinct names may refer to the same
 //! function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
-//! names. All other standard sections (including import, start, and data count)
+//! names. All other standard sections (including import and data count)
 //! are rejected, even when empty.
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
@@ -173,14 +178,15 @@
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
 //! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
-//! with private decoded bodies, their signatures, named export entries, the table
-//! and memory sizes (if defined), global initial values, and active element and
-//! data segments. It does not allocate linear memory. A separate fallible
-//! [`Module::instantiate`] step checks all segment ranges before initializing
-//! either table or memory. The first out-of-bounds element segment takes
-//! precedence over the first out-of-bounds data segment, and both take
-//! precedence over memory allocation failure. Offsets are interpreted as `u32`
-//! bits and widened before adding the segment length. An empty segment may
+//! with private decoded bodies, their signatures, named export entries, an
+//! optional start index, the table and memory sizes (if defined), global initial
+//! values, and active element and data segments. It does not allocate linear
+//! memory. A separate fallible [`Module::instantiate`] step checks all segment
+//! ranges before initializing either table or memory. The first out-of-bounds
+//! element segment takes precedence over the first out-of-bounds data segment,
+//! and both take precedence over memory allocation failure. Offsets are
+//! interpreted as `u32` bits and widened before adding the segment length.
+//! An empty segment may
 //! start at the end of its table or memory, but not beyond it. Out-of-bounds
 //! segments are reported by zero-based source index as
 //! [`InstantiationError::ElementSegmentOutOfBounds`] or
@@ -189,12 +195,17 @@
 //! fresh linear memory starts with all bytes zero. Segments of each kind are
 //! applied in source order; the last write to an entry or byte wins. Global
 //! initial values are copied into fixed private slots with no allocation.
-//! Failed instantiation exposes no instance.
+//! Only after preflight, allocation, and all initialization succeed does it run
+//! the optional start function once by index, with no host authority and with
+//! the same execution budgets as an explicit invocation. Completed start stores
+//! are visible on success. A guest trap ([`InstantiationError::StartTrap`]) or
+//! host execution limit ([`InstantiationError::StartLimitExceeded`]) discards
+//! the unpublished instance. No instantiation failure exposes an instance.
 //! [`Instance::invoke_i32_with_args`] and [`Instance::invoke_void_with_args`]
 //! scan at most eight export names for an exact match, then check the argument
 //! count and declared result kind, in that order, before executing any guest
 //! instruction or making any guest state change. A wrong result kind is
-//! [`InvokeError::ResultMismatch`], not a trap. Invocation does not allocate or
+//! [`InvokeError::ResultMismatch`], not a trap. Execution does not allocate or
 //! recurse in Rust. Zero selects the else arm (or skips straight to the join if
 //! no `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames with explicit result arities.
@@ -262,11 +273,12 @@
 //! `i32::MIN / -1` traps for signed division; signed remainder for those operands
 //! returns zero. Executing `unreachable` immediately raises [`Trap::Unreachable`].
 //! These are runtime outcomes, not validation errors. [`InvokeError::Trap`]
-//! reports the first guest trap and skips all remaining instructions, including
-//! in callers. Host resource limits are separate:
-//! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
-//! exceed either 16 live frames (including the exported function) or 1024 total
-//! instruction dispatches. Every executed decoded instruction costs one dispatch,
+//! or [`InstantiationError::StartTrap`] reports the first guest trap, skipping
+//! all remaining instructions, including in callers. Host resource limits are
+//! separate: [`InvokeError::LimitExceeded`] or
+//! [`InstantiationError::StartLimitExceeded`] stops the execution before it
+//! would exceed either 16 live frames (including the entry function) or 1024
+//! total instruction dispatches. Every executed decoded instruction costs one dispatch,
 //! including `unreachable`, `nop`, `drop`, `select`, memory and global
 //! instructions, either kind of call, an `if` test, an executed `else` jump,
 //! a `br`, a `br_if` with either outcome, a `br_table` regardless of its length
@@ -279,9 +291,10 @@
 //! instruction would exceed the dispatch budget, that limit takes precedence
 //! over executing it. For an indirect call with a dispatch available, the
 //! bounds, null, and signature checks take precedence over the call-depth limit.
-//! The same instance can be invoked again with fresh call-local state and budgets.
-//! All functions in an instance share its memory and globals. Completed memory
-//! and global stores persist across calls, exports, traps, and host limits.
+//! Each explicit invocation has fresh call-local state and budgets, including
+//! the first one after a successful start. All functions in an instance share
+//! its memory and globals. Completed memory and global stores persist across
+//! calls, including explicit invocations that trap or hit a host limit.
 //! Separate instances have independent tables, memory, and globals. Empty,
 //! custom-only, and other unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
@@ -396,6 +409,14 @@
 //! floors in all bodies, and unsupported imports, exports, and global offsets.
 //! They exercise shared state across exports and calls, fresh instances, and
 //! suppression of later writes after a trap or exhausted dispatch budget.
+//! Start tests cover section order, exact framing, padded and invalid indices,
+//! signature errors and validation precedence, private and exported targets,
+//! one automatic execution per instance, independence, and visibility of start
+//! stores. They check that start sees initialized globals, data, and elements,
+//! that preflight errors precede start traps, and that execution reports typed
+//! traps or limits with the existing dispatch and frame bounds. A store before
+//! a start trap does not leak into another attempt to instantiate. An explicit
+//! invocation after start gets a fresh dispatch budget.
 //! Parsing uses fixed scratch tables for up to eight type signatures, eight
 //! resolved function signatures, and eight global declarations. It checks local
 //! group counts against the remaining local budget without expanding groups,
@@ -428,7 +449,8 @@ use table::{ElementSegment, FunctionTable};
 /// ```compile_fail
 /// use swayze_wasm::Module;
 /// let forged = Module {
-///     functions: Vec::new(), exports: Vec::new(), memory_bytes: None, data_segments: Vec::new(),
+///     functions: Vec::new(), exports: Vec::new(), start_function: None,
+///     memory_bytes: None, data_segments: Vec::new(),
 ///     global_initial_values: [0; 8],
 ///     table_entries: None, element_segments: Vec::new(),
 /// };
@@ -437,6 +459,7 @@ use table::{ElementSegment, FunctionTable};
 pub struct Module {
     functions: Vec<binary::ValidatedCode>,
     exports: Vec<Export>,
+    start_function: Option<usize>,
     // None means absent; Some is a validated byte length (zero or one page).
     memory_bytes: Option<usize>,
     global_initial_values: [i32; binary::MAX_GLOBALS as usize],
@@ -453,7 +476,7 @@ struct Export {
 }
 
 impl Module {
-    /// Create an independent instance without executing guest code.
+    /// Create an independent instance and run its optional start function.
     ///
     /// Check active segment ranges in source order within each kind: elements
     /// before data. Neither table nor memory is initialized until all checks
@@ -461,6 +484,9 @@ impl Module {
     /// zero-page memory has no allocation. A defined table uses fixed storage
     /// and starts all null. Segments of each kind are applied in source order.
     /// Global initial values are copied into fixed, independent instance slots.
+    /// Once initialization succeeds, start (if specified) runs once with fresh
+    /// execution budgets. Its stores are visible on the returned instance.
+    /// A start trap or execution limit discards the instance instead.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
         let memory_bytes = self.memory_bytes.unwrap_or(0);
         FunctionTable::preflight(self.table_entries.unwrap_or(0), &self.element_segments)?;
@@ -470,12 +496,21 @@ impl Module {
         let table = self
             .table_entries
             .map(|len| FunctionTable::new_preflighted(len, &self.element_segments));
-        Ok(Instance {
+        let instance = Instance {
             module: self,
             memory,
             globals: self.global_initial_values.map(Cell::new),
             table,
-        })
+        };
+        if let Some(index) = self.start_function {
+            binary::execute(&instance, index, &[]).map_err(|error| match error {
+                binary::ExecutionError::Trap(trap) => InstantiationError::StartTrap(trap),
+                binary::ExecutionError::LimitExceeded { limit } => {
+                    InstantiationError::StartLimitExceeded { limit }
+                }
+            })?;
+        }
+        Ok(instance)
     }
 }
 
@@ -494,6 +529,10 @@ pub enum InstantiationError {
         /// Zero-based index of the first out-of-bounds segment in source order.
         segment_index: usize,
     },
+    /// The start function or one of its callees trapped.
+    StartTrap(Trap),
+    /// The start execution would exceed a host resource bound, not a Core trap.
+    StartLimitExceeded { limit: ExecutionLimit },
 }
 
 impl fmt::Display for InstantiationError {
@@ -514,11 +553,27 @@ impl fmt::Display for InstantiationError {
                     "WebAssembly data segment {segment_index} is out of bounds"
                 )
             }
+            Self::StartTrap(trap) => write!(f, "WebAssembly start function trapped: {trap}"),
+            Self::StartLimitExceeded { limit } => write!(
+                f,
+                "WebAssembly start execution {limit:?} limit exceeded (maximum {})",
+                limit.maximum()
+            ),
         }
     }
 }
 
-impl std::error::Error for InstantiationError {}
+impl std::error::Error for InstantiationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StartTrap(trap) => Some(trap),
+            Self::MemoryAllocationFailed
+            | Self::ElementSegmentOutOfBounds { .. }
+            | Self::DataSegmentOutOfBounds { .. }
+            | Self::StartLimitExceeded { .. } => None,
+        }
+    }
+}
 
 /// An instance of a validated module, with a private table, memory, and globals.
 ///
@@ -609,7 +664,7 @@ impl Instance<'_> {
             .iter()
             .find(|export| export.name == name)
             .ok_or(InvokeError::ExportNotFound)?;
-        binary::execute(self, export.function_index, args, expected)
+        binary::invoke_index(self, export.function_index, args, expected)
     }
 }
 
@@ -691,7 +746,8 @@ impl std::error::Error for InvokeError {
     }
 }
 
-/// Fixed host resource bounds for one invocation. These are not Wasm traps.
+/// Fixed host resource bounds for one execution (start or explicit invocation).
+/// These are not Wasm traps.
 ///
 /// Dispatch is budgeted before executing an instruction. If no dispatches
 /// remain, the dispatch limit takes precedence over executing the next
@@ -699,9 +755,9 @@ impl std::error::Error for InvokeError {
 /// bounds, null, and signature before checking the frame limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionLimit {
-    /// Simultaneously live function frames, including the exported function.
+    /// Simultaneously live function frames, including the entry function.
     CallDepth,
-    /// Total executed decoded instructions across all frames in the invocation.
+    /// Total executed decoded instructions across all frames in the execution.
     InstructionDispatches,
 }
 

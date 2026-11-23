@@ -21,6 +21,8 @@ mod if_branch;
 mod memory;
 #[path = "execution/stack.rs"]
 mod stack;
+#[path = "execution/start.rs"]
+mod start;
 #[path = "execution/unreachable.rs"]
 mod unreachable;
 #[path = "execution/void_control.rs"]
@@ -2732,11 +2734,13 @@ fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
 #[test]
 fn rejects_invalid_suffixes_even_after_a_complete_valid_function() {
     let complete = module(&SECTIONS);
-    for id in [2, 8] {
-        // Imports and start never reach instantiation.
+    for (id, kind) in [
+        (2, ErrorKind::UnsupportedSection { id: 2 }),
+        (8, ErrorKind::SectionOutOfOrder { id: 8 }),
+    ] {
         let mut bytes = complete.clone();
         push_section(&mut bytes, id, &[0]);
-        expect_error(&bytes, complete.len(), ErrorKind::UnsupportedSection { id });
+        expect_error(&bytes, complete.len(), kind);
     }
     let mut bytes = complete.clone();
     let custom = push_section(&mut bytes, 0, &[1, 0xff]);

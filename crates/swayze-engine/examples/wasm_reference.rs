@@ -87,6 +87,7 @@ enum Outcome {
     VoidInvocation(Result<(), WasmTrap>),
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
+    StartTrap(WasmTrap),
 }
 
 struct Fixture {
@@ -585,6 +586,30 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![selector],
         });
     }
+    // Start increments the initialized global once, or prevents publication
+    // of the instance by trapping. The regular export just reads the global.
+    let start_prefix = b"\0asm\x01\0\0\0\x01\x08\x02\x60\0\x01\x7f\x60\0\0\
+                         \x03\x03\x02\0\x01\x06\x06\x01\x7f\x01\x41\x29\x0b\
+                         \x07\x05\x01\x01x\0\0\x08\x01\x01";
+    for (code, expected) in [
+        (
+            &b"\x0a\x10\x02\x04\0\x23\0\x0b\x09\0\x23\0\x41\x01\x6a\x24\0\x0b"[..],
+            Outcome::Invocation(Ok(42)),
+        ),
+        (
+            &b"\x0a\x0a\x02\x04\0\x23\0\x0b\x03\0\0\x0b"[..],
+            Outcome::StartTrap(WasmTrap::Unreachable),
+        ),
+    ] {
+        let mut bytes = start_prefix.to_vec();
+        bytes.extend_from_slice(code);
+        cases.push(Fixture {
+            expected,
+            bytes,
+            export: "x",
+            args: vec![],
+        });
+    }
     cases
 }
 
@@ -652,6 +677,7 @@ fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
         Err(WasmInstantiationError::ElementSegmentOutOfBounds { segment_index }) => {
             return Ok(Outcome::ElementSegmentOutOfBounds(segment_index));
         }
+        Err(WasmInstantiationError::StartTrap(trap)) => return Ok(Outcome::StartTrap(trap)),
         Err(error) => return Err(error.into()),
     };
     if matches!(fixture.expected, Outcome::VoidInvocation(_)) {
@@ -699,9 +725,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
             Outcome::VoidInvocation(Ok(())) => reference == "void",
             Outcome::Invocation(Err(_)) | Outcome::VoidInvocation(Err(_)) => reference == "trap",
-            Outcome::DataSegmentOutOfBounds(_) | Outcome::ElementSegmentOutOfBounds(_) => {
-                reference == "instantiation-error"
-            }
+            Outcome::DataSegmentOutOfBounds(_)
+            | Outcome::ElementSegmentOutOfBounds(_)
+            | Outcome::StartTrap(_) => reference == "instantiation-error",
         };
         if !agrees || actual != expected {
             return Err(format!(

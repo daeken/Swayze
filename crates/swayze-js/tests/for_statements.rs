@@ -22,6 +22,47 @@ fn initializes_once_and_orders_test_body_and_update() {
 }
 
 #[test]
+fn non_store_clauses_work_at_root_and_in_nested_loops() {
+    let script = parse_script(
+        "let i=0; let trace=0;
+         for (i /* leading name */ + 1, true ? (null, 8) : 9; i<3;
+              i, null ?? (false, void i)) {
+             i++;
+             if (i===1) {continue;}
+             trace=trace*10+i;
+         }
+         for (let outer=0;outer<2;outer++) {
+             let j=0;
+             for (j,outer ? true : null; j<3; j,(outer ? (void j,true) : null)) {
+                 j++;
+                 trace=trace*10+j;
+                 if (j===1) {continue;}
+                 if (outer) {break;}
+             }
+         }
+         trace",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(2312312.0));
+    assert_eq!(script.evaluate(), Ok(2312312.0));
+
+    for source in [
+        "for (1;false;){}42",
+        "for (;false;1+2){}42",
+        "for ((1,2);false;(3,4)){}42",
+        "let i=1;for(i;false;i){}42",
+        "for(let i=1;false;i,void i){let i;}42",
+        "for(const i=(1,2);false;i,void i){const i=0;}42",
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(42.0),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn each_clause_can_be_omitted() {
     for statement in [
         "for (;i<3;i=i+1) {}",
@@ -269,21 +310,19 @@ fn checks_inactive_headers_and_bodies_with_lexical_diagnostics() {
 }
 
 #[test]
-fn requires_braces_delimiters_and_assignment_clauses() {
+fn requires_braces_and_explicit_delimiters() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, needle) in [
         ("for ;", Malformed, ";"),
         ("for(){}42", Malformed, ")"),
         ("for(;;;){}42", Malformed, ";;|;"),
-        ("for(0;false;){}42", Unsupported, "0"),
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "**="),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
         ("for(;i=1;){}42", Unsupported, "="),
         ("for(;false;i++){}42", Unsupported, "false;|i"),
-        ("for(;false;1+2){}42", Unsupported, "1"),
-        ("for(;false;i+1){}42", Unsupported, "+"),
+        ("for(;false;i+1){}42", Unsupported, "false;|i"),
         ("for(;false;i=0,i=1){}42", Unsupported, ","),
         ("for(i=;false;){}42", Malformed, "i=|;"),
         ("for(i=0\ntrue;){}42", Malformed, "true"),
@@ -307,6 +346,133 @@ fn requires_braces_delimiters_and_assignment_clauses() {
             .evaluate(),
         Ok(5.0)
     );
+}
+
+#[test]
+fn non_store_clauses_still_require_delimiters_and_complete_expressions() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, marked, message) in [
+        (
+            "for(1){}0",
+            Malformed,
+            ")",
+            "expected ';' between for clauses",
+        ),
+        (
+            "for(1\nfalse;){}0",
+            Malformed,
+            "false",
+            "expected a binary operator",
+        ),
+        ("for(1,;false;){}0", Malformed, ",|;", "expected an operand"),
+        (
+            "for(1?2,3:4;false;){}0",
+            Malformed,
+            ",",
+            "expected ':' before ','",
+        ),
+        ("for(;false;1,){}0", Malformed, ",|)", "expected an operand"),
+        (
+            "for(;false;undefined",
+            Malformed,
+            "",
+            "expected ')' after the for update",
+        ),
+        (
+            "for(;false;undefined;){}0",
+            Malformed,
+            "undefined|;",
+            "expected ')' after the for update",
+        ),
+        (
+            "for(;false;1{}0",
+            Malformed,
+            "{",
+            "expected ')' after the for update",
+        ),
+        (
+            "for(;false;const i=0){}0",
+            Unsupported,
+            "const",
+            "declarations are not expression tokens",
+        ),
+        (
+            "for(;false;let i){}0",
+            Unsupported,
+            "let",
+            "declarations are not expression tokens",
+        ),
+    ] {
+        assert_eq!(
+            assert_error_at(source, kind, marked).message(),
+            message,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn skipped_non_store_clauses_still_resolve_all_names_in_their_own_scope() {
+    let unbound = "unbound name is outside the subset";
+    let tdz = "access before lexical binding initialization is outside the subset";
+    for (source, marked, message) in [
+        ("if(false){for(missing,0;false;){}}42", "missing", unbound),
+        (
+            "let a=0;if(false){for(a;false;){}let a=2;}42",
+            "for(|a",
+            tdz,
+        ),
+        ("for(;false;missing){}42", "missing", unbound),
+        (
+            "for(const i=1;false;i,(false&&missing)){}42",
+            "missing",
+            unbound,
+        ),
+        (
+            "for(let i=1;false;i,body){let body=1;}42",
+            "i,|body",
+            unbound,
+        ),
+    ] {
+        assert_eq!(
+            assert_error_at(source, ErrorKind::Unsupported, marked).message(),
+            message,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn stores_remain_standalone_in_both_clauses() {
+    let source = "let i;for(i??=(null,0);i<3;i+=(true?1:2,1)){}i";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(3.0));
+    let source = "let i=2;for(--i;i<3;i/**/++){if(i===2){break;}continue;}i";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(2.0));
+
+    let requires_group = "a sequence in an assignment RHS requires parentheses";
+    let assignment_expr = "assignment expressions are outside the subset";
+    let update_expr = "increment and decrement expressions are outside the subset";
+    for (source, marked, message) in [
+        ("let i;for(i??=null,0;false;){}0", ",", requires_group),
+        ("let i;for(;false;i+=true?1:2,1){}0", ",", requires_group),
+        ("let i;for(i, i=1;false;){}0", "=", assignment_expr),
+        ("let i;for(;false;(i=1)){}0", "=", assignment_expr),
+        ("let i=0,j=0;for(i++,j++;false;){}0", "i|++", update_expr),
+        ("let i=0,j=0;for(;false;++i,j--){}0", "++", update_expr),
+        ("let i;for(;false;0,i--){}0", "--", update_expr),
+        ("let i;for((i++);false;){}0", "++", update_expr),
+        (
+            "let i;for(;false;i/*\n*/++){}0",
+            "++",
+            "a line terminator cannot precede a postfix update",
+        ),
+    ] {
+        assert_eq!(
+            assert_error_at(source, ErrorKind::Unsupported, marked).message(),
+            message,
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -657,6 +823,115 @@ fn for_dispatches_share_the_inclusive_execution_ceiling() {
             parse_script(source).unwrap().evaluate(),
             Err(EvalError::DispatchLimitExceeded)
         );
+    }
+}
+
+#[test]
+fn non_store_clauses_share_exact_token_work_and_nesting_caps() {
+    let source = "for(undefined/*é*/,null;false;(undefined,true)){}null";
+    // 14 emissions, one unit each for the header, group and body frame, and
+    // source bytes (including the looked-ahead comma and preceding trivia).
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 17,
+        max_nesting_depth: 2,
+        max_work: source.len() + 17,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 14);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate_value(), Ok(Value::Null));
+
+    let group = source.find(";(undefined").unwrap() + 1;
+    let init_end = source.find(';').unwrap();
+    let final_expr = source.len() - 4;
+    for (limits, kind, start, len) in [
+        (
+            Limits {
+                max_tokens: 16,
+                ..limits
+            },
+            Limit::Tokens,
+            final_expr,
+            1,
+        ),
+        (
+            Limits {
+                max_nesting_depth: 1,
+                ..limits
+            },
+            Limit::NestingDepth,
+            group,
+            1,
+        ),
+        (
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+            Limit::Work,
+            final_expr,
+            4,
+        ),
+        // Source through ';', header, and the three emissions before the final init discard.
+        (
+            Limits {
+                max_work: init_end + 1 + 4,
+                ..limits
+            },
+            Limit::Work,
+            init_end,
+            1,
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(kind));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + len
+            }
+        );
+    }
+}
+
+#[test]
+fn non_store_clauses_count_toward_prepared_limit_even_if_skipped() {
+    let update_tail = ",null".repeat(2042);
+    let limits = Limits {
+        max_tokens: 8192,
+        max_nesting_depth: 2,
+        ..Limits::default()
+    };
+    for (result, count, expected) in [
+        ("!null", 4096, Ok(Value::Boolean(true))),
+        ("!!null", 4097, Err(EvalError::LimitExceeded)),
+    ] {
+        let source = format!("for(null;false;!null{update_tail}){{}}{result}");
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), count);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(script.evaluate_value(), expected);
+    }
+}
+
+#[test]
+fn non_store_clauses_and_their_discards_dispatch_once_on_each_entry() {
+    // 7 setup dispatches, 15 per iteration (including both update discards),
+    // 4 for the final falsy test and 1 for the final load = 16,377 before prefixes.
+    for (prefixes, expected) in [
+        (6, Ok(1091.0)),
+        (7, Ok(1091.0)),
+        (8, Err(EvalError::DispatchLimitExceeded)),
+    ] {
+        let source = format!(
+            "let i=0;for(null,void i;i<1091;i,null){{i++;continue;}}{}i",
+            "+ ".repeat(prefixes)
+        );
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.evaluate(), expected);
+        assert_eq!(script.evaluate(), expected);
     }
 }
 

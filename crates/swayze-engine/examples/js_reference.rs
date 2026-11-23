@@ -333,7 +333,10 @@ fn fixtures() -> Vec<String> {
             "1 + 2; false; null",
             "void 0; let n = 42; n; /* end */",
             "let n = 40; { n; false && (1, 2); n += 2; } n",
-            "let n = 0; while (n < 2) { n, undefined; n++; } n"
+            "let n = 0; while (n < 2) { n, undefined; n++; } n",
+            "let n = 0; for (n, void 1; n < 3; n + 1, undefined) { n++; } n",
+            "let n = 0; for (let end = 3; n < end; end, n) { n++; if (n < end) { continue; } } n",
+            "let n = 42; for (n ? null : undefined, n; true; void n) { break; } n"
         ]
         .map(str::to_owned),
     );

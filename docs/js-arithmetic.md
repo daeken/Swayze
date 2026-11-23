@@ -99,8 +99,10 @@ to be empty; a missing test is true. The initializer can be a `let` or `const`
 declaration list. Its bindings are visible in the initializer, test, update, and body, but
 not after the loop. The initializer runs once each time execution enters the
 loop statement, not on each iteration. The update and any non-declaration
-initializer must be a supported assignment, increment, or decrement of an
-initialized mutable binding. `break;` skips the update. The subset has no
+initializer can be a supported expression (including a comma sequence), whose
+result is discarded, or a standalone assignment, increment, or decrement of
+an initialized mutable binding. Sequences cannot contain assignments or updates.
+`break;` skips the update. The subset has no
 closures and does not model their observable per-iteration environments.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`

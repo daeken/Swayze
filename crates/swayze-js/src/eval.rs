@@ -177,9 +177,12 @@ impl Script {
     /// body only when the test is truthy. A `for` statement first runs its
     /// optional initializer and then tests (an omitted test is truthy). Each
     /// normal iteration ends with the optional update, then another test.
-    /// `break;` exits the innermost loop without updating, and `continue;`
-    /// skips the rest of its body but still runs its update, if any, before
-    /// retesting. None of these statements leaves a result.
+    /// A `do { ... } while (test);` statement runs its body before its first
+    /// test and repeats while the test is truthy. The test is outside the
+    /// body scope. `break;` exits the innermost loop without running its
+    /// update or test. `continue;` skips the rest of that loop's body and
+    /// runs its next test (after the update in a `for`, if present).
+    /// None of these statements leaves a result.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments use fresh immutable `const` and mutable `let` slots for
@@ -240,7 +243,7 @@ fn evaluate(
     // No clearing on scope exit is needed: the parser emits references only
     // within the declaration's scope after its initializer. A jump can skip a
     // block or leave it, but cannot enter a suffix from outside the block.
-    // Loop back edges restart at a test or update, outside the body scope.
+    // Loop back edges restart at a test, an update, or the start of a do body.
     let mut bindings = Vec::<Option<Slot>>::new();
     bindings
         .try_reserve_exact(binding_slots)

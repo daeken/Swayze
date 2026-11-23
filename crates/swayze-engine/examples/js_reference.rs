@@ -263,6 +263,12 @@ fn fixtures() -> Vec<String> {
             "let x = 0 / 0; x ||= 42; x",
             "let x = null; x ??= false || 42; x",
             "let i = 0; let x = null; for (x ??= 1; i < 2; x &&= x + i) { i += 1; continue; } x",
+            "0x2a + 0X2A + 0o52 + 0O52 + 0b101010 + 0B101010",
+            "-0o0000",
+            "0x20000000000001",
+            "0x20000000000003",
+            "0x20000000000005",
+            "0XfffffffF >>> 0",
         ]
         .map(str::to_owned),
     );
@@ -287,6 +293,14 @@ fn fixtures() -> Vec<String> {
         format!("{huge} - {huge}"),
         format!("0 * {huge}"),
         format!("{huge} + (0 - {huge})"),
+    ]);
+    // Consecutive integers around the rounding boundary for infinity.
+    let leading = "1".repeat(53);
+    cases.extend([
+        format!("0b{leading}0{}", "1".repeat(970)),
+        format!("0b{leading}1{}", "0".repeat(970)),
+        format!("0b{leading}1{}1", "0".repeat(969)),
+        format!("0o{}52", "0".repeat(2048)),
     ]);
     cases
 }

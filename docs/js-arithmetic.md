@@ -10,9 +10,12 @@ Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 the default value, but a block-local declaration of that name takes precedence.
 A top-level declaration of `undefined` is malformed in a classic script.
 
-This path evaluates an expression over decimal literals (including fractions and
-signed exponents) with binary
-`+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
+Number literals include decimal fractions and signed exponents, plus binary
+(`0b`), octal (`0o`), and hexadecimal (`0x`) integers with either case of prefix.
+Explicit-radix literals round to binary64 with ties to even, including at the
+overflow boundary. Numeric separators, legacy octal, and BigInt stay outside
+the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
+`+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and initialized
 `let` declarations initialize slots in source order, preserving the value type.
 Simple and compound assignments update earlier `let` slots. Arithmetic and

@@ -30,6 +30,7 @@ fn eager_prefixes_store_and_yield_the_same_number() {
 fn mixed_chains_snapshot_old_values_and_finish_from_right_to_left() {
     for (source, expected) in [
         ("let x=8; let r=x/=x=2; r*10+x", 44.0),
+        ("let x=2; let r=x += x = 5; x * 10 + r", 77.0),
         ("let x=8; let r=x-=x*=x=2; r*10+x", -88.0),
         ("let x=8,y=2; (x -= y <<= 1)*100+x*10+y", 444.0),
         ("let x=8,y=2; x /= y **= 2; x*10+y", 24.0),
@@ -80,6 +81,25 @@ fn logical_prefixes_skip_or_take_the_rhs_and_pass_the_tag_to_outer_writes() {
                 _ => assert_eq!(actual, expected, "{source}"),
             }
         }
+    }
+}
+
+#[test]
+fn logical_skips_resume_at_the_immediate_enclosing_instruction() {
+    for (source, expected) in [
+        // The skipped RHS must feed the enclosing += with y's old value.
+        ("let x=2,y=3; let r=x += y ||= 9; x*100+r*10+y", 553.0),
+        // The skipped consequent must still jump over the alternate's write.
+        (
+            "let x=2,alt=0; let r=true ? x ||= 9 : alt += 1; r*100+x*10+alt",
+            220.0,
+        ),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
     }
 }
 

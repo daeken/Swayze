@@ -56,6 +56,10 @@ impl FunctionTable {
         table
     }
 
+    pub(super) fn size(&self) -> u32 {
+        self.len as u32
+    }
+
     pub(super) fn resolve(&self, selector: u32) -> Result<usize, Trap> {
         if selector >= self.len as u32 {
             return Err(Trap::TableOutOfBounds);

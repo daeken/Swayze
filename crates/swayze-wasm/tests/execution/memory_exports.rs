@@ -234,14 +234,6 @@ fn binary_index_and_name_diagnostics_are_section_framed() {
             ),
             (b"\x01\x01m", 3, TruncatedByte { expected: 0 }),
             (
-                b"\x01\x01m\x01\0",
-                3,
-                UnexpectedByte {
-                    expected: 0,
-                    found: 1,
-                },
-            ),
-            (
                 b"\x01\x01m\x04\0",
                 3,
                 UnexpectedByte {

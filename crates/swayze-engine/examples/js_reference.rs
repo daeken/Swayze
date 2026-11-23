@@ -167,6 +167,11 @@ fn fixtures() -> Vec<String> {
             "let x = 1; if (x === 1 && true) { x = x + 1; x = x * 5; } x + 1",
             "let x = 1; if (false) {} else {} if (x) { x = true; } x",
             "let x = false; if ((1 ? 2 : 3) < 3) { x = true; } const answer = x ? 42 : 0; answer",
+            "let x = 1; while (x < 40) { x = x * 2; } x",
+            "let x = true; let n = 41; while (x) { x = false; n = n + 1; } n",
+            "let x = -0; while (x || 0 / 0) { x = 42; } x",
+            "let x = 4; let y = 0; while (x !== 0 && true) { y = y + x; x = x - 1; } y",
+            "let x = 0; while (false) {} while (x < 2) { x = x + 1; } if (x) { x = x * 21; } x",
         ]
         .map(str::to_owned),
     );

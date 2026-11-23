@@ -26,7 +26,7 @@ fn assert_limit(source: &str, limits: Limits, limit: Limit, start: usize, end: u
 
 #[test]
 fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
-    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBinding};
+    use Instruction::{Boolean, Jump, JumpIfFalseStatement, StoreBinding};
 
     assert_postfix(
         "let x=0;if(true){x=1;}else{x=2+(3+4);}x",
@@ -34,7 +34,7 @@ fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
             Number(0.0),
             InitBinding(BindingKind::Let),
             Boolean(true),
-            JumpIfFalse(7),
+            JumpIfFalseStatement(7),
             Number(1.0),
             StoreBinding(0),
             Jump(13),
@@ -50,8 +50,86 @@ fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
     );
     assert_postfix(
         "if(false){}42",
-        &[Boolean(false), JumpIfFalse(2), Number(42.0)],
+        &[Boolean(false), JumpIfFalseStatement(2), Number(42.0)],
         1,
+    );
+}
+
+#[test]
+fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
+    use Instruction::{Boolean, JumpIfFalseStatement, LoopBack, StoreBinding};
+
+    assert_postfix(
+        "let x=1;while(x){x=x-(2+3);}x",
+        &[
+            Number(1.0),
+            InitBinding(BindingKind::Let),
+            LoadBinding(0),
+            JumpIfFalseStatement(11),
+            LoadBinding(0),
+            Number(2.0),
+            Number(3.0),
+            Add,
+            Subtract,
+            StoreBinding(0),
+            LoopBack(2),
+            LoadBinding(0),
+        ],
+        3,
+    );
+    assert_postfix(
+        "while(false){}42",
+        &[
+            Boolean(false),
+            JumpIfFalseStatement(3),
+            LoopBack(0),
+            Number(42.0),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn while_body_and_back_edge_are_metered_even_if_skipped() {
+    let source = "let x=0;while(false){x=1;}x";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 16,
+        max_nesting_depth: 1,
+        // Same as an if with no else, plus one emission for the back edge.
+        max_work: source.len() + 15,
+    };
+    assert!(parse_script_with_limits(source, limits).is_ok());
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 15,
+            ..limits
+        },
+        Limit::Tokens,
+        source.len() - 1,
+        source.len(),
+    );
+    let close = source.find('}').unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_work: close + 1 + 11,
+            ..limits
+        },
+        Limit::Work,
+        close,
+        close + 1,
+    ); // The source through '}', two conversions, one marker, six prior emissions, and a lookup.
+    assert_limit(
+        source,
+        Limits {
+            max_nesting_depth: 0,
+            ..limits
+        },
+        Limit::NestingDepth,
+        13,
+        14,
     );
 }
 

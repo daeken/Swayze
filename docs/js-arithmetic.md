@@ -36,14 +36,19 @@ All operands and arms must use supported syntax and bindings.
 Top-level `if (test) { ... }` statements may precede the final expression.
 Braced arms hold simple assignments to earlier `let` bindings. Only the
 selected arm runs; a false test with no `else` leaves the bindings unchanged.
-Both arms are checked without executing them. Nested statements, `else if`,
-and declarations in branches are outside the subset.
+Both arms are checked without executing them. Top-level `while (test) { ... }`
+statements reevaluate the test before each iteration and run the braced
+assignments only while it is truthy. Nested control statements, `else if`,
+and declarations in branches or loop bodies are outside the subset.
 
 The evaluator sees only private instructions, not the original source. Before
-allocating, it checks a ceiling of 4,096 instructions, counting skipped arms
-and operands and their forward jumps, independent of custom parse limits.
-It visits each instruction at most once. Each literal adds one operand and each eager binary
-operation consumes two operands and leaves one. A unary operation replaces the
+allocating, it checks a ceiling of 4,096 prepared instructions, counting
+skipped paths and jumps, independent of custom parse limits. At runtime,
+each evaluation gets 16,384 dispatches. Repeated tests, assignments and loop
+back edges count each time they execute; skipped paths and exiting do not.
+An evaluation that needs another dispatch returns `DispatchLimitExceeded`.
+Each literal adds one operand, and each eager binary operation consumes two
+operands and leaves one. A unary operation replaces the
 top operand. Initialization consumes a value and appends a slot; a read pushes
 that slot's value. Assignment replaces the value of a mutable slot. The
 evaluator checks bounds before reserving at most 2,048

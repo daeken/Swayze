@@ -5,8 +5,9 @@ use crate::{
     parser::{BindingKind, Instruction},
 };
 
-// This is an execution ceiling, independent of custom parse limits.
+// Fixed evaluation ceilings, independent of custom parse limits.
 const MAX_INSTRUCTIONS: usize = 4096;
+const MAX_DISPATCHES: usize = 16_384;
 
 /// A result or intermediate value in the supported JavaScript subset.
 ///
@@ -51,8 +52,10 @@ impl Value {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EvalError {
-    /// The instruction sequence exceeds the evaluator's operation budget.
+    /// The prepared instruction sequence exceeds the 4,096-instruction ceiling.
     LimitExceeded,
+    /// Execution would dispatch more than 16,384 instructions in this evaluation.
+    DispatchLimitExceeded,
     /// The instruction sequence has invalid control flow, operands, or binding-slot usage.
     InvalidScript,
     /// The evaluator could not allocate bounded operand or binding storage.
@@ -64,9 +67,10 @@ pub enum EvalError {
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::LimitExceeded => "arithmetic script exceeds the evaluation operation limit",
-            Self::InvalidScript => "invalid prepared arithmetic instruction sequence",
-            Self::AllocationFailed => "could not allocate arithmetic operand or binding storage",
+            Self::LimitExceeded => "prepared JavaScript instruction limit exceeded",
+            Self::DispatchLimitExceeded => "JavaScript evaluation dispatch limit exceeded",
+            Self::InvalidScript => "invalid prepared JavaScript instruction sequence",
+            Self::AllocationFailed => "could not allocate JavaScript operand or binding storage",
             Self::NonNumericResult => "script result is a Boolean, not a Number",
         })
     }
@@ -107,17 +111,22 @@ impl Script {
     /// preserving the selected value and type. An `if` statement uses the same
     /// truthiness but evaluates only the selected branch's assignments, leaving
     /// no operand stack result. A falsy test with no `else` performs no writes.
+    /// A `while` statement evaluates its test before each iteration and runs its
+    /// assignments in order only when the test is truthy. It leaves no result.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
-    /// and assignments run in source order with fresh immutable `const` and
-    /// mutable `let` slots for each call. The evaluation ceiling is 4,096 total
-    /// instructions, including jumps and potentially skipped operands or arms,
-    /// regardless of the parse limits used.
+    /// and assignments use fresh immutable `const` and mutable `let` slots for
+    /// each call. Independent of parse limits, a script can have at most 4,096
+    /// prepared instructions, including jumps and skipped paths. Each call can
+    /// dispatch at most 16,384 instructions; each execution of an instruction
+    /// counts once, including tests, jumps, and repeated loop instructions.
     ///
     /// # Errors
     ///
-    /// Returns an error if operand or binding storage could not be allocated, or if the
-    /// prepared instruction sequence violates its internal shape or size limits.
+    /// Returns [`EvalError::LimitExceeded`] for an oversized prepared script,
+    /// [`EvalError::DispatchLimitExceeded`] if another dispatch would exceed
+    /// its budget, [`EvalError::InvalidScript`] for an invalid instruction
+    /// sequence, or [`EvalError::AllocationFailed`] if storage cannot be allocated.
     pub fn evaluate_value(&self) -> Result<Value, EvalError> {
         evaluate(
             self.instructions(),
@@ -140,9 +149,10 @@ fn evaluate(
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
-    // On a path that reaches the peak, that many pushes and at least one less
-    // pop are needed to finish with one value. Each binding also needs at least
-    // a push and an initializer, and the final expression needs an instruction.
+    // Back edges require an empty stack, so repeated passes cannot build up
+    // operands. A path to the peak needs that many distinct pushes and at
+    // least one less distinct pop to finish or return to a loop test. Each
+    // binding also needs a push and initializer, plus a final expression.
     if max_operands == 0
         || max_operands > ops.len().div_ceil(2)
         || binding_slots > ops.len().saturating_sub(1) / 2
@@ -162,10 +172,14 @@ fn evaluate(
         .try_reserve_exact(binding_slots)
         .map_err(|_| EvalError::AllocationFailed)?;
 
-    // Each step advances the instruction pointer, so the total instruction
-    // ceiling bounds execution even with jumps. `ops.len()` denotes exit.
+    // `ops.len()` denotes exit, which is not a dispatch and needs no fuel.
+    let mut remaining = MAX_DISPATCHES;
     let mut ip = 0;
-    while let Some(&op) = ops.get(ip) {
+    while ip != ops.len() {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or(EvalError::DispatchLimitExceeded)?;
+        let op = *ops.get(ip).ok_or(EvalError::InvalidScript)?;
         ip += 1;
         match op {
             Instruction::Number(value) => {
@@ -224,8 +238,11 @@ fn evaluate(
             Instruction::Not => {
                 apply_unary(&mut stack, |value| Value::Boolean(!value.to_boolean()))?;
             }
-            Instruction::JumpIfFalse(target) => {
-                let target = check_target(ip, target, ops.len())?;
+            Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
+                let target = check_forward_target(ip, target, ops.len())?;
+                if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
+                    return Err(EvalError::InvalidScript);
+                }
                 let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if !condition.to_boolean() {
                     ip = target;
@@ -235,7 +252,7 @@ fn evaluate(
                 target,
                 when_truthy,
             } => {
-                let target = check_target(ip, target, ops.len())?;
+                let target = check_forward_target(ip, target, ops.len())?;
                 let lhs = stack.last().ok_or(EvalError::InvalidScript)?;
                 if lhs.to_boolean() == when_truthy {
                     ip = target;
@@ -243,7 +260,15 @@ fn evaluate(
                     stack.pop();
                 }
             }
-            Instruction::Jump(target) => ip = check_target(ip, target, ops.len())?,
+            Instruction::Jump(target) => ip = check_forward_target(ip, target, ops.len())?,
+            Instruction::LoopBack(target) => {
+                // `ip` already points past this instruction. Reject self and
+                // forward edges, and only re-enter a test at statement depth.
+                if target >= ip - 1 || !stack.is_empty() {
+                    return Err(EvalError::InvalidScript);
+                }
+                ip = target;
+            }
         }
     }
 
@@ -253,7 +278,7 @@ fn evaluate(
     }
 }
 
-fn check_target(next: usize, target: usize, exit: usize) -> Result<usize, EvalError> {
+fn check_forward_target(next: usize, target: usize, exit: usize) -> Result<usize, EvalError> {
     if (next..=exit).contains(&target) {
         Ok(target)
     } else {
@@ -361,6 +386,99 @@ mod tests {
             );
         }
         assert_eq!(evaluate(&[one, Jump(2)], 1, 0), Ok(Value::Number(1.0)));
+    }
+
+    #[test]
+    fn checks_statement_tests_and_backward_edges() {
+        use Instruction::{Boolean, Jump, JumpIfFalseStatement, LoopBack, Number};
+        let one = Number(1.0);
+        for target in [1, 2, 3, usize::MAX] {
+            let ops = [Jump(1), LoopBack(target), one];
+            assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+        }
+        assert_eq!(
+            evaluate(&[LoopBack(0), one], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[one, LoopBack(0)], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[JumpIfFalseStatement(1), one], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        for truthy in [true, false] {
+            let mut ops = [Boolean(truthy), JumpIfFalseStatement(3), LoopBack(0), one];
+            let expected = if truthy {
+                Err(EvalError::DispatchLimitExceeded)
+            } else {
+                Ok(Value::Number(1.0))
+            };
+            assert_eq!(evaluate(&ops, 1, 0), expected);
+            // A statement exit is forward, even if the branch is not taken.
+            ops[1] = JumpIfFalseStatement(0);
+            assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+            let extra_operand = [
+                one,
+                Boolean(truthy),
+                JumpIfFalseStatement(4),
+                LoopBack(0),
+                one,
+            ];
+            assert_eq!(
+                evaluate(&extra_operand, 2, 0),
+                Err(EvalError::InvalidScript)
+            );
+        }
+    }
+
+    #[test]
+    fn loop_test_short_circuits_on_every_path() {
+        use Instruction::{
+            Boolean, JumpIfFalseStatement, LoadBinding, LoopBack, ShortCircuit, StoreBinding,
+        };
+        // `while (x && (true || bad_slot)) { x = false; } x` with an
+        // invalid private load to make execution of the skipped operand observable.
+        let mut ops = [
+            Boolean(true),
+            INIT_LET,
+            LoadBinding(0),
+            ShortCircuit {
+                target: 7,
+                when_truthy: false,
+            },
+            Boolean(true),
+            ShortCircuit {
+                target: 7,
+                when_truthy: true,
+            },
+            LoadBinding(1),
+            JumpIfFalseStatement(11),
+            Boolean(false),
+            StoreBinding(0),
+            LoopBack(2),
+            LoadBinding(0),
+        ];
+        assert_eq!(evaluate(&ops, 1, 1), Ok(Value::Boolean(false)));
+        ops[4] = Boolean(false);
+        assert_eq!(evaluate(&ops, 1, 1), Err(EvalError::InvalidScript));
+    }
+
+    #[test]
+    fn checks_fuel_before_dispatching_even_an_invalid_operation() {
+        use Instruction::LoadBinding;
+        // Seven dispatches per iteration, two for initialization, two for the
+        // final falsy test, and seven for the final expression. No exit dispatch.
+        let script = crate::parse_script("let x=2339; while(x){x=x-1;} + + + + + + x").unwrap();
+        assert_eq!(2339 * 7 + 2 + 2 + 7, MAX_DISPATCHES);
+        assert_eq!(script.evaluate(), Ok(0.0));
+        let mut ops = script.instructions().to_vec();
+        *ops.last_mut().unwrap() = LoadBinding(1);
+        assert_eq!(evaluate(&ops, 2, 1), Err(EvalError::InvalidScript));
+        *ops.last_mut().unwrap() = Instruction::Positive;
+        ops.push(LoadBinding(1));
+        assert_eq!(evaluate(&ops, 2, 1), Err(EvalError::DispatchLimitExceeded));
     }
 
     #[test]

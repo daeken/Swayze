@@ -322,6 +322,32 @@ fn nested_control_edges_target_their_own_tests_and_joins() {
 }
 
 #[test]
+fn else_if_edges_go_directly_to_the_next_test_or_the_common_join() {
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, StoreBinding};
+
+    assert_postfix(
+        "let x=0;if(false){}else if(false){}else if(true){}else{x=42;}x",
+        &[
+            Number(0.0),
+            init_let(0),
+            Boolean(false),
+            JumpIfFalseStatement(5),
+            JumpStatement(13),
+            Boolean(false), // 5: second test
+            JumpIfFalseStatement(8),
+            JumpStatement(13),
+            Boolean(true), // 8: third test
+            JumpIfFalseStatement(11),
+            JumpStatement(13),
+            Number(42.0), // 11: final else
+            StoreBinding(0),
+            LoadBinding(0), // 13: common join
+        ],
+        1,
+    );
+}
+
+#[test]
 fn loop_jumps_resolve_to_their_own_test_and_exit_across_if_frames() {
     use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
 
@@ -423,9 +449,9 @@ fn nested_controls_charge_one_frame_push_per_statement_and_lex_each_token_once()
         max_tokens: 35,
         max_nesting_depth: 1,
         // 15 instructions + 3 conversions + 3 expression markers + 3
-        // statement frames + 10 lookup units (including 4 parent hops).
-        // Else reuses the enclosing frame but gets its own scope.
-        max_work: source.len() + 34,
+        // statement frames + 3 if jump fixups + 10 lookup units (including
+        // 4 parent hops). Else reuses the frame but gets its own scope.
+        max_work: source.len() + 37,
     };
     assert_eq!(
         parse_script_with_limits(source, limits).unwrap().evaluate(),
@@ -472,7 +498,7 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
         max_source_bytes: source.len(),
         max_tokens: 16,
         max_nesting_depth: 1,
-        // Same as an if with no else, plus one emission for the back edge.
+        // Includes the back-edge emission; unlike if, the exit fixup is not charged.
         max_work: source.len() + 17,
     };
     assert!(parse_script_with_limits(source, limits).is_ok());
@@ -512,11 +538,11 @@ fn while_body_and_back_edge_are_metered_even_if_skipped() {
 #[test]
 fn if_tokens_and_work_are_counted_once_even_in_untaken_branches() {
     for (source, tokens, work_beyond_source) in [
-        ("let x=0;if(false){x=1;}x", 16, 16),
-        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 23),
+        ("let x=0;if(false){x=1;}x", 16, 17),
+        ("let x=0;if(false){x=1;}else{x=2;}x", 23, 25),
     ] {
         // Besides the source bytes: decimal input bytes, the '(' marker, the
-        // statement frame, instruction emissions, and binding lookups.
+        // statement frame, instruction emissions, if fixups, and binding lookups.
         let limits = Limits {
             max_source_bytes: source.len(),
             max_tokens: tokens,

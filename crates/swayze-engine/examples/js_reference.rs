@@ -304,6 +304,11 @@ fn fixtures() -> Vec<String> {
             "const a = 20, b = a + 2; a + b",
             "let a = true ? (20 + 1) : 0, b = a === 21 ? a : 0; a + b",
             "let a = 1, out; { let a = 20, b = a + 21; out = b; } out + a",
+            "let out; if (false) { out = 1; } else if (true) { out = 42; } else if (true) { out = 3; } else { out = 4; } out",
+            "let out; if (false) { out = 1; } else if (false) { out = 2; } else { out = null; } out",
+            "let x = true, out; if (false) { let x = false; } else if (x) { out = 42; } out",
+            "let out; if (true) { if (false) {} else if (true) { out = 42; } } else if (true) { out = 1; } out",
+            "let i = 0, out = 0; while (i < 4) { i++; if (i === 1) {} else if (i === 2) { continue; } else if (i === 4) { break; } else { out += i; } } out",
         ]
         .map(str::to_owned),
     );

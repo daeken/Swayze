@@ -88,9 +88,12 @@ mutable binding in the enclosing scope. `break;` skips the update.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`
 jumps to the test; `break;` skips it. Untaken arms and skipped loop bodies
-are still checked. The parser
-uses at most 128 active statement frames, separate from the expression nesting
-limit. Unbraced `else if` is unsupported.
+are still checked. An `else if` chain tests conditions in order, skips later
+arms once one matches, and requires braces around every arm body. Each test
+uses the enclosing scope, not the preceding arm's scope. The parser uses at
+most 128 active statement frames, separately from the expression nesting
+limit. Each `if` in a chain counts as a frame, and each `if` branch fixup
+costs one unit of parse work, including in a plain `if`.
 
 The evaluator sees only private instructions, not the original source. Before
 allocating, it checks a ceiling of 4,096 prepared instructions, counting

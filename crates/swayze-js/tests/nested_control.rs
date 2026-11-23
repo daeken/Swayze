@@ -21,7 +21,10 @@ fn else_binds_only_to_the_if_whose_then_arm_just_closed() {
     for (source, needle) in [
         ("if(true){while(false){}else{}}42", "else"),
         ("while(false){if(true){}else{}else{}}42", "else"),
-        ("while(false){if(false){}else if(true){}}42", "if"),
+        (
+            "while(false){if(false){}else if(true){}else{}else{}}42",
+            "else",
+        ),
     ] {
         let start = source.rfind(needle).unwrap();
         let error = parse_script(source).unwrap_err();
@@ -35,6 +38,40 @@ fn else_binds_only_to_the_if_whose_then_arm_just_closed() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn nested_else_if_joins_do_not_consume_an_enclosing_arms_else() {
+    for (outer, expected) in [(true, 420.0), (false, 3.0)] {
+        let source = format!(
+            "let x=0;
+             if (false) {{}} else if ({outer}) {{
+                 if (false) {{}} else if (true) {{ x=4; }}
+                 if (false) {{}} else {{
+                     if (false) {{}} else if (false) {{}} else {{ x=x*10+2; }}
+                     x*=10;
+                 }}
+             }} else if (true) {{ x=3; }} else {{ x=1; }} x"
+        );
+        assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(expected));
+    }
+}
+
+#[test]
+fn else_if_arms_break_and_continue_only_the_innermost_loop() {
+    let source = "let i=0; let j=0; let sum=0;
+                  for (; i<5; i++) {
+                      j=0;
+                      do {
+                          j++;
+                          if (false) {} else if (j===1) { continue; } else if (j===2) { break; }
+                          sum+=1000;
+                      } while (j<3);
+                      if (false) {} else if (i===1) { continue; } else if (i===3) { break; }
+                      sum+=j;
+                  }
+                  sum*10+i";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(43.0));
 }
 
 #[test]

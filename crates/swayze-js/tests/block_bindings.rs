@@ -207,9 +207,9 @@ fn const_write_checks_the_resolved_binding() {
 fn shadow_access_resolution_has_an_exact_work_budget() {
     let source = "let x=1;if(x){let x=2;if(true){x=x+1;}}x";
     // Source bytes, 13 emissions, 3 conversion bytes, 2 frames, 2 groups,
-    // 1 operator, 8 units for four matching candidates and 2 parent hops.
+    // 2 if jump fixups, 1 operator, 8 units for four matching candidates and 2 parent hops.
     let limits = Limits {
-        max_work: source.len() + 31,
+        max_work: source.len() + 33,
         ..Limits::default()
     };
     assert_eq!(
@@ -218,9 +218,9 @@ fn shadow_access_resolution_has_an_exact_work_budget() {
     );
     let target = source.find("x=x").unwrap();
     for (max_work, start) in [
-        (source.len() + 23, target), // no work left for the first parent hop
-        (source.len() + 24, target), // hop paid, no work left to visit a candidate
-        (source.len() + 25, target), // candidate visit paid, not the comparison
+        (source.len() + 25, target), // no work left for the first parent hop
+        (source.len() + 26, target), // hop paid, no work left to visit a candidate
+        (source.len() + 27, target), // candidate visit paid, not the comparison
         (limits.max_work - 1, source.len() - 1), // final root name comparison
     ] {
         let error = parse_script_with_limits(source, Limits { max_work, ..limits }).unwrap_err();
@@ -259,9 +259,9 @@ fn skipped_block_declarations_count_against_parse_budgets() {
     let source = "if(false){let x=0;}else{const x=1;}2";
     let limits = Limits {
         max_tokens: 20,
-        // Source bytes, frame, pending test group, 8 emissions and 3 decimal
-        // conversion bytes. Disjoint scopes don't scan each other's declarations.
-        max_work: source.len() + 13,
+        // Source bytes, frame, pending test group, 8 emissions, 2 if jump
+        // fixups, and 3 decimal conversion bytes. Sibling scopes are not scanned.
+        max_work: source.len() + 15,
         ..Limits::default()
     };
     let script = parse_script_with_limits(source, limits).unwrap();

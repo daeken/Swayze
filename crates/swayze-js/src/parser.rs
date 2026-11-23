@@ -1055,6 +1055,11 @@ enum StatementFrame {
     IfElse {
         join: usize,
     },
+    // The then-arm scope has closed, but this if is still active until its
+    // nested `else if` finishes. Only the pending jump to the join remains.
+    IfAwaitJoin {
+        join: usize,
+    },
     Loop {
         layout: LoopLayout,
         enclosing_loop: Option<usize>,
@@ -1079,13 +1084,14 @@ enum LoopLayout {
 
 struct BlockFrame {
     statement: StatementFrame,
+    // The open body's scope, or the enclosing scope for IfAwaitJoin.
     scope: usize,
 }
 
 struct Parser<'s> {
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) after a top-level name or
-    // the first if branch, so disambiguation never re-lexes a token.
+    // an if's then-arm, so disambiguation never re-lexes a token.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -1302,11 +1308,24 @@ impl Parser<'_> {
                 {
                     let join = self.instructions.len();
                     self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
-                    self.patch_jump(branch, span)?;
-                    let brace = self.require_block_open("expected '{' after 'else'")?;
-                    // Same control frame, disjoint lexical scope with the same parent.
-                    let parent = self.scopes[self.statement_frames[index].scope].parent;
-                    let scope = self.add_scope(parent, brace)?;
+                    self.patch_if_jump(branch, span)?;
+                    let missing = "expected '{' or 'if' after 'else'";
+                    let arm = self.require_token(missing)?;
+                    let parent = self.statement_frames[..index]
+                        .last()
+                        .map_or(0, |frame| frame.scope);
+                    if matches!(arm.kind, TokenKind::If) {
+                        // The next test sees the enclosing scope, but this if
+                        // still occupies a frame when opening the nested if.
+                        self.statement_frames[index] = BlockFrame {
+                            statement: StatementFrame::IfAwaitJoin { join },
+                            scope: parent,
+                        };
+                        return self.open_statement(arm);
+                    }
+                    let brace = Self::block_open(arm, missing)?;
+                    // Same control frame, disjoint lexical scope.
+                    let scope = self.add_scope(Some(parent), brace)?;
                     self.statement_frames[index] = BlockFrame {
                         statement: StatementFrame::IfElse { join },
                         scope,
@@ -1314,9 +1333,16 @@ impl Parser<'_> {
                     return Ok(());
                 }
                 self.lookahead = Some(next);
-                self.patch_jump(branch, close)?;
+                self.patch_if_jump(branch, close)?;
+                return self.close_if_chain(close);
             }
-            StatementFrame::IfElse { join } => self.patch_jump(join, close)?,
+            StatementFrame::IfElse { join } => {
+                self.patch_if_jump(join, close)?;
+                return self.close_if_chain(close);
+            }
+            StatementFrame::IfAwaitJoin { .. } => {
+                unreachable!("a brace always closes an open body");
+            }
             StatementFrame::Loop {
                 layout,
                 enclosing_loop,
@@ -1347,6 +1373,26 @@ impl Parser<'_> {
         }
         self.statement_frames.pop();
         Ok(())
+    }
+
+    fn close_if_chain(&mut self, close: Span) -> Result<(), Error> {
+        self.statement_frames.pop();
+        // Only suspended `else if` ancestors close here, not any enclosing
+        // braced body. All arms jump directly to this single empty-stack join.
+        while let Some(BlockFrame {
+            statement: StatementFrame::IfAwaitJoin { join },
+            ..
+        }) = self.statement_frames.last()
+        {
+            self.patch_if_jump(*join, close)?;
+            self.statement_frames.pop();
+        }
+        Ok(())
+    }
+
+    fn patch_if_jump(&mut self, at: usize, span: Span) -> Result<(), Error> {
+        self.lexer.charge(1, span)?;
+        self.patch_jump(at, span)
     }
 
     fn loop_frame(&self, layout: LoopLayout) -> StatementFrame {
@@ -1503,12 +1549,15 @@ impl Parser<'_> {
     }
 
     fn require_block_open(&mut self, missing_open: &'static str) -> Result<Span, Error> {
-        let open = self.require_token(missing_open)?;
+        Self::block_open(self.require_token(missing_open)?, missing_open)
+    }
+
+    fn block_open(open: Token, missing_open: &'static str) -> Result<Span, Error> {
         match open.kind {
             TokenKind::OpenBrace => Ok(open.span),
             TokenKind::If => Err(Error::unsupported(
                 open.span,
-                "if branches and loop bodies require braces; else if is outside the subset",
+                "if branches and loop bodies require braces",
             )),
             _ => Err(Error::malformed(open.span, missing_open)),
         }
@@ -2394,16 +2443,14 @@ impl Parser<'_> {
         let slot = match self.instructions.get_mut(at) {
             Some(
                 Instruction::JumpIfFalse(slot)
-                | Instruction::JumpIfFalseStatement(slot)
                 | Instruction::ShortCircuit { target: slot, .. }
-                | Instruction::Jump(slot)
-                | Instruction::JumpStatement(slot),
+                | Instruction::Jump(slot),
             ) if *slot == UNPATCHED => slot,
-            Some(Instruction::ShortCircuitStatement { target: slot, .. })
-                if *slot == UNPATCHED && self.stack_depth == 0 =>
-            {
-                slot
-            }
+            Some(
+                Instruction::JumpIfFalseStatement(slot)
+                | Instruction::JumpStatement(slot)
+                | Instruction::ShortCircuitStatement { target: slot, .. },
+            ) if *slot == UNPATCHED && self.stack_depth == 0 => slot,
             _ => return Err(Error::malformed(span, "invalid forward jump")),
         };
         *slot = target;

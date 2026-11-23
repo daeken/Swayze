@@ -23,6 +23,8 @@ mod float_operands;
 mod float_rounding;
 #[path = "execution/float_signatures.rs"]
 mod float_signatures;
+#[path = "execution/float_sqrt.rs"]
+mod float_sqrt;
 #[path = "execution/function_exit.rs"]
 mod function_exit;
 #[path = "execution/globals.rs"]
@@ -2268,8 +2270,8 @@ fn rejects_every_opcode_outside_the_slice() {
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)
-            && !(0x41..=0x90).contains(&opcode)
-            && !(0x96..=0x9e).contains(&opcode)
+            && !(0x41..=0x91).contains(&opcode)
+            && !(0x96..=0x9f).contains(&opcode)
             && !(0xa4..=0xa7).contains(&opcode)
             && !(0xbc..=0xbf).contains(&opcode)
         {

@@ -1223,13 +1223,16 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(bits as i64)],
         });
     }
-    // Exercise all four operations at both widths through the non-NaN host ABI.
+    // Exercise rounding and sqrt at both widths through the non-NaN host ABI.
     for (opcode, input, expected) in [
         (0x8d, -0.25_f32, -0.0_f32),
         (0x8e, -0.25, -1.0),
         (0x8f, -1.75, -1.0),
         (0x90, -0.5, -0.0),
         (0x90, 3.5, 4.0),
+        (0x91, -0.0, -0.0),
+        (0x91, 2.25, 1.5),
+        (0x91, f32::INFINITY, f32::INFINITY),
     ] {
         cases.push(Fixture {
             expected: Outcome::F32Invocation(Ok(expected.to_bits())),
@@ -1244,6 +1247,19 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::F64(f64::from(input).to_bits())],
         });
     }
+    // Smallest positive subnormals use each width's own encoding.
+    cases.push(Fixture {
+        expected: Outcome::F32Invocation(Ok(0x1a35_04f3)),
+        bytes: modules(0x7d, 0x7d, 0x91),
+        export: "x",
+        args: vec![WasmValue::F32(1)],
+    });
+    cases.push(Fixture {
+        expected: Outcome::F64Invocation(Ok(0x1e60_0000_0000_0000)),
+        bytes: modules(0x7c, 0x7c, 0x9f),
+        export: "x",
+        args: vec![WasmValue::F64(1)],
+    });
     for (opcode, lhs, rhs, expected) in [
         (0x96, 0.0_f32, -0.0_f32, -0.0_f32),
         (0x96, -0.0, 0.0, -0.0),

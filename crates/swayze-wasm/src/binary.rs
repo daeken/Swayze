@@ -638,7 +638,7 @@ enum Instruction {
     GlobalGet(u32),
     GlobalSet(u32),
     Call(u32),
-    Eqz,
+    Unary(UnaryOp),
     Binary(BinaryOp),
     LoadI32 { kind: LoadKind, offset: u32 },
     StoreI32 { width: AccessWidth, offset: u32 },
@@ -663,6 +663,26 @@ impl LoopTarget {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum UnaryOp {
+    Eqz,
+    Clz,
+    Ctz,
+    Popcnt,
+}
+
+impl UnaryOp {
+    fn apply(self, operand: i32) -> i32 {
+        let bits = operand as u32;
+        match self {
+            Self::Eqz => i32::from(operand == 0),
+            Self::Clz => bits.leading_zeros() as i32,
+            Self::Ctz => bits.trailing_zeros() as i32,
+            Self::Popcnt => bits.count_ones() as i32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum BinaryOp {
     Eq,
     Ne,
@@ -681,10 +701,20 @@ enum BinaryOp {
     DivU,
     RemS,
     RemU,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrS,
+    ShrU,
+    Rotl,
+    Rotr,
 }
 
 impl BinaryOp {
     fn apply(self, lhs: i32, rhs: i32) -> Result<i32, Trap> {
+        // Shifts and rotates use the low five bits even for negative counts.
+        let shift = (rhs as u32) & 31;
         match self {
             Self::Eq => Ok(i32::from(lhs == rhs)),
             Self::Ne => Ok(i32::from(lhs != rhs)),
@@ -713,6 +743,14 @@ impl BinaryOp {
                 .checked_rem(rhs as u32)
                 .map(|value| value as i32)
                 .ok_or(Trap::IntegerDivideByZero),
+            Self::And => Ok(lhs & rhs),
+            Self::Or => Ok(lhs | rhs),
+            Self::Xor => Ok(lhs ^ rhs),
+            Self::Shl => Ok(((lhs as u32) << shift) as i32),
+            Self::ShrS => Ok(lhs >> shift),
+            Self::ShrU => Ok(((lhs as u32) >> shift) as i32),
+            Self::Rotl => Ok((lhs as u32).rotate_left(shift) as i32),
+            Self::Rotr => Ok((lhs as u32).rotate_right(shift) as i32),
         }
     }
 }
@@ -830,9 +868,9 @@ pub(super) fn execute(
                 active += 1;
                 frames[active] = callee;
             }
-            Instruction::Eqz => {
+            Instruction::Unary(op) => {
                 let top = &mut frame.operands[frame.depth - 1];
-                *top = i32::from(*top == 0);
+                *top = op.apply(*top);
             }
             Instruction::Binary(op) => {
                 let rhs = frame.pop();
@@ -1001,7 +1039,7 @@ fn decode_plain(
             Instruction::MemorySize
         }
         I32_CONST => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
-        0x45 => Instruction::Eqz,
+        0x45 => Instruction::Unary(UnaryOp::Eqz),
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
         0x48 => Instruction::Binary(BinaryOp::LtS),
@@ -1012,6 +1050,9 @@ fn decode_plain(
         0x4d => Instruction::Binary(BinaryOp::LeU),
         0x4e => Instruction::Binary(BinaryOp::GeS),
         0x4f => Instruction::Binary(BinaryOp::GeU),
+        0x67 => Instruction::Unary(UnaryOp::Clz),
+        0x68 => Instruction::Unary(UnaryOp::Ctz),
+        0x69 => Instruction::Unary(UnaryOp::Popcnt),
         0x6a => Instruction::Binary(BinaryOp::Add),
         0x6b => Instruction::Binary(BinaryOp::Sub),
         0x6c => Instruction::Binary(BinaryOp::Mul),
@@ -1019,6 +1060,14 @@ fn decode_plain(
         0x6e => Instruction::Binary(BinaryOp::DivU),
         0x6f => Instruction::Binary(BinaryOp::RemS),
         0x70 => Instruction::Binary(BinaryOp::RemU),
+        0x71 => Instruction::Binary(BinaryOp::And),
+        0x72 => Instruction::Binary(BinaryOp::Or),
+        0x73 => Instruction::Binary(BinaryOp::Xor),
+        0x74 => Instruction::Binary(BinaryOp::Shl),
+        0x75 => Instruction::Binary(BinaryOp::ShrS),
+        0x76 => Instruction::Binary(BinaryOp::ShrU),
+        0x77 => Instruction::Binary(BinaryOp::Rotl),
+        0x78 => Instruction::Binary(BinaryOp::Rotr),
         _ => {
             return Err(Error {
                 offset,
@@ -1247,9 +1296,9 @@ fn validate_body(
                         consume(function_arities[index as usize] as usize)? + 1
                     }
                     Instruction::LocalSet(_) | Instruction::GlobalSet(_) => consume(1)?,
-                    Instruction::LocalTee(_) | Instruction::Eqz | Instruction::LoadI32 { .. } => {
-                        consume(1)? + 1
-                    }
+                    Instruction::LocalTee(_)
+                    | Instruction::Unary(_)
+                    | Instruction::LoadI32 { .. } => consume(1)? + 1,
                     Instruction::StoreI32 { .. } => consume(2)?,
                     Instruction::Binary(_) => consume(2)? + 1,
                     Instruction::JumpIfZero { .. }

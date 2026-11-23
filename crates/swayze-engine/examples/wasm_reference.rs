@@ -383,6 +383,32 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![input],
         });
     }
+    for (opcode, input, expected) in [
+        (0x67, 0, 32),
+        (0x67, i32::MIN, 0),
+        (0x68, 0, 32),
+        (0x68, i32::MIN, 31),
+        (0x69, -1, 32),
+    ] {
+        cases.push(Fixture::new(expected, &[input], &[0x20, 0, opcode]));
+    }
+    for (opcode, lhs, rhs, expected) in [
+        (0x71, 0b1100, 0b1010, 0b1000),
+        (0x72, 0b1100, 0b1010, 0b1110),
+        (0x73, 0b1100, 0b1010, 0b0110),
+        (0x74, 1, 33, 2),
+        (0x74, 1, i32::MIN, 1),
+        (0x75, i32::MIN, -1, -1),
+        (0x76, i32::MIN, -1, 1),
+        (0x77, i32::MIN, 33, 1),
+        (0x78, 1, 33, i32::MIN),
+    ] {
+        cases.push(Fixture::new(
+            expected,
+            &[lhs, rhs],
+            &[0x20, 0, 0x20, 1, opcode],
+        ));
+    }
     cases
 }
 

@@ -15,10 +15,12 @@
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
 //! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
-//! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
-//! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `i32.load`, `i32.load8_s`,
-//! `i32.load8_u`, `i32.load16_s`, `i32.load16_u`, `i32.store`, `i32.store8`,
-//! `i32.store16`, `memory.size`, `call`, `if (result i32) ... else ... end`,
+//! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.clz`, `i32.ctz`, `i32.popcnt`,
+//! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
+//! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
+//! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
+//! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
+//! `call`, `if (result i32) ... else ... end`,
 //! `block (result i32) ... end`, `loop ... end`, and `br_if 0`. Local indices
 //! start at zero and address parameters first, then locals in declaration order.
 //! Both can be assigned.
@@ -77,9 +79,10 @@
 //! stack and checks each stack effect: `local.get`, `global.get`, and `i32.const`
 //! push one i32; `local.set` and `global.set` pop one, and `local.tee` requires
 //! and leaves the top operand.
-//! `i32.eqz` consumes one and pushes one, and the binary operators consume two
-//! and push one. `call` consumes as many i32s as the target function's type has
-//! parameters (the top operand is the last parameter) and pushes one result.
+//! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one and push
+//! one; the binary operators consume two and push one. `call` consumes as many
+//! i32s as the target function's type has parameters (the top operand is the
+//! last parameter) and pushes one result.
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
@@ -145,6 +148,14 @@
 //! division truncates toward zero, and a nonzero signed remainder has the sign
 //! of the dividend. Unsigned division and remainder interpret the operand bits
 //! as `u32` and preserve the result bits in the returned `i32` value.
+//! The bit operations do not trap. `i32.clz` and `i32.ctz` count leading and
+//! trailing zero bits in a 32-bit value (both return 32 for zero); `i32.popcnt`
+//! counts set bits. `i32.and`, `i32.or`, and `i32.xor` operate independently on
+//! each pair of bits. Shifts and rotates use only the low five bits of the
+//! right operand, even for negative counts. `i32.shl` shifts left, drops bits
+//! above bit 31, and fills with zeros. `i32.shr_s` fills with the sign bit and
+//! `i32.shr_u` fills with zeros. `i32.rotl` and `i32.rotr` wrap the shifted-out
+//! bits to the opposite end in the indicated direction.
 //! Loads and stores add the base bits interpreted as `u32` and the `u32` offset
 //! in `u64`, without wrapping at 32 bits. The entire 1-, 2-, or 4-byte range
 //! must be in bounds, or the instruction returns [`Trap::MemoryOutOfBounds`]
@@ -200,6 +211,11 @@
 //! unsigned boundary values, unary and binary underflows at the function and
 //! arm floors, conditional selection, and comparisons at the instruction and
 //! operand limits.
+//! Bit-operation tests distinguish each opcode using exact 32-bit results.
+//! They cover zero, the high bit, all bits set, masked counts including negative
+//! values and `i32::MIN`, signed and unsigned right shifts, preserved operand
+//! prefixes, underflow at control floors (including both untaken arms), and
+//! exact decoded-instruction and dispatch budget boundaries.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor

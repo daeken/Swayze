@@ -262,7 +262,7 @@ fn rejects_malformed_comparisons_and_does_not_join_punctuators_across_trivia() {
         ("true ? false : 1 >=", ErrorKind::Malformed, 19, 19),
         ("true ? false : 1 ==", ErrorKind::Malformed, 19, 19),
         ("let x==1; x", ErrorKind::Malformed, 5, 7),
-        ("if(0){x==1;}0", ErrorKind::Unsupported, 7, 9),
+        ("if(0){x==;}0", ErrorKind::Malformed, 9, 10),
         ("let x=1; x==(x=0)", ErrorKind::Unsupported, 14, 15),
     ] {
         let error = parse_script(source).unwrap_err();

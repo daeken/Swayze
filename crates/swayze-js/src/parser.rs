@@ -250,6 +250,10 @@ pub(crate) enum Instruction {
 }
 
 /// Parse a complete Script in the supported subset with default [`Limits`].
+///
+/// A root expression at EOF yields the result, with or without a trailing
+/// semicolon. If another token follows its semicolon, it is a statement and
+/// its value is discarded. A final root expression is still required.
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
@@ -1040,6 +1044,7 @@ struct WriteAccess {
 
 enum ExpressionEnd {
     Script,
+    ExpressionStatement,
     Semicolon(&'static str),
     Declarator(DeclaratorEnd),
     StatementTest,
@@ -1055,6 +1060,7 @@ enum DeclaratorEnd {
 }
 
 const FOR_SEMICOLON: &str = "expected ';' between for clauses";
+const EXPRESSION_STATEMENT_SEMICOLON: &str = "expression statements require explicit semicolons";
 
 const STORE_STATEMENT_END: ExpressionEnd =
     ExpressionEnd::Semicolon("assignments require explicit semicolons");
@@ -1105,8 +1111,8 @@ struct BlockFrame {
 
 struct Parser<'s> {
     lexer: Lexer<'s>,
-    // Cache the next lexer result (including EOF) after a top-level name or
-    // an if's then-arm, so disambiguation never re-lexes a token.
+    // Cache the next lexer result (including EOF) when disambiguating a
+    // statement-start name, a root semicolon, or an if's then-arm.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -1149,53 +1155,21 @@ impl Parser<'_> {
             // Reaching this loop's EOF check again means a statement was parsed,
             // even if it emitted nothing. The final expression exits the loop.
             saw_statement = true;
-            match first.kind {
-                TokenKind::Semicolon => continue,
-                TokenKind::Declaration(kind) => {
-                    self.parse_declaration(kind)?;
-                    continue;
-                }
-                TokenKind::OpenBrace
-                | TokenKind::If
-                | TokenKind::While
-                | TokenKind::For
-                | TokenKind::Do => {
-                    self.open_statement(first)?;
-                    continue;
-                }
-                TokenKind::Break | TokenKind::Continue => {
-                    self.parse_loop_jump(&first)?;
-                    continue;
-                }
-                TokenKind::Update(op) => {
-                    self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
-                    continue;
-                }
-                TokenKind::Identifier => {
-                    let next = self.next_token()?;
-                    if let Some(operator) = &next
-                        && self
-                            .parse_store_after_name(first.span, operator, STORE_STATEMENT_END)?
-                            .is_some()
-                    {
-                        continue;
-                    }
-                    self.lookahead = Some(next);
-                }
-                _ => {}
+            let Some(first) = self.parse_non_expression_statement(first)? else {
+                continue;
+            };
+            let (end, delimiter) = self.parse_expression(first, ExpressionEnd::Script)?;
+            if delimiter.is_none() {
+                break;
             }
-            self.parse_expression(first, ExpressionEnd::Script)?;
-            break;
-        }
-        if let Some(token) = self.next_token()? {
-            if matches!(token.kind, TokenKind::Break | TokenKind::Continue) {
-                // A jump here also has no enclosing loop.
-                self.parse_loop_jump(&token)?;
+            // A root semicolon terminates the final expression only at EOF.
+            // Otherwise discard the completed value and resume with the cached token.
+            let next = self.next_token()?;
+            if next.is_none() {
+                break;
             }
-            return Err(Error::unsupported(
-                token.span,
-                "no additional statements are supported after the final expression",
-            ));
+            self.lookahead = Some(next);
+            self.emit(Instruction::Discard, end)?;
         }
         self.resolve_accesses()?;
         Ok(Script {
@@ -1598,28 +1572,46 @@ impl Parser<'_> {
     fn parse_block_item(&mut self) -> Result<(), Error> {
         let first = self.require_token("expected a statement or '}' in the block")?;
         self.check_statement_boundary(first.span)?;
+        if matches!(first.kind, TokenKind::CloseBrace) {
+            return self.close_block(first.span);
+        }
+        if let Some(first) = self.parse_non_expression_statement(first)? {
+            let (end, _) = self.parse_expression(first, ExpressionEnd::ExpressionStatement)?;
+            self.emit(Instruction::Discard, end)?;
+        }
+        Ok(())
+    }
+
+    // If the token does not start a dedicated statement, return it as the
+    // start of an expression. Bare braces and name-based stores take priority.
+    fn parse_non_expression_statement(&mut self, first: Token) -> Result<Option<Token>, Error> {
         match first.kind {
-            TokenKind::CloseBrace => self.close_block(first.span),
-            TokenKind::Semicolon => Ok(()),
-            TokenKind::Declaration(kind) => self.parse_declaration(kind),
+            TokenKind::Semicolon => {}
+            TokenKind::Declaration(kind) => self.parse_declaration(kind)?,
             TokenKind::OpenBrace
             | TokenKind::If
             | TokenKind::While
             | TokenKind::For
-            | TokenKind::Do => self.open_statement(first),
-            TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
-            TokenKind::Identifier | TokenKind::Update(_) => self
-                .parse_required_store(
-                    first,
-                    STORE_STATEMENT_END,
-                    "only assignments, increments and decrements of names are supported here",
-                )
-                .map(|_| ()),
-            _ => Err(Error::unsupported(
-                first.span,
-                "expected a supported statement; general expression statements are outside the subset",
-            )),
+            | TokenKind::Do => self.open_statement(first)?,
+            TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first)?,
+            TokenKind::Update(op) => {
+                self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
+            }
+            TokenKind::Identifier => {
+                let next = self.next_token()?;
+                if let Some(operator) = &next
+                    && self
+                        .parse_store_after_name(first.span, operator, STORE_STATEMENT_END)?
+                        .is_some()
+                {
+                    return Ok(None);
+                }
+                self.lookahead = Some(next);
+                return Ok(Some(first));
+            }
+            _ => return Ok(Some(first)),
         }
+        Ok(None)
     }
 
     fn parse_loop_jump(&mut self, keyword: &Token) -> Result<(), Error> {
@@ -2081,6 +2073,7 @@ impl Parser<'_> {
             _ => None,
         };
         let missing_semicolon = match end_kind {
+            ExpressionEnd::ExpressionStatement => Some(EXPRESSION_STATEMENT_SEMICOLON),
             ExpressionEnd::Semicolon(message)
             | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
             _ => None,
@@ -2242,7 +2235,9 @@ impl Parser<'_> {
                         Some((Pending::Group, _)) => {}
                         None if matches!(
                             end_kind,
-                            ExpressionEnd::Script | ExpressionEnd::ForTest
+                            ExpressionEnd::Script
+                                | ExpressionEnd::ExpressionStatement
+                                | ExpressionEnd::ForTest
                         ) => {}
                         _ => {
                             return Err(Error::unsupported(
@@ -2331,8 +2326,7 @@ impl Parser<'_> {
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(
                                 span,
-                                missing_semicolon
-                                    .unwrap_or("only one expression statement is supported"),
+                                missing_semicolon.unwrap_or(EXPRESSION_STATEMENT_SEMICOLON),
                             ));
                         }
                     }

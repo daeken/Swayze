@@ -87,7 +87,7 @@ fn rejects_malformed_delimiters_missing_final_expression_and_trailing_input() {
         ("while (false) {}", Unsupported),
         ("while (false) {} else {} 1", Unsupported),
         ("1; while (false) {}", Unsupported),
-        ("while (false) {} 1; 2", Unsupported),
+        ("while (false) {} 1; 2;;", Unsupported),
         ("while (false) {} 1; /*", Malformed),
         ("let x=0\nwhile (false) {} x", Unsupported),
     ] {
@@ -105,7 +105,7 @@ fn checks_the_whole_body_even_when_the_test_is_initially_false() {
         ("c=1;", Unsupported),
         ("let y=;", Malformed),
         ("const y=1", Unsupported),
-        ("x;", Unsupported),
+        ("x", Unsupported),
         ("x=1\n", Unsupported),
         ("x=1\nx=2;", Unsupported),
         ("x=;", Malformed),

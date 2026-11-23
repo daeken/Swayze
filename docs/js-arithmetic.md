@@ -40,8 +40,11 @@ no store would run. Prefix and postfix `++` and `--` convert an initialized
 forms cannot cross a line terminator between the name and operator, including
 a line terminator in a comment. Assignments and updates do not produce
 expression values in this subset.
-Declaration, assignment, and update statements require an explicit semicolon; the
-final expression's semicolon is optional. Unavailable bindings
+Declarations, assignments, updates, and nonfinal expression statements require
+explicit semicolons. Expression statements discard their values. The script
+must end in a root-level expression, whose trailing semicolon is optional;
+only trivia may follow it. This is not general JavaScript Script completion.
+Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global
 lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
 calls or objects.
@@ -78,10 +81,10 @@ and arms must use supported syntax and bindings.
 Comma expressions bind more loosely than `?:`. They evaluate operands
 left to right, discard each nonfinal value, and return the final value
 without coercion. Each discard costs one instruction dispatch. Comma
-expressions are allowed in the final expression and in control tests;
+expressions are allowed in expression statements, the final expression, and control tests;
 within a ternary arm or an assignment right-hand side they require grouping.
 
-Standalone blocks, empty statements (`;`), and braced `if`, `while`,
+Standalone blocks, empty statements (`;`), expression statements, and braced `if`, `while`,
 `do…while`, and `for` statements may precede the required final expression.
 Braced bodies can contain `let` and `const` declarations,
 assignments and updates to earlier visible `let` bindings, and other supported

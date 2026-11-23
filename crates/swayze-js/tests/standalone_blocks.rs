@@ -101,20 +101,14 @@ fn empty_statements_do_not_supply_or_follow_the_final_expression() {
             "empty scripts are outside the arithmetic subset"
         );
     }
-    for source in [";|", "{}|", ";{;{}}; /* trivia */|"] {
+    for source in [";|", "{}|", ";{;{}}; /* trivia */|", "42;;|", "42;{}|"] {
         let error = error_at(source, 0, ErrorKind::Unsupported);
         assert_eq!(
             error.message(),
             "a final expression is required after statements"
         );
     }
-    for source in ["42;|;", "42;|{}", "{}42;|43", "42\n|{}"] {
-        error_at(
-            source,
-            if source.ends_with("43") { 2 } else { 1 },
-            ErrorKind::Unsupported,
-        );
-    }
+    error_at("42\n|{}", 1, ErrorKind::Unsupported);
     error_at("{;|", 0, ErrorKind::Malformed);
 }
 
@@ -122,8 +116,8 @@ fn empty_statements_do_not_supply_or_follow_the_final_expression() {
 fn statement_positions_do_not_expand_expression_grammar_or_insert_semicolons() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, len, kind) in [
-        ("{|42;}0", 2, Unsupported),
-        ("let x=1;{{x|+1;}}0", 1, Unsupported),
+        ("{42|}0", 1, Unsupported),
+        ("let x=1;{{x+1|}}0", 1, Unsupported),
         ("let x=1;{x=2\n|}x", 1, Unsupported),
         ("{let x=1\n|}0", 1, Unsupported),
         ("let x=|{};x", 1, Unsupported),

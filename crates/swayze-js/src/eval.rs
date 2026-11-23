@@ -178,6 +178,8 @@ impl Script {
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. A comma sequence evaluates its operands
     /// from left to right, discarding each but the last without coercion.
+    /// A standalone expression statement also discards its result without coercion.
+    /// Only the required final root expression supplies the Script's result.
     /// An `if` statement uses the same
     /// truthiness but executes only the selected branch, leaving no operand
     /// stack result. A falsy test with no `else` performs no writes.

@@ -120,11 +120,7 @@ fn resolves_only_initialized_let_targets_after_syntax_in_source_order() {
         assert_error(source, Unsupported, message);
     }
     assert_error("missing++;let x=@;@0", Malformed, "operand");
-    assert_error(
-        "const x=0;++x;0;@extra@",
-        Unsupported,
-        "additional statements",
-    );
+    assert_error("const x=0;++x;0;extra + @@", Malformed, "operand");
     assert_error("const x=0;x++;@@", Unsupported, "final expression");
 }
 
@@ -212,7 +208,7 @@ fn rejects_expression_values_and_other_targets_with_maximal_munch() {
         ("let x=0;x + @++@x", "expressions"),
         ("let x=0;x - @--@x", "expressions"),
         ("let x=0;@--@>x", "identifier"),
-        ("1;@++@x;0", "additional statements"),
+        ("1;++@x@;0", "unbound name"),
     ] {
         assert_error(source, Unsupported, message);
     }

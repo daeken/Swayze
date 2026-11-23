@@ -61,11 +61,11 @@ fn generated_scripts_evaluate_at_the_inclusive_source_limit() {
 #[test]
 fn generated_script_suffixes_report_byte_spans() {
     for (_, source, _) in scripts() {
-        // One suffix ends inside a numeric token; the other starts a second
-        // expression, which is outside the supported Script subset.
+        // One suffix ends inside a numeric token; the other ends with the
+        // unsupported BigInt suffix in the new final expression.
         for (suffix, kind, span_width) in [
             ("+1e+", JsErrorKind::Malformed, 0),
-            (";\u{2003}0", JsErrorKind::Unsupported, 1),
+            (";\u{2003}0n", JsErrorKind::Unsupported, 1),
         ] {
             let input = format!("{source}{suffix}");
             let error = parse_script(&input)
@@ -80,6 +80,21 @@ fn generated_script_suffixes_report_byte_spans() {
                 "{input:?}"
             );
         }
+    }
+}
+
+#[test]
+fn generated_expression_statements_discard_their_results() {
+    for (depth, source, _) in scripts() {
+        let input = format!("{source};\u{2003}0");
+        let script = parse_script(&input).unwrap_or_else(|error| panic!("depth {depth}: {error}"));
+        assert_eq!(script.instruction_count(), 2 * depth + 3, "{input:?}");
+        assert_eq!(script.max_stack_depth(), depth + 1, "{input:?}");
+        assert_eq!(
+            script.evaluate().unwrap().to_bits(),
+            0.0_f64.to_bits(),
+            "{input:?}"
+        );
     }
 }
 

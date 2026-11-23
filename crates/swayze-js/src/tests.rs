@@ -640,7 +640,11 @@ fn booleans_are_whole_tokens_not_names_or_prefixes_of_names() {
     assert_error("1true", Unsupported, 1, 2);
     assert_error("false true", Malformed, 6, 10);
     assert_error("false\ntrue", Unsupported, 6, 10);
-    assert_error("true;false", Unsupported, 5, 10);
+    assert_postfix(
+        "true;false",
+        &[Boolean(true), Instruction::Discard, Boolean(false)],
+        1,
+    );
 }
 
 #[test]
@@ -907,6 +911,33 @@ fn sequence_discard_is_the_join_target_for_short_circuit_and_conditional_paths()
 }
 
 #[test]
+fn expression_statement_discards_are_the_join_targets() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{Boolean, Discard, Jump, JumpIfFalse, Null, ShortCircuit};
+
+    assert_postfix(
+        "true ? 1 : 2; {false && true;} null;",
+        &[
+            Boolean(true),
+            JumpIfFalse(4),
+            Number(1.),
+            Jump(5),
+            Number(2.),
+            Discard,
+            Boolean(false),
+            ShortCircuit {
+                condition: ShortCircuitCondition::Falsy,
+                target: 9,
+            },
+            Boolean(true),
+            Discard,
+            Null,
+        ],
+        1,
+    );
+}
+
+#[test]
 fn sequence_discards_each_completed_left_operand_before_the_next() {
     use Instruction::{Boolean, Discard, Jump, JumpIfFalse};
     assert_postfix(
@@ -1048,10 +1079,9 @@ fn postfix_orders_prefix_and_multiplicative_operators() {
 #[test]
 fn entire_input_is_required() {
     use ErrorKind::{Malformed, Unsupported};
-    assert_error("1; 2", Unsupported, 3, 4);
-    assert_error("1;;", Unsupported, 2, 3);
+    assert_error("1;;", Unsupported, 3, 3);
     assert_error("1;\u{00A0}🚧", Unsupported, 4, 8);
-    assert_error("1; let x", Unsupported, 3, 6);
+    assert_error("1; let x", Malformed, 8, 8);
     assert_postfix("1; // comment", &[Number(1.)], 1);
     assert_error("1;\0", Unsupported, 2, 3);
     assert_error("1 23", Malformed, 2, 4);
@@ -1193,8 +1223,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const {x}=1; x", Unsupported, 6, 7),
         ("const x=(1;); x", Malformed, 10, 11),
         ("const x=1;;", Unsupported, 11, 11),
-        ("const x=1; x; x", Unsupported, 14, 15),
-        ("const x=1; x; const y=1; y", Unsupported, 14, 19),
+        ("const x=1; x; const y=1;", Unsupported, 24, 24),
         ("const x=1; x=2", Unsupported, 14, 14),
         ("const x=1; x=2; x", Unsupported, 12, 13),
         ("const x=1; x += 2; x", Unsupported, 13, 15),
@@ -1394,7 +1423,7 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
 }
 
 #[test]
-fn only_explicit_assignments_before_the_final_expression() {
+fn assignments_require_explicit_semicolons_and_are_not_expressions() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [
         ("let x=1; x=2", Unsupported, 12, 12),
@@ -1410,9 +1439,7 @@ fn only_explicit_assignments_before_the_final_expression() {
         ("let x=1; let y=(x=2); y", Unsupported, 17, 18),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
         ("let x=1; x**=2; x", Unsupported, 10, 13),
-        ("let x=1; x==2; x", Unsupported, 15, 16),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
-        ("let x=1; x; x=2; x", Unsupported, 12, 13),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),
         ("let x=1; x/*🚧", Malformed, 10, 16),
         ("let x=1; x/*🚧*/2", Malformed, 18, 19),
@@ -1625,7 +1652,11 @@ fn decimal_literal_forms_and_token_boundaries() {
     }
     assert_error("1 .5", Malformed, 2, 4);
     assert_error("1.\n.5", Unsupported, 3, 5);
-    assert_error(".5; 1e0", Unsupported, 4, 7);
+    assert_postfix(
+        ".5; 1e0",
+        &[Number(0.5), Instruction::Discard, Number(1.0)],
+        1,
+    );
     assert_postfix("1./*comment*/", &[Number(1.)], 1);
     assert_postfix(".5e-1//comment", &[Number(0.05)], 1);
 }

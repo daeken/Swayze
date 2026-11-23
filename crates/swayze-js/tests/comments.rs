@@ -34,7 +34,7 @@ fn every_ecmascript_line_terminator_ends_line_comments_and_affects_diagnostics()
             assert_eq!(error.kind(), ErrorKind::Unsupported);
             assert_eq!(
                 error.message(),
-                "only one expression statement is supported"
+                "expression statements require explicit semicolons"
             );
             assert_eq!(
                 error.span(),
@@ -165,8 +165,8 @@ fn comments_do_not_join_tokens_or_enable_other_syntax() {
         "8/**//=2",
         "1/**/++2",
         "1/**/***2",
-        "1;/* comment */2",
-        "1; // comment\u{2028}const x=1; x",
+        "1;/* comment */2\n3",
+        "1; // comment\u{2028}const x=1;",
         "1/**/\nvar x=2",
         "#!/usr/bin/env node\n1",
         "1;/* comment */#extra",

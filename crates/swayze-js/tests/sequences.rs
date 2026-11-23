@@ -163,8 +163,8 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("let x; for(;false;x=1|,2){} x", 1, Unsupported),
         ("for (|(1,2);false;){} 0", 1, Unsupported),
         ("for (;false;|(1,2)){} 0", 1, Unsupported),
-        ("{|1,2;} 0", 1, Unsupported),
-        ("1, 2; |3", 1, Unsupported),
+        ("{1,2|} 0", 1, Unsupported),
+        ("1, 2; 3,|", 0, Malformed),
         ("let x; x=(1,2)\n|x", 1, Unsupported),
         ("let x; (1,x|=2)", 1, Unsupported),
     ] {

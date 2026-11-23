@@ -101,7 +101,6 @@ fn missing_digits_invalid_digits_and_unsupported_suffixes_have_exact_spans() {
         ("0xＦ", 2, 5),
         ("\u{FEFF}0b1🔑", 6, 10),
         ("0b1\u{2028}2", 6, 7),
-        ("0o7;0x1", 4, 7),
         ("077", 1, 2),
         ("00x1", 1, 2),
     ] {

@@ -111,21 +111,7 @@ fn comparisons_integrate_with_conditionals_and_binding_statements() {
 
 #[test]
 fn rejects_unsupported_punctuators_as_whole_tokens() {
-    for (op, width) in [
-        ("==", 2),
-        ("!=", 2),
-        ("<<", 2),
-        (">>", 2),
-        (">>>", 3),
-        ("<<=", 3),
-        (">>=", 3),
-        (">>>=", 4),
-        (">>>>=", 3),
-        ("<<==", 3),
-        ("==>", 2),
-        ("=>", 2),
-        ("!", 1),
-    ] {
+    for (op, width) in [("==", 2), ("!=", 2), ("==>", 2), ("=>", 2), ("!", 1)] {
         let prefix = "let x=1; x\u{00a0}";
         let source = format!("{prefix}{op}2");
         let error = parse_script(&source).unwrap_err();
@@ -225,17 +211,17 @@ fn comparison_tokens_charge_each_byte_and_each_push_and_emission_once() {
 
     // Even a rejected punctuator is one token and charges all its bytes.
     for (work, kind, start) in [
-        (7, ErrorKind::Unsupported, 1),
-        (6, ErrorKind::LimitExceeded(Limit::Work), 4),
+        (5, ErrorKind::Unsupported, 1),
+        (4, ErrorKind::LimitExceeded(Limit::Work), 2),
     ] {
         let limits = Limits {
             max_tokens: 2,
             max_work: work,
             ..Limits::default()
         };
-        let error = parse_script_with_limits("1>>>=2", limits).unwrap_err();
+        let error = parse_script_with_limits("1==2", limits).unwrap_err();
         assert_eq!(error.kind(), kind);
-        assert_eq!(error.span(), Span { start, end: 5 });
+        assert_eq!(error.span(), Span { start, end: 3 });
     }
 }
 

@@ -141,9 +141,9 @@ fn void_floors_and_fallthrough_are_checked_even_on_untaken_paths() {
         ErrorKind::InvalidResultDepth { depth: 1 },
     );
     bad_body(
-        &[block, &[0x0f, 0x0b, 0x0b]].concat(),
+        &[block, &[0x0e, 0x0b, 0x0b]].concat(),
         block.len(),
-        ErrorKind::UnsupportedOpcode { opcode: 0x0f },
+        ErrorKind::UnsupportedOpcode { opcode: 0x0e },
     );
     bad_body(
         &[block, &[0x1a, 0x41, 42, 0x0b, 0x0b]].concat(),
@@ -171,10 +171,11 @@ fn void_floors_and_fallthrough_are_checked_even_on_untaken_paths() {
 }
 
 #[test]
-fn void_if_and_function_labels_remain_unsupported() {
+fn void_if_labels_remain_unsupported() {
     for arm in [&[][..], &[0x05]] {
         let prefix = [&[0, 0x41, 0, 0x04, 0x40][..], arm, &[0x41, 1, 0x0d]].concat();
-        for index in [0, 1] {
+        for index in [0, 2] {
+            // The if label, and one beyond the function label.
             bad_body(
                 &[&prefix[..], &[index, 0x0b, 0x41, 42, 0x0b]].concat(),
                 prefix.len(),

@@ -269,9 +269,9 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// A `br` or `br_if` depth that does not name an enclosing block or loop is reported as
-/// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
-/// the immediate. This includes depths naming an `if` or the function label.
+/// A `br` or `br_if` depth that does not name a block, loop, or the function
+/// label is reported as [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`]
+/// at the start of the immediate. This includes depths naming an `if`.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -629,6 +629,7 @@ const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR: u8 = 0x0c;
 const BR_IF: u8 = 0x0d;
+const RETURN: u8 = 0x0f;
 const I32_CONST: u8 = 0x41;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -687,6 +688,7 @@ enum Instruction {
 enum BranchTarget {
     Block { pc: usize, result: ResultArity },
     Loop(LoopTarget),
+    Function,
 }
 
 /// The first decoded slot of the target loop body, no later than the
@@ -799,9 +801,10 @@ impl BinaryOp {
 /// mutability, every stack effect, and the complete body frame. Block and if
 /// jump targets are strictly later decoded instruction indices or the
 /// one-past-last index. Block exits carry their target floor and result arity.
-/// Loop continues target an in-body index at or before the branch. Implicit
-/// operands are validation-only: no execution falls through `unreachable` or
-/// `br`, and transfers establish the target's concrete stack depth.
+/// Loop continues target an in-body index at or before the branch. Function
+/// exits target the one-past-last index with just one result. Implicit operands
+/// are validation-only: no execution falls through `unreachable`, `br`, or
+/// `return`, and transfers establish the target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -867,8 +870,8 @@ pub(super) fn execute(
         // Export and call indices are bounded by the exact decoded body count.
         let code = &module.functions[frame.function_index];
         let Some(&instruction) = code.instructions.get(frame.pc) else {
-            // At the one-past-last PC validation guarantees one result. Returning
-            // does not spend fuel, even when the final dispatch used it up.
+            // At the one-past-last PC, whether by fallthrough or a function
+            // exit, there is one result. Resuming the caller needs no fuel.
             debug_assert_eq!(frame.pc, code.instructions.len());
             debug_assert_eq!(frame.depth, 1);
             let value = frame.operands[0];
@@ -961,6 +964,7 @@ pub(super) fn execute(
                     let (pc, result) = match target {
                         BranchTarget::Block { pc, result } => (pc, result),
                         BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
+                        BranchTarget::Function => (code.instructions.len(), ResultArity::I32),
                     };
                     let value = match result {
                         ResultArity::Void => None,
@@ -1362,11 +1366,15 @@ fn validate_body(
                 frames[nesting].unreachable = false;
                 depth = base;
             }
-            BR | BR_IF => {
-                // Count all explicit frames. An if label or the implicit
-                // function label is not a supported destination.
+            BR | BR_IF | RETURN => {
+                // The function is at depth `nesting`, outside every explicit
+                // frame. Only branches have a label immediate.
                 let label_offset = body.position();
-                let label = body.index(IntegerField::LabelIndex, nesting as u32)?;
+                let label = if opcode == RETURN {
+                    nesting as u32
+                } else {
+                    body.index(IntegerField::LabelIndex, (nesting + 1) as u32)?
+                };
                 let target = &mut frames[nesting - label as usize];
                 let destination = match &mut target.kind {
                     ControlKind::Block { last_branch } => {
@@ -1381,7 +1389,8 @@ fn validate_body(
                     ControlKind::Loop { body_pc } => {
                         BranchTarget::Loop(LoopTarget::at_branch(*body_pc, pc))
                     }
-                    ControlKind::Function | ControlKind::Then { .. } | ControlKind::Else { .. } => {
+                    ControlKind::Function => BranchTarget::Function,
+                    ControlKind::Then { .. } | ControlKind::Else { .. } => {
                         return Err(Error {
                             offset: label_offset,
                             kind: ErrorKind::InvalidIndex {

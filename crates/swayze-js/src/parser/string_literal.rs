@@ -1,6 +1,9 @@
 use super::{Error, Lexer, Limit, Span, is_line_terminator};
 
 const MAX_STRING_LITERAL_BYTES: usize = 4096;
+// Two quotes emit nothing; every other scalar or escape emits at most as
+// many UTF-16 units as the number of UTF-8 source bytes it consumes.
+pub(crate) const MAX_STRING_LITERAL_CODE_UNITS: usize = MAX_STRING_LITERAL_BYTES - 2;
 const MAX_STRING_LITERAL_UNITS: usize = 16_384;
 const MAX_CODE_POINT: u32 = 0x10_FFFF;
 const _: () = assert!(MAX_STRING_LITERAL_UNITS <= u16::MAX as usize);

@@ -210,9 +210,25 @@ dispatch budget. Equality charges the full length for equal-length Strings
 and zero otherwise; ordering charges the shorter length. Both charge before
 comparing, even on an early mismatch. Strings compare strictly unequal to
 other types and loosely unequal to `null` and `undefined`. Mixed loose equality
-with Numbers or Booleans, mixed String/scalar ordering, concatenation, numeric
-coercion and updates on Strings are unsupported. An unsupported String
-operation is an evaluation error only when it executes.
+with Numbers or Booleans, mixed String/scalar ordering, concatenation and
+updates on Strings are unsupported. An unsupported String operation is an
+evaluation error only when it executes.
+
+Unary `+` converts a String to a Number. It trims ECMAScript whitespace and
+line terminators, then accepts signed decimal and `Infinity` forms and
+unsigned `0x`, `0o`, and `0b` integers. Empty text becomes `+0`, negative
+zero is preserved, and invalid numeric text produces NaN rather than a
+parse error. Decimal parsing rounds the full magnitude to binary64 through
+the pinned Rust parser; radix conversion rounds directly from integer digits.
+No other operator performs this conversion yet.
+
+Each evaluation has 262,144 conversion credits, separate from comparison
+and dispatch limits. A reached String conversion charges `1 + original
+UTF-16 length`. Trimmed-empty text, exact optionally signed `Infinity`, and
+recognized unsigned radix prefixes pay only that amount. Every other
+candidate also pays `256 + 3 × trimmed magnitude length`, excluding the
+optional sign, before syntax validation. Skipped conversions cost nothing.
+Exhausting this budget yields `StringNumericConversionLimitExceeded`.
 
 ## Evidence and limits
 

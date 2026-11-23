@@ -5,6 +5,7 @@
 
 mod eval;
 mod parser;
+mod radix_integer;
 
 pub use eval::{EvalError, PrimitiveValue, Value};
 pub use parser::{

@@ -397,7 +397,6 @@ fn mixed_string_relations_are_unsupported_only_when_reached() {
 #[test]
 fn unsupported_operations_fail_only_when_dispatched() {
     for expr in [
-        "+''",
         "-''",
         "~''",
         "'a' + 'b'",

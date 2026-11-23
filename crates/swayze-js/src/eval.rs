@@ -10,6 +10,8 @@ const MAX_INSTRUCTIONS: usize = 4096;
 const MAX_DISPATCHES: usize = 16_384;
 const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
 
+mod string_number;
+
 /// A scalar value in the supported JavaScript subset.
 ///
 /// The derived [`PartialEq`] compares Rust enum variants and their payloads.
@@ -151,6 +153,8 @@ pub enum EvalError {
     UnsupportedStringOperation,
     /// A String comparison would exceed the evaluation's 65,536-pair budget.
     StringComparisonLimitExceeded,
+    /// A unary `+` String conversion would exceed the evaluation's 262,144-credit budget.
+    StringNumericConversionLimitExceeded,
 }
 
 impl fmt::Display for EvalError {
@@ -166,6 +170,9 @@ impl fmt::Display for EvalError {
                 "operator on a JavaScript String is outside the subset"
             }
             Self::StringComparisonLimitExceeded => "JavaScript string comparison limit exceeded",
+            Self::StringNumericConversionLimitExceeded => {
+                "JavaScript string numeric conversion limit exceeded"
+            }
         })
     }
 }
@@ -209,6 +216,10 @@ impl Script {
     /// return a Boolean, always `false` if either operand is NaN. Two Strings
     /// are ordered lexicographically by UTF-16 code units, with a proper prefix
     /// sorting before the longer String.
+    /// Unary `+` additionally converts a String using ECMAScript's whitespace,
+    /// signed decimal and `Infinity` forms, and unsigned `0x`, `0o`, and `0b`
+    /// integer forms. Empty or whitespace-only Strings become `+0`; invalid
+    /// numeric text becomes NaN. Other numeric operators do not coerce Strings.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators also use this conversion, then truncate and wrap to 32
@@ -225,7 +236,7 @@ impl Script {
     /// other Strings; mixed strict equality and String/nullish loose equality
     /// are false. `!==` and `!=` negate their corresponding equality results.
     /// String/Number and String/Boolean loose equality, mixed String/scalar
-    /// relational comparison, String arithmetic (including concatenation),
+    /// relational comparison, other String arithmetic (including concatenation),
     /// bitwise operations, and Number coercions in updates and eager compounds
     /// are unsupported.
     ///
@@ -281,6 +292,13 @@ impl Script {
     /// nothing otherwise. Ordering charges the shorter length. Both charge
     /// before comparison, even for aliases or an early mismatch; skipped
     /// comparisons cost nothing.
+    /// String-to-Number conversion has a separate 262,144-credit budget per
+    /// call. After dispatch and range validation, unary `+` charges `1 +`
+    /// the original UTF-16 length. Trimmed-empty text, exact optionally signed
+    /// `Infinity`, and recognized unsigned radix prefixes only pay this base
+    /// charge. All other candidates additionally pay `256 + 3 *` the trimmed
+    /// magnitude length (excluding a leading sign), before validating decimal
+    /// syntax. Skipped instructions and scalar unary `+` cost no conversion credits.
     /// String operands only copy ranges; evaluation allocates no String storage.
     ///
     /// # Errors
@@ -291,7 +309,9 @@ impl Script {
     /// sequence, or [`EvalError::AllocationFailed`] if storage cannot be allocated.
     /// Returns [`EvalError::UnsupportedStringOperation`] if execution reaches an
     /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
-    /// if a comparison would exceed its pair budget.
+    /// if a comparison would exceed its pair budget. Returns
+    /// [`EvalError::StringNumericConversionLimitExceeded`] if a String
+    /// conversion would exceed its credit budget.
     pub fn evaluate_primitive(&self) -> Result<PrimitiveValue<'_>, EvalError> {
         evaluate(
             self.instructions(),
@@ -348,6 +368,7 @@ fn evaluate<'script>(
     // `ops.len()` denotes exit, which is not a dispatch and needs no fuel.
     let mut remaining = MAX_DISPATCHES;
     let mut string_pairs_left = MAX_STRING_COMPARISON_PAIRS;
+    let mut string_conversion_credits_left = string_number::MAX_CREDITS;
     let mut ip = 0;
     while ip != ops.len() {
         remaining = remaining
@@ -489,7 +510,14 @@ fn evaluate<'script>(
             }
             Instruction::Positive => {
                 apply_unary(&mut stack, |value| {
-                    Ok(Value::Number(value.require_scalar()?.to_number()))
+                    let number = match value {
+                        Operand::Scalar(value) => value.to_number(),
+                        Operand::String(range) => {
+                            let units = range.get(string_units).ok_or(EvalError::InvalidScript)?;
+                            string_number::convert(units, &mut string_conversion_credits_left)?
+                        }
+                    };
+                    Ok(Value::Number(number))
                 })?;
             }
             Instruction::Negate => {
@@ -787,6 +815,26 @@ mod tests {
             );
         }
         assert_eq!(script.evaluate_primitive(), Ok(PrimitiveValue::String(&[])));
+    }
+
+    #[test]
+    fn unary_plus_on_strings_requires_a_checked_operand_when_reached() {
+        use Instruction::{Discard, JumpStatement, Number, Positive};
+        let script = crate::parse_script("+'1'").unwrap();
+        let [literal @ Instruction::String(_), Positive] = script.instructions() else {
+            panic!("expected a String operand and the existing unary plus instruction");
+        };
+        let ops = [*literal, Positive];
+        assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+        assert_eq!(script.evaluate_value(), Ok(Value::Number(1.0)));
+        assert_eq!(
+            evaluate(
+                &[JumpStatement(4), *literal, Positive, Discard, Number(42.0)],
+                1,
+                0
+            ),
+            Ok(Value::Number(42.0)),
+        );
     }
 
     #[test]

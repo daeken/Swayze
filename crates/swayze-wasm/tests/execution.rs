@@ -11,6 +11,8 @@ mod branch;
 mod branch_table;
 #[path = "execution/call_indirect.rs"]
 mod call_indirect;
+#[path = "execution/debug_format.rs"]
+mod debug_format;
 #[path = "execution/float_add_sub.rs"]
 mod float_add_sub;
 #[path = "execution/float_control.rs"]

@@ -359,7 +359,7 @@ fn rejects_post_mvp_segment_forms_and_wrong_offset_expressions() {
         },
     );
     bad_element(&[1, 0], 2, TruncatedByte { expected: 0x41 });
-    for found in [0x0b, 0x23, 0x42, 0xd2] {
+    for found in [0x0b, 0x42, 0xd2] {
         bad_element(
             &[1, 0, found, 0, 0x0b, 0],
             2,

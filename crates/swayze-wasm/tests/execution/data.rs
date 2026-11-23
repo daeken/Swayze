@@ -174,8 +174,8 @@ fn checks_exact_offset_expression_and_bounded_leb32s() {
         }
     }
     bad_data(&[1, 0], 2, ErrorKind::TruncatedByte { expected: 0x41 });
-    for other_opcode in [0x0b, 0x23, 0x42] {
-        // empty, global.get, i64.const
+    for other_opcode in [0x0b, 0x42] {
+        // empty, i64.const
         bad_data(
             &[1, 0, other_opcode, 0, 0x0b, 0],
             2,

@@ -1710,6 +1710,34 @@ fn global_export_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     })
 }
 
+fn global_offset_fixtures() -> [Fixture<WasmValue>; 2] {
+    [
+        Fixture {
+            // Data offset from immutable global 0 via a padded global index.
+            bytes: b"\0asm\x01\0\0\0\x05\x03\x01\0\x01\x06\x06\x01\x7f\0\x41\x02\x0b\
+                     \x07\x07\x01\x03mem\x02\0\x0b\x09\x01\0\x23\x80\0\x0b\x02hi"
+                .to_vec(),
+            export: "mem",
+            expected: Outcome::MemoryRead {
+                offset: 0,
+                bytes: *b"\0\0hi",
+            },
+            args: vec![],
+        },
+        Fixture {
+            // Put the private callee at table slot 1, then call it through f.
+            bytes: b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x03\x02\0\0\
+                     \x04\x04\x01\x70\0\x02\x06\x06\x01\x7f\0\x41\x01\x0b\
+                     \x07\x05\x01\x01f\0\0\x09\x07\x01\0\x23\0\x0b\x01\x01\
+                     \x0a\x0e\x02\x07\0\x41\x01\x11\0\0\x0b\x04\0\x41\x2a\x0b"
+                .to_vec(),
+            export: "f",
+            expected: Outcome::Invocation(Ok(42)),
+            args: vec![],
+        },
+    ]
+}
+
 fn memory_export_fixtures() -> [Fixture<WasmValue>; 2] {
     [
         Fixture {
@@ -1849,6 +1877,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain(global_export_fixtures())
         .chain(empty_section_fixtures())
         .chain(table_export_fixtures())
+        .chain(global_offset_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.

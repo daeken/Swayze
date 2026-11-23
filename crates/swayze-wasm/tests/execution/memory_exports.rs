@@ -153,13 +153,49 @@ fn wrong_kind_and_missing_precede_range_or_signature_checks_without_effects() {
             actual: ResultKind::F32
         })
     );
+    // Function and memory both have index zero in their own index spaces.
+    // Isolate each signature error and also try the exact function signature:
+    // the memory name must never reach signature preflight or guest dispatch.
+    let f32_arg = [Value::F32(0x7f80_1234)];
+    for (args, result, expected) in [
+        (
+            &[][..],
+            ResultKind::F32,
+            InvokeError::ArityMismatch {
+                expected: 1,
+                actual: 0,
+            },
+        ),
+        (
+            &f32_arg[..],
+            ResultKind::I32,
+            InvokeError::ResultMismatch {
+                expected: ResultKind::I32,
+                actual: ResultKind::F32,
+            },
+        ),
+        (
+            &[Value::I32(1)],
+            ResultKind::F32,
+            InvokeError::ArgumentTypeMismatch {
+                index: 0,
+                expected: swayze_wasm::ValType::F32,
+                actual: swayze_wasm::ValType::I32,
+            },
+        ),
+    ] {
+        assert_eq!(
+            instance.invoke_with_values("mix", args, result),
+            Err(expected)
+        );
+        assert_eq!(
+            instance.invoke_with_values("mem", args, result),
+            Err(InvokeError::ExportNotFunction)
+        );
+    }
     assert_eq!(
-        instance.invoke_with_values("mix", &[Value::I32(1)], ResultKind::F32),
-        Err(InvokeError::ArgumentTypeMismatch {
-            index: 0,
-            expected: swayze_wasm::ValType::F32,
-            actual: swayze_wasm::ValType::I32
-        })
+        instance.invoke_with_values("mem", &f32_arg, ResultKind::F32),
+        Err(InvokeError::ExportNotFunction)
     );
     instance.read_memory("mem", 0, &mut dest).unwrap();
     assert_eq!(dest, [0; 4]);
@@ -303,14 +339,22 @@ fn memory_exports_do_not_change_legacy_function_section_precedence() {
         (7, b"\x02\x03mem\x02\0\x06answer\0\0"),
         (10, CODE),
     ];
-    for missing in [1, 3, 10] {
-        let sections: Vec<_> = valid.into_iter().filter(|&(id, _)| id != missing).collect();
-        let bytes = module(&sections);
-        expect_error(
-            &bytes,
-            bytes.len(),
-            ErrorKind::MissingSection { id: missing },
-        );
+    for names in [valid[3].1, EXPORT, &[0]] {
+        let mut sections = valid;
+        sections[3].1 = names;
+        assert!(validate_module(&module(&sections)).is_ok());
+        for missing in [1, 3, 10] {
+            let present: Vec<_> = sections
+                .into_iter()
+                .filter(|&(id, _)| id != missing)
+                .collect();
+            let bytes = module(&present);
+            expect_error(
+                &bytes,
+                bytes.len(),
+                ErrorKind::MissingSection { id: missing },
+            );
+        }
     }
     for sections in [
         &[(7, &[0][..])][..], // Legacy empty export vector.

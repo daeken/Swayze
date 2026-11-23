@@ -929,6 +929,32 @@ fn fixtures() -> Vec<Fixture> {
             0x44, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x21, 1, 0x20, 1, 0xbd, 0x42, 0, 0x53,
         ],
     ));
+    // A mutable f32 sNaN and an immutable f64 negative zero, both private.
+    let globals = b"\x06\x15\x02\x7d\x01\x43\x42\0\x80\x7f\x0b\
+                    \x7c\0\x44\0\0\0\0\0\0\0\x80\x0b";
+    for (expected, arg, expression) in [
+        (0x7f80_0042, 0, &[0x23, 0, 0xbc][..]),
+        (
+            i32::MIN,
+            i32::MIN,
+            &[0x20, 0, 0xbe, 0x24, 0, 0x23, 0, 0xbc][..],
+        ),
+        (1, 0, &[0x23, 1, 0xbd, 0x42, 0, 0x53][..]),
+    ] {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\x03\x02\x01\0".to_vec();
+        bytes.extend(globals);
+        bytes.extend(b"\x07\x05\x01\x01x\0\0");
+        let len = 2 + u8::try_from(expression.len()).unwrap();
+        bytes.extend([10, len + 2, 1, len, 0]);
+        bytes.extend(expression);
+        bytes.push(0x0b);
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(expected)),
+            bytes,
+            export: "x",
+            args: vec![arg],
+        });
+    }
     cases
 }
 

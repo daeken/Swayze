@@ -376,7 +376,7 @@ fn let_headers_require_declarators_and_both_for_semicolons() {
         ("for(let i=0,;false;){}0", Malformed, ",|;"),
         ("for(let i=;false;){}0", Malformed, "i=|;"),
         ("for(let i+=0;false;){}0", Unsupported, "+="),
-        ("for(let i=(0,1);false;){}0", Unsupported, ","),
+        ("for(let i=(0,);false;){}0", Malformed, ",|)"),
         ("for(let i=0){}0", Malformed, ")"),
         ("for(let i=0\ntrue;){}0", Malformed, "true"),
         ("for(let i\ntrue;){}0", Malformed, "true"),

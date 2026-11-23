@@ -23,8 +23,9 @@ The parser determines precedence and associativity. `const` and `let`
 declarations initialize slots in source order, including left to right within
 comma-separated lists. Each `const` item requires an initializer. A `let`
 item without an initializer initializes to `undefined` each time it executes,
-without reading any binding named `undefined`. Comma expressions and trailing
-commas in declaration lists are unsupported.
+without reading any binding named `undefined`. Top-level commas separate
+declarators; a comma expression inside an initializer requires parentheses.
+Trailing commas in declaration lists are unsupported.
 Simple and compound assignments update earlier `let` slots. Arithmetic and
 bitwise compound assignments read the target once, evaluate the right operand,
 apply the corresponding operator, and store the result. Logical assignments
@@ -70,6 +71,12 @@ true. `null` and `undefined` are also false in tests. The same truthiness drives
 It is left-associative, binds between bitwise OR and `?:`, and cannot mix with
 `&&` or `||` without parentheses at the same expression level. All operands
 and arms must use supported syntax and bindings.
+
+Comma expressions bind more loosely than `?:`. They evaluate operands
+left to right, discard each nonfinal value, and return the final value
+without coercion. Each discard costs one instruction dispatch. Comma
+expressions are allowed in the final expression and in control tests;
+within a ternary arm or an assignment right-hand side they require grouping.
 
 Standalone blocks, empty statements (`;`), and braced `if`, `while`,
 `do…while`, and `for` statements may precede the required final expression.

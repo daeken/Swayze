@@ -19,6 +19,9 @@ for decimal fractions and exponents. Decimal conversion strips separators
 with a metered, fallible pass; explicit-radix conversion skips them while
 scanning. Legacy octal and BigInt remain outside the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
 `+` and `-` and parenthesized grouping.
+Unary `void` evaluates its operand once, then returns `undefined` without
+coercion. It has the same precedence and right associativity as the other
+prefix operators.
 The parser determines precedence and associativity. `const` and `let`
 declarations initialize slots in source order, including left to right within
 comma-separated lists. Each `const` item requires an initializer. A `let`

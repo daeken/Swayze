@@ -323,7 +323,13 @@ fn fixtures() -> Vec<String> {
             "true ? (1, false) : 2",
             "let a = (1, 20), b = (true, a + 22); b",
             "let out = 0; out += (null, 42); out",
-            "let out = 0; for (let i = 0; false, i < 3; i++) { out += 14; } out"
+            "let out = 0; for (let i = 0; false, i < 3; i++) { out += 14; } out",
+            "void 42",
+            "void 1 + 2",
+            "void false ?? 42",
+            "void true ? 0 : 42",
+            "void (true, null)",
+            "let void0 = 42; false && void void0, void0"
         ]
         .map(str::to_owned),
     );

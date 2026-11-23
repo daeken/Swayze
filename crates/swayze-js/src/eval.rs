@@ -154,6 +154,8 @@ impl Script {
     /// low five bits of the converted count. Bitwise results are Numbers
     /// representing signed 32-bit integers, except for zero-fill right shift
     /// (`>>>`), which returns an unsigned 32-bit result.
+    /// Unary `void` evaluates its operand once, then returns [`Value::Undefined`]
+    /// without coercing the operand's value.
     /// Equality and inequality return Booleans. Strict equality (`===`) never
     /// coerces. Loose equality (`==`) uses strict equality for matching tags,
     /// equates `null` with `undefined`, and compares a Number and a Boolean
@@ -361,6 +363,7 @@ fn evaluate(
                     Value::Number(f64::from(!value.to_int32()))
                 })?;
             }
+            Instruction::Void => apply_unary(&mut stack, |_| Value::Undefined)?,
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
@@ -503,6 +506,7 @@ mod tests {
             (&[Instruction::Negate, one][..], 1),
             (&[Instruction::Not, one][..], 1),
             (&[Instruction::BitwiseNot, one][..], 1),
+            (&[Instruction::Void, one][..], 1),
             (&[one, Instruction::BitwiseAnd][..], 1),
             (&[one, Instruction::BitwiseXor][..], 1),
             (&[one, Instruction::BitwiseOr][..], 1),

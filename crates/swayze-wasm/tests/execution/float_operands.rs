@@ -555,12 +555,16 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
 }
 
 #[test]
-fn float_loop_results_and_other_numeric_ops_stay_unsupported() {
-    let unexpected = |expected, found| ErrorKind::UnexpectedByte { expected, found };
-    for ty in [0x7d, 0x7c] {
-        bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
-    }
-    bad_payload(6, &[1, 0x7f, 0, F32_CONST], 3, unexpected(0x41, F32_CONST));
+fn mismatched_global_type_and_unsupported_numeric_ops_are_rejected() {
+    bad_payload(
+        6,
+        &[1, 0x7f, 0, F32_CONST],
+        3,
+        ErrorKind::UnexpectedByte {
+            expected: 0x41,
+            found: F32_CONST,
+        },
+    );
     for opcode in [0x1c, 0xfc] {
         // Typed select, saturating-conversion prefix.
         bad_body(

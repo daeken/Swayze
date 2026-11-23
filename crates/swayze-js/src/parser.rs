@@ -26,7 +26,8 @@ pub struct Limits {
     pub max_source_bytes: usize,
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
-    /// Maximum combined depth of open parentheses and pending conditional expressions.
+    /// Maximum combined depth of open parentheses (including statement tests)
+    /// and pending conditional expressions.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
     pub max_work: usize,
@@ -144,7 +145,8 @@ pub struct Script {
 }
 
 impl Script {
-    /// The total number of instructions, including jumps and potentially skipped operands or arms.
+    /// The number of prepared instructions, including jumps and skipped paths.
+    /// A loop can dispatch the same instruction more than once during evaluation.
     pub fn instruction_count(&self) -> usize {
         self.instructions().len()
     }
@@ -201,9 +203,13 @@ pub(crate) enum Instruction {
     GreaterThan,
     GreaterThanOrEqual,
     JumpIfFalse(usize),
+    // A statement test must be the only operand when the jump consumes it.
+    JumpIfFalseStatement(usize),
     // Keep the test value when jumping; otherwise pop it before evaluating the RHS.
     ShortCircuit { target: usize, when_truthy: bool },
     Jump(usize),
+    // The only backward edge; re-enter the test with an empty operand stack.
+    LoopBack(usize),
 }
 
 /// Parse a complete Script in the Number and Boolean subset with default [`Limits`].
@@ -312,6 +318,7 @@ enum TokenKind {
     Declaration(BindingKind),
     If,
     Else,
+    While,
     Equals,
     Operator(Operator),
     Open,
@@ -362,7 +369,7 @@ fn is_excluded_name(name: &str) -> bool {
             | "delete" | "do" | "enum" | "export" | "extends"
             | "finally" | "for" | "function" | "import" | "in" | "instanceof"
             | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
-            | "try" | "typeof" | "var" | "void" | "while" | "with" | "await" | "yield"
+            | "try" | "typeof" | "var" | "void" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
             // Contextual syntax, strict-mode restricted names, and selected globals.
@@ -523,6 +530,7 @@ impl Lexer<'_> {
             "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
+            "while" => Ok(TokenKind::While),
             "true" => Ok(TokenKind::Boolean(true)),
             "false" => Ok(TokenKind::Boolean(false)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
@@ -780,7 +788,7 @@ struct Binding {
 enum ExpressionEnd {
     Script,
     Semicolon(&'static str),
-    IfTest,
+    StatementTest,
 }
 
 struct Parser<'s> {
@@ -818,6 +826,10 @@ impl Parser<'_> {
                 }
                 TokenKind::If => {
                     self.parse_if()?;
+                    continue;
+                }
+                TokenKind::While => {
+                    self.parse_while()?;
                     continue;
                 }
                 TokenKind::Identifier => {
@@ -864,15 +876,8 @@ impl Parser<'_> {
     }
 
     fn parse_if(&mut self) -> Result<(), Error> {
-        let open = self.require_token("expected '(' after 'if'")?;
-        if !matches!(open.kind, TokenKind::Open) {
-            return Err(Error::malformed(open.span, "expected '(' after 'if'"));
-        }
-        let end = self.parse_expression(open, ExpressionEnd::IfTest)?;
-        let branch = self.instructions.len();
-        // The test leaves one value, which this jump consumes on both paths.
-        self.emit(Instruction::JumpIfFalse(UNPATCHED), end)?;
-        let end = self.parse_if_branch()?;
+        let branch = self.parse_statement_test("expected '(' after 'if'")?;
+        let end = self.parse_assignment_block("expected '{' to open an if branch")?;
 
         let next = self.next_token()?;
         if let Some(Token {
@@ -884,7 +889,7 @@ impl Parser<'_> {
             let jump = self.instructions.len();
             self.emit(Instruction::Jump(UNPATCHED), span)?;
             self.patch_jump(branch, span)?;
-            let end = self.parse_if_branch()?;
+            let end = self.parse_assignment_block("expected '{' after 'else'")?;
             self.patch_jump(jump, end)
         } else {
             self.lookahead = Some(next);
@@ -892,8 +897,29 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_if_branch(&mut self) -> Result<Span, Error> {
-        let open = self.require_token("expected '{' to open an if branch")?;
+    fn parse_while(&mut self) -> Result<(), Error> {
+        let test = self.instructions.len();
+        let branch = self.parse_statement_test("expected '(' after 'while'")?;
+        let end = self.parse_assignment_block("expected '{' to open the while body")?;
+        // The block leaves an empty stack, the same depth as at test entry.
+        self.emit(Instruction::LoopBack(test), end)?;
+        self.patch_jump(branch, end)
+    }
+
+    fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
+        let open = self.require_token(missing_open)?;
+        if !matches!(open.kind, TokenKind::Open) {
+            return Err(Error::malformed(open.span, missing_open));
+        }
+        let end = self.parse_expression(open, ExpressionEnd::StatementTest)?;
+        let branch = self.instructions.len();
+        // The test leaves one value, which the jump consumes on both paths.
+        self.emit(Instruction::JumpIfFalseStatement(UNPATCHED), end)?;
+        Ok(branch)
+    }
+
+    fn parse_assignment_block(&mut self, missing_open: &'static str) -> Result<Span, Error> {
+        let open = self.require_token(missing_open)?;
         match open.kind {
             TokenKind::OpenBrace => {}
             TokenKind::If => {
@@ -902,29 +928,24 @@ impl Parser<'_> {
                     "nested if and else if are outside the subset",
                 ));
             }
-            _ => {
-                return Err(Error::malformed(
-                    open.span,
-                    "expected '{' to open an if branch",
-                ));
-            }
+            _ => return Err(Error::malformed(open.span, missing_open)),
         }
         loop {
-            let first = self.require_token("expected an assignment or '}' in if branch")?;
+            let first = self.require_token("expected an assignment or '}' in the block")?;
             match first.kind {
                 TokenKind::CloseBrace => {
                     if self.stack_depth != 0 {
                         return Err(Error::malformed(
                             first.span,
-                            "if branches must leave no operands",
+                            "assignment blocks must leave no operands",
                         ));
                     }
                     return Ok(first.span);
                 }
-                TokenKind::If => {
+                TokenKind::If | TokenKind::While => {
                     return Err(Error::unsupported(
                         first.span,
-                        "nested if is outside the subset",
+                        "nested if and while statements are outside the subset",
                     ));
                 }
                 TokenKind::Identifier => {
@@ -932,7 +953,7 @@ impl Parser<'_> {
                     if !matches!(equals.kind, TokenKind::Equals) {
                         return Err(Error::unsupported(
                             equals.span,
-                            "only simple assignments are supported in if branches",
+                            "only simple assignments are supported in these blocks",
                         ));
                     }
                     self.parse_assignment(first.span, equals.span)?;
@@ -940,7 +961,7 @@ impl Parser<'_> {
                 _ => {
                     return Err(Error::unsupported(
                         first.span,
-                        "only simple assignments are supported in if branches",
+                        "only simple assignments are supported in these blocks",
                     ));
                 }
             }
@@ -963,10 +984,10 @@ impl Parser<'_> {
                     "Boolean literals cannot be used as binding names",
                 ));
             }
-            TokenKind::If | TokenKind::Else => {
+            TokenKind::If | TokenKind::Else | TokenKind::While => {
                 return Err(Error::unsupported(
                     name.span,
-                    "if and else are reserved names",
+                    "control-flow keywords are reserved names",
                 ));
             }
             TokenKind::OpenBrace => {
@@ -1038,7 +1059,7 @@ impl Parser<'_> {
     }
 
     fn parse_expression(&mut self, first: Token, end_kind: ExpressionEnd) -> Result<Span, Error> {
-        let if_test = matches!(end_kind, ExpressionEnd::IfTest);
+        let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
         let missing_semicolon = match end_kind {
             ExpressionEnd::Semicolon(message) => Some(message),
             _ => None,
@@ -1084,22 +1105,25 @@ impl Parser<'_> {
                         "declarations are only allowed as top-level statements before the final expression",
                     ));
                 }
-                (_, TokenKind::If | TokenKind::Else) => {
+                (_, TokenKind::If | TokenKind::Else | TokenKind::While) => {
                     return Err(Error::unsupported(
                         span,
-                        "if and else are not expression tokens",
+                        "control-flow keywords are not expression tokens",
                     ));
                 }
                 (false, TokenKind::CloseBrace) if let Some(message) = missing_semicolon => {
                     return Err(Error::unsupported(span, message));
                 }
-                (false, TokenKind::OpenBrace) if if_test => {
-                    return Err(Error::malformed(span, "expected ')' after the if test"));
+                (false, TokenKind::OpenBrace) if statement_test => {
+                    return Err(Error::malformed(
+                        span,
+                        "expected ')' after the statement test",
+                    ));
                 }
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
                     return Err(Error::unsupported(
                         span,
-                        "braces are only supported around if branches",
+                        "braces are only supported around if branches and while bodies",
                     ));
                 }
                 (true, TokenKind::Number(value)) => {
@@ -1146,8 +1170,11 @@ impl Parser<'_> {
                 (true, TokenKind::Close)
                     if matches!(self.pending.last(), Some((Pending::Group, _))) =>
                 {
-                    if if_test && self.pending.len() == 1 {
-                        return Err(Error::malformed(span, "expected an if test expression"));
+                    if statement_test && self.pending.len() == 1 {
+                        return Err(Error::malformed(
+                            span,
+                            "expected a statement test expression",
+                        ));
                     }
                     // Empty parens can start an arrow function; don't misreport that as malformed.
                     self.lexer.skip_trivia()?;
@@ -1225,9 +1252,9 @@ impl Parser<'_> {
                         }
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
-                    // An if test starts with its required '(' as the first group.
-                    // Stop at that group's close without consuming the branch's '{'.
-                    if if_test && self.pending.is_empty() {
+                    // The statement test starts with its required '(' as the first group.
+                    // Stop at that group's close without consuming the block's '{'.
+                    if statement_test && self.pending.is_empty() {
                         break (span, false);
                     }
                 }
@@ -1362,6 +1389,7 @@ impl Parser<'_> {
         let slot = match self.instructions.get_mut(at) {
             Some(
                 Instruction::JumpIfFalse(slot)
+                | Instruction::JumpIfFalseStatement(slot)
                 | Instruction::ShortCircuit { target: slot, .. }
                 | Instruction::Jump(slot),
             ) if *slot == UNPATCHED => slot,
@@ -1383,8 +1411,9 @@ impl Parser<'_> {
             Instruction::InitBinding(_)
             | Instruction::StoreBinding(_)
             | Instruction::JumpIfFalse(_)
+            | Instruction::JumpIfFalseStatement(_)
             | Instruction::ShortCircuit { .. } => (1, 0),
-            Instruction::Jump(_) => (0, 0),
+            Instruction::Jump(_) | Instruction::LoopBack(_) => (0, 0),
             Instruction::Positive | Instruction::Negate | Instruction::Not => (1, 1),
             Instruction::Add
             | Instruction::Subtract

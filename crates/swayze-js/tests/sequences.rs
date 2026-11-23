@@ -48,6 +48,17 @@ fn sequence_keeps_the_last_primitive_without_coercion() {
 }
 
 #[test]
+fn lazy_left_operands_join_before_the_sequence_result() {
+    for source in [
+        "(false && true, 42)",
+        "(true ? 1 : 2, 42)",
+        "(false ? 1 : 2, 42)",
+    ] {
+        assert_value(source, Value::Number(42.0));
+    }
+}
+
+#[test]
 fn comma_binds_below_the_complete_conditional_and_arms_can_group() {
     use Value::{Boolean, Null, Number, Undefined};
     for (source, expected) in [
@@ -67,6 +78,7 @@ fn comma_binds_below_the_complete_conditional_and_arms_can_group() {
 fn grouped_sequences_do_not_consume_declarator_separators_or_other_operands() {
     use Value::{Number, Undefined};
     for (source, expected) in [
+        ("const a = (1, 20), b = a + 22; b", Number(42.0)),
         (
             "const a = (true ? 1 : 0, 20), b = (false, a + 22); b",
             Number(42.0),
@@ -142,7 +154,6 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("(1,|,2)", 1, Malformed),
         ("true ? 1|, 2 : 3", 1, Malformed),
         ("true ? false ? 1 : 2|, 3 : 4", 1, Malformed),
-        ("(true ? 1|, 2 : 3)", 1, Malformed),
         ("true ? (1, 2) : |,3", 1, Malformed),
         ("for (;true,|;){} 0", 1, Malformed),
         ("const x=1, |2; x", 1, Malformed),
@@ -159,6 +170,12 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
     ] {
         assert_error_at(source, kind, len);
     }
+}
+
+#[test]
+fn ungrouped_sequences_in_a_consequent_or_assignment_rhs_error_at_the_comma() {
+    assert_error_at("(true ? 1|, 2 : 3)", ErrorKind::Malformed, 1);
+    assert_error_at("let x; x = 1|, 2; x", ErrorKind::Unsupported, 1);
 }
 
 #[test]

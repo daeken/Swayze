@@ -632,6 +632,9 @@ const I32_CONST: u8 = 0x41;
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
+    Nop,
+    Drop,
+    Select,
     Const(i32),
     LocalGet(u32),
     LocalSet(u32),
@@ -846,6 +849,16 @@ pub(super) fn execute(
         remaining_dispatches -= 1;
         frame.pc += 1;
         match instruction {
+            Instruction::Nop => {}
+            Instruction::Drop => {
+                frame.pop();
+            }
+            Instruction::Select => {
+                let condition = frame.pop();
+                let second = frame.pop();
+                let first = frame.pop();
+                frame.push(if condition != 0 { first } else { second });
+            }
             Instruction::Const(value) => frame.push(value),
             Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
             Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
@@ -1007,7 +1020,10 @@ fn decode_plain(
         Ok(Instruction::StoreI32 { width, offset })
     };
     Ok(match opcode {
+        0x01 => Instruction::Nop,
         0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
+        0x1a => Instruction::Drop,
+        0x1b => Instruction::Select,
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
@@ -1294,6 +1310,8 @@ fn validate_body(
                     globals,
                 )?;
                 depth = match instruction {
+                    Instruction::Nop => depth,
+                    Instruction::Select => consume(3)? + 1,
                     Instruction::Const(_)
                     | Instruction::LocalGet(_)
                     | Instruction::GlobalGet(_)
@@ -1301,7 +1319,9 @@ fn validate_body(
                     Instruction::Call(index) => {
                         consume(function_arities[index as usize] as usize)? + 1
                     }
-                    Instruction::LocalSet(_) | Instruction::GlobalSet(_) => consume(1)?,
+                    Instruction::Drop | Instruction::LocalSet(_) | Instruction::GlobalSet(_) => {
+                        consume(1)?
+                    }
                     Instruction::LocalTee(_)
                     | Instruction::Unary(_)
                     | Instruction::LoadI32 { .. } => consume(1)? + 1,

@@ -20,7 +20,7 @@
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
-//! `call`, `if (result i32) ... else ... end`,
+//! `nop`, `drop`, untyped `select`, `call`, `if (result i32) ... else ... end`,
 //! `block (result i32) ... end`, `loop ... end`, and `br_if <depth>`. Local indices
 //! start at zero and address parameters first, then locals in declaration order.
 //! Both can be assigned.
@@ -32,8 +32,8 @@
 //! depth: zero names the innermost frame, and each enclosing frame, including
 //! `if`, adds one to the depth. A branch may cross any of these frames but may
 //! target only a `block` or `loop`. Branches to `if` or the implicit function
-//! label, other block types, `br`, `return`, `unreachable`, and indirect calls
-//! are unsupported.
+//! label, other block types, typed `select`, `br`, `return`, `unreachable`, and
+//! indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
 //! any global, export, and code sections. It may be empty (a zero-length vector) or
@@ -80,7 +80,12 @@
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get`, `global.get`, and `i32.const`
 //! push one i32; `local.set` and `global.set` pop one, and `local.tee` requires
-//! and leaves the top operand.
+//! and leaves the top operand. `nop` has no stack effect; `drop` discards the top
+//! i32. Untyped `select` consumes three i32 operands pushed in first-value,
+//! second-value, condition order. It pushes the first value for any nonzero
+//! condition and the second for zero. Unlike `if`, `select` does not skip
+//! either value's computation; a producer may trap even if its result would be
+//! unselected or dropped.
 //! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one and push
 //! one; the binary operators consume two and push one. `call` consumes as many
 //! i32s as the target function's type has parameters (the top operand is the
@@ -108,10 +113,10 @@
 //! The function has a floor of zero; its own `end` must be the final byte of
 //! the body frame and leave exactly one result. The inclusive limits are 256
 //! body bytes (including the locals vector and all delimiters), 127 decoded
-//! instructions (including `if`, `else`, and `br_if`, but not `block`, `loop`,
-//! or `end`), 32 live i32 operands including those below floors, and 16
-//! simultaneously open `block`, `loop`, and `if` frames combined, excluding
-//! the function frame.
+//! instructions (including `nop`, `drop`, `select`, `if`, `else`, and `br_if`,
+//! but not `block`, `loop`, or `end`), 32 live i32 operands including those below
+//! floors, and 16 simultaneously open `block`, `loop`, and `if` frames combined,
+//! excluding the function frame.
 //!
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
@@ -177,11 +182,11 @@
 //! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
-//! including memory and global instructions, a `call`, an `if` test, an executed
-//! `else` jump, or a `br_if` with either outcome. Skipped instructions, `block`,
-//! `loop`, and `end` delimiters, and returning from frames cost nothing. A
-//! continue does not reset the budget: all loop iterations and calls share it,
-//! including recursive guest calls.
+//! including `nop`, `drop`, `select`, memory and global instructions, a `call`,
+//! an `if` test, an executed `else` jump, or a `br_if` with either outcome.
+//! Skipped instructions, `block`, `loop`, and `end` delimiters, and returning
+//! from frames cost nothing. A continue does not reset the budget: all loop
+//! iterations and calls share it, including recursive guest calls.
 //! An invocation can return just after its last allowed dispatch. If the next
 //! instruction would exceed the dispatch budget, that limit takes precedence
 //! over executing it.
@@ -221,6 +226,11 @@
 //! values and `i32::MIN`, signed and unsigned right shifts, preserved operand
 //! prefixes, underflow at control floors (including both untaken arms), and
 //! exact decoded-instruction and dispatch budget boundaries.
+//! Stack-operation tests check selection order and zero, positive, and negative
+//! conditions (including signed extrema), discarded values and eager producer
+//! traps, preserved operands across mixed control, exact underflow offsets
+//! including in skipped code, and exact body byte, instruction, operand, and
+//! dispatch limits with `nop`, including limit precedence over a guest trap.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor

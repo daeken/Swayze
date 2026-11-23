@@ -15,6 +15,8 @@ mod call_indirect;
 mod float_control;
 #[path = "execution/float_locals.rs"]
 mod float_locals;
+#[path = "execution/float_min_max.rs"]
+mod float_min_max;
 #[path = "execution/float_operands.rs"]
 mod float_operands;
 #[path = "execution/float_rounding.rs"]
@@ -2262,12 +2264,13 @@ fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1a,
-            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0x98, 0xa6, 0xa7, 0xac, 0xad,
+            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0xac, 0xad,
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)
             && !(0x41..=0x90).contains(&opcode)
-            && !(0x99..=0x9e).contains(&opcode)
+            && !(0x96..=0x9e).contains(&opcode)
+            && !(0xa4..=0xa7).contains(&opcode)
             && !(0xbc..=0xbf).contains(&opcode)
         {
             bad_body(

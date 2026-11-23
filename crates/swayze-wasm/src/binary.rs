@@ -968,7 +968,7 @@ enum Instruction {
     Const(Operand),
     Convert(Conversion),
     FloatUnary(FloatWidth, FloatUnaryOp),
-    FloatCopysign(FloatWidth),
+    FloatBinary(FloatWidth, FloatBinaryOp),
     FloatCompare(FloatWidth, FloatComparison),
     LocalGet(u32),
     LocalSet(u32),
@@ -1160,6 +1160,8 @@ const F32_SIGN: u32 = 1 << 31;
 const F64_SIGN: u64 = 1 << 63;
 const F32_INFINITY: u32 = 0x7f80_0000;
 const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
+const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
+const F64_CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 #[derive(Clone, Copy, Debug)]
 enum FloatWidth {
@@ -1172,13 +1174,6 @@ impl FloatWidth {
         match self {
             Self::F32 => ValType::F32,
             Self::F64 => ValType::F64,
-        }
-    }
-
-    fn copysign(self, lhs: Operand, rhs: Operand) -> Operand {
-        match self {
-            Self::F32 => Operand::F32((lhs.f32_bits() & !F32_SIGN) | (rhs.f32_bits() & F32_SIGN)),
-            Self::F64 => Operand::F64((lhs.f64_bits() & !F64_SIGN) | (rhs.f64_bits() & F64_SIGN)),
         }
     }
 }
@@ -1201,12 +1196,18 @@ impl FloatUnaryOp {
                 u64::from(value.f32_bits()),
                 u64::from(F32_SIGN),
                 u64::from(F32_INFINITY),
+                u64::from(F32_CANONICAL_NAN),
                 23,
                 127,
             ) as u32),
-            (FloatWidth::F64, Self::Round(mode)) => {
-                Operand::F64(mode.round_bits(value.f64_bits(), F64_SIGN, F64_INFINITY, 52, 1023))
-            }
+            (FloatWidth::F64, Self::Round(mode)) => Operand::F64(mode.round_bits(
+                value.f64_bits(),
+                F64_SIGN,
+                F64_INFINITY,
+                F64_CANONICAL_NAN,
+                52,
+                1023,
+            )),
         }
     }
 }
@@ -1225,6 +1226,7 @@ impl FloatRounding {
         bits: u64,
         sign_mask: u64,
         infinity: u64,
+        canonical_nan: u64,
         fraction_bits: u32,
         bias: u32,
     ) -> u64 {
@@ -1233,7 +1235,7 @@ impl FloatRounding {
         let implicit_bit = 1 << fraction_bits;
         if magnitude > infinity {
             // All NaNs map to the positive canonical quiet NaN, not a payload-preserving result.
-            return infinity | (implicit_bit >> 1);
+            return canonical_nan;
         }
         let exponent = (magnitude >> fraction_bits) as u32;
         if magnitude == 0 || exponent >= bias + fraction_bits {
@@ -1265,6 +1267,52 @@ impl FloatRounding {
             || (matches!(self, Self::Nearest) && (fraction > half || (fraction == half && odd)));
         // Adding one unit to the truncated encoding can carry into the exponent.
         sign | (whole + if up { unit } else { 0 })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FloatBinaryOp {
+    Min,
+    Max,
+    Copysign,
+}
+
+impl FloatBinaryOp {
+    fn apply(self, width: FloatWidth, lhs: Operand, rhs: Operand) -> Operand {
+        match width {
+            FloatWidth::F32 => Operand::F32(self.apply_bits(
+                u64::from(lhs.f32_bits()),
+                u64::from(rhs.f32_bits()),
+                u64::from(F32_SIGN),
+                u64::from(F32_INFINITY),
+                u64::from(F32_CANONICAL_NAN),
+            ) as u32),
+            FloatWidth::F64 => Operand::F64(self.apply_bits(
+                lhs.f64_bits(),
+                rhs.f64_bits(),
+                F64_SIGN,
+                F64_INFINITY,
+                F64_CANONICAL_NAN,
+            )),
+        }
+    }
+
+    fn apply_bits(self, lhs: u64, rhs: u64, sign: u64, infinity: u64, canonical_nan: u64) -> u64 {
+        let min = match self {
+            Self::Min => true,
+            Self::Max => false,
+            Self::Copysign => return (lhs & !sign) | (rhs & sign),
+        };
+        use Ordering::{Equal, Greater, Less};
+        match (compare_float_bits(lhs, rhs, sign, infinity), min) {
+            (None, _) => canonical_nan,
+            (Some(Less), true) | (Some(Greater), false) => lhs,
+            (Some(Greater), true) | (Some(Less), false) => rhs,
+            // Equal encodings are unchanged by either operation. For mixed
+            // zeros, OR selects -0 and AND selects +0, regardless of order.
+            (Some(Equal), true) => lhs | rhs,
+            (Some(Equal), false) => lhs & rhs,
+        }
     }
 }
 
@@ -1799,10 +1847,10 @@ fn execute(
                 let value = op.apply(width, frame.pop());
                 frame.push(value);
             }
-            Instruction::FloatCopysign(width) => {
+            Instruction::FloatBinary(width, op) => {
                 let rhs = frame.pop();
                 let lhs = frame.pop();
-                frame.push(width.copysign(lhs, rhs));
+                frame.push(op.apply(width, lhs, rhs));
             }
             Instruction::FloatCompare(width, op) => {
                 let rhs = frame.pop();
@@ -2203,7 +2251,7 @@ fn validate_plain_stack(
             let ty = Some(width.operand_type());
             (1, ty, ty)
         }
-        Instruction::FloatCopysign(width) => {
+        Instruction::FloatBinary(width, _) => {
             let ty = Some(width.operand_type());
             (2, ty, ty)
         }
@@ -2466,7 +2514,9 @@ fn decode_plain(
         0x90 => {
             Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
-        0x98 => Instruction::FloatCopysign(FloatWidth::F32),
+        0x96 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Min),
+        0x97 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Max),
+        0x98 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Copysign),
         0x99 => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Abs),
         0x9a => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Neg),
         0x9b => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Ceil)),
@@ -2475,7 +2525,9 @@ fn decode_plain(
         0x9e => {
             Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
-        0xa6 => Instruction::FloatCopysign(FloatWidth::F64),
+        0xa4 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Min),
+        0xa5 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Max),
+        0xa6 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Copysign),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),

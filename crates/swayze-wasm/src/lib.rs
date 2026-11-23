@@ -169,15 +169,20 @@
 //! and finite integral values unchanged. For any NaN, Swayze deterministically
 //! returns the positive canonical quiet NaN (`0x7fc00000` for f32,
 //! `0x7ff8000000000000` for f64), not the input NaN's sign or payload.
-//! For both widths, `eq`, `ne`,
-//! `lt`, `gt`, `le`, and `ge` (`0x5b`–`0x60` for f32, `0x61`–`0x66` for f64)
-//! consume two operands of their exact width in lhs, rhs order and push an i32
-//! Boolean (0 or 1). Either quiet or signaling NaN makes the pair unordered:
+//! `min` and `max` (`0x96`/`0x97` for f32, `0xa4`/`0xa5` for f64) consume two
+//! operands of their width and return the exact encoding of the lesser or
+//! greater operand, respectively. Mixed-sign zeros return -0 for `min` and +0
+//! for `max`; same-sign zeros retain their sign. If either operand is a NaN,
+//! both instructions return the same positive canonical quiet NaN as rounding.
+//! For both widths, `eq`, `ne`, `lt`, `gt`, `le`, and `ge` (`0x5b`–`0x60` for f32,
+//! `0x61`–`0x66` for f64) consume two operands of their exact width in lhs, rhs
+//! order and push an i32 Boolean (0 or 1). Either quiet or signaling NaN makes
+//! the pair unordered:
 //! only `ne` returns 1. Positive and negative zero compare equal; all other
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
-//! sign operations, rounding, and comparisons each count as one dispatch. None
-//! uses native floating-point operations. Floats are supported as
+//! sign operations, rounding, `min`/`max`, and comparisons each count as one
+//! dispatch. None uses native floating-point operations. Floats are supported as
 //! operands, private globals, locals, `block` and `if` results, and function
 //! parameters and results, including across the host boundary. Fallthrough,
 //! `return`, and branch exits preserve all result bits. Loop results and
@@ -484,6 +489,14 @@
 //! signs, subnormals, infinities, and canonicalization of quiet and signaling
 //! NaNs. They check live and dead floor diagnostics, shared caps, and a one-dispatch
 //! charge per op at the fuel limit. The fixed vectors are evidence, not a proof.
+//! Float `min`/`max` tests check exact tagged results for ordered pairs in both
+//! widths, including equal finite values, both zero signs, subnormals and
+//! infinities, and positive canonical quiet NaNs for quiet or signaling NaNs in
+//! either operand. They check type and floor diagnostics in live and dead code,
+//! the shared body-byte, instruction, and operand limits, and exact dispatch
+//! charging. Before/after layout probes with pinned Rust on arm64 macOS agreed
+//! in debug and release: 16 bytes per operand, 32 per decoded instruction,
+//! 856 per call frame, and 17,512 bytes summed across body-validation scratch.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

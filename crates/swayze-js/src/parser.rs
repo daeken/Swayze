@@ -30,7 +30,8 @@ pub struct Limits {
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
     /// Maximum combined depth of open parentheses (including control headers)
-    /// and pending conditional expressions. Statement frames have a separate fixed cap.
+    /// and pending conditional expressions or ungrouped assignment RHSs.
+    /// Statement frames have a separate fixed cap.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
     pub max_work: usize,
@@ -1025,6 +1026,10 @@ enum Pending {
     AssignmentGroup {
         access: usize,
         tail: AssignmentTail,
+        rhs_base_depth: usize,
+    },
+    SimpleAssignment {
+        access: usize,
         rhs_base_depth: usize,
     },
     Consequent {
@@ -2242,6 +2247,33 @@ impl Parser<'_> {
         Ok(())
     }
 
+    fn finish_expression_assignment(
+        &mut self,
+        access: usize,
+        tail: AssignmentTail,
+        rhs_base_depth: usize,
+        operator: Span,
+        end: Span,
+    ) -> Result<(), Error> {
+        if self.stack_depth.checked_sub(rhs_base_depth) != Some(1) {
+            return Err(Error::malformed(
+                end,
+                "assignment value must leave one result",
+            ));
+        }
+        if let AssignmentTail::Eager(binary) = tail {
+            self.emit(binary.instruction(), operator)?;
+        }
+        self.finish_write(access, end, true)?;
+        if let AssignmentTail::ShortCircuit(skip) = tail {
+            // Both paths leave one value above rhs_base_depth:
+            // the old value on skip, or the RHS after the store.
+            self.patch_jump(skip, end)?;
+        }
+        self.nesting_depth -= 1;
+        Ok(())
+    }
+
     fn record_access(&mut self, name: Span, write: Option<WriteAccess>) -> Result<usize, Error> {
         let index = self.accesses.len();
         let scope = self.current_scope();
@@ -2407,6 +2439,12 @@ impl Parser<'_> {
         };
         let mut needs_operand = true;
         let mut after_open = false;
+        // Ungrouped simple assignment is allowed only as an RHS prefix, not
+        // after an operator, at a ternary arm, in tests, or after a comma.
+        let mut rhs_start = matches!(
+            end_kind,
+            ExpressionEnd::Declarator(_) | ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(_)
+        );
         let mut next = Some(first);
         let (end, delimiter) = loop {
             let Some(token) = next else {
@@ -2448,7 +2486,7 @@ impl Parser<'_> {
                         && after_line_break
                         && let Some(message) = missing_semicolon
                     {
-                        self.reduce_expression()?;
+                        self.reduce_expression(span)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(span, message));
                         }
@@ -2511,9 +2549,21 @@ impl Parser<'_> {
                             kind: TokenKind::Assignment(op),
                             span: operator,
                             ..
-                        }) if group_start => {
-                            self.begin_group_assignment(span, op, operator)?;
+                        }) if group_start || (rhs_start && op.is_none()) => {
+                            if group_start {
+                                self.begin_group_assignment(span, op, operator)?;
+                            } else {
+                                let access = self.begin_write(span, operator, false)?;
+                                self.open_pending(
+                                    Pending::SimpleAssignment {
+                                        access,
+                                        rhs_base_depth: self.stack_depth,
+                                    },
+                                    operator,
+                                )?;
+                            }
                             after_open = false;
+                            rhs_start = true;
                             next = self.next_token()?;
                             continue;
                         }
@@ -2581,9 +2631,9 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "empty parenthesized expression"));
                 }
                 (false, TokenKind::Comma) => {
-                    // Comma is looser than ?:, so join completed conditionals before
+                    // Comma is looser than ?: and =. Finish the RHS before
                     // deciding which surrounding grammar production owns the comma.
-                    self.reduce_expression()?;
+                    self.reduce_expression(span)?;
                     match self.pending.last() {
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(span, "expected ':' before ','"));
@@ -2644,7 +2694,7 @@ impl Parser<'_> {
                     needs_operand = true;
                 }
                 (false, TokenKind::Close) => {
-                    self.reduce_expression()?;
+                    self.reduce_expression(span)?;
                     match self.pending.pop() {
                         Some((Pending::Group, _)) => self.nesting_depth -= 1,
                         Some((
@@ -2655,22 +2705,13 @@ impl Parser<'_> {
                             },
                             operator,
                         )) => {
-                            if self.stack_depth.checked_sub(rhs_base_depth) != Some(1) {
-                                return Err(Error::malformed(
-                                    span,
-                                    "assignment value must leave one result",
-                                ));
-                            }
-                            if let AssignmentTail::Eager(binary) = tail {
-                                self.emit(binary.instruction(), operator)?;
-                            }
-                            self.finish_write(access, span, true)?;
-                            if let AssignmentTail::ShortCircuit(skip) = tail {
-                                // Both paths leave one value above rhs_base_depth:
-                                // the old value on skip, or the RHS after the store.
-                                self.patch_jump(skip, span)?;
-                            }
-                            self.nesting_depth -= 1;
+                            self.finish_expression_assignment(
+                                access,
+                                tail,
+                                rhs_base_depth,
+                                operator,
+                                span,
+                            )?;
                         }
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(
@@ -2707,7 +2748,7 @@ impl Parser<'_> {
                     | TokenKind::Operator(Operator::Void),
                 ) => {
                     if after_line_break && for_delimiter.is_none() {
-                        self.reduce_expression()?;
+                        self.reduce_expression(span)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(
                                 span,
@@ -2727,10 +2768,11 @@ impl Parser<'_> {
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
             after_open = matches!(kind, TokenKind::Open);
+            rhs_start = false;
             next = self.next_token()?;
         };
         let at_eof = delimiter.is_none();
-        self.reduce_expression()?;
+        self.reduce_expression(end)?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
                 Pending::Group | Pending::AssignmentGroup { .. } if at_eof => {
@@ -2848,28 +2890,45 @@ impl Parser<'_> {
         Ok(())
     }
 
-    // At an expression delimiter, reduce through completed conditionals but stop
-    // at an opening parenthesis or a conditional whose ':' has not been seen.
-    // '?' drained operators at its level, so there are no operator entries
-    // underneath the alternate markers until after the next delimiter.
-    fn reduce_expression(&mut self) -> Result<(), Error> {
+    // At a delimiter, finish conditionals and ungrouped assignments inside out.
+    // '?' drained operators at its level, and a simple assignment began at an
+    // RHS prefix, so neither marker has operators immediately beneath it.
+    // Groups and conditionals that haven't seen their ':' still stop reduction.
+    fn reduce_expression(&mut self, end: Span) -> Result<(), Error> {
         self.reduce_operators(0)?;
-        while let Some(&(Pending::Alternate { jump, join_depth }, span)) = self.pending.last() {
-            if self.stack_depth != join_depth {
-                return Err(Error::malformed(
-                    span,
-                    "conditional branches must each leave one result",
-                ));
+        while let Some(&(pending, span)) = self.pending.last() {
+            match pending {
+                Pending::Alternate { jump, join_depth } => {
+                    if self.stack_depth != join_depth {
+                        return Err(Error::malformed(
+                            span,
+                            "conditional branches must each leave one result",
+                        ));
+                    }
+                    self.patch_jump(jump, span)?;
+                    self.nesting_depth -= 1;
+                }
+                Pending::SimpleAssignment {
+                    access,
+                    rhs_base_depth,
+                } => {
+                    self.finish_expression_assignment(
+                        access,
+                        AssignmentTail::Simple,
+                        rhs_base_depth,
+                        span,
+                        end,
+                    )?;
+                }
+                _ => break,
             }
-            self.patch_jump(jump, span)?;
             self.pending.pop();
-            self.nesting_depth -= 1;
         }
         Ok(())
     }
 
     fn start_alternate(&mut self, span: Span) -> Result<(), Error> {
-        self.reduce_expression()?;
+        self.reduce_expression(span)?;
         let Some((Pending::Consequent { branch, base_depth }, _)) = self.pending.pop() else {
             return Err(Error::malformed(span, "':' without a matching '?'"));
         };

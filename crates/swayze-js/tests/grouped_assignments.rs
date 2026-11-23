@@ -471,7 +471,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             Malformed,
             "expected a closing parenthesis",
         ),
-        ("let x,y;(x=y@=@42)", Unsupported, "assignment expressions"),
         ("let x;(0,x@=@42)", Unsupported, "assignment expressions"),
         (
             "let x;(x=true ? x@=@1 : 2)",

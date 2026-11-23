@@ -7,7 +7,15 @@ case $#:$* in
 esac
 cd "$(CDPATH= cd "$(dirname "$0")/.." && pwd)"
 
-# Preserve the example's result codes; build/launch errors are infrastructure errors.
+# Build separately so Cargo cannot mask the runner's result codes.
+if ! version=$(rustc -vV) || ! host=$(printf '%s\n' "$version" | sed -n 's/^host: //p'); then
+    echo 'infra: cannot determine Rust host target' >&2
+    exit 2
+fi
+case $host in
+    ''|*[!a-zA-Z0-9._-]*) echo 'infra: cannot determine Rust host target' >&2; exit 2 ;;
+esac
+target_dir="$PWD/target/test262"
 result=0
 for profile in debug release; do
     printf 'Test262 slice (%s)\n' "$profile"
@@ -16,8 +24,13 @@ for profile in debug release; do
     else
         flag=
     fi
+    if ! cargo build --quiet --frozen -p swayze-engine --example run_test262 \
+        --target-dir "$target_dir" --target "$host" $flag; then
+        echo "infra: $profile runner build failed" >&2
+        exit 2
+    fi
     status=0
-    cargo run --quiet --frozen -p swayze-engine --example run_test262 $flag -- "$@" || status=$?
+    "$target_dir/$host/$profile/examples/run_test262" "$@" || status=$?
     case $status in
         0) ;;
         1) if [ "$result" -eq 0 ]; then result=1; fi ;;

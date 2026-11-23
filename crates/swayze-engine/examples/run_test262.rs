@@ -1,9 +1,10 @@
 //! Opt-in slice runner, not the Test262 harness. Its only corpus input is a
 //! reviewed manifest in the current superproject commit and the pinned Git tree.
 //!
-//! TSV rows: `raw PATH` or `adapted PATH CALL ACTUAL EXPECTED [MESSAGE]`,
-//! with tabs between fields and zero-based half-open byte spans `START:END`.
-//! Review each whole blob; the call span includes the final semicolon.
+//! TSV rows: `ROLE raw PATH` or `ROLE adapted PATH CALL ACTUAL EXPECTED [MESSAGE]`.
+//! Fields are tab-separated; byte spans are zero-based and half-open (`START:END`).
+//! Review each whole blob; the call span includes the final semicolon. `required`
+//! rows must pass raw/sloppy; `frontier` may be unsupported but must not fail.
 
 use std::{
     ffi::OsStr,
@@ -21,8 +22,6 @@ const MANIFEST: &str = "tools/test262-cases.tsv";
 const SUBMODULE: &str = "vendor/test262";
 const MAX_CASES: usize = 32;
 const MAX_BYTES: usize = 8 * 1024; // Per blob, including the manifest.
-const ACTUAL: &str = "__swayze262_actual";
-const EXPECTED: &str = "__swayze262_expected";
 
 type Diagnostic = &'static str;
 
@@ -43,10 +42,19 @@ struct Assertion {
 
 struct Case<'a> {
     path: &'a str,
+    required: bool,
     assertion: Option<Assertion>,
 }
 
 impl Case<'_> {
+    fn role(&self) -> &'static str {
+        if self.required {
+            "required"
+        } else {
+            "frontier"
+        }
+    }
+
     fn mode(&self) -> &'static str {
         if self.assertion.is_some() {
             "adapted"
@@ -69,6 +77,11 @@ fn manifest(text: &str) -> Option<Vec<Case<'_>>> {
             continue;
         }
         let mut fields = line.split('\t');
+        let required = match fields.next()? {
+            "required" => true,
+            "frontier" => false,
+            _ => return None,
+        };
         let mode = fields.next()?;
         let path = fields.next()?;
         if cases.len() == MAX_CASES
@@ -103,7 +116,11 @@ fn manifest(text: &str) -> Option<Vec<Case<'_>>> {
         if fields.next().is_some() {
             return None;
         }
-        cases.push(Case { path, assertion });
+        cases.push(Case {
+            path,
+            required,
+            assertion,
+        });
     }
     Some(cases)
 }
@@ -224,6 +241,34 @@ fn is_quoted_literal(source: &str) -> bool {
     !escaped && end == quote
 }
 
+// Only the comment/metadata surroundings needed by the first cohort. The
+// trusted review still establishes the exact call and operand boundaries.
+fn comment_prefix(prefix: &str) -> Option<()> {
+    let (before, rest) = prefix.split_once("/*---\n")?;
+    let (header, after) = rest.split_once("\n---*/")?;
+    let line_comment_or_empty = |line: &str| {
+        let line = line.trim_ascii();
+        !line.contains(['\r', '\u{2028}', '\u{2029}'])
+            && (line.is_empty() || line.starts_with("//"))
+    };
+    (!header.contains("*/")
+        && (before.is_empty() || before.ends_with('\n'))
+        && before.lines().all(line_comment_or_empty)
+        && after.starts_with('\n')
+        && after.lines().all(line_comment_or_empty))
+    .then_some(())
+}
+
+// A shape check only: Swayze, not the host's decimal parser, determines the
+// value. Isolated expectations cannot read any bindings or have side effects.
+fn is_primitive_literal(source: &str) -> bool {
+    let decimal = source.strip_prefix('-').unwrap_or(source);
+    is_quoted_literal(source)
+        || matches!(source, "true" | "false" | "null")
+        || (decimal.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && source.parse::<f64>().is_ok())
+}
+
 impl Assertion {
     // Structural anchors for reviewed spans, not an argument splitter or a JS
     // lexer. The pinned blob review must establish a top-level terminal call,
@@ -231,10 +276,9 @@ impl Assertion {
     fn scripts(&self, source: &str) -> Option<(String, String)> {
         let prefix = source.get(..self.call.start)?;
         let suffix = source.get(self.call.end..)?;
+        comment_prefix(prefix)?;
         if !prefix.rsplit('\n').next()?.trim_ascii().is_empty()
             || !suffix.trim_ascii().is_empty()
-            || source.contains(ACTUAL)
-            || source.contains(EXPECTED)
             || source
                 .get(self.call.start..self.actual.start)?
                 .trim_ascii_end()
@@ -248,6 +292,9 @@ impl Assertion {
         }
         let actual = source.get(self.actual.clone())?;
         let expected = source.get(self.expected.clone())?;
+        if !is_primitive_literal(expected) {
+            return None;
+        }
         let (last_end, message) = if let Some(span) = &self.message {
             let message = source.get(span.clone())?;
             if source.get(self.expected.end..span.start)?.trim_ascii() != ","
@@ -262,14 +309,12 @@ impl Assertion {
         if source.get(last_end..self.call.end)?.trim_ascii_start() != ");" {
             return None;
         }
-        // The bindings cannot capture names in the admitted parser slice (it
-        // declines escaped/non-ASCII identifiers). Both deterministic replays
-        // run both operands in order, even when an operand has side effects.
-        let common =
-            format!("{prefix};const {ACTUAL}=({actual});const {EXPECTED}=({expected});{message}");
+        // Preserve all bytes outside the call and evaluate the actual once.
+        // The isolated expectation and optional message are pure literals;
+        // grouping prevents either from accidentally becoming a directive.
         Some((
-            format!("{common}({ACTUAL});{suffix}"),
-            format!("{common}({EXPECTED});{suffix}"),
+            format!("{prefix}({actual});{suffix}"),
+            format!("{message}({expected});"),
         ))
     }
 }
@@ -339,17 +384,22 @@ struct Totals {
     unsupported: usize,
     fail: usize,
     infra: usize,
+    required_pass: usize,
+    required_unsupported: usize,
 }
 
 impl Totals {
     fn report(&mut self, case: &Case<'_>, variant: &str, outcome: Outcome) {
+        let gated = case.required && variant != "strict/not-run";
         let (class, detail) = match outcome {
             Outcome::Pass => {
                 self.pass += 1;
+                self.required_pass += usize::from(gated);
                 ("pass", "")
             }
             Outcome::Unsupported(detail) => {
                 self.unsupported += 1;
+                self.required_unsupported += usize::from(gated);
                 ("unsupported", detail)
             }
             Outcome::Fail(detail) => {
@@ -361,13 +411,23 @@ impl Totals {
                 ("infra", detail)
             }
         };
-        println!("{class} {}/{variant} {} {detail}", case.mode(), case.path);
+        let detail = if detail.is_empty() {
+            "".to_owned()
+        } else {
+            format!(": {detail}")
+        };
+        println!(
+            "{class} {} {}/{variant} {}{detail}",
+            case.role(),
+            case.mode(),
+            case.path
+        );
     }
 
     fn status(&self) -> u8 {
         if self.infra != 0 {
             2
-        } else if self.fail != 0 || self.pass == 0 {
+        } else if self.fail != 0 || self.required_unsupported != 0 || self.required_pass == 0 {
             1
         } else {
             0
@@ -401,9 +461,16 @@ fn run_case(case: &Case<'_>, source: &str, totals: &mut Totals) {
                 totals.report(case, "sloppy", outcome);
             }
             if matches!(variants, Variants::Strict | Variants::Both) {
+                // Default strict is explicitly not run, never a required
+                // variant. A strict-only required row cannot be satisfied.
+                let variant = if variants == Variants::Strict && case.required {
+                    "strict-only/not-run"
+                } else {
+                    "strict/not-run"
+                };
                 totals.report(
                     case,
-                    "strict",
+                    variant,
                     Outcome::Unsupported("strict Script outside Swayze slice"),
                 );
             }
@@ -444,8 +511,12 @@ fn run() -> Result<u8, Diagnostic> {
         "pass={} unsupported={} fail={} infra={}",
         totals.pass, totals.unsupported, totals.fail, totals.infra
     );
-    if totals.pass == 0 {
-        println!("no passing variants");
+    println!(
+        "required-pass={} required-unsupported={}",
+        totals.required_pass, totals.required_unsupported
+    );
+    if totals.required_pass == 0 {
+        println!("no passing required variants");
     }
     Ok(totals.status())
 }
@@ -486,9 +557,9 @@ fn self_test() {
     assert!(!same_value(Scalar(Number(1.0)), String(&[49])));
     assert!(same_value(String(&[0xd800]), String(&[0xd800])));
     assert!(!same_value(String(&[0xd800]), String(&[0xfffd])));
-    assert!(manifest("raw\ttest/../bad.js\n").is_none());
-    assert!(manifest("raw\ttest/x.js\nraw\ttest/x.js\n").is_none());
-    assert!(manifest("raw\ttest/x.js\textra\n").is_none());
+    assert!(manifest("required\traw\ttest/../bad.js\n").is_none());
+    assert!(manifest("required\traw\ttest/x.js\nfrontier\traw\ttest/x.js\n").is_none());
+    assert!(manifest("required\traw\ttest/x.js\textra\n").is_none());
     assert!(manifest("").unwrap().is_empty());
     assert_eq!(Totals::default().status(), 1);
     assert!(metadata("/*---\nnegative:\n  phase: parse\n---*/").is_err());
@@ -513,16 +584,23 @@ fn self_test() {
     );
     assert_eq!(evaluate(("0 / 0;", Some("-(0 / 0);"))), Outcome::Pass);
 
-    let prefix = "/*---\nflags: [noStrict]\n---*/\nlet x = 2;\n";
-    let call = "assert.sameValue(++x, x, 'literal');";
+    let prefix = "/*---\ndescription: synthetic\n---*/\n";
+    let call = "assert.sameValue(-0, -0, 'literal');";
     let source = format!("{prefix}{call}\n");
     let offset = prefix.len();
     let assertion = Assertion {
         call: offset..offset + call.len(),
-        actual: offset + 17..offset + 20,
-        expected: offset + 22..offset + 23,
+        actual: offset + 17..offset + 19,
+        expected: offset + 21..offset + 23,
         message: Some(offset + 25..offset + 34),
     };
+    assert!(!is_primitive_literal("x"));
+    assert!(!is_primitive_literal("1+1"));
+    assert!(comment_prefix("/*---\ndescription: synthetic\n---*/\nlet x = 2;\n").is_none());
+    assert_eq!(
+        evaluate(("('use strict');", Some("('use strict');"))),
+        Outcome::Pass
+    );
     let (actual, expected) = assertion.scripts(&source).expect("exact reviewed spans");
     assert_eq!(evaluate((&actual, Some(&expected))), Outcome::Pass);
     assert!(assertion.scripts(&format!("{source}4;")).is_none());
@@ -536,4 +614,47 @@ fn self_test() {
             .scripts(&source.replace("'literal'", "('other')"))
             .is_none()
     );
+
+    let mut case = Case {
+        path: "test/synthetic.js",
+        required: true,
+        assertion: Some(assertion),
+    };
+    let baseline = || Totals {
+        pass: 1,
+        required_pass: 1,
+        ..Totals::default()
+    };
+    let mut totals = Totals::default();
+    run_case(&case, &source, &mut totals);
+    assert_eq!(
+        (totals.status(), totals.required_pass, totals.unsupported),
+        (0, 1, 1)
+    );
+
+    let unsupported = source.replacen("-0,", "xx,", 1);
+    let mut totals = baseline();
+    run_case(&case, &unsupported, &mut totals);
+    assert_eq!((totals.status(), totals.required_unsupported), (1, 1));
+
+    case.required = false;
+    let mut totals = baseline();
+    run_case(&case, &unsupported, &mut totals);
+    assert_eq!(
+        (
+            totals.status(),
+            totals.required_unsupported,
+            totals.unsupported
+        ),
+        (0, 0, 2)
+    );
+
+    for actual in ["+0,", "1+,"] {
+        let mut totals = baseline();
+        run_case(&case, &source.replacen("-0,", actual, 1), &mut totals);
+        assert_eq!((totals.status(), totals.fail), (1, 1));
+    }
+    let mut totals = baseline();
+    run_case(&case, &format!("{source}4;"), &mut totals);
+    assert_eq!((totals.status(), totals.infra), (2, 1));
 }

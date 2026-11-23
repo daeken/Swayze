@@ -1,0 +1,5 @@
+required	adapted	test/language/literals/numeric/numeric-separators/numeric-separator-literal-dd-dot-dd-ep-sign-minus-dd-nsl-dd.js	576:612	593:601	603:610
+required	adapted	test/language/literals/string/line-separator.js	542:576	559:564	566:574
+required	adapted	test/language/expressions/unary-plus/11.4.6-2-1.js	199:231	216:219	221:222	224:229
+required	adapted	test/language/expressions/unary-minus/11.4.7-4-1.js	199:232	216:219	221:223	225:230
+frontier	adapted	test/language/expressions/typeof/unresolvable-reference.js	459:535	479:487	491:502	506:532

@@ -123,6 +123,18 @@ fn logical_assignment_skip_and_take_both_reach_the_remaining_operands() {
 }
 
 #[test]
+fn skipped_initializer_store_still_runs_suffix_and_continue_runs_both_updates() {
+    let script = parse_script(
+        "let i=0,n=0,guard=1;
+         for (guard ||= (n=99), n += 1; i < 2; i += 1, n += 10) { continue; }
+         i*100+n",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(221.0));
+    assert_eq!(script.evaluate(), Ok(221.0));
+}
+
+#[test]
 fn each_clause_can_be_omitted() {
     for statement in [
         "for (;i<3;i=i+1) {}",
@@ -538,21 +550,23 @@ fn no_comma_stores_and_leading_update_restrictions_remain_unchanged() {
 }
 
 #[test]
+fn empty_assignment_sequence_suffixes_report_the_clause_delimiter() {
+    for (source, delimiter) in [
+        ("let x;for(x=1,;false;){}x", ",|;"),
+        ("let x;for(;false;x=1,){}x", ",|)"),
+    ] {
+        assert_eq!(
+            assert_error_at(source, ErrorKind::Malformed, delimiter).message(),
+            "expected an operand",
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn assignment_sequence_diagnostics_respect_comma_ownership_and_scope() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, marked, message) in [
-        (
-            "let x;for(x=1,;false;){}x",
-            Malformed,
-            ",|;",
-            "expected an operand",
-        ),
-        (
-            "let x;for(;false;x=1,){}x",
-            Malformed,
-            ",|)",
-            "expected an operand",
-        ),
         (
             "let x;for(x=1,",
             Malformed,

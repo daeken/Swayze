@@ -321,6 +321,73 @@ fn equality_uses_units_not_ranges_or_unicode_normalization() {
 }
 
 #[test]
+fn relational_comparisons_use_lexicographic_utf16_order() {
+    let ascending = [true, true, false, false];
+    let equal = [false, true, false, true];
+    for (lhs, rhs, expected) in [
+        ("'aa'", "'z'", ascending), // The first mismatch takes priority over length.
+        ("'z'", "'za'", ascending), // Proper prefix.
+        ("''", "'a'", ascending),
+        ("''", "''", equal),
+        (r"'a\0b'", r"'a\0c'", ascending),     // Compare past NUL.
+        (r"'\uD800'", r"'\uD801'", ascending), // Preserve distinct lone surrogates.
+        (r"'\u{10000}'", r"'\uE000'", ascending), // D800 < E000, despite code-point order.
+        (r"'\u00FF'", r"'\u0100'", ascending), // Compare u16 values, not their bytes.
+        ("'e\u{301}'", "'é'", ascending),      // No normalization.
+        ("'😀'", r"'\uD83D\uDE00'", equal),
+    ] {
+        let [lt, le, gt, ge] = expected;
+        for (lhs, rhs, expected) in [(lhs, rhs, expected), (rhs, lhs, [gt, ge, lt, le])] {
+            for (op, expected) in ["<", "<=", ">", ">="].into_iter().zip(expected) {
+                let source = format!("{lhs} {op} {rhs}");
+                let script = parse_script(&source).unwrap();
+                assert_eq!(script.instruction_count(), 3, "{source}");
+                assert_eq!(script.max_stack_depth(), 2, "{source}");
+                assert_eq!(
+                    script.evaluate_value(),
+                    Ok(Value::Boolean(expected)),
+                    "{source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn relational_operands_run_once_in_source_order() {
+    for (op, expected) in [("<", false), ("<=", false), (">", true), (">=", true)] {
+        // Left must snapshot 'b' before the right operand writes 'a'.
+        assert_scalar(
+            &format!(
+                "let x = 'b', n = 0; const result = (n++, x) {op} (n++, x = 'a'); \
+                 result === {expected} && n === 2 && x === 'a'"
+            ),
+            Value::Boolean(true),
+        );
+    }
+}
+
+#[test]
+fn mixed_string_relations_are_unsupported_only_when_reached() {
+    for scalar in ["0", "false", "null", "undefined"] {
+        for (lhs, rhs) in [("''", scalar), (scalar, "''")] {
+            for op in ["<", "<=", ">", ">="] {
+                let expr = format!("{lhs} {op} {rhs}");
+                let script = parse_script(&expr).unwrap();
+                assert_eq!(
+                    script.evaluate_primitive(),
+                    Err(EvalError::UnsupportedStringOperation),
+                    "{expr}"
+                );
+                assert_scalar(&format!("false && ({expr})"), Value::Boolean(false));
+            }
+        }
+    }
+    assert!(parse_script(r"true || '' < '\u{}'").is_err());
+    assert!(parse_script("true || '' < missing").is_err());
+}
+
+#[test]
 fn unsupported_operations_fail_only_when_dispatched() {
     for expr in [
         "+''",
@@ -339,10 +406,6 @@ fn unsupported_operations_fail_only_when_dispatched() {
         "'' << 1",
         "1 >> ''",
         "'' >>> 1",
-        "'' < 'x'",
-        "'' <= 1",
-        "1 > ''",
-        "1 >= ''",
         "'' == 0",
         "0 != ''",
         "'' != false",
@@ -422,4 +485,56 @@ fn equality_pair_budget_is_inclusive_shared_and_fresh_per_eval() {
     .unwrap();
     assert_eq!(inclusive.evaluate(), Ok(64.0));
     assert_eq!(inclusive.evaluate(), Ok(64.0));
+}
+
+#[test]
+fn ordering_and_equality_share_the_exact_pair_budget() {
+    let suffix = "a".repeat(1023);
+    // Each iteration charges 4 * 1,024 pairs: equality and ordering of an
+    // alias, plus early mismatches with unequal lengths in both operand orders.
+    let prelude = format!(
+        "const x = 'a{suffix}', y = 'b{suffix}b'; let i = 0; \
+         while (i < 16) {{ x === x; x <= x; x < y; y > x; i++; }} "
+    );
+    let inclusive = parse_script(&format!(
+        "{prelude}if (false) {{ x >= x; }} x > '' && '' < x && '' <= '' && x !== y"
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(inclusive.evaluate_value(), Ok(Value::Boolean(true)));
+    }
+    // A single extra pair is too many even if comparing aliases or mismatching
+    // in the first unit. Equality and all four relations see the same balance.
+    for op in ["===", "<", "<=", ">", ">="] {
+        let script = parse_script(&format!("{prelude}const one = 'a'; one {op} one")).unwrap();
+        assert_eq!(
+            script.evaluate_value(),
+            Err(EvalError::StringComparisonLimitExceeded)
+        );
+    }
+    let script = parse_script(&format!("{prelude}'b' >= x")).unwrap();
+    assert_eq!(
+        script.evaluate_value(),
+        Err(EvalError::StringComparisonLimitExceeded)
+    );
+}
+
+#[test]
+fn dispatch_limit_is_checked_before_the_relational_pair_budget() {
+    // 4 initialization dispatches, 64 * 9 loop dispatches (exhausting pairs),
+    // 4 for the failed test; then 2 to initialize, 3,157 * 5 for the loop and 4 for
+    // the failed test. Three number statement/discard pairs and the final
+    // comparison use the remaining nine dispatches, unless `+` adds one.
+    let x = "a".repeat(1024);
+    let prelude = format!(
+        "const x = '{x}'; let n = 0; while (n++ < 64) {{ x <= x; }} \
+         let k = 0; while (k++ < 3157) {{}} 0; 0; "
+    );
+    for (pad, expected) in [
+        ("0", EvalError::StringComparisonLimitExceeded),
+        ("+0", EvalError::DispatchLimitExceeded),
+    ] {
+        let script = parse_script(&format!("{prelude}{pad}; x <= x")).unwrap();
+        assert_eq!(script.evaluate_value(), Err(expected));
+    }
 }

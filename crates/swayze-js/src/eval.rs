@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use crate::{
     Script,
@@ -149,7 +149,7 @@ pub enum EvalError {
     NonScalarResult,
     /// Execution reached an operator whose String behavior is outside the subset.
     UnsupportedStringOperation,
-    /// A String equality test would exceed the evaluation's 65,536-pair budget.
+    /// A String comparison would exceed the evaluation's 65,536-pair budget.
     StringComparisonLimitExceeded,
 }
 
@@ -203,10 +203,12 @@ impl Script {
 
     /// Evaluate the Script and return the final expression's tagged primitive value.
     ///
-    /// Arithmetic and relational operators leave Numbers unchanged and convert
-    /// `true` to `1`, `false` and `null` to `+0`, and `undefined` to NaN.
-    /// Arithmetic returns a Number; relational
-    /// operators return a Boolean, always `false` if either operand is NaN.
+    /// For scalar operands, arithmetic and relational operators leave Numbers
+    /// unchanged and convert `true` to `1`, `false` and `null` to `+0`, and
+    /// `undefined` to NaN. Arithmetic returns a Number; relational operators
+    /// return a Boolean, always `false` if either operand is NaN. Two Strings
+    /// are ordered lexicographically by UTF-16 code units, with a proper prefix
+    /// sorting before the longer String.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators also use this conversion, then truncate and wrap to 32
@@ -222,9 +224,10 @@ impl Script {
     /// numerically after converting the Boolean. Strings compare code units with
     /// other Strings; mixed strict equality and String/nullish loose equality
     /// are false. `!==` and `!=` negate their corresponding equality results.
-    /// String/Number and String/Boolean loose equality, String arithmetic
-    /// (including concatenation), bitwise operations, relational comparison,
-    /// and Number coercions in updates and eager compounds are unsupported.
+    /// String/Number and String/Boolean loose equality, mixed String/scalar
+    /// relational comparison, String arithmetic (including concatenation),
+    /// bitwise operations, and Number coercions in updates and eager compounds
+    /// are unsupported.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -273,9 +276,11 @@ impl Script {
     /// skipped paths. Each call can dispatch at most 16,384 instructions; each
     /// execution of an instruction counts once, including tests, jumps, and
     /// repeated loop instructions.
-    /// Each call also allows 65,536 String code-unit pairs for equality tests.
-    /// Two Strings of equal length charge their entire length before comparison,
-    /// even for aliases or an early mismatch. Different lengths cost no pairs.
+    /// String equality and ordering share a budget of 65,536 code-unit pairs
+    /// per call. Equality charges the full length for equal-length Strings and
+    /// nothing otherwise. Ordering charges the shorter length. Both charge
+    /// before comparison, even for aliases or an early mismatch; skipped
+    /// comparisons cost nothing.
     /// String operands only copy ranges; evaluation allocates no String storage.
     ///
     /// # Errors
@@ -459,11 +464,29 @@ fn evaluate<'script>(
                     Ok(Value::Boolean(equal ^ negate))
                 })?;
             }
-            // Direct binary64 comparisons all return false for unordered operands.
-            Instruction::LessThan => apply_relational(&mut stack, |lhs, rhs| lhs < rhs)?,
-            Instruction::LessThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs <= rhs)?,
-            Instruction::GreaterThan => apply_relational(&mut stack, |lhs, rhs| lhs > rhs)?,
-            Instruction::GreaterThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs >= rhs)?,
+            Instruction::LessThan
+            | Instruction::LessThanOrEqual
+            | Instruction::GreaterThan
+            | Instruction::GreaterThanOrEqual => {
+                apply_binary(&mut stack, |lhs, rhs| {
+                    let order = operands_order(lhs, rhs, string_units, &mut string_pairs_left)?;
+                    let result = match order {
+                        Some(Ordering::Less) => {
+                            matches!(op, Instruction::LessThan | Instruction::LessThanOrEqual)
+                        }
+                        Some(Ordering::Equal) => matches!(
+                            op,
+                            Instruction::LessThanOrEqual | Instruction::GreaterThanOrEqual
+                        ),
+                        Some(Ordering::Greater) => matches!(
+                            op,
+                            Instruction::GreaterThan | Instruction::GreaterThanOrEqual
+                        ),
+                        None => false, // All four relations are false for NaN operands.
+                    };
+                    Ok(Value::Boolean(result))
+                })?;
+            }
             Instruction::Positive => {
                 apply_unary(&mut stack, |value| {
                     Ok(Value::Number(value.require_scalar()?.to_number()))
@@ -561,9 +584,7 @@ fn operands_equal(
             if lhs.len() != rhs.len() {
                 return Ok(false);
             }
-            *string_pairs_left = string_pairs_left
-                .checked_sub(lhs.len())
-                .ok_or(EvalError::StringComparisonLimitExceeded)?;
+            charge_string_pairs(string_pairs_left, lhs.len())?;
             Ok(lhs == rhs)
         }
         (Operand::String(_), Operand::Scalar(scalar))
@@ -575,6 +596,34 @@ fn operands_equal(
             }
         }
     }
+}
+
+fn operands_order(
+    lhs: Operand,
+    rhs: Operand,
+    string_units: &[u16],
+    string_pairs_left: &mut usize,
+) -> Result<Option<Ordering>, EvalError> {
+    match (lhs, rhs) {
+        (Operand::Scalar(lhs), Operand::Scalar(rhs)) => {
+            Ok(lhs.to_number().partial_cmp(&rhs.to_number()))
+        }
+        (Operand::String(lhs), Operand::String(rhs)) => {
+            let lhs = lhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            let rhs = rhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            charge_string_pairs(string_pairs_left, lhs.len().min(rhs.len()))?;
+            // Slice ordering compares u16 values, then lengths if the prefix matches.
+            Ok(Some(lhs.cmp(rhs)))
+        }
+        _ => Err(EvalError::UnsupportedStringOperation),
+    }
+}
+
+fn charge_string_pairs(remaining: &mut usize, pairs: usize) -> Result<(), EvalError> {
+    *remaining = remaining
+        .checked_sub(pairs)
+        .ok_or(EvalError::StringComparisonLimitExceeded)?;
+    Ok(())
 }
 
 fn writable_binding(bindings: &mut [Option<Slot>], slot: usize) -> Result<&mut Operand, EvalError> {
@@ -699,15 +748,6 @@ fn apply_bitwise(
     })
 }
 
-fn apply_relational(
-    stack: &mut Vec<Operand>,
-    op: impl FnOnce(f64, f64) -> bool,
-) -> Result<(), EvalError> {
-    apply_scalar_binary(stack, |lhs, rhs| {
-        Value::Boolean(op(lhs.to_number(), rhs.to_number()))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +787,32 @@ mod tests {
             );
         }
         assert_eq!(script.evaluate_primitive(), Ok(PrimitiveValue::String(&[])));
+    }
+
+    #[test]
+    fn string_order_checks_both_ranges_before_charging() {
+        let script = crate::parse_script("'a' < 'b'").unwrap();
+        let [
+            Instruction::String(a),
+            Instruction::String(b),
+            Instruction::LessThan,
+        ] = script.instructions()
+        else {
+            panic!("expected two literal instructions and a comparison");
+        };
+        // Only the first range fits in this truncated pool.
+        let short_pool = &script.string_units()[..1];
+        for (&lhs, &rhs) in [(a, b), (b, a)] {
+            assert_eq!(
+                operands_order(
+                    Operand::String(lhs),
+                    Operand::String(rhs),
+                    short_pool,
+                    &mut 0
+                ),
+                Err(EvalError::InvalidScript)
+            );
+        }
     }
 
     #[test]

@@ -97,6 +97,29 @@ fn sibling_bindings_and_a_later_root_binding_have_distinct_fixed_slots() {
 }
 
 #[test]
+fn both_conditional_rhs_edges_join_before_assignment_stores() {
+    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBinding, StoreBindingKeep, Undefined};
+    assert_postfix(
+        "let x,y; x = y = true ? 1 : 2; x",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Boolean(true),
+            JumpIfFalse(8),
+            Number(1.0),
+            Jump(9),
+            Number(2.0),
+            StoreBindingKeep(1),
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn updates_load_and_store_the_same_slot_once_with_no_result() {
     use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
     assert_postfix(
@@ -1620,8 +1643,6 @@ fn assignment_statements_require_explicit_semicolons() {
         ("let x=1\nx=2; x", Unsupported, 8, 9),
         ("let x=1; (x)=2; x", Unsupported, 12, 13),
         ("let x=1; (x + x=2)", Unsupported, 15, 16),
-        ("let x=1; let y=x=2; y", Unsupported, 16, 17),
-        ("let x=1; x=x=2; x", Unsupported, 12, 13),
         ("let x=1; ((x)||=2)", Unsupported, 13, 16),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),

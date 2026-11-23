@@ -377,7 +377,11 @@ fn fixtures() -> Vec<String> {
             "let x = 2; (++x ** 2) + x",
             "let x = 2; (-x++) ** 2 + x",
             "let x = -0; const old = x++; 1 / old === -1 / 0 && x === 1",
-            "let x = 0; if (x++) { x = 99; } else if (++x) { 40 + x++; } x"
+            "let x = 0; if (x++) { x = 99; } else if (++x) { 40 + x++; } x",
+            "let x; let y = x = 3, z = 4; x * 100 + y * 10 + z",
+            "let x, y, n = 0; x = y = true ? (++n) : 99; x * 100 + y * 10 + n",
+            "let x = 1, y = 42; (x ||= y = 0); y",
+            "let x = 1, y; (x += y = 20) + y + 1"
         ]
         .map(str::to_owned),
     );

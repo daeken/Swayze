@@ -872,6 +872,41 @@ fn conditionals_compile_to_forward_jumps_and_join_at_the_same_stack_depth() {
 }
 
 #[test]
+fn sequence_discard_is_the_join_target_for_short_circuit_and_conditional_paths() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{Boolean, Discard, Jump, JumpIfFalse, ShortCircuit};
+
+    assert_postfix(
+        "(false && true, 42)",
+        &[
+            Boolean(false),
+            ShortCircuit {
+                condition: ShortCircuitCondition::Falsy,
+                target: 3,
+            },
+            Boolean(true),
+            Discard,
+            Number(42.),
+        ],
+        1,
+    );
+    // The consequent jumps to the discard; the alternate falls through to it.
+    assert_postfix(
+        "(true ? 1 : 2, 42)",
+        &[
+            Boolean(true),
+            JumpIfFalse(4),
+            Number(1.),
+            Jump(5),
+            Number(2.),
+            Discard,
+            Number(42.),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn sequence_discards_each_completed_left_operand_before_the_next() {
     use Instruction::{Boolean, Discard, Jump, JumpIfFalse};
     assert_postfix(

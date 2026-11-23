@@ -15,6 +15,7 @@
 //! groups are allowed but must still specify `i32`.
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
+//! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
 //! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.clz`, `i32.ctz`, `i32.popcnt`,
 //! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
@@ -119,8 +120,15 @@
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get`, `global.get`, and `i32.const`
 //! push one i32; `local.set` and `global.set` pop one, and `local.tee` requires
-//! and leaves the top operand. `nop` has no stack effect; `drop` discards the top
-//! i32. Untyped `select` consumes three i32 operands pushed in first-value,
+//! and leaves the top i32 operand. `i64.const` pushes one i64 and accepts valid
+//! padding within ten signed LEB128 bytes. In a ten-byte encoding the terminal
+//! byte must be `0x00` or `0x7f` to match the sign bit. The immediate cannot read
+//! beyond its body frame. The two extensions pop an i32 and push an i64,
+//! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
+//! and pushes its low 32 bits as i32. i64 is limited to internal operands:
+//! signatures, locals, globals, and control label types do not change.
+//! `nop` has no stack effect; `drop` discards an operand of either type.
+//! Untyped `select` consumes three i32 operands pushed in first-value,
 //! second-value, condition order. It pushes the first value for any nonzero
 //! condition and the second for zero. Unlike `if`, `select` does not skip
 //! either value's computation; a producer may trap even if its result would be
@@ -147,10 +155,11 @@
 //! For validation, `unreachable`, `br`, `br_table`, and `return` discard
 //! operands above the active floor and mark only that frame unreachable, after
 //! checking any required operands. A pop at the floor of an unreachable frame
-//! supplies an implicit i32 without reducing the depth; pushes still count as
-//! explicit operands. No operand access crosses the active floor. At `else` or
-//! `end`, an unreachable frame may supply a missing i32 result implicitly, but
-//! any excess explicit operands are still rejected. Every new frame starts reachable,
+//! supplies an implicit operand of the required type without reducing the depth;
+//! pushes remain concrete and count against the stack cap. No operand access
+//! crosses the active floor. At `else` or `end`, an unreachable frame may supply
+//! a missing i32 result implicitly, but a concrete result of the wrong type or
+//! any excess operands are still rejected. Every new frame starts reachable,
 //! even inside an unreachable frame. `else` checks the then result and starts
 //! a reachable else arm at the same floor. `end` checks the final result, then
 //! leaves the declared result on the parent's stack (none for void) without
@@ -174,13 +183,13 @@
 //! all immediates, indices, mutability, delimiters, and limits.
 //! The function has a floor of zero and its own unreachable flag; its `end`
 //! must be the final byte of the body frame and checks for the declared result
-//! arity, including that a void function leaves no operands. The inclusive
+//! type and arity, including that a void function leaves no operands. The inclusive
 //! limits are 256 body bytes (including the locals vector and all delimiters),
 //! 127 decoded instructions (including `unreachable`, `nop`,
 //! `drop`, `select`, `if`, `else`, `br`, `br_if`, `br_table`, and `return`, but
-//! not `block`, `loop`, or `end`), 32 explicitly stacked i32 operands including
-//! those below floors, and 16 simultaneously open `block`, `loop`, and `if`
-//! frames combined, excluding the function frame.
+//! not `block`, `loop`, or `end`), 32 explicitly stacked operands of either
+//! type including those below floors, and 16 simultaneously open `block`,
+//! `loop`, and `if` frames combined, excluding the function frame.
 //!
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
@@ -221,7 +230,8 @@
 //! page is installed, it is never resized or reallocated. A failed reserve can
 //! be retried by a later dispatch within the same execution limits. Zero selects the else arm (or skips straight to the join if
 //! no `else` is present); every nonzero i32 selects the then arm.
-//! Validation uses a fixed stack of control frames with explicit result arities.
+//! Validation uses a fixed stack of operand types and a fixed stack of control
+//! frames with explicit result arities.
 //! Each `block` and `if` label keeps a linked chain of incoming branch edges in
 //! fixed scratch storage, patched once per edge at `end`. Edges are identified by
 //! slot, so a table can refer to several labels and repeat the same label. The
@@ -243,7 +253,8 @@
 //! it. Validation retains decoded code only after all edges have been resolved
 //! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
-//! Each active call frame has its own fixed operand stack and local storage.
+//! Each active call frame has its own fixed operand stack of tagged i32/i64 values
+//! and separate i32 local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
 //! declared locals start at zero for every frame. A callee starts with no
 //! operands. A callee returning i32 pushes that value onto the caller's
@@ -348,6 +359,10 @@
 //! traps, preserved operands across mixed control, exact underflow offsets
 //! including in skipped code, and exact body byte, instruction, operand, and
 //! dispatch limits with `nop`, including limit precedence over a guest trap.
+//! i64 operand tests check exact extended and wrapped values, signed LEB64
+//! padding, terminal bytes and frame offsets, i32-only boundaries in live and
+//! dead code, preservation through control and calls, and shared stack and
+//! dispatch budgets.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor
@@ -455,7 +470,7 @@ mod binary;
 mod memory;
 mod table;
 
-pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, validate_module};
+pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, ValType, validate_module};
 
 use memory::{DataSegment, LinearMemory, MemoryLimits};
 use std::{cell::Cell, convert::Infallible, fmt};

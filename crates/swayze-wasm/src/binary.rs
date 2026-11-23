@@ -24,7 +24,8 @@ pub struct Error {
 /// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
 /// active frame's entry stack floor. The latter is reported at a delimiter if
 /// the depth differs from the frame's result arity (zero for void, one for i32),
-/// unless a missing result is supplied by an unreachable frame's implicit i32.
+/// unless a missing result is supplied by an unreachable frame's polymorphic
+/// floor. `TypeMismatch` is reported at the consuming opcode or delimiter.
 /// `BranchTableArityMismatch` compares a `br_table` target's result arity to
 /// that of the first target. `InvalidStartSignature` reports the parameter
 /// count and result kind of a start target that is not `() -> ()`.
@@ -72,6 +73,7 @@ pub enum ErrorKind {
     MissingElse,
     BranchTableArityMismatch { expected: usize, actual: usize },
     StackUnderflow { depth: usize },
+    TypeMismatch { expected: ValType, actual: ValType },
     InvalidResultDepth { depth: usize },
     AllocationFailed,
     LimitExceeded { limit: Limit },
@@ -88,7 +90,7 @@ pub enum LengthField {
     DataSize,
 }
 
-/// A count, index, or immediate encoded as a LEB32 integer.
+/// A count, index, or immediate encoded as a LEB32 integer (LEB64 for `I64Const`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IntegerField {
@@ -122,8 +124,31 @@ pub enum IntegerField {
     /// Number of explicit `br_table` labels, excluding the mandatory default.
     BranchTableCount,
     I32Const,
+    I64Const,
     /// Number of declared locals in one group.
     LocalCount,
+}
+
+impl IntegerField {
+    fn leb_width(self) -> u8 {
+        if self == Self::I64Const { 64 } else { 32 }
+    }
+}
+
+/// A concrete type on the internal operand stack, not a supported signature type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValType {
+    I32,
+    I64,
+}
+
+impl fmt::Display for ValType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+        })
+    }
 }
 
 /// Fixed resource bounds for [`validate_module`]. All maxima are inclusive.
@@ -140,7 +165,7 @@ pub enum Limit {
     /// Decoded operations across the whole body, including `if`, `else`, `br`, `br_if`,
     /// and `br_table`, but not `block`, `loop`, or `end`.
     BodyInstructions,
-    /// Peak number of explicitly stacked i32 operands during body validation.
+    /// Peak number of explicitly stacked operands of either type during body validation.
     OperandStackDepth,
     /// Number of simultaneously open `block`, `loop`, and `if` frames, excluding the function frame.
     ControlDepth,
@@ -186,8 +211,12 @@ impl fmt::Display for Error {
             MissingSection { id } => write!(f, "missing required section ID {id}"),
             TruncatedLength { field } => write!(f, "truncated LEB32 for {field:?}"),
             LengthOverflow { field } => write!(f, "LEB32 overflow for {field:?}"),
-            TruncatedInteger { field } => write!(f, "truncated LEB32 for {field:?}"),
-            IntegerOverflow { field } => write!(f, "LEB32 overflow for {field:?}"),
+            TruncatedInteger { field } => {
+                write!(f, "truncated LEB{} for {field:?}", field.leb_width())
+            }
+            IntegerOverflow { field } => {
+                write!(f, "LEB{} overflow for {field:?}", field.leb_width())
+            }
             TruncatedSection {
                 declared,
                 available,
@@ -273,6 +302,9 @@ impl fmt::Display for Error {
                     f,
                     "not enough operands above the frame's stack floor, found {depth}"
                 )
+            }
+            TypeMismatch { expected, actual } => {
+                write!(f, "expected {expected} operand, found {actual}")
             }
             InvalidResultDepth { depth } => {
                 write!(
@@ -852,7 +884,8 @@ enum Instruction {
     Nop,
     Drop,
     Select,
-    Const(i32),
+    Const(Value),
+    Convert(Conversion),
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
@@ -869,6 +902,60 @@ enum Instruction {
     Jump { target: usize },
     Branch { edge: BranchEdge, conditional: bool },
     BranchTable { first: usize, explicit_count: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Value {
+    I32(i32),
+    I64(i64),
+}
+
+impl Value {
+    fn operand_type(self) -> ValType {
+        match self {
+            Self::I32(_) => ValType::I32,
+            Self::I64(_) => ValType::I64,
+        }
+    }
+
+    // Only validated code reaches execution. These checks guard the internal
+    // invariant; an i64 cannot be silently read as an i32 or vice versa.
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::I32(value) => value,
+            Self::I64(_) => unreachable!("validated i32 operand"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Conversion {
+    WrapI64,
+    ExtendI32S,
+    ExtendI32U,
+}
+
+impl Conversion {
+    fn types(self) -> (ValType, ValType) {
+        use ValType::{I32, I64};
+        match self {
+            Self::WrapI64 => (I64, I32),
+            Self::ExtendI32S | Self::ExtendI32U => (I32, I64),
+        }
+    }
+
+    fn apply(self, value: Value) -> Value {
+        match self {
+            Self::WrapI64 => {
+                let Value::I64(value) = value else {
+                    unreachable!("validated i64 operand");
+                };
+                Value::I32(value as i32)
+            }
+            Self::ExtendI32S => Value::I64(i64::from(value.as_i32())),
+            Self::ExtendI32U => Value::I64(i64::from(value.as_i32() as u32)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1017,7 +1104,7 @@ struct CallFrame {
     function_index: usize,
     pc: usize,
     locals: [i32; MAX_LOCAL_SLOTS],
-    operands: [i32; Limit::OperandStackDepth.maximum()],
+    operands: [Value; Limit::OperandStackDepth.maximum()],
     depth: usize,
 }
 
@@ -1026,27 +1113,37 @@ impl CallFrame {
         function_index: 0,
         pc: 0,
         locals: [0; MAX_LOCAL_SLOTS],
-        operands: [0; Limit::OperandStackDepth.maximum()],
+        operands: [Value::I32(0); Limit::OperandStackDepth.maximum()],
         depth: 0,
     };
 
-    fn new(function_index: usize, args: &[i32]) -> Self {
+    fn new(function_index: usize, args: impl ExactSizeIterator<Item = i32>) -> Self {
         let mut frame = Self {
             function_index,
             ..Self::EMPTY
         };
-        frame.locals[..args.len()].copy_from_slice(args);
+        for (local, arg) in frame.locals[..args.len()].iter_mut().zip(args) {
+            *local = arg;
+        }
         frame
     }
 
-    fn push(&mut self, value: i32) {
+    fn push(&mut self, value: Value) {
         self.operands[self.depth] = value;
         self.depth += 1;
     }
 
-    fn pop(&mut self) -> i32 {
+    fn push_i32(&mut self, value: i32) {
+        self.push(Value::I32(value));
+    }
+
+    fn pop(&mut self) -> Value {
         self.depth -= 1;
         self.operands[self.depth]
+    }
+
+    fn pop_i32(&mut self) -> i32 {
+        self.pop().as_i32()
     }
 
     fn take_branch(&mut self, edge: BranchEdge, code: &ValidatedCode) {
@@ -1057,12 +1154,12 @@ impl CallFrame {
         };
         let value = match result {
             ResultKind::Void => None,
-            ResultKind::I32 => Some(self.pop()),
+            ResultKind::I32 => Some(self.pop_i32()),
         };
         // Restore the target's prefix, not the active frame's.
         self.depth = edge.floor;
         if let Some(value) = value {
-            self.push(value);
+            self.push_i32(value);
         }
         self.pc = pc;
     }
@@ -1106,7 +1203,7 @@ pub(super) fn execute(
 ) -> Result<Option<i32>, ExecutionError> {
     let module = instance.module;
     let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
-    frames[0] = CallFrame::new(function_index, args);
+    frames[0] = CallFrame::new(function_index, args.iter().copied());
     let mut active = 0;
     let mut remaining_dispatches = ExecutionLimit::InstructionDispatches.maximum();
     loop {
@@ -1120,14 +1217,14 @@ pub(super) fn execute(
             debug_assert_eq!(frame.depth, code.signature.result.count());
             let value = match code.signature.result {
                 ResultKind::Void => None,
-                ResultKind::I32 => Some(frame.operands[0]),
+                ResultKind::I32 => Some(frame.operands[0].as_i32()),
             };
             if active == 0 {
                 return Ok(value);
             }
             active -= 1;
             if let Some(value) = value {
-                frames[active].push(value);
+                frames[active].push_i32(value);
             }
             continue;
         };
@@ -1145,19 +1242,23 @@ pub(super) fn execute(
                 frame.pop();
             }
             Instruction::Select => {
-                let condition = frame.pop();
-                let second = frame.pop();
-                let first = frame.pop();
-                frame.push(if condition != 0 { first } else { second });
+                let condition = frame.pop_i32();
+                let second = frame.pop_i32();
+                let first = frame.pop_i32();
+                frame.push_i32(if condition != 0 { first } else { second });
             }
             Instruction::Const(value) => frame.push(value),
-            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
-            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
-            Instruction::LocalTee(index) => {
-                frame.locals[index as usize] = frame.operands[frame.depth - 1]
+            Instruction::Convert(op) => {
+                let value = op.apply(frame.pop());
+                frame.push(value);
             }
-            Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
-            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
+            Instruction::LocalGet(index) => frame.push_i32(frame.locals[index as usize]),
+            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop_i32(),
+            Instruction::LocalTee(index) => {
+                frame.locals[index as usize] = frame.operands[frame.depth - 1].as_i32();
+            }
+            Instruction::GlobalGet(index) => frame.push_i32(instance.globals[index as usize].get()),
+            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop_i32()),
             Instruction::Call(target) => {
                 let index = match target {
                     CallTarget::Direct(index) => index as usize,
@@ -1166,7 +1267,7 @@ pub(super) fn execute(
                         // before checking whether another frame can be entered.
                         let table = instance.table.as_ref().expect("validated table presence");
                         let index = table
-                            .resolve(frame.pop() as u32)
+                            .resolve(frame.pop_i32() as u32)
                             .map_err(ExecutionError::Trap)?;
                         if module.functions[index].signature != expected {
                             return Err(ExecutionError::Trap(Trap::IndirectCallTypeMismatch));
@@ -1183,47 +1284,52 @@ pub(super) fn execute(
                 // parameter order. Reset reused frame storage before entering.
                 let end = frame.depth;
                 frame.depth -= module.functions[index].signature.parameters as usize;
-                let callee = CallFrame::new(index, &frame.operands[frame.depth..end]);
+                let args = frame.operands[frame.depth..end]
+                    .iter()
+                    .copied()
+                    .map(Value::as_i32);
+                let callee = CallFrame::new(index, args);
                 active += 1;
                 frames[active] = callee;
             }
             Instruction::Unary(op) => {
-                let top = &mut frame.operands[frame.depth - 1];
-                *top = op.apply(*top);
+                let result = op.apply(frame.pop_i32());
+                frame.push_i32(result);
             }
             Instruction::Binary(op) => {
-                let rhs = frame.pop();
-                let lhs = &mut frame.operands[frame.depth - 1];
-                *lhs = op.apply(*lhs, rhs).map_err(ExecutionError::Trap)?;
+                let rhs = frame.pop_i32();
+                let lhs = frame.pop_i32();
+                frame.push_i32(op.apply(lhs, rhs).map_err(ExecutionError::Trap)?);
             }
             Instruction::LoadI32 { kind, offset } => {
-                let address_and_result = &mut frame.operands[frame.depth - 1];
-                *address_and_result = instance
+                let address = frame.pop_i32();
+                let value = instance
                     .memory
-                    .load_i32(*address_and_result, offset, kind)
+                    .load_i32(address, offset, kind)
                     .map_err(ExecutionError::Trap)?;
+                frame.push_i32(value);
             }
             Instruction::StoreI32 { width, offset } => {
-                let value = frame.pop();
-                let address = frame.pop();
+                let value = frame.pop_i32();
+                let address = frame.pop_i32();
                 instance
                     .memory
                     .store_i32(address, offset, width, value)
                     .map_err(ExecutionError::Trap)?;
             }
-            Instruction::MemorySize => frame.push(instance.memory.size_in_pages()),
+            Instruction::MemorySize => frame.push_i32(instance.memory.size_in_pages()),
             Instruction::MemoryGrow => {
-                let delta = frame.pop() as u32;
-                frame.push(instance.memory.grow(delta));
+                let delta = frame.pop_i32() as u32;
+                frame.push_i32(instance.memory.grow(delta));
             }
             Instruction::JumpIfZero { target } => {
-                if frame.pop() == 0 {
+                if frame.pop_i32() == 0 {
                     frame.pc = target;
                 }
             }
             Instruction::Jump { target } => frame.pc = target,
             Instruction::Branch { edge, conditional } => {
-                if !conditional || frame.pop() != 0 {
+                if !conditional || frame.pop_i32() != 0 {
                     frame.take_branch(edge, code);
                 }
             }
@@ -1235,7 +1341,7 @@ pub(super) fn execute(
                 // (16), where the default lives. The decoder appended all
                 // explicit_count + 1 edges starting at first, so first + index
                 // is below table_targets.len() (at most MAX_BODY_TABLE_TARGETS).
-                let index = (frame.pop() as u32).min(explicit_count) as usize;
+                let index = (frame.pop_i32() as u32).min(explicit_count) as usize;
                 frame.take_branch(code.table_targets[first + index], code);
             }
         }
@@ -1281,10 +1387,11 @@ impl ControlFrame {
         self.base
     }
 
-    fn check_result_depth(self, depth: usize, offset: usize) -> Result<(), Error> {
+    fn pop_result(self, stack: &mut OperandStack, offset: usize) -> Result<(), Error> {
+        let depth = stack.depth - self.base;
         let expected = self.result.count();
         if depth == expected || (self.unreachable && depth < expected) {
-            Ok(())
+            stack.pop(self, expected, Some(ValType::I32), offset)
         } else {
             Err(Error {
                 offset,
@@ -1344,16 +1451,111 @@ fn decode_branch_edge(
     }
 }
 
-fn check_operand_depth(depth: usize, offset: usize) -> Result<(), Error> {
-    let limit = Limit::OperandStackDepth;
-    if depth <= limit.maximum() {
-        Ok(())
-    } else {
-        Err(Error {
-            offset,
-            kind: ErrorKind::LimitExceeded { limit },
-        })
+struct OperandStack {
+    types: [ValType; Limit::OperandStackDepth.maximum()],
+    depth: usize,
+}
+
+impl OperandStack {
+    fn new() -> Self {
+        Self {
+            types: [ValType::I32; Limit::OperandStackDepth.maximum()],
+            depth: 0,
+        }
     }
+
+    fn push(&mut self, ty: ValType, offset: usize) -> Result<(), Error> {
+        let slot = self.types.get_mut(self.depth).ok_or(Error {
+            offset,
+            kind: ErrorKind::LimitExceeded {
+                limit: Limit::OperandStackDepth,
+            },
+        })?;
+        *slot = ty;
+        self.depth += 1;
+        Ok(())
+    }
+
+    // All supported multi-operand consumers require i32s. Drop is the only
+    // consumer with no expected type. Check concrete operands above the floor;
+    // any remaining pops in a dead tail are implicit and consume no slots.
+    fn pop(
+        &mut self,
+        frame: ControlFrame,
+        count: usize,
+        expected: Option<ValType>,
+        offset: usize,
+    ) -> Result<(), Error> {
+        let available = self.depth - frame.base;
+        if count > available && !frame.unreachable {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::StackUnderflow { depth: available },
+            });
+        }
+        let remaining = self.depth - count.min(available);
+        if let Some(expected) = expected {
+            for &actual in self.types[remaining..self.depth].iter().rev() {
+                if actual != expected {
+                    return Err(Error {
+                        offset,
+                        kind: ErrorKind::TypeMismatch { expected, actual },
+                    });
+                }
+            }
+        }
+        self.depth = remaining;
+        Ok(())
+    }
+}
+
+fn validate_plain_stack(
+    instruction: Instruction,
+    operands: &mut OperandStack,
+    frame: ControlFrame,
+    offset: usize,
+    functions: &[FunctionType],
+) -> Result<(), Error> {
+    use ValType::I32;
+    let i32_type = Some(I32);
+    let (count, expected, result) = match instruction {
+        Instruction::Nop => return Ok(()),
+        Instruction::Drop => (1, None, None),
+        Instruction::Select => (3, i32_type, i32_type),
+        Instruction::Const(value) => (0, None, Some(value.operand_type())),
+        Instruction::Convert(op) => {
+            let (from, to) = op.types();
+            (1, Some(from), Some(to))
+        }
+        Instruction::LocalGet(_) | Instruction::GlobalGet(_) | Instruction::MemorySize => {
+            (0, None, i32_type)
+        }
+        Instruction::Call(target) => {
+            let (signature, selectors) = match target {
+                CallTarget::Direct(index) => (functions[index as usize], 0),
+                CallTarget::Indirect(expected) => (expected, 1),
+            };
+            let result = (signature.result == ResultKind::I32).then_some(I32);
+            (signature.parameters as usize + selectors, i32_type, result)
+        }
+        Instruction::LocalSet(_) | Instruction::GlobalSet(_) => (1, i32_type, None),
+        Instruction::LocalTee(_)
+        | Instruction::Unary(_)
+        | Instruction::MemoryGrow
+        | Instruction::LoadI32 { .. } => (1, i32_type, i32_type),
+        Instruction::StoreI32 { .. } => (2, i32_type, None),
+        Instruction::Binary(_) => (2, i32_type, i32_type),
+        Instruction::Unreachable
+        | Instruction::JumpIfZero { .. }
+        | Instruction::Jump { .. }
+        | Instruction::Branch { .. }
+        | Instruction::BranchTable { .. } => unreachable!("handled during control validation"),
+    };
+    operands.pop(frame, count, expected, offset)?;
+    if let Some(result) = result {
+        operands.push(result, offset)?;
+    }
+    Ok(())
 }
 
 fn require_memory(has_memory: bool, offset: usize) -> Result<(), Error> {
@@ -1467,7 +1669,8 @@ fn decode_plain(
                 Instruction::MemoryGrow
             }
         }
-        I32_CONST => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
+        I32_CONST => Instruction::Const(Value::I32(body.integer(IntegerField::I32Const)? as i32)),
+        0x42 => Instruction::Const(Value::I64(body.i64_const()?)),
         0x45 => Instruction::Unary(UnaryOp::Eqz),
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
@@ -1497,6 +1700,9 @@ fn decode_plain(
         0x76 => Instruction::Binary(BinaryOp::ShrU),
         0x77 => Instruction::Binary(BinaryOp::Rotl),
         0x78 => Instruction::Binary(BinaryOp::Rotr),
+        0xa7 => Instruction::Convert(Conversion::WrapI64),
+        0xac => Instruction::Convert(Conversion::ExtendI32S),
+        0xad => Instruction::Convert(Conversion::ExtendI32U),
         _ => {
             return Err(Error {
                 offset,
@@ -1542,6 +1748,7 @@ fn validate_body(
     signature: FunctionType,
     environment: &BodyEnvironment<'_>,
 ) -> Result<ValidatedCode, Error> {
+    use ValType::I32;
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
     let mut body = section.frame(declared).ok_or(Error {
@@ -1555,7 +1762,7 @@ fn validate_body(
     // Forward transfers reserve slots that their matching delimiters backpatch.
     // Each block or if chains its incoming edges, each visited once at the
     // target's end. Loop edges resolve immediately to the PC saved at entry.
-    let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
+    let mut decoded = [Instruction::Nop; Limit::BodyInstructions.maximum()];
     let mut table_targets = [BranchEdge {
         target: BranchTarget::Function,
         floor: 0,
@@ -1563,7 +1770,7 @@ fn validate_body(
     let mut target_count = 0;
     let mut previous_branch = [None; Limit::BodyInstructions.maximum() + MAX_BODY_TABLE_TARGETS];
     let mut count = 0;
-    let mut depth = 0usize;
+    let mut operands = OperandStack::new();
     // Slot zero is the function frame, which does not count against the cap.
     let mut frames = [ControlFrame::function(signature.result); Limit::ControlDepth.maximum() + 1];
     let mut nesting = 0;
@@ -1571,13 +1778,11 @@ fn validate_body(
         let offset = body.position();
         let frame = frames[nesting];
         let ControlFrame {
-            base,
             result,
             kind,
             mut last_branch,
-            unreachable,
+            ..
         } = frame;
-        let available = depth - base;
         let requires_else = result == ResultKind::I32 && matches!(kind, ControlKind::Then { .. });
         let opcode = body.byte().ok_or_else(|| {
             let expected = if requires_else { ELSE } else { END };
@@ -1590,11 +1795,12 @@ fn validate_body(
                     kind: ErrorKind::MissingElse,
                 });
             }
-            frame.check_result_depth(available, offset)?;
-            // Pop the frame and push its declared results onto the parent's stack,
-            // even if the frame could supply a result only by polymorphism.
-            depth = base + result.count();
-            check_operand_depth(depth, offset)?;
+            frame.pop_result(&mut operands, offset)?;
+            // Push the declared result onto the parent's stack as a concrete
+            // value, even if the child supplied it only by polymorphism.
+            if result == ResultKind::I32 {
+                operands.push(I32, offset)?;
+            }
             // Forward edges target the next decoded slot, possibly the final
             // one-past-last index. All sources are in the decoded prefix.
             match kind {
@@ -1642,18 +1848,6 @@ fn validate_body(
             }
             count += 1;
         }
-        let consume = |operands| {
-            // Consume concrete operands first. In a dead tail, pops at the
-            // current floor yield an implicit i32 without lowering the depth.
-            if operands <= available || unreachable {
-                Ok(base + available.saturating_sub(operands))
-            } else {
-                Err(Error {
-                    offset,
-                    kind: ErrorKind::StackUnderflow { depth: available },
-                })
-            }
-        };
         match opcode {
             BLOCK | LOOP | IF => {
                 let result = if opcode == LOOP {
@@ -1672,13 +1866,13 @@ fn validate_body(
                     BLOCK => ControlKind::Block,
                     LOOP => ControlKind::Loop { body_pc: pc },
                     IF => {
-                        depth = consume(1)?;
+                        operands.pop(frame, 1, Some(I32), offset)?;
                         ControlKind::Then { if_pc: pc }
                     }
                     _ => unreachable!("only control openers"),
                 };
                 *next = ControlFrame {
-                    base: depth,
+                    base: operands.depth,
                     result,
                     kind,
                     last_branch: None,
@@ -1693,13 +1887,12 @@ fn validate_body(
                         kind: ErrorKind::UnexpectedElse,
                     });
                 };
-                frame.check_result_depth(available, offset)?;
+                frame.pop_result(&mut operands, offset)?;
                 // Skip the then arm and its else jump on a zero condition.
                 decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
                 // The arms share a label: keep its branch chain until end.
                 frames[nesting].kind = ControlKind::Else { else_pc: pc };
                 frames[nesting].unreachable = false;
-                depth = base;
             }
             BR | BR_IF | RETURN => {
                 // The function is at depth `nesting`, outside every explicit
@@ -1716,14 +1909,14 @@ fn validate_body(
                 // branch uses the target floor.
                 let conditional = opcode == BR_IF;
                 let results = target.result.count(); // Supported loops are void.
-                let after_pop = consume(usize::from(conditional) + results)?;
+                operands.pop(frame, usize::from(conditional) + results, Some(I32), offset)?;
                 decoded[pc] = Instruction::Branch { edge, conditional };
-                depth = if conditional {
+                if !conditional {
+                    operands.depth = frames[nesting].mark_unreachable();
+                } else if results != 0 {
                     // Fallthrough restores the result, even if it was implicit.
-                    after_pop + results
-                } else {
-                    frames[nesting].mark_unreachable()
-                };
+                    operands.push(I32, offset)?;
+                }
             }
             BR_TABLE => {
                 let explicit_count =
@@ -1757,52 +1950,30 @@ fn validate_body(
                     target_count += 1;
                 }
                 let results = common.expect("every table has a default").count();
-                consume(1 + results)?;
+                operands.pop(frame, 1 + results, Some(I32), offset)?;
                 decoded[pc] = Instruction::BranchTable {
                     first,
                     explicit_count,
                 };
-                depth = frames[nesting].mark_unreachable();
+                operands.depth = frames[nesting].mark_unreachable();
             }
             _ => {
                 let instruction =
                     decode_plain(&mut body, opcode, offset, local_bound, environment)?;
-                depth = match instruction {
-                    Instruction::Unreachable => frames[nesting].mark_unreachable(),
-                    Instruction::Nop => depth,
-                    Instruction::Select => consume(3)? + 1,
-                    Instruction::Const(_)
-                    | Instruction::LocalGet(_)
-                    | Instruction::GlobalGet(_)
-                    | Instruction::MemorySize => depth + 1,
-                    Instruction::Call(target) => {
-                        let (signature, selectors) = match target {
-                            CallTarget::Direct(index) => (environment.functions[index as usize], 0),
-                            CallTarget::Indirect(expected) => (expected, 1),
-                        };
-                        consume(signature.parameters as usize + selectors)?
-                            + signature.result.count()
-                    }
-                    Instruction::Drop | Instruction::LocalSet(_) | Instruction::GlobalSet(_) => {
-                        consume(1)?
-                    }
-                    Instruction::LocalTee(_)
-                    | Instruction::Unary(_)
-                    | Instruction::MemoryGrow
-                    | Instruction::LoadI32 { .. } => consume(1)? + 1,
-                    Instruction::StoreI32 { .. } => consume(2)?,
-                    Instruction::Binary(_) => consume(2)? + 1,
-                    Instruction::JumpIfZero { .. }
-                    | Instruction::Jump { .. }
-                    | Instruction::Branch { .. }
-                    | Instruction::BranchTable { .. } => {
-                        unreachable!("plain instructions do not create jumps")
-                    }
-                };
+                if matches!(instruction, Instruction::Unreachable) {
+                    operands.depth = frames[nesting].mark_unreachable();
+                } else {
+                    validate_plain_stack(
+                        instruction,
+                        &mut operands,
+                        frame,
+                        offset,
+                        environment.functions,
+                    )?;
+                }
                 decoded[pc] = instruction;
             }
         }
-        check_operand_depth(depth, offset)?;
     };
     // The successful function end closes the exact body frame. Every inner
     // frame has now closed and patched its incoming edges; unvalidated and
@@ -1985,6 +2156,38 @@ impl<'a> Reader<'a> {
         )
     }
 
+    fn i64_const(&mut self) -> Result<i64, Error> {
+        let field = IntegerField::I64Const;
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let offset = self.position();
+            let byte = self
+                .byte()
+                .ok_or_else(|| self.error(ErrorKind::TruncatedInteger { field }))?;
+            if shift == 63 {
+                // Only the sign bit remains. A tenth byte must terminate, with
+                // all six unused payload bits equal to the actual sign bit.
+                return match byte {
+                    0x00 => Ok(value as i64),
+                    0x7f => Ok((value | (1 << 63)) as i64),
+                    _ => Err(Error {
+                        offset,
+                        kind: ErrorKind::IntegerOverflow { field },
+                    }),
+                };
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                if byte & 0x40 != 0 {
+                    value |= u64::MAX << (shift + 7);
+                }
+                return Ok(value as i64);
+            }
+            shift += 7;
+        }
+    }
+
     // For signed input the returned bits represent the two's-complement i32.
     fn leb32(
         &mut self,
@@ -2020,6 +2223,56 @@ impl<'a> Reader<'a> {
                 return Ok(value);
             }
             shift += 7;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_and_unsigned_extension_differ_in_the_high_bits() {
+        // The public i32 result cannot observe those high bits; test the
+        // conversions used by dispatch directly as well as wrap round trips.
+        for (input, signed, unsigned) in [
+            (0, 0, 0),
+            (i32::MAX, 0x7fff_ffff, 0x7fff_ffff),
+            (i32::MIN, -0x8000_0000, 0x8000_0000),
+            (-1, -1, 0xffff_ffff),
+        ] {
+            let input = Value::I32(input);
+            let extended_s = Conversion::ExtendI32S.apply(input);
+            let extended_u = Conversion::ExtendI32U.apply(input);
+            assert_eq!(extended_s, Value::I64(signed));
+            assert_eq!(extended_u, Value::I64(unsigned));
+            assert_eq!(Conversion::WrapI64.apply(extended_s), input);
+            assert_eq!(Conversion::WrapI64.apply(extended_u), input);
+        }
+    }
+
+    #[test]
+    fn decodes_full_i64_signed_values_not_just_the_low_word() {
+        for (immediate, expected) in [
+            (&[0x40][..], -64),
+            (&[0xc0, 0x00], 64),
+            (&[0x80, 0x80, 0x80, 0x80, 0x10], 0x1_0000_0000),
+            (&[0xff, 0xff, 0xff, 0xff, 0x6f], -0x1_0000_0001),
+            (
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00],
+                i64::MAX,
+            ),
+            (
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f],
+                i64::MIN,
+            ),
+        ] {
+            let mut reader = Reader {
+                remaining: immediate,
+                end: immediate.len(),
+            };
+            assert_eq!(reader.i64_const(), Ok(expected));
+            assert_eq!(reader.position(), immediate.len());
         }
     }
 }

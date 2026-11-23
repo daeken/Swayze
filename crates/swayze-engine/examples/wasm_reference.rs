@@ -632,6 +632,13 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![delta],
         });
     }
+    // The internal i64 operations still cross the host boundary as i32.
+    cases.extend([
+        Fixture::new(42, &[], &[0x42, 0xaa, 0x80, 0x80, 0x80, 0x10, 0xa7]),
+        Fixture::new(-1, &[-1], &[0x20, 0, 0xac, 0xa7]),
+        Fixture::new(i32::MIN, &[i32::MIN], &[0x20, 0, 0xad, 0xa7]),
+        Fixture::new(42, &[], &[0x42, 0x7f, 0x1a, 0x41, 42]),
+    ]);
     cases
 }
 

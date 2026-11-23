@@ -1669,11 +1669,11 @@ fn empty_section_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     [&[0][..], &[0x80, 0x80, 0x80, 0x80, 0][..]]
         .into_iter()
         .flat_map(|count| {
-            (0..16)
+            (0..32)
                 .filter(move |&mask| mask != 0 || count.len() == 1)
                 .map(move |mask| {
                     let mut bytes = b"\0asm\x01\0\0\0".to_vec();
-                    for (bit, id) in [1, 3, 7, 10].into_iter().enumerate() {
+                    for (bit, id) in [1, 2, 3, 7, 10].into_iter().enumerate() {
                         if mask & (1 << bit) != 0 {
                             bytes.extend([id, u8::try_from(count.len()).unwrap()]);
                             bytes.extend_from_slice(count);

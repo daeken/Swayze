@@ -4,8 +4,9 @@ use IntegerField::*;
 
 const ZERO: &[u8] = &[0];
 const PADDED_ZERO: &[u8] = &[0x80, 0x80, 0x80, 0x80, 0];
-const VECTORS: [(u8, IntegerField); 4] = [
+const VECTORS: [(u8, IntegerField); 5] = [
     (1, TypeCount),
+    (2, ImportCount),
     (3, FunctionCount),
     (7, ExportCount),
     (10, CodeCount),
@@ -45,6 +46,58 @@ fn omitted_and_explicit_empty_vectors_have_no_entries() {
 }
 
 #[test]
+fn omitted_and_empty_import_vectors_preserve_defined_function_execution() {
+    for imports in [None, Some(ZERO), Some(PADDED_ZERO)] {
+        let mut bytes = module(&[(1, TYPE), (0, CUSTOM)]);
+        if let Some(imports) = imports {
+            push_section(&mut bytes, 2, imports);
+            push_section(&mut bytes, 0, CUSTOM);
+        }
+        for (id, payload) in [(3, FUNCTION), (7, EXPORT), (10, CODE)] {
+            push_section(&mut bytes, id, payload);
+        }
+        let validated = validate_module(&bytes).unwrap();
+        assert_eq!(
+            validated.instantiate().unwrap().invoke_i32("answer"),
+            Ok(42)
+        );
+    }
+}
+
+#[test]
+fn nonzero_import_counts_are_fully_decoded_before_entries() {
+    for (encoding, count) in [
+        (&[1][..], 1),
+        (&[0x81, 0x80, 0x80, 0x80, 0], 1),
+        (&[0x80, 0x80, 0x80, 0x80, 1], 1 << 28),
+        (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX),
+    ] {
+        // No descriptor, an invalid UTF-8 module name, or a valid function import.
+        for rest in [&[][..], b"\x01\xff", b"\x01m\x01f\0\0"] {
+            let mut bytes = module(&[(1, TYPE), (0, CUSTOM)]);
+            let at = push_section(&mut bytes, 2, &[encoding, rest].concat());
+            expect_error(
+                &bytes,
+                at,
+                UnsupportedCount {
+                    field: ImportCount,
+                    count,
+                },
+            );
+        }
+    }
+
+    // Nonzero low bits do not override decoding failures.
+    bad_payload(2, &[0x81], 1, TruncatedInteger { field: ImportCount });
+    bad_payload(
+        2,
+        &[0x81, 0x80, 0x80, 0x80, 0x10],
+        4,
+        IntegerOverflow { field: ImportCount },
+    );
+}
+
+#[test]
 fn empty_counts_still_obey_leb_and_section_frames() {
     for (id, field) in VECTORS {
         for end in 0..PADDED_ZERO.len() {
@@ -80,6 +133,47 @@ fn empty_sections_remain_ordered_and_unique_across_custom_sections() {
             // Ordering wins over count decoding (the section frame is valid).
             push_section(&mut bytes, id, &[]);
             expect_error(&bytes, at, SectionOutOfOrder { id });
+        }
+    }
+}
+
+#[test]
+fn import_section_framing_wins_over_duplicate_or_out_of_order_ids() {
+    for preceding in [2, 3] {
+        let prefix = module(&[(preceding, ZERO), (0, CUSTOM)]);
+        for (suffix, relative_offset, kind) in [
+            (
+                &[2, 0x80][..],
+                2,
+                TruncatedLength {
+                    field: LengthField::SectionSize,
+                },
+            ),
+            (
+                &[2, 0x80, 0x80, 0x80, 0x80, 0x10],
+                5,
+                LengthOverflow {
+                    field: LengthField::SectionSize,
+                },
+            ),
+            (
+                &[2, 0xff, 0xff, 0xff, 0xff, 0x0f],
+                1,
+                LimitExceeded {
+                    limit: Limit::SectionBytes,
+                },
+            ),
+            (
+                &[2, 2, 1],
+                3,
+                TruncatedSection {
+                    declared: 2,
+                    available: 1,
+                },
+            ),
+        ] {
+            let bytes = [prefix.as_slice(), suffix].concat();
+            expect_error(&bytes, prefix.len() + relative_offset, kind);
         }
     }
 }

@@ -209,19 +209,22 @@ fn rejects_bad_limits_and_checks_the_entire_memory_section() {
 
 #[test]
 fn rejects_other_memory_features() {
-    // Import and data count are rejected even alongside a defined memory.
-    for id in [2, 12] {
-        let mut bytes = HEADER.to_vec();
-        if id > 5 {
-            push_section(&mut bytes, 5, ONE_PAGE);
-        }
-        let id_offset = bytes.len();
-        push_section(&mut bytes, id, &[0]);
-        if id < 5 {
-            push_section(&mut bytes, 5, ONE_PAGE);
-        }
-        expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id });
-    }
+    // Memory imports and even an empty data count are still rejected.
+    let mut bytes = HEADER.to_vec();
+    let count = push_section(&mut bytes, 2, b"\x01\x01m\x01m\x02\0\x01");
+    push_section(&mut bytes, 5, ONE_PAGE);
+    expect_error(
+        &bytes,
+        count,
+        ErrorKind::UnsupportedCount {
+            field: IntegerField::ImportCount,
+            count: 1,
+        },
+    );
+    let mut bytes = module(&[(5, ONE_PAGE)]);
+    let id_offset = bytes.len();
+    push_section(&mut bytes, 12, &[0]);
+    expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id: 12 });
     bad_memory_body(
         ONE_PAGE,
         &[0, 0x41, 0, 0xfc, 0, 0x0b],

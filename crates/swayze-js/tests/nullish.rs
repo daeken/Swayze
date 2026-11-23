@@ -168,14 +168,20 @@ fn undefined_is_a_name_with_an_immutable_unbound_read_default() {
     use Value::{Boolean, Null, Number, Undefined};
     for (source, result) in [
         ("undefined", Undefined),
-        ("let undefined=8; undefined=0; undefined??7", Number(0.0)),
-        ("const undefined=false; undefined", Boolean(false)),
         (
-            "let undefined=1; if(true){let undefined=2; undefined=3;} undefined",
-            Number(1.0),
+            "let x=9; if(true){let undefined=8; undefined=0; x=undefined??7;} x",
+            Number(0.0),
         ),
         (
-            "let undefined=0; if (true) {if(true){undefined=4;}} undefined",
+            "let x=9; if(true){const undefined=false; x=undefined;} x",
+            Boolean(false),
+        ),
+        (
+            "let x=0; if(true){let undefined=1; if(true){let undefined=2; undefined=3; x=undefined;} x=x*10+undefined;} x",
+            Number(31.0),
+        ),
+        (
+            "let x=0; if(true){let undefined=0; if(true){undefined=4;} x=undefined;} x",
             Number(4.0),
         ),
         (
@@ -187,7 +193,10 @@ fn undefined_is_a_name_with_an_immutable_unbound_read_default() {
             Undefined,
         ),
         ("if (true) {const undefined=1;} undefined", Undefined),
-        ("let undefined=null; undefined", Null),
+        (
+            "let x=0; if(true){let undefined=null; x=undefined;} x",
+            Null,
+        ),
         (
             "const undefined0=1; const null$=2; undefined0 + null$",
             Number(3.0),
@@ -198,17 +207,17 @@ fn undefined_is_a_name_with_an_immutable_unbound_read_default() {
     for (source, start, end) in [
         ("undefined=1; undefined", 0, 9),
         ("if(false){undefined=1;} 2", 10, 19),
-        ("const undefined=undefined; 0", 16, 25),
-        ("const x=undefined; let undefined=1; x", 8, 17),
+        ("if(true){const undefined=undefined;} 0", 25, 34),
+        ("if(false){const x=undefined; let undefined=1;} 0", 18, 27),
         (
-            "let undefined=1; if(false){let x=0??undefined; let undefined=2;} undefined",
-            36,
+            "if(true){let undefined=1; if(false){let x=0??undefined; let undefined=2;}} undefined",
             45,
+            54,
         ),
         (
-            "let undefined=1; if(false){undefined=2; let undefined=3;} undefined",
-            27,
+            "if(true){let undefined=1; if(false){undefined=2; let undefined=3;}} undefined",
             36,
+            45,
         ),
         ("0??missing", 3, 10),
         ("Undefined", 0, 9),
@@ -218,12 +227,33 @@ fn undefined_is_a_name_with_an_immutable_unbound_read_default() {
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{source}: {error}");
         assert_eq!(error.span(), Span { start, end }, "{source}");
     }
-    let write = parse_script("const undefined=1; undefined=2; 3").unwrap_err();
+    let write = parse_script("if(true){const undefined=1; undefined=2;} 3").unwrap_err();
     assert_eq!(write.kind(), ErrorKind::Unsupported);
-    assert_eq!(write.span(), Span { start: 28, end: 29 });
-    let duplicate = parse_script("let undefined=1; const undefined=2; 3").unwrap_err();
+    assert_eq!(write.span(), Span { start: 37, end: 38 });
+    let duplicate = parse_script("if(true){let undefined=1; const undefined=2;} 3").unwrap_err();
     assert_eq!(duplicate.kind(), ErrorKind::Malformed);
-    assert_eq!(duplicate.span(), Span { start: 23, end: 32 });
+    assert_eq!(duplicate.span(), Span { start: 32, end: 41 });
+}
+
+#[test]
+fn script_scope_cannot_declare_undefined() {
+    for (source, start) in [
+        ("let undefined=1; 0", 4),
+        ("const undefined=1; 0", 6),
+        ("if (false) {} const undefined=1; 0", 20),
+    ] {
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Malformed, "{source}: {error}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 9
+            },
+            "{source}"
+        );
+    }
+    assert_value("let Undefined=1; Undefined", Value::Number(1.0));
 }
 
 #[test]

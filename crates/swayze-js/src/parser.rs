@@ -1252,6 +1252,14 @@ impl Parser<'_> {
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         let scope = self.current_scope();
+        // The classic Script global scope cannot lexically redeclare its
+        // non-configurable `undefined` property. Block scopes can shadow it.
+        if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
+            return Err(Error::malformed(
+                name.span,
+                "undefined cannot be declared in the Script scope",
+            ));
+        }
         if self.find_in_scope(scope, name.span)?.is_some() {
             return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
@@ -1328,6 +1336,10 @@ impl Parser<'_> {
         Ok(None)
     }
 
+    fn is_undefined_name(&self, name: Span) -> bool {
+        &self.lexer.source[name.start..name.end] == "undefined"
+    }
+
     fn resolve_access(&mut self, access: Access) -> Result<Instruction, Error> {
         let mut scope = access.scope;
         loop {
@@ -1358,9 +1370,7 @@ impl Parser<'_> {
             let Some(parent) = self.scopes[scope].parent else {
                 // Only an unbound read gets the immutable default. A declaration
                 // in any visible scope, even in its TDZ, wins over this fallback.
-                if access.equals.is_none()
-                    && &self.lexer.source[access.name.start..access.name.end] == "undefined"
-                {
+                if access.equals.is_none() && self.is_undefined_name(access.name) {
                     return Ok(Instruction::Undefined);
                 }
                 return Err(Error::unsupported(

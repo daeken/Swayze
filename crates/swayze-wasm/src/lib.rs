@@ -3,7 +3,7 @@
 //! # Supported slice
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
-//! custom sections within [`Limit`], and an optional memory section. Modules
+//! custom sections within [`Limit`], and optional memory and data sections. Modules
 //! with functions must have one to eight types, one to eight function
 //! declarations, and exactly as many code bodies as function declarations,
 //! in that section order. Each type must have zero to four `i32` parameters
@@ -40,6 +40,14 @@
 //! take an unsigned LEB32 alignment exponent of 0, 1, or 2 and an unsigned
 //! LEB32 byte offset. Other memory instructions are unsupported.
 //!
+//! The optional data section (ID 11) follows code, if present, and any memory
+//! section. It may contain zero to eight active segments with at most 64 KiB of
+//! payload bytes total, counting overlaps. Each segment requires a defined
+//! memory and encodes the Core 1.0 memory index zero as unsigned LEB32, exactly
+//! `i32.const <signed LEB32> end`, and a length-prefixed vector of raw bytes.
+//! An empty segment vector does not require memory. Passive segments, bulk
+//! memory, and global offsets are unsupported.
+//!
 //! An optional export section between function and code (after memory, if
 //! present) may contain zero to eight function exports. Memory cannot be
 //! exported. Name matching is exact (no Unicode normalization), and duplicate
@@ -47,8 +55,8 @@
 //! zero-based declaration index. Distinct names may refer to the same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
-//! names. All other standard sections (including import, start, and data) are
-//! rejected, even when empty.
+//! names. All other standard sections (including import, start, and data count)
+//! are rejected, even when empty.
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
@@ -86,10 +94,16 @@
 //! Validation resolves every function's type index before decoding any body,
 //! and checks the entire input, including every body even if unexported. It
 //! returns an immutable, owned [`Module`] with private decoded bodies, their
-//! arities, named export entries, and the memory size, if defined. A separate
-//! fallible [`Module::instantiate`] step creates an [`Instance`] and reserves
-//! and zeroes its private linear memory; validation retains only the size, not
-//! its contents. The typed [`Instance::invoke_i32_with_args`] method
+//! arities, named export entries, the memory size (if defined), and the active
+//! data segments. It does not allocate linear memory. A separate fallible
+//! [`Module::instantiate`] step checks all segment ranges before allocating and
+//! zeroing fresh private linear memory. It then applies the segments in source
+//! order; the last segment to write a byte wins. Offsets are interpreted as
+//! `u32` bits and widened before adding the payload length. An empty segment may
+//! start at the end of memory, but not beyond it. An out-of-bounds segment is an
+//! [`InstantiationError::DataSegmentOutOfBounds`], not a validation error or an
+//! invocation trap. Failed instantiation exposes no instance. The typed
+//! [`Instance::invoke_i32_with_args`] method
 //! scans at most eight export names for an exact match, then checks the selected
 //! function's arity and begins execution without allocating or recursing
 //! in Rust. Zero selects the else arm; every nonzero i32 selects the then arm.
@@ -185,14 +199,19 @@
 //! prevention, widened address arithmetic, independent instances, and sharing
 //! across calls and exports. They also check store persistence and suppression
 //! of later stores after guest traps or dispatch exhaustion.
+//! Data tests cover section order and framing, index and offset encodings, the
+//! count and aggregate byte limits, absent and zero-page memories, full-range
+//! preflight (including wrapping offsets and empty segments at the end), overlap
+//! order, and reinitialization from the same module into independent instances.
 //! Parsing uses fixed scratch tables for up to eight type arities and eight
 //! resolved function arities. It checks local group counts against the remaining
 //! local budget without expanding groups, uses bounded borrowed frames, and
 //! decodes instructions into a fixed-size scratch array. After checking `end`
 //! and the complete body frame, it calls `Vec::try_reserve_exact` for the count and
-//! copies those instructions. The body and export vectors are reserved fallibly
-//! after checking their counts, and each name is reserved fallibly after checking
-//! its length. The count caps bound aggregate decoding to eight body budgets and
+//! copies those instructions. The body, export, and data segment vectors are
+//! reserved fallibly after checking their counts. Each name and segment payload
+//! is reserved fallibly after checking its length, with an aggregate limit for
+//! data payloads. The count caps bound aggregate decoding to eight body budgets and
 //! duplicate checks to at most 28 comparisons of bounded names. There is no
 //! unsafe code, Rust recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
@@ -205,14 +224,16 @@ mod memory;
 
 pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, validate_module};
 
-use memory::LinearMemory;
+use memory::{DataSegment, LinearMemory};
 use std::{convert::Infallible, fmt};
 
 /// An owned, opaque module produced only by successful [`validate_module`].
 ///
 /// ```compile_fail
 /// use swayze_wasm::Module;
-/// let forged = Module { functions: Vec::new(), exports: Vec::new(), memory_bytes: None };
+/// let forged = Module {
+///     functions: Vec::new(), exports: Vec::new(), memory_bytes: None, data_segments: Vec::new(),
+/// };
 /// ```
 #[derive(Debug)]
 pub struct Module {
@@ -220,6 +241,7 @@ pub struct Module {
     exports: Vec<Export>,
     // None means absent; Some is a validated byte length (zero or one page).
     memory_bytes: Option<usize>,
+    data_segments: Vec<DataSegment>,
 }
 
 #[derive(Debug)]
@@ -231,10 +253,12 @@ struct Export {
 impl Module {
     /// Create an independent instance without executing guest code.
     ///
-    /// A one-page memory is allocated fallibly and initialized to zero here.
+    /// Active data segments are checked against the fixed memory size before
+    /// allocating or writing any linear memory. A one-page memory is allocated
+    /// fallibly, zeroed, then initialized by the segments in source order.
     /// No linear memory is allocated for an absent or zero-page memory.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
-        let memory = LinearMemory::new(self.memory_bytes.unwrap_or(0))?;
+        let memory = LinearMemory::new(self.memory_bytes.unwrap_or(0), &self.data_segments)?;
         Ok(Instance {
             module: self,
             memory,
@@ -247,6 +271,11 @@ impl Module {
 pub enum InstantiationError {
     /// The instance's linear memory could not be reserved.
     MemoryAllocationFailed,
+    /// An active data segment does not fit in the initial linear memory.
+    DataSegmentOutOfBounds {
+        /// Zero-based index of the first out-of-bounds segment in source order.
+        segment_index: usize,
+    },
 }
 
 impl fmt::Display for InstantiationError {
@@ -254,6 +283,12 @@ impl fmt::Display for InstantiationError {
         match self {
             Self::MemoryAllocationFailed => {
                 f.write_str("could not reserve WebAssembly linear memory")
+            }
+            Self::DataSegmentOutOfBounds { segment_index } => {
+                write!(
+                    f,
+                    "WebAssembly data segment {segment_index} is out of bounds"
+                )
             }
         }
     }

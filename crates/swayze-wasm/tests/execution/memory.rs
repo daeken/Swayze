@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "data.rs"]
+mod data;
+
 const PAGE: i32 = 64 * 1024;
 const ONE_PAGE: &[u8] = &[1, 0, 1];
 const TWO_BOUNDS: &[u8] = &[1, 1, 1, 1];
@@ -178,8 +181,8 @@ fn rejects_memory_exports_and_other_memory_features() {
             found: 2,
         },
     );
-    // Import, start, data and data count are rejected even alongside a defined memory.
-    for id in [2, 8, 11, 12] {
+    // Import, start and data count are rejected even alongside a defined memory.
+    for id in [2, 8, 12] {
         let mut bytes = HEADER.to_vec();
         if id > 5 {
             push_section(&mut bytes, 5, ONE_PAGE);

@@ -348,7 +348,10 @@ fn fixtures() -> Vec<String> {
             "undefined ** 0",
             "let out = 0; outer: for (let i = 0; i < 3; i++) { while (true) { { out += i; continue outer; } } } out",
             "let out = 40; outer: while (true) { while (true) { if (true) { out += 2; break outer; } } } out",
-            "let outer = 40; outer: do { for (;;) { outer++; continue outer; } } while (outer < 42); outer: while (false) {} outer"
+            "let outer = 40; outer: do { for (;;) { outer++; continue outer; } } while (outer < 42); outer: while (false) {} outer",
+            "let n = 40; done: { while (true) { n += 2; break done; } n = 0; } n",
+            "let n = 0; for (let i = 0; i < 3; i++) { done: { while (true) { break done; } } n += 14; continue; } n",
+            "let n = 40; done: { doneInner: { break doneInner; n = 0; } n += 1; } done: { n += 1; break done; } n"
         ]
         .map(str::to_owned),
     );

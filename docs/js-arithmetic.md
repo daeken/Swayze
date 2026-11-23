@@ -100,10 +100,11 @@ unsupported, even in code that would not run; it never falls back to an outer
 binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. An ASCII identifier label can directly
-precede a `while`, `do`, or classic `for` loop. `break name;` and
-`continue name;` target that active loop, with no intervening line terminator
-between the jump keyword and name. Labels are separate from lexical bindings;
-active duplicate labels are rejected. Label lookup is charged to parse work.
+precede a standalone block or a `while`, `do`, or classic `for` loop.
+`break name;` exits that active block or loop; `continue name;` can target
+only a loop. Neither permits a line terminator between the keyword and name.
+Labels are separate from lexical bindings, and active duplicates are rejected.
+Label lookup charges parse work for visits to active loops and labeled blocks.
 `for (init; test; update)` permits any clause
 to be empty; a missing test is true. The initializer can be a `let` or `const`
 declaration list. Its bindings are visible in the initializer, test, update, and body, but

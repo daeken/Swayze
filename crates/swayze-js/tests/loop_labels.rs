@@ -173,7 +173,6 @@ fn invalid_labels_and_static_targets_pin_error_spans() {
         ("while(true){a:}42", Malformed, "}"),
         ("a: /**/", Malformed, ""),
         ("a:if(true){}42", Unsupported, "if"),
-        ("a:{while(false){}}42", Unsupported, "{while"),
         ("a:b:while(false){}42", Unsupported, "b"),
         ("aé:while(false){}42", Unsupported, "é"),
         ("a\\u0030:while(false){}42", Unsupported, "\\"),
@@ -183,7 +182,7 @@ fn invalid_labels_and_static_targets_pin_error_spans() {
         // Some needles include trailing text to pick out one occurrence.
         let start = source.rfind(last).unwrap();
         let len = match last {
-            "a:" | "a;" | ";while" | "{while" => 1,
+            "a:" | "a;" | ";while" => 1,
             "later;" => 5,
             _ => last.len(),
         };

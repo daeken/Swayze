@@ -442,6 +442,20 @@ fn fixtures() -> Vec<Fixture> {
         &[0],
         &[0x41, 42, 0x41, 1, 0x41, 0, 0x6d, 0x41, 1, 0x1b],
     ));
+    // An omitted else skips the local write and leaves the prefix intact.
+    let void_if = [
+        0x41, 3, 0x20, 0, 0x04, 0x40, 0x41, 39, 0x21, 0, 0x0b, 0x20, 0, 0x6a,
+    ];
+    for (condition, expected) in [(0, 3), (1, 42), (-1, 42)] {
+        cases.push(Fixture::new(expected, &[condition], &void_if));
+    }
+    // The void block exit discards 7 and has no label result.
+    let void_exit = [
+        0x41, 3, 0x02, 0x40, 0x41, 7, 0x20, 0, 0x0d, 0, 0x21, 0, 0x0b, 0x20, 0, 0x6a,
+    ];
+    for (condition, expected) in [(0, 10), (1, 4)] {
+        cases.push(Fixture::new(expected, &[condition], &void_exit));
+    }
     cases
 }
 

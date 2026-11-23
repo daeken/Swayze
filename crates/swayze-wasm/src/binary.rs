@@ -1,5 +1,6 @@
 use crate::{
-    ExecutionLimit, Export, ExportTarget, Instance, InvokeError, Module, ResultKind, Trap,
+    ExecutionLimit, Export, ExportTarget, GlobalImport, GlobalImportSidecar, Instance, InvokeError,
+    Module, ModuleWithGlobalImports, ResultKind, Trap,
     memory::{
         AccessWidth, DataSegment, LoadKind, MAX_INSTANCE_MEMORY_PAGES, MEMORY_PAGE_BYTES,
         MEMORY32_MAX_PAGES, MemoryLimits,
@@ -56,6 +57,9 @@ pub enum ErrorKind {
     TruncatedName { declared: usize, available: usize },
     TruncatedData { declared: usize, available: usize },
     InvalidUtf8Name,
+    ImportNameTooLong { field: LengthField, declared: u32 },
+    UnsupportedImportKind { kind: u8 },
+    MutableGlobalImport { import_index: usize },
     DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
@@ -74,6 +78,7 @@ pub enum ErrorKind {
     InvalidGlobalMutability { byte: u8 },
     ImmutableGlobal { index: u32 },
     MutableGlobalInSegmentOffset { index: u32 },
+    BindingDependentSegmentOffset { index: u32 },
     MissingMemory,
     InvalidMemoryAlignment { exponent: u32 },
     TruncatedByte { expected: u8 },
@@ -98,6 +103,8 @@ pub enum ErrorKind {
 pub enum LengthField {
     SectionSize,
     CustomNameSize,
+    ImportModuleNameSize,
+    ImportFieldNameSize,
     ExportNameSize,
     CodeBodySize,
     DataSize,
@@ -110,7 +117,8 @@ pub enum IntegerField {
     TypeCount,
     ParameterCount,
     ResultCount,
-    /// Number of entries in the import section's vector. Only zero is supported.
+    /// Number of entries in the import section's vector. Only zero is supported
+    /// without explicitly opting in to global imports.
     ImportCount,
     FunctionCount,
     ExportCount,
@@ -150,8 +158,7 @@ impl IntegerField {
     }
 }
 
-/// A concrete operand type. Only integers are supported in function
-/// signatures and across the host boundary.
+/// A concrete numeric operand type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValType {
     I32,
@@ -267,6 +274,14 @@ impl fmt::Display for Error {
                 "data segment declares {declared} bytes but only {available} remain in its section"
             ),
             InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
+            ImportNameTooLong { field, declared } => write!(
+                f,
+                "{field:?} of {declared} exceeds {MAX_IMPORT_NAME_BYTES} bytes"
+            ),
+            UnsupportedImportKind { kind } => write!(f, "unsupported import kind {kind:#04x}"),
+            MutableGlobalImport { import_index } => {
+                write!(f, "mutable global import {import_index} is unsupported")
+            }
             DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
@@ -308,6 +323,12 @@ impl fmt::Display for Error {
             ImmutableGlobal { index } => write!(f, "cannot set immutable global {index}"),
             MutableGlobalInSegmentOffset { index } => {
                 write!(f, "cannot use mutable global {index} in a segment offset")
+            }
+            BindingDependentSegmentOffset { index } => {
+                write!(
+                    f,
+                    "segment offset global {index} depends on an import value"
+                )
             }
             MissingMemory => {
                 f.write_str("memory instruction, export, or data segment requires a defined memory")
@@ -450,6 +471,32 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::ImmutableGlobal`] points to the start of the `global.set`
 /// index field and takes precedence over operand errors.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
+    validate(bytes, None)
+}
+
+/// Validate the supported slice with explicit immutable numeric global copy-in.
+///
+/// As in [`validate_module`], section framing precedes the order and count
+/// checks. The import count is capped at eight. Within each entry, validate the
+/// complete module name before the field name, then the global descriptor kind,
+/// numeric type, and immutable mutability byte. Each name's padded LEB32 length
+/// is checked against 4 KiB before taking its bytes within the section frame;
+/// only then is the whole name checked for UTF-8. This bounds the aggregate
+/// name payload (excluding framing) to 64 KiB, including repeated names.
+///
+/// Module-declared names are metadata, not authorization. Only explicit bindings
+/// to [`ModuleWithGlobalImports::instantiate_with_globals`] can supply values.
+/// Defined initializers may read an imported immutable global of the exact
+/// numeric type. Active segment offsets see all globals, but any well-formed
+/// offset expression requiring an import value is rejected during validation.
+/// Binding, segment bounds, and execution are not part of validation.
+pub fn validate_module_with_global_imports(bytes: &[u8]) -> Result<ModuleWithGlobalImports, Error> {
+    let mut sidecar = GlobalImportSidecar::default();
+    let module = validate(bytes, Some(&mut sidecar))?;
+    Ok(ModuleWithGlobalImports { module, sidecar })
+}
+
+fn validate(bytes: &[u8], mut sidecar: Option<&mut GlobalImportSidecar>) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
         return Err(Error {
@@ -475,6 +522,8 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut element_segments = Vec::new();
     let mut memory_limits = None;
     let mut globals = [Global::EMPTY; MAX_GLOBALS as usize];
+    let allows_global_imports = sidecar.is_some();
+    let mut import_count = 0;
     let mut global_count = 0;
     let mut data_segments = Vec::new();
     let limit = Limit::SectionCount;
@@ -511,7 +560,13 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         match id {
             1 => type_count = Some(validate_types(&mut section, &mut types)?),
             2 => {
-                section.count(IntegerField::ImportCount, 0..=0)?;
+                if let Some(sidecar) = sidecar.as_deref_mut() {
+                    sidecar.imports = validate_imports(&mut section, &mut globals)?;
+                    import_count = sidecar.imports.len();
+                    global_count = import_count;
+                } else {
+                    section.count(IntegerField::ImportCount, 0..=0)?;
+                }
             }
             3 => {
                 let count = section.count(IntegerField::FunctionCount, 0..=MAX_FUNCTIONS)?;
@@ -527,7 +582,14 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
             4 => table_entries = validate_table(&mut section)?,
             5 => memory_limits = validate_memory(&mut section)?,
-            6 => global_count = validate_globals(&mut section, &mut globals)?,
+            6 => {
+                global_count = validate_globals(
+                    &mut section,
+                    &mut globals,
+                    import_count,
+                    allows_global_imports,
+                )?;
+            }
             7 => {
                 exports = validate_exports(
                     &mut section,
@@ -626,6 +688,14 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     } else {
         None
     };
+    if let Some(sidecar) = sidecar {
+        for (recipe, global) in sidecar.initializer_copies[import_count..]
+            .iter_mut()
+            .zip(&globals[import_count..global_count])
+        {
+            *recipe = global.import_source;
+        }
+    }
     Ok(Module {
         functions,
         exports,
@@ -673,6 +743,7 @@ const MAX_TYPES: u32 = 8;
 const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
 pub(super) const MAX_GLOBALS: u32 = 8;
+const MAX_IMPORT_NAME_BYTES: usize = 4 * 1024;
 const MAX_DATA_SEGMENTS: u32 = 8;
 const MAX_ELEMENT_SEGMENTS: u32 = 8;
 const MAX_PARAMETERS: u32 = 4;
@@ -807,14 +878,18 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Err
 
 #[derive(Clone, Copy)]
 struct Global {
+    // For an import-dependent slot this is only a type carrier. It never
+    // supplies an instance value or a segment offset in that case.
     initial_value: Operand,
     mutable: bool,
+    import_source: Option<u8>,
 }
 
 impl Global {
     const EMPTY: Self = Self {
         initial_value: Operand::I32(0),
         mutable: false,
+        import_source: None,
     };
 
     fn operand_type(self) -> ValType {
@@ -822,31 +897,102 @@ impl Global {
     }
 }
 
+fn validate_imports(
+    section: &mut Reader<'_>,
+    globals: &mut [Global; MAX_GLOBALS as usize],
+) -> Result<Vec<GlobalImport>, Error> {
+    let allocation_error = section.error(ErrorKind::AllocationFailed);
+    let count = section.count(IntegerField::ImportCount, 0..=MAX_GLOBALS)? as usize;
+    // At most 8 entries * 2 names * 4 KiB of input name payload. Validate the
+    // bounded borrowed names and exact import frame before retaining anything.
+    let mut names = [("", "", 0, 0); MAX_GLOBALS as usize];
+    let names = &mut names[..count];
+    let globals = &mut globals[..count];
+    for (import_index, (names, global)) in names.iter_mut().zip(&mut *globals).enumerate() {
+        let module_offset = section.position();
+        let module = section.name(LengthField::ImportModuleNameSize)?;
+        let field_offset = section.position();
+        let field = section.name(LengthField::ImportFieldNameSize)?;
+        let kind_offset = section.position();
+        match section.byte() {
+            Some(0x03) => (),
+            Some(kind) => {
+                return Err(Error {
+                    offset: kind_offset,
+                    kind: ErrorKind::UnsupportedImportKind { kind },
+                });
+            }
+            None => return Err(section.error(ErrorKind::TruncatedByte { expected: 0x03 })),
+        }
+        let ty = section.numeric_type()?;
+        let offset = section.position();
+        if section.global_mutability()? {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::MutableGlobalImport { import_index },
+            });
+        }
+        *names = (module, field, module_offset, field_offset);
+        *global = Global {
+            initial_value: Operand::zero(ty),
+            mutable: false,
+            import_source: Some(import_index as u8),
+        };
+    }
+    section.finish(ErrorKind::TrailingSectionBytes { id: 2 })?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut imports = Vec::new();
+    imports
+        .try_reserve_exact(count)
+        .map_err(|_| allocation_error)?;
+    for (&(module, field, module_offset, field_offset), global) in names.iter().zip(globals) {
+        // There are exactly `count` pushes into the reserved capacity.
+        imports.push(GlobalImport {
+            module: retain_import_name(module, module_offset)?,
+            field: retain_import_name(field, field_offset)?,
+            value_type: global.operand_type(),
+        });
+    }
+    Ok(imports)
+}
+
+fn retain_import_name(name: &str, offset: usize) -> Result<String, Error> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(name.len()).map_err(|_| Error {
+        offset,
+        kind: ErrorKind::AllocationFailed,
+    })?;
+    for &byte in name.as_bytes() {
+        // Vec::push does not allocate while len < capacity.
+        bytes.push(byte);
+    }
+    // This checks the already valid UTF-8 and takes over the same allocation.
+    Ok(String::from_utf8(bytes).unwrap_or_else(|_| unreachable!("validated UTF-8 import name")))
+}
+
 fn validate_globals(
     section: &mut Reader<'_>,
     globals: &mut [Global; MAX_GLOBALS as usize],
+    import_count: usize,
+    allows_global_imports: bool,
 ) -> Result<usize, Error> {
-    let count = section.count(IntegerField::GlobalCount, 0..=MAX_GLOBALS)? as usize;
-    for global in &mut globals[..count] {
+    let (imports, definitions) = globals.split_at_mut(import_count);
+    let imports = allows_global_imports.then_some(&*imports);
+    let count = section.count(IntegerField::GlobalCount, 0..=definitions.len() as u32)? as usize;
+    for global in &mut definitions[..count] {
         let ty = section.numeric_type()?;
-        let offset = section.position();
-        let mutable = match section.byte() {
-            Some(0) => false,
-            Some(1) => true,
-            Some(byte) => {
-                return Err(Error {
-                    offset,
-                    kind: ErrorKind::InvalidGlobalMutability { byte },
-                });
-            }
-            None => return Err(section.error(ErrorKind::TruncatedGlobalMutability)),
-        };
+        let mutable = section.global_mutability()?;
+        let (initial_value, import_source) = section.global_initializer(ty, imports)?;
         *global = Global {
-            initial_value: section.global_initializer(ty)?,
+            initial_value,
             mutable,
+            import_source,
         };
     }
-    Ok(count)
+    Ok(import_count + count)
 }
 
 fn validate_exports(
@@ -1121,7 +1267,7 @@ pub enum Value {
 }
 
 impl Value {
-    fn operand_type(self) -> ValType {
+    pub(super) fn operand_type(self) -> ValType {
         match self {
             Self::I32(_) => ValType::I32,
             Self::I64(_) => ValType::I64,
@@ -3628,18 +3774,26 @@ impl<'a> Reader<'a> {
                         kind: ErrorKind::MutableGlobalInSegmentOffset { index },
                     });
                 }
-                // Segment offsets see all validated globals. Without imports,
-                // each immutable global already has its literal initial value.
-                let Operand::I32(value) = global.initial_value else {
+                let actual = global.operand_type();
+                if actual != ValType::I32 {
                     return Err(Error {
                         offset: opcode_offset,
                         kind: ErrorKind::TypeMismatch {
                             expected: ValType::I32,
-                            actual: global.operand_type(),
+                            actual,
                         },
                     });
-                };
-                value as u32
+                }
+                // Check the complete expression in the full global context (C)
+                // before applying this subset's static-offset restriction.
+                self.expect_byte(END)?;
+                if global.import_source.is_some() {
+                    return Err(Error {
+                        offset: index_offset,
+                        kind: ErrorKind::BindingDependentSegmentOffset { index },
+                    });
+                }
+                return Ok(global.initial_value.as_i32() as u32);
             }
             // Preserve the old expected byte for missing or unsupported opcodes.
             Some(found) => {
@@ -3661,9 +3815,46 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    fn global_mutability(&mut self) -> Result<bool, Error> {
+        let offset = self.position();
+        match self.byte() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(byte) => Err(Error {
+                offset,
+                kind: ErrorKind::InvalidGlobalMutability { byte },
+            }),
+            None => Err(self.error(ErrorKind::TruncatedGlobalMutability)),
+        }
+    }
+
     // Core 1.0 validates defined initializers with only imported globals in
-    // scope, unlike segment offsets. There are no imports in this slice.
-    fn global_initializer(&mut self, ty: ValType) -> Result<Operand, Error> {
+    // scope (C′). In the legacy mode, recognize only literal initializers.
+    fn global_initializer(
+        &mut self,
+        ty: ValType,
+        imports: Option<&[Global]>,
+    ) -> Result<(Operand, Option<u8>), Error> {
+        let opcode_offset = self.position();
+        if let Some(imports) = imports
+            && self.remaining.first() == Some(&GLOBAL_GET)
+        {
+            self.expect_byte(GLOBAL_GET)?;
+            let index = self.index(IntegerField::GlobalIndex, imports.len() as u32)?;
+            let actual = imports[index as usize].operand_type();
+            // Imported slots are already known to be immutable.
+            if ty != actual {
+                return Err(Error {
+                    offset: opcode_offset,
+                    kind: ErrorKind::TypeMismatch {
+                        expected: ty,
+                        actual,
+                    },
+                });
+            }
+            self.expect_byte(END)?;
+            return Ok((Operand::zero(ty), Some(index as u8)));
+        }
         self.expect_byte(match ty {
             ValType::I32 => I32_CONST,
             ValType::I64 => I64_CONST,
@@ -3672,7 +3863,7 @@ impl<'a> Reader<'a> {
         })?;
         let value = self.const_operand(ty)?;
         self.expect_byte(END)?;
-        Ok(value)
+        Ok((value, None))
     }
 
     fn const_operand(&mut self, ty: ValType) -> Result<Operand, Error> {
@@ -3713,6 +3904,18 @@ impl<'a> Reader<'a> {
             LengthField::CodeBodySize => Limit::CodeBodyBytes,
             LengthField::CustomNameSize => Limit::CustomNameBytes,
             LengthField::ExportNameSize => Limit::ExportNameBytes,
+            LengthField::ImportModuleNameSize | LengthField::ImportFieldNameSize => {
+                return match usize::try_from(value) {
+                    Ok(length) if length <= MAX_IMPORT_NAME_BYTES => Ok(length),
+                    _ => Err(Error {
+                        offset: start,
+                        kind: ErrorKind::ImportNameTooLong {
+                            field,
+                            declared: value,
+                        },
+                    }),
+                };
+            }
             LengthField::DataSize => Limit::DataBytes,
         };
         match usize::try_from(value) {

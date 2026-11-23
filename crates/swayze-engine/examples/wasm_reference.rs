@@ -2,7 +2,8 @@
 
 use std::{error::Error, process::Command};
 use swayze_engine::{
-    WasmInstantiationError, WasmInvokeError, WasmResultKind, WasmTrap, WasmValue, validate_module,
+    WasmGlobalImportBinding, WasmInstance, WasmInstantiationError, WasmInvokeError, WasmResultKind,
+    WasmTrap, WasmValue, validate_module, validate_module_with_global_imports,
 };
 
 const EXPORT: &str = "answer";
@@ -33,12 +34,15 @@ function decodeArg(arg) {
     return value;
 }
 for (const fixture of fixtures) {
-    const [hex, nameBytes, result, ...args] = fixture.split(':');
+    // The bound fixtures use only this fixed synthetic interface.
+    const bound = fixture.startsWith('bound|');
+    const [hex, nameBytes, result, ...args] = (bound ? fixture.slice(6) : fixture).split(':');
     const name = Buffer.from(nameBytes, 'hex').toString('utf8');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
     let instance;
     try {
-        instance = new WebAssembly.Instance(module);
+        const imports = bound ? {m: {a: -42, b: -9007199254740993n, c: -0, d: 1.0000000000000002}} : undefined;
+        instance = new WebAssembly.Instance(module, imports);
     } catch (error) {
         if (!(error instanceof WebAssembly.RuntimeError)) throw error;
         console.log('instantiation-error');
@@ -1854,6 +1858,41 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+const GLOBAL_IMPORT_BINDINGS: [WasmGlobalImportBinding<'static>; 4] = [
+    WasmGlobalImportBinding {
+        module: "m",
+        field: "a",
+        value: WasmValue::I32(-42),
+    },
+    WasmGlobalImportBinding {
+        module: "m",
+        field: "b",
+        value: WasmValue::I64(-9_007_199_254_740_993),
+    },
+    WasmGlobalImportBinding {
+        module: "m",
+        field: "c",
+        value: WasmValue::F32(0x8000_0000),
+    },
+    WasmGlobalImportBinding {
+        module: "m",
+        field: "d",
+        value: WasmValue::F64(0x3ff0_0000_0000_0001),
+    },
+];
+
+fn global_import_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    // Export a, c, d directly; b is a definition initialized from import b.
+    let bytes = b"\0asm\x01\0\0\0\x02\x1d\x04\x01m\x01a\x03\x7f\0\x01m\x01b\x03\x7e\0\x01m\x01c\x03\x7d\0\x01m\x01d\x03\x7c\0\
+                  \x06\x06\x01\x7e\0\x23\x01\x0b\x07\x11\x04\x01a\x03\0\x01b\x03\x04\x01c\x03\x02\x01d\x03\x03";
+    GLOBAL_IMPORT_BINDINGS.iter().map(move |binding| Fixture {
+        expected: Outcome::GlobalRead(binding.value),
+        bytes: bytes.to_vec(),
+        export: binding.field,
+        args: vec![],
+    })
+}
+
 fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
     let module = validate_module(&fixture.bytes)?;
     let instance = match module.instantiate() {
@@ -1867,6 +1906,13 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
         Err(WasmInstantiationError::StartTrap(trap)) => return Ok(Outcome::StartTrap(trap)),
         Err(error) => return Err(error.into()),
     };
+    observe(&instance, fixture)
+}
+
+fn observe(
+    instance: &WasmInstance<'_>,
+    fixture: &Fixture<WasmValue>,
+) -> Result<Outcome, Box<dyn Error>> {
     if let Outcome::MemoryRead { offset, .. } = fixture.expected {
         let mut bytes = [0; 4];
         instance.read_memory(fixture.export, offset, &mut bytes)?;
@@ -1900,7 +1946,7 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cases: Vec<_> = fixtures()
+    let mut cases: Vec<_> = fixtures()
         .into_iter()
         .map(Fixture::into_typed)
         .chain(typed_fixtures())
@@ -1911,7 +1957,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain(global_offset_fixtures())
         .chain(two_page_memory_fixtures())
         .collect();
-    let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
+    let import_start = cases.len();
+    cases.extend(global_import_fixtures());
+    let encoded: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, fixture)| {
+            let encoded = fixture.encode();
+            if index >= import_start {
+                format!("bound|{encoded}")
+            } else {
+                encoded
+            }
+        })
+        .collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
     let output = Command::new("node")
         .env_remove("NODE_OPTIONS")
@@ -1933,9 +1992,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     if count != cases.len() {
         return Err(format!("Node returned {count} results for {} fixtures", cases.len()).into());
     }
-    for ((fixture, encoded), reference) in cases.iter().zip(encoded).zip(lines) {
+    for (index, ((fixture, encoded), reference)) in cases.iter().zip(encoded).zip(lines).enumerate()
+    {
         let expected = fixture.expected;
-        let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
+        let actual = if index >= import_start {
+            let module = validate_module_with_global_imports(&fixture.bytes)?;
+            let instance = module.instantiate_with_globals(&GLOBAL_IMPORT_BINDINGS)?;
+            observe(&instance, fixture)
+        } else {
+            evaluate(fixture)
+        }
+        .map_err(|error| format!("fixture {encoded}: {error}"))?;
         let agrees = match actual {
             Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
             Outcome::I64Invocation(Ok(value)) => {

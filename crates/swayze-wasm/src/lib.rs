@@ -74,10 +74,19 @@
 //!
 //! The optional import section (ID 2) follows any type section and precedes
 //! all other standard sections. Custom sections can appear before or after it.
-//! Its entire payload must be the unsigned LEB32 count zero, with valid padding
-//! allowed. A nonzero count is rejected before reading any import names or
-//! descriptors. No imported objects are supported, and an empty import section
-//! does not change instantiation.
+//! With [`validate_module`], its entire payload must be the unsigned LEB32
+//! count zero, with valid padding allowed. A nonzero count is rejected before
+//! reading any import names or descriptors. An empty import section does not
+//! change instantiation.
+//!
+//! The standalone opt-in [`validate_module_with_global_imports`] also accepts
+//! immutable numeric global imports as explicit by-value copies. Imports occupy
+//! the first global indices in declaration order. There are at most eight
+//! globals total, including definitions. Only a literal global kind (`0x03`),
+//! one of the four numeric type bytes, and literal immutable mutability (`0x00`)
+//! are supported. Each module and field name is UTF-8 and at most 4 KiB;
+//! together the name payloads total at most 64 KiB, including repeated names
+//! but excluding framing. No other imports or host objects are supported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
 //! any memory, global, export, start, element, and code sections. It may be
@@ -108,16 +117,18 @@
 //!
 //! The optional global section (ID 6) follows any type, function, table, and
 //! memory sections and precedes any export, start, element, and code sections.
-//! It may contain zero to eight defined globals total, indexed from zero in
-//! declaration order. Each declaration uses a value type byte (`0x7f` for i32,
+//! It may contain up to eight defined globals, minus the number of imports.
+//! Definitions are indexed in declaration order after any imports. Each
+//! declaration uses a value type byte (`0x7f` for i32,
 //! `0x7e` for i64, `0x7d` for f32, or `0x7c` for f64) and a literal mutability
 //! byte (`0x00` for immutable or `0x01` for mutable). The initializer is exactly
 //! the matching `i32.const`, `i64.const`, `f32.const`, or `f64.const`, followed
 //! by `end`. Integer immediates are signed LEB32 or LEB64 with valid padding
 //! accepted; float immediates are four or eight little-endian bytes. The
 //! initializer cannot read past the global section frame. Every body can read
-//! any declared global and can set only mutable globals. Global imports and
-//! initializer reads are unsupported.
+//! any declared global and can set only mutable globals. In opt-in validation,
+//! an initializer may instead be `global.get <unsigned LEB32> end` naming an
+//! immutable import of the exact declared type. It cannot read a defined global.
 //!
 //! The optional start section (ID 8) comes after any exports and before any
 //! elements, code, and data. Its entire payload is one unsigned LEB32 index
@@ -146,10 +157,11 @@
 //!
 //! Active element and data offsets are exactly `i32.const <signed LEB32> end`
 //! or `global.get <unsigned LEB32> end`, with valid padding accepted in all
-//! LEB32 fields. The global must be defined, immutable, and i32. Validation
-//! resolves it to its literal initializer value. Both forms use the unsigned
-//! interpretation of the i32 bits as the offset. Bounds are checked against
-//! the initial table or memory size at instantiation.
+//! LEB32 fields. The global must be immutable and i32. After checking the
+//! complete offset expression, validation rejects any offset requiring an import
+//! value; a literal initializer resolves to its static value. Both forms use
+//! the unsigned interpretation of the i32 bits as the offset. Bounds are checked
+//! against the initial table or memory size at instantiation.
 //!
 //! An optional export section after any table, memory, and globals and before
 //! any start, elements, code, and data may contain zero to eight names total
@@ -157,7 +169,7 @@
 //! Unicode normalization), and duplicate names are rejected across all kinds.
 //! An export descriptor is `0x00` followed by a defined function index, `0x01`
 //! followed by the defined table index zero, `0x02` followed by the defined
-//! memory index zero, or `0x03` followed by a defined global index. All indices
+//! memory index zero, or `0x03` followed by a global index. All indices
 //! are unsigned LEB32 and accept valid padding. Distinct names may refer to the
 //! same target. An omitted or empty export section contributes no exports.
 //! Table, memory, and global exports do not require any functions. Both export
@@ -864,6 +876,7 @@ mod table;
 
 pub use binary::{
     Error, ErrorKind, IntegerField, LengthField, Limit, ValType, Value, validate_module,
+    validate_module_with_global_imports,
 };
 
 use memory::{DataSegment, LinearMemory, MemoryLimits};
@@ -896,6 +909,250 @@ pub struct Module {
     // None means absent; Some(0) means a declared zero-entry table.
     table_entries: Option<usize>,
     element_segments: Vec<ElementSegment>,
+}
+
+/// An owned module validated in the explicit global-copy mode.
+///
+/// Only [`Self::instantiate_with_globals`] can create an instance. [`Debug`](fmt::Debug)
+/// reports only counts; it does not format manifest names or guest state.
+///
+/// ```compile_fail,E0599
+/// let module = swayze_wasm::validate_module_with_global_imports(b"\0asm\x01\0\0\0").unwrap();
+/// module.instantiate().unwrap();
+/// ```
+///
+/// ```compile_fail,E0616
+/// let module = swayze_wasm::validate_module_with_global_imports(b"\0asm\x01\0\0\0").unwrap();
+/// module.module.instantiate().unwrap();
+/// ```
+pub struct ModuleWithGlobalImports {
+    module: Module,
+    sidecar: GlobalImportSidecar,
+}
+
+#[derive(Default)]
+struct GlobalImportSidecar {
+    imports: Vec<GlobalImport>,
+    // Destination-indexed; Some(source) copies from that imported ordinal.
+    initializer_copies: [Option<u8>; binary::MAX_GLOBALS as usize],
+}
+
+/// One global import declaration. Accessors deliberately expose the exact names
+/// supplied by the Wasm input; these strings are not authorization.
+/// [`Debug`](fmt::Debug) reports the type only.
+pub struct GlobalImport {
+    module: String,
+    field: String,
+    value_type: ValType,
+}
+
+impl GlobalImport {
+    /// Borrow the exact UTF-8 module name (not normalized).
+    pub fn module(&self) -> &str {
+        &self.module
+    }
+
+    /// Borrow the exact UTF-8 field name (not normalized).
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// Return the exact numeric type required by this slot.
+    pub fn value_type(&self) -> ValType {
+        self.value_type
+    }
+}
+
+impl fmt::Debug for GlobalImport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalImport")
+            .field("value_type", &self.value_type)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A deliberate data grant to one ordinal global import slot.
+///
+/// The names are assertions about that slot, not a request for host resolution
+/// and not authorization. The value is copied as raw bits, with no shared
+/// global identity, handles, callbacks, or authority beyond the supplied value.
+pub struct GlobalImportBinding<'names> {
+    /// The declared module name, matched byte for byte.
+    pub module: &'names str,
+    /// The declared field name, matched byte for byte.
+    pub field: &'names str,
+    /// The exact tagged numeric value to copy.
+    pub value: Value,
+}
+
+impl fmt::Debug for ModuleWithGlobalImports {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.module.fmt_metadata(f, "ModuleWithGlobalImports")
+    }
+}
+
+impl ModuleWithGlobalImports {
+    /// Borrow the manifest in declaration order, including repeated names.
+    /// These names are guest-supplied metadata, never authorization to supply data.
+    ///
+    /// ```compile_fail,E0597
+    /// use swayze_wasm::validate_module_with_global_imports;
+    /// let name = {
+    ///     let bytes = b"\0asm\x01\0\0\0\x02\x08\x01\x01m\x01f\x03\x7f\0";
+    ///     let module = validate_module_with_global_imports(bytes).unwrap();
+    ///     module.global_imports()[0].module()
+    /// };
+    /// println!("{name}");
+    /// ```
+    pub fn global_imports(&self) -> &[GlobalImport] {
+        &self.sidecar.imports
+    }
+
+    /// Create an independent instance by copying one value for each import.
+    ///
+    /// Checks the exact count, then each entry in ordinal order: exact module
+    /// name, exact field name, then exact numeric tag. Repeated names denote
+    /// separate slots, even if their types differ. The assertions do not resolve
+    /// names or infer which values to supply. Supply only data you deliberately
+    /// grant to this guest, which can read and re-export it. The instance borrows
+    /// only the validated module and retains neither the bindings nor their names.
+    ///
+    /// All binding checks precede element and then data segment preflight,
+    /// memory allocation, and start, as in [`Module::instantiate`].
+    ///
+    /// ```
+    /// use swayze_wasm::{GlobalImportBinding, Value, validate_module_with_global_imports};
+    /// // Imports m.f as immutable i32 and re-exports it as g.
+    /// let bytes = b"\0asm\x01\0\0\0\x02\x08\x01\x01m\x01f\x03\x7f\0\x07\x05\x01\x01g\x03\0";
+    /// let module = validate_module_with_global_imports(bytes)?;
+    /// let instance = module.instantiate_with_globals(&[GlobalImportBinding {
+    ///     module: "m", field: "f", value: Value::I32(42),
+    /// }])?;
+    /// assert_eq!(instance.read_global("g")?, Value::I32(42));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn instantiate_with_globals(
+        &self,
+        bindings: &[GlobalImportBinding<'_>],
+    ) -> Result<Instance<'_>, GlobalImportInstantiationError> {
+        use GlobalImportInstantiationError::*;
+        let imports = self.global_imports();
+        if bindings.len() != imports.len() {
+            return Err(BindingCountMismatch {
+                expected: imports.len(),
+                actual: bindings.len(),
+            });
+        }
+        if imports.is_empty() {
+            return self.module.instantiate().map_err(Instantiation);
+        }
+        for (import_index, (import, binding)) in imports.iter().zip(bindings).enumerate() {
+            if !exact_import_name(import.module(), binding.module) {
+                return Err(ModuleNameMismatch { import_index });
+            }
+            if !exact_import_name(import.field(), binding.field) {
+                return Err(FieldNameMismatch { import_index });
+            }
+            let expected = import.value_type();
+            let actual = binding.value.operand_type();
+            if expected != actual {
+                return Err(ValueTypeMismatch {
+                    import_index,
+                    expected,
+                    actual,
+                });
+            }
+        }
+
+        let mut initial_globals = self.module.global_initial_values;
+        for (slot, binding) in initial_globals.iter_mut().zip(bindings) {
+            *slot = binding.value.into();
+        }
+        for (target, source) in self.sidecar.initializer_copies.iter().enumerate() {
+            if let Some(source) = source {
+                initial_globals[target] = initial_globals[usize::from(*source)];
+            }
+        }
+        self.module
+            .instantiate_with_initial_globals(&initial_globals)
+            .map_err(Instantiation)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_import_manifests_reserve_no_storage() {
+    for bytes in [
+        &b"\0asm\x01\0\0\0"[..],
+        &b"\0asm\x01\0\0\0\x02\x01\0"[..],
+        &b"\0asm\x01\0\0\0\x02\x05\x80\x80\x80\x80\0"[..],
+    ] {
+        let validated = validate_module_with_global_imports(bytes).unwrap();
+        assert_eq!(validated.sidecar.imports.capacity(), 0);
+        assert_eq!(validated.sidecar.initializer_copies, [None; 8]);
+        validated.instantiate_with_globals(&[]).unwrap();
+    }
+}
+
+fn exact_import_name(expected: &str, actual: &str) -> bool {
+    // Check length before inspecting any caller bytes. Only matching bounded
+    // lengths can enter byte comparison, with no normalization or allocation.
+    expected.len() == actual.len() && expected.as_bytes() == actual.as_bytes()
+}
+
+/// Why explicit global copy-in or subsequent instantiation failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum GlobalImportInstantiationError {
+    /// There must be exactly one binding per import declaration.
+    BindingCountMismatch { expected: usize, actual: usize },
+    /// The module name assertion failed at this zero-based ordinal.
+    ModuleNameMismatch { import_index: usize },
+    /// The field name assertion failed at this zero-based ordinal.
+    FieldNameMismatch { import_index: usize },
+    /// The value had a different numeric tag at this zero-based ordinal.
+    ValueTypeMismatch {
+        import_index: usize,
+        expected: ValType,
+        actual: ValType,
+    },
+    /// All bindings matched, but normal instantiation failed.
+    Instantiation(InstantiationError),
+}
+
+impl fmt::Display for GlobalImportInstantiationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BindingCountMismatch { expected, actual } => write!(
+                f,
+                "expected {expected} WebAssembly global import bindings, found {actual}"
+            ),
+            Self::ModuleNameMismatch { import_index } => {
+                write!(f, "global import {import_index} module name mismatch")
+            }
+            Self::FieldNameMismatch { import_index } => {
+                write!(f, "global import {import_index} field name mismatch")
+            }
+            Self::ValueTypeMismatch {
+                import_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "global import {import_index} expected {expected} value, found {actual}"
+            ),
+            Self::Instantiation(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for GlobalImportInstantiationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Instantiation(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 struct Export {
@@ -948,6 +1205,13 @@ impl Module {
     /// returned instance.
     /// A start trap or execution limit discards the instance instead.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
+        self.instantiate_with_initial_globals(&self.global_initial_values)
+    }
+
+    fn instantiate_with_initial_globals(
+        &self,
+        initial_globals: &[binary::Operand; binary::MAX_GLOBALS as usize],
+    ) -> Result<Instance<'_>, InstantiationError> {
         FunctionTable::preflight(self.table_entries.unwrap_or(0), &self.element_segments)?;
         LinearMemory::preflight(self.memory_limits, &self.data_segments)?;
 
@@ -958,7 +1222,7 @@ impl Module {
         let instance = Instance {
             module: self,
             memory,
-            globals: self.global_initial_values.map(Cell::new),
+            globals: initial_globals.map(Cell::new),
             table,
         };
         if let Some(index) = self.start_function {

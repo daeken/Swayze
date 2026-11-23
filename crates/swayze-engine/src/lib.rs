@@ -14,10 +14,13 @@ pub use swayze_js::{
 };
 pub use swayze_wasm::{
     Error as WasmValidationError, ErrorKind as WasmErrorKind, ExecutionLimit as WasmExecutionLimit,
-    Instance as WasmInstance, InstantiationError as WasmInstantiationError,
-    IntegerField as WasmIntegerField, InvokeError as WasmInvokeError,
-    LengthField as WasmLengthField, Limit as WasmLimit, Module as WasmModule,
+    GlobalImport as WasmGlobalImport, GlobalImportBinding as WasmGlobalImportBinding,
+    GlobalImportInstantiationError as WasmGlobalImportInstantiationError, Instance as WasmInstance,
+    InstantiationError as WasmInstantiationError, IntegerField as WasmIntegerField,
+    InvokeError as WasmInvokeError, LengthField as WasmLengthField, Limit as WasmLimit,
+    Module as WasmModule, ModuleWithGlobalImports as WasmModuleWithGlobalImports,
     ReadGlobalError as WasmReadGlobalError, ReadMemoryError as WasmReadMemoryError,
     ResultKind as WasmResultKind, TableSizeError as WasmTableSizeError, Trap as WasmTrap,
     ValType as WasmValType, Value as WasmValue, validate_module,
+    validate_module_with_global_imports,
 };

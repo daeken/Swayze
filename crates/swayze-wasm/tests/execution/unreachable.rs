@@ -101,9 +101,9 @@ fn inner_frames_and_alternate_arms_start_reachable() {
 fn dead_code_still_checks_syntax_immediates_and_indices() {
     for (tail, offset, kind) in [
         (
-            &[0x0c, 0, 0x0b][..],
+            &[0x0f, 0x0b][..],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x0c },
+            ErrorKind::UnsupportedOpcode { opcode: 0x0f },
         ),
         (
             &[0x41, 0x80],

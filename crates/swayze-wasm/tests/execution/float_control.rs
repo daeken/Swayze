@@ -83,6 +83,28 @@ fn float_if_arms_and_blocks_fall_through_with_exact_bits() {
 }
 
 #[test]
+fn br_if_taken_and_fallthrough_reach_the_same_join_with_identical_snan_bits() {
+    for case in &CASES {
+        let mut body = vec![0, 0x02, case.block_type];
+        body.extend(float_const(case.snan));
+        body.extend(b"\x20\0\x0d\0"); // br_if to this block's join.
+        // Only the untaken branch executes this optional trap before end.
+        body.extend(b"\x20\x01\x04\x40\0\x0b\x0b");
+        for condition in [0, 1] {
+            assert_eq!(
+                case.invoke_bits(&body, &[condition, 0]),
+                Ok(Some(case.snan))
+            );
+        }
+        assert_eq!(case.invoke_bits(&body, &[1, 1]), Ok(Some(case.snan)));
+        assert_eq!(
+            case.invoke_bits(&body, &[0, 1]),
+            Err(InvokeError::Trap(Trap::Unreachable)),
+        );
+    }
+}
+
+#[test]
 fn br_and_br_if_keep_bits_and_restore_the_outer_label_floor() {
     for case in &CASES {
         for (payload, prefix) in [
@@ -163,23 +185,50 @@ fn br_table_explicit_and_default_exits_keep_bits_and_share_the_if_label() {
     }
 }
 
+// Labels: 0 void loop, 1 i64 block, 2 f64 block, 3 f32 block, 4 i32 function.
+const TABLE_PREFIX: &[u8] = b"\0\x02\x7d\x02\x7c\x02\x7e\x03\x40\0\x0e";
+
 #[test]
-fn br_table_reports_incompatible_label_at_the_explicit_or_default_index() {
-    use ErrorKind::{BranchTableArityMismatch, BranchTableTypeMismatch};
-    use ValType::{F32, F64, I32, I64};
-    // Labels: 0 void loop, 1 i64 block, 2 f64 block, 3 f32 block, 4 i32 function.
-    let prefix = b"\0\x02\x7d\x02\x7c\x02\x7e\x03\x40\0\x0e";
-    let wrong_type = |expected, actual| BranchTableTypeMismatch { expected, actual };
-    let wrong_arity = |expected, actual| BranchTableArityMismatch { expected, actual };
-    for (table, kind) in [
-        (&[2, 3, 0x82, 0, 3][..], wrong_type(F32, F64)), // Padded explicit index.
-        (&[1, 2, 3][..], wrong_type(F64, F32)),          // Default index.
-        (&[2, 1, 3, 1][..], wrong_type(I64, F32)),
-        (&[1, 2, 4][..], wrong_type(F64, I32)),
-        (&[1, 0, 3][..], wrong_arity(0, 1)),
-        (&[1, 2, 0][..], wrong_arity(1, 0)),
+fn br_table_reports_type_mismatch_at_the_explicit_index() {
+    use ValType::{F32, F64, I64};
+    for (table, expected, actual) in [
+        (&[2, 3, 0x82, 0, 3][..], F32, F64), // The offending index is padded.
+        (&[2, 1, 3, 1][..], I64, F32),
     ] {
-        bad_body(&[prefix.as_slice(), table].concat(), prefix.len() + 2, kind);
+        bad_body(
+            &[TABLE_PREFIX, table].concat(),
+            TABLE_PREFIX.len() + 2,
+            ErrorKind::BranchTableTypeMismatch { expected, actual },
+        );
+    }
+}
+
+#[test]
+fn br_table_reports_type_mismatch_at_the_default_index() {
+    use ValType::{F32, F64, I32};
+    // Both explicit indices match. The first is padded, so the default
+    // starts at offset 4 within the immediates rather than offset 3.
+    let prefix = [TABLE_PREFIX, &[2, 0x82, 0, 2]].concat();
+    for (default, actual) in [(3, F32), (4, I32)] {
+        bad_suffix(
+            &prefix,
+            &[default],
+            ErrorKind::BranchTableTypeMismatch {
+                expected: F64,
+                actual,
+            },
+        );
+    }
+}
+
+#[test]
+fn br_table_distinguishes_mixed_float_and_void_arities() {
+    for (table, expected, actual) in [([1, 0, 3], 0, 1), ([1, 2, 0], 1, 0)] {
+        bad_body(
+            &[TABLE_PREFIX, &table].concat(),
+            TABLE_PREFIX.len() + 2,
+            ErrorKind::BranchTableArityMismatch { expected, actual },
+        );
     }
 }
 

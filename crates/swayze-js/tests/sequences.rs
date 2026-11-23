@@ -332,8 +332,6 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("const x=1, |2; x", 1, Malformed),
         ("let x; x=true ? 1 : 2|, 3; x", 1, Unsupported),
         ("let x; x ??= 1|, 2; x", 1, Unsupported),
-        ("let x; for(x=1|,2;;){} x", 1, Unsupported),
-        ("let x; for(;false;x=1|,2){} x", 1, Unsupported),
         ("{1,2|} 0", 1, Unsupported),
         ("1, 2; 3,|", 0, Malformed),
         ("let x; x=(1,2)\n|x", 1, Unsupported),
@@ -371,8 +369,8 @@ fn ungrouped_sequences_in_a_consequent_or_assignment_rhs_error_at_the_comma() {
     for source in [
         "let x; x=1|, 2; x",
         "let x; x=1|, x=2; x",
-        "let x; for (x=1|,x=2;;) {} x",
-        "let x; for (;false;x=1|,x=2) {} x",
+        "let x; {x=1|,x=2;} x",
+        "let x; for (;false;) {x=1|,x=2;} x",
     ] {
         assert_error_at(source, Unsupported, 1);
     }

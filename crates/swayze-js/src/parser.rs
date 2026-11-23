@@ -1084,6 +1084,7 @@ struct WriteAccess {
     load: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 enum ExpressionEnd {
     Script,
     ExpressionStatement,
@@ -1092,6 +1093,7 @@ enum ExpressionEnd {
     StatementTest,
     ForTest,
     ForClause(ForClauseEnd),
+    // An outer comma ends an assignment RHS, but is not an update delimiter.
     ForStore(ForClauseEnd),
 }
 
@@ -1615,7 +1617,8 @@ impl Parser<'_> {
     }
 
     fn parse_for_clause(&mut self, first: Token, end: ForClauseEnd) -> Result<Span, Error> {
-        // Stores are standalone. Only the non-store path permits an ungrouped sequence.
+        // Keep the consuming store path for a leading assignment or update.
+        // An assignment (but not an update) can then continue at a comma.
         let store_end = ExpressionEnd::ForStore(end);
         match first.kind {
             TokenKind::Update(op) => return self.parse_prefix_update(op, first.span, store_end),
@@ -2180,15 +2183,20 @@ impl Parser<'_> {
             binary => (None, binary),
         };
         let first = self.require_token("expected an assignment value")?;
-        let (end, _) = self.parse_expression(first, end)?;
+        let (rhs_end, delimiter) = self.parse_expression(first, end)?;
         if let Some(binary) = binary {
             self.emit(binary, operator_span)?;
         }
-        self.finish_write(access, end, false)?;
+        self.finish_write(access, rhs_end, false)?;
         if let Some(skip) = skip {
-            self.patch_jump(skip, end)?;
+            self.patch_jump(skip, rhs_end)?;
         }
-        Ok(end)
+        if let (ExpressionEnd::ForStore(clause), Some(TokenKind::Comma)) = (end, delimiter) {
+            // The store (or its skip edge) already leaves no value to discard.
+            let first = self.require_token("expected an operand before end of source")?;
+            return self.parse_discarded_expression(first, ExpressionEnd::ForClause(clause));
+        }
+        Ok(rhs_end)
     }
 
     fn begin_write(&mut self, name: Span, operator_span: Span, load: bool) -> Result<usize, Error> {
@@ -2470,7 +2478,9 @@ impl Parser<'_> {
             (Some(first), false)
         };
         // Bare assignment prefixes can start a test, RHS, ternary arm, or
-        // noninitial sequence operand, but not an operator operand.
+        // noninitial sequence operand, but not an operator operand. ForClause
+        // starts at the first operand after a leading store's comma, or at a
+        // clause start where parse_for_clause has ruled out a leading store.
         let mut allow_assignment = statement_test
             || matches!(
                 end_kind,
@@ -2478,6 +2488,7 @@ impl Parser<'_> {
                     | ExpressionEnd::Declarator(_)
                     | ExpressionEnd::Semicolon(_)
                     | ExpressionEnd::ForStore(_)
+                    | ExpressionEnd::ForClause(_)
             );
         let (end, delimiter) = loop {
             let Some(token) = next else {
@@ -2652,15 +2663,19 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "empty parenthesized expression"));
                 }
                 (false, TokenKind::Comma) => {
-                    // Comma is looser than ?: and =. Finish the RHS before
-                    // deciding which surrounding grammar production owns the comma.
+                    // Comma is looser than ?: and =. Finish pending subexpressions
+                    // before deciding which surrounding production owns the comma.
                     self.reduce_expression(span)?;
                     self.finish_group_assignment(span)?;
                     match self.pending.last() {
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(span, "expected ':' before ','"));
                         }
-                        None if matches!(end_kind, ExpressionEnd::Declarator(_)) => {
+                        None if matches!(
+                            end_kind,
+                            ExpressionEnd::Declarator(_) | ExpressionEnd::ForStore(_)
+                        ) =>
+                        {
                             break (span, Some(kind));
                         }
                         Some((Pending::Group | Pending::StatementTest, _)) => {}

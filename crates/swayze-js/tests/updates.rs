@@ -407,6 +407,8 @@ fn respects_ecmascript_line_terminators_without_asi() {
                     format!("let x=0;for(;false;x{trivia}@{op}@){{}}x"),
                     format!("let x=0;for(x{trivia}@{op}@,null;false;){{}}x"),
                     format!("let x=0;for(;false;x{trivia}@{op}@,null){{}}x"),
+                    format!("let x=0;for(x{trivia}@{op}@ + 0;false;){{}}x"),
+                    format!("let x=0;for(;false;x{trivia}@{op}@ ? 0 : 1){{}}x"),
                     format!("let x=0;x{trivia}@{op}@x;x"),
                 ] {
                     assert_error(&marked, Unsupported, "line terminator");
@@ -417,6 +419,11 @@ fn respects_ecmascript_line_terminators_without_asi() {
             let source =
                 format!("let x=0;++{trivia}x{trivia},null{trivia};{{x/*💡*/++{trivia},null;}}x");
             assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(2.0));
+            let source = format!(
+                "let x=0,y=0;for(x/**/++{trivia}+0;y<2;x--{trivia}?++{trivia}y:0){{}}x*10+y"
+            );
+            // Postfix may be followed by a line break before either continuation.
+            assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(-18.0));
         }
     }
     let source = "let $x_1=0;if(false){}$x_1/*💡*/\u{00a0}++;--/**/$x_1;$x_1";
@@ -454,10 +461,8 @@ fn respects_ecmascript_line_terminators_without_asi() {
 fn standalone_dispatch_still_requires_a_complete_update() {
     use ErrorKind::Unsupported;
     for (source, message) in [
-        ("let x=0;for(++x;false;x@++@ + 1){}x", "expressions"),
-        ("let x=0;for(;false;@++@x\n**2){}x", "expressions"),
-        ("let x=0;for(x@++@\n+1;false;){}x", "expressions"),
-        ("let x=0;for(@++@x ? 1 : 2;false;){}x", "expressions"),
+        ("let x=0;for(x@++@=1;false;){}x", "expressions"),
+        ("let x=0;for(;false;@--@x !1){}x", "expressions"),
         ("let x=0;x@++@=1;x", "expressions"),
         ("let x=0;x@--@=1;x", "expressions"),
         ("let x=0;@++@+x;x", "identifier"),

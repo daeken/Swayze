@@ -567,6 +567,54 @@ fn for_update_sequences_discard_only_the_suffix_values() {
 }
 
 #[test]
+fn for_leading_expression_updates_feed_expression_discards_and_loop_edges() {
+    use crate::parser::{Update, UpdateResult};
+    use Instruction::{
+        Boolean, Discard, Jump, JumpIfFalse, JumpIfFalseStatement, JumpStatement, LoopBack, Null,
+        UpdateBinding,
+    };
+
+    let inc = UpdateBinding {
+        slot: 0,
+        op: Update::Increment,
+        result: UpdateResult::New,
+    };
+    assert_postfix(
+        "let x=false;for(++x+true;false;x--?true:null,++x){continue;break;}x",
+        &[
+            Boolean(false),
+            init_let(0),
+            inc,
+            Boolean(true),
+            Add,
+            Discard,        // final initializer result
+            Boolean(false), // 6: test
+            JumpIfFalseStatement(21),
+            JumpStatement(18),
+            UpdateBinding {
+                // 9: update
+                slot: 0,
+                op: Update::Decrement,
+                result: UpdateResult::Old,
+            },
+            JumpIfFalse(13),
+            Boolean(true),
+            Jump(14),
+            Null,
+            Discard, // completed conditional, at the comma
+            inc,
+            Discard, // final updater result
+            LoopBack(6),
+            LoopBack(9),       // 18: continue
+            JumpStatement(21), // break
+            LoopBack(9),       // body fallthrough
+            LoadBinding(0),    // 21: exit
+        ],
+        2,
+    );
+}
+
+#[test]
 fn for_expression_clauses_join_at_discards_before_statement_edges() {
     use crate::parser::ShortCircuitCondition;
     use Instruction::{

@@ -1093,7 +1093,7 @@ struct WriteAccess {
 
 enum ExpressionStart {
     Token(Token),
-    // Statement dispatch checked the update and already read its continuation.
+    // Statement or for-clause dispatch checked the update and read its continuation.
     Update {
         name: Span,
         operator: Span,
@@ -1107,6 +1107,11 @@ impl From<Token> for ExpressionStart {
     fn from(token: Token) -> Self {
         Self::Token(token)
     }
+}
+
+enum LeadingUpdate {
+    Expression(ExpressionStart),
+    Consumed(Span),
 }
 
 #[derive(Clone, Copy)]
@@ -1645,48 +1650,41 @@ impl Parser<'_> {
     }
 
     fn parse_for_clause(&mut self, first: Token, end: ForClauseEnd) -> Result<Span, Error> {
-        // Keep the consuming store path for a leading assignment or update.
-        // Either can then continue with a sequence suffix at a comma.
         let store_end = ExpressionEnd::ForStore(end);
-        match first.kind {
-            TokenKind::Update(op) => return self.parse_prefix_update(op, first.span, store_end),
-            TokenKind::Identifier => {
-                let next = self.next_token()?;
-                if let Some(span) = self.parse_name_store(first.span, next, store_end)? {
-                    return Ok(span);
+        let expression_end = ExpressionEnd::ForClause(end);
+        let (name, op, operator, result) = match first.kind {
+            TokenKind::Update(op) => (
+                self.parse_update_target(first.span)?,
+                op,
+                first.span,
+                UpdateResult::New,
+            ),
+            TokenKind::Identifier => match self.next_token()? {
+                Some(Token {
+                    kind: TokenKind::Assignment(op),
+                    span,
+                    ..
+                }) => return self.parse_assignment(first.span, op, span, store_end),
+                Some(Token {
+                    kind: TokenKind::Update(op),
+                    span,
+                    after_line_break,
+                }) => {
+                    check_postfix_line_break(span, after_line_break)?;
+                    (first.span, op, span, UpdateResult::Old)
                 }
+                next => {
+                    self.lookahead = Some(next);
+                    return self.parse_discarded_expression(first.into(), expression_end);
+                }
+            },
+            _ => return self.parse_discarded_expression(first.into(), expression_end),
+        };
+        match self.parse_leading_update(name, op, operator, result, store_end)? {
+            LeadingUpdate::Expression(start) => {
+                self.parse_discarded_expression(start, expression_end)
             }
-            _ => {}
-        }
-        self.parse_discarded_expression(first.into(), ExpressionEnd::ForClause(end))
-    }
-
-    // The for clause has already read one token after the name. If it doesn't
-    // commit to a store, leave it cached for the expression parser.
-    fn parse_name_store(
-        &mut self,
-        name: Span,
-        next: Option<Token>,
-        end: ExpressionEnd,
-    ) -> Result<Option<Span>, Error> {
-        match next {
-            Some(Token {
-                kind: TokenKind::Assignment(op),
-                span,
-                ..
-            }) => self.parse_assignment(name, op, span, end).map(Some),
-            Some(Token {
-                kind: TokenKind::Update(op),
-                span,
-                after_line_break,
-            }) => {
-                check_postfix_line_break(span, after_line_break)?;
-                self.parse_update(name, op, span, end).map(Some)
-            }
-            _ => {
-                self.lookahead = Some(next);
-                Ok(None)
-            }
+            LeadingUpdate::Consumed(span) => Ok(span),
         }
     }
 
@@ -2111,14 +2109,34 @@ impl Parser<'_> {
         operator: Span,
         result: UpdateResult,
     ) -> Result<Option<ExpressionStart>, Error> {
-        // Only binary operators and '?' opt into the expression path. In
-        // particular, an immediate comma still begins a consuming store suffix.
+        match self.parse_leading_update(
+            name,
+            op,
+            operator,
+            result,
+            ExpressionEnd::StatementStore,
+        )? {
+            LeadingUpdate::Expression(start) => Ok(Some(start)),
+            LeadingUpdate::Consumed(_) => Ok(None),
+        }
+    }
+
+    fn parse_leading_update(
+        &mut self,
+        name: Span,
+        op: Update,
+        operator: Span,
+        result: UpdateResult,
+        store_end: ExpressionEnd,
+    ) -> Result<LeadingUpdate, Error> {
+        // Look ahead once after the checked update. Only binary operators and
+        // '?' opt into the expression path; ',' still starts a store suffix.
         match self.next_token()? {
             Some(following)
                 if matches!(following.kind, TokenKind::Question)
                     || matches!(following.kind, TokenKind::Operator(op) if op.is_binary()) =>
             {
-                Ok(Some(ExpressionStart::Update {
+                Ok(LeadingUpdate::Expression(ExpressionStart::Update {
                     name,
                     operator,
                     op,
@@ -2126,27 +2144,10 @@ impl Parser<'_> {
                     following,
                 }))
             }
-            next => {
-                self.parse_consuming_update(
-                    name,
-                    op,
-                    operator,
-                    ExpressionEnd::StatementStore,
-                    next,
-                )?;
-                Ok(None)
-            }
+            next => self
+                .parse_consuming_update(name, op, operator, store_end, next)
+                .map(LeadingUpdate::Consumed),
         }
-    }
-
-    fn parse_prefix_update(
-        &mut self,
-        op: Update,
-        operator: Span,
-        end: ExpressionEnd,
-    ) -> Result<Span, Error> {
-        let name = self.parse_update_target(operator)?;
-        self.parse_update(name, op, operator, end)
     }
 
     fn parse_update_target(&mut self, operator: Span) -> Result<Span, Error> {
@@ -2154,17 +2155,6 @@ impl Parser<'_> {
             .filter(|t| matches!(t.kind, TokenKind::Identifier))
             .map(|t| t.span)
             .ok_or_else(|| Error::unsupported(operator, UPDATE_TARGET_REQUIRED))
-    }
-
-    fn parse_update(
-        &mut self,
-        name: Span,
-        op: Update,
-        operator: Span,
-        end: ExpressionEnd,
-    ) -> Result<Span, Error> {
-        let next = self.next_token()?;
-        self.parse_consuming_update(name, op, operator, end, next)
     }
 
     fn parse_consuming_update(

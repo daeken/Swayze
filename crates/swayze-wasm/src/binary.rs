@@ -1565,6 +1565,7 @@ enum FloatBinaryOp {
     Max,
     Copysign,
     Mul,
+    Div,
 }
 
 impl FloatBinaryOp {
@@ -1593,6 +1594,9 @@ impl FloatBinaryOp {
         let min = match self {
             Self::Mul => {
                 return mul_bits(lhs, rhs, sign, infinity, canonical_nan, fraction_bits, bias);
+            }
+            Self::Div => {
+                return div_bits(lhs, rhs, sign, infinity, canonical_nan, fraction_bits, bias);
             }
             Self::Min => true,
             Self::Max => false,
@@ -1637,23 +1641,9 @@ fn mul_bits(
         return sign;
     }
 
-    // Each magnitude is m * 2^(e-h), where h is the fraction width and
-    // m is in [2^h, 2^(h+1)). For subnormals the nonzero fraction shifts
-    // left by 1..=h, giving e in -149..=127 (f32) or -1074..=1023 (f64).
-    let implicit_bit = 1 << fraction_bits;
     let min_exponent = 1 - bias;
-    let decode = |magnitude| {
-        let fraction: u64 = magnitude & (implicit_bit - 1);
-        let field = (magnitude >> fraction_bits) as i32;
-        if field == 0 {
-            let shift = fraction_bits - fraction.ilog2();
-            (fraction << shift, min_exponent - shift as i32)
-        } else {
-            (implicit_bit | fraction, field - bias)
-        }
-    };
-    let (lhs_m, lhs_e) = decode(lhs);
-    let (rhs_m, rhs_e) = decode(rhs);
+    let (lhs_m, lhs_e) = normalized_finite(lhs, fraction_bits, bias);
+    let (rhs_m, rhs_e) = normalized_finite(rhs, fraction_bits, bias);
     let product = u128::from(lhs_m) * u128::from(rhs_m);
     // The full product occupies 48 or 106 bits at most, with its top bit
     // at 2h or 2h+1. Its top exponent is in -298..=255 or -2148..=2047.
@@ -1679,15 +1669,95 @@ fn mul_bits(
     let up = remainder > midpoint || (remainder == midpoint && retained & 1 != 0);
     let rounded = retained as u64 + u64::from(up);
 
-    let magnitude = if exponent < min_exponent {
+    sign | pack_rounded_finite(rounded, exponent, fraction_bits, bias)
+}
+
+fn div_bits(
+    lhs: u64,
+    rhs: u64,
+    sign_mask: u64,
+    infinity: u64,
+    canonical_nan: u64,
+    fraction_bits: u32,
+    bias: i32,
+) -> u64 {
+    let sign = (lhs ^ rhs) & sign_mask;
+    let lhs = lhs & !sign_mask;
+    let rhs = rhs & !sign_mask;
+    if lhs > infinity || rhs > infinity || (lhs == rhs && (lhs == 0 || lhs == infinity)) {
+        return canonical_nan;
+    }
+    if lhs == infinity || rhs == 0 {
+        return sign | infinity;
+    }
+    if lhs == 0 || rhs == infinity {
+        return sign;
+    }
+
+    // Both inputs are finite and nonzero; in particular rhs_m cannot be zero.
+    let (lhs_m, lhs_e) = normalized_finite(lhs, fraction_bits, bias);
+    let (rhs_m, rhs_e) = normalized_finite(rhs, fraction_bits, bias);
+    // The exponent difference is at most 276 (f32) or 2097 (f64) in magnitude.
+    let difference = lhs_e - rhs_e;
+    // The exact significand ratio is strictly between 1/2 and 2. Comparing
+    // the significands decides which binade it lies in, without rounding.
+    let exponent = difference - i32::from(lhs_m < rhs_m);
+    let h = fraction_bits as i32;
+    let min_exponent = 1 - bias;
+    if exponent > bias {
+        return sign | infinity;
+    }
+    if exponent < min_exponent - h - 1 {
+        return sign; // Strictly less than half the least subnormal.
+    }
+
+    // Express the exact quotient directly in units of 2^(max(exponent, emin)-h).
+    // shift = h + [lhs_m < rhs_m] - max(emin - exponent, 0), so the underflow
+    // guard bounds it to -1..=h+1. The numerator has at most 2h+2 bits, the
+    // denominator at most h+2, and doubling the remainder needs at most h+3.
+    let shift = difference - exponent.max(min_exponent) + h;
+    let lhs_m = u128::from(lhs_m);
+    let rhs_m = u128::from(rhs_m);
+    let (numerator, denominator) = if shift < 0 {
+        (lhs_m, rhs_m << 1) // The only negative shift is -1.
+    } else {
+        (lhs_m << shift, rhs_m)
+    };
+    let retained = numerator / denominator;
+    let twice_remainder = 2 * (numerator % denominator);
+    let up = twice_remainder > denominator || (twice_remainder == denominator && retained & 1 != 0);
+    // Rounding can reach at most 2^(h+1) for a normal binade or 2^h below it.
+    let rounded = retained as u64 + u64::from(up);
+    sign | pack_rounded_finite(rounded, exponent, fraction_bits, bias)
+}
+
+// Decode a positive finite nonzero magnitude as m * 2^(e-h), with h the
+// fraction width and m in [2^h, 2^(h+1)). A subnormal's nonzero fraction shifts
+// left by 1..=h, giving e in -149..=127 (f32) or -1074..=1023 (f64).
+fn normalized_finite(magnitude: u64, fraction_bits: u32, bias: i32) -> (u64, i32) {
+    let implicit_bit = 1 << fraction_bits;
+    let fraction = magnitude & (implicit_bit - 1);
+    let field = (magnitude >> fraction_bits) as i32;
+    if field == 0 {
+        let shift = fraction_bits - fraction.ilog2();
+        (fraction << shift, 1 - bias - shift as i32)
+    } else {
+        (implicit_bit | fraction, field - bias)
+    }
+}
+
+// Pack a magnitude already rounded in units of 2^(max(exponent, 1-bias)-h),
+// with exponent <= bias. No further rounding is performed here.
+fn pack_rounded_finite(rounded: u64, exponent: i32, fraction_bits: u32, bias: i32) -> u64 {
+    if exponent < 1 - bias {
         // 0..=2^h: a carry out of the fraction gives the least normal.
         rounded
     } else {
         // 2^h..=2^(h+1): remove the implicit bit, then let addition carry
         // into the exponent, including to infinity at the overflow tie.
+        let implicit_bit = 1 << fraction_bits;
         (((exponent + bias) as u64) << fraction_bits) + (rounded - implicit_bit)
-    };
-    sign | magnitude
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2890,6 +2960,7 @@ fn decode_plain(
         }
         0x91 => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Sqrt),
         0x94 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Mul),
+        0x95 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Div),
         0x96 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Min),
         0x97 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Max),
         0x98 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Copysign),
@@ -2903,6 +2974,7 @@ fn decode_plain(
         }
         0x9f => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Sqrt),
         0xa2 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Mul),
+        0xa3 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Div),
         0xa4 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Min),
         0xa5 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Max),
         0xa6 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Copysign),

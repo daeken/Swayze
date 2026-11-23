@@ -216,6 +216,15 @@
 //! overflow to infinity. The result has the XOR of the operand signs, including
 //! zero and infinity, except that any NaN or zero times infinity returns the
 //! positive canonical quiet NaN.
+//! `div` (`0x95` for f32, `0xa3` for f64) divides the first operand by the
+//! second and returns a result of their width. For finite nonzero inputs it
+//! rounds an exact integer ratio at the destination precision, nearest with ties
+//! to even, including gradual underflow and overflow. Any NaN, zero divided by
+//! zero, or infinity divided by infinity returns the positive canonical quiet
+//! NaN. Otherwise the result sign is the XOR of the operand signs; dividing a
+//! nonzero value by zero returns signed infinity, not a trap. An infinity
+//! numerator gives signed infinity, and a zero numerator or infinity denominator
+//! gives signed zero in the remaining cases. Each `div` uses one guest dispatch.
 //! `min` and `max` (`0x96`/`0x97` for f32, `0xa4`/`0xa5` for f64) consume two
 //! operands of their width and return the exact encoding of the lesser or
 //! greater operand, respectively. Mixed-sign zeros return -0 for `min` and +0
@@ -556,6 +565,13 @@
 //! classes in both operand orders and signs, live and dead typing, and exact
 //! dispatch charging. Deterministic finite pairs compared with native products
 //! provide independent evidence, not a proof.
+//! Float division tests cover the signed special-value cross product, normal
+//! results on both sides of a rounding midpoint, overflow and gradual underflow,
+//! and attainable subnormal ties and their neighbors. Exact vectors distinguish
+//! single rounding from double rounding in both directions. The tests also check
+//! live and dead typing and exact dispatch charging, including zero divisors.
+//! Deterministic finite pairs compared with native division provide independent
+//! evidence, not a proof.
 //! Float width-conversion tests check exact round trips, signed zeros and
 //! infinities, canonical NaNs, and both neighbors of ties at normal, subnormal,
 //! underflow, and overflow boundaries. They also cover live and dead typing

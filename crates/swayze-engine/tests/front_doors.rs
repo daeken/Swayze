@@ -52,6 +52,31 @@ fn script_handles_bounded_nesting() {
 }
 
 #[test]
+fn script_scratch_exposes_runtime_utf16_without_changing_scalar_apis() {
+    use swayze_engine::{JsEvalError, JsEvalScratch, JsPrimitiveValue};
+
+    let script = parse_script(r#"'\uD800' + '\0'"#).unwrap();
+    assert_eq!(
+        script.evaluate_primitive(),
+        Err(JsEvalError::RuntimeStringResultRequiresScratch)
+    );
+    assert_eq!(script.evaluate_value(), Err(JsEvalError::NonScalarResult));
+    assert_eq!(script.evaluate(), Err(JsEvalError::NonNumericResult));
+
+    let mut scratch = JsEvalScratch::new();
+    assert_eq!(
+        script.evaluate_primitive_with_scratch(&mut scratch),
+        Ok(JsPrimitiveValue::String(&[0xd800, 0]))
+    );
+    let empty = parse_script("'' + ''").unwrap();
+    assert_eq!(
+        empty.evaluate_primitive_with_scratch(&mut scratch),
+        Ok(JsPrimitiveValue::String(&[]))
+    );
+    assert_eq!(parse_script("+('4' + '2')").unwrap().evaluate(), Ok(42.0));
+}
+
+#[test]
 fn module_admits_empty_and_custom_only_modules() {
     assert!(validate_module(EMPTY_MODULE).is_ok());
 

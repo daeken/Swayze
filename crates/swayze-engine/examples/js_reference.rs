@@ -1,7 +1,7 @@
 //! Opt-in differential JS value smoke check: run tools/check-js-reference.sh.
 
 use std::{error::Error, fmt::Write, process::Command};
-use swayze_engine::{JsPrimitiveValue, JsValue, parse_script};
+use swayze_engine::{JsEvalScratch, JsPrimitiveValue, JsValue, parse_script};
 
 // Evaluate complete Scripts (including optional semicolons), not expressions
 // rewritten by the harness. Print binary64 and UTF-16 in hex; ignore NaN payloads.
@@ -545,6 +545,16 @@ fn fixtures() -> Vec<String> {
             "let x='3', y=0; x--, y=x*10; y",
             "let x='2'; false && ++x; x",
             "let x='3', i=0; for (; i<3; --x, i++) { continue; } x",
+            "'' + ''",
+            r#"'\uD83D' + '\uDE42' + '\0' + '\uD800'"#,
+            r#"'e' + '\u0301'"#,
+            "let s='a' + 'b'; s += s; s + s",
+            "let s='old'; s += (s = 'new'); s",
+            "let s=''; for (let i=0; i<5; i++) { s += 'x'; } s",
+            "('1' + '0') < '2' && !('1' + '0' < 2)",
+            "+('-' + '0')",
+            "let s='4' + '2'; s--; s",
+            "false && ('bad' + 'branch') || ('x' + 'y')",
         ]
         .map(str::to_owned),
     );
@@ -554,7 +564,8 @@ fn fixtures() -> Vec<String> {
 fn evaluate(source: &str) -> Result<String, Box<dyn Error>> {
     use JsPrimitiveValue::{Scalar, String};
     let script = parse_script(source)?;
-    let actual = match script.evaluate_primitive()? {
+    let mut scratch = JsEvalScratch::new();
+    let actual = match script.evaluate_primitive_with_scratch(&mut scratch)? {
         Scalar(JsValue::Number(value)) if value.is_nan() => "number:nan".to_owned(),
         Scalar(JsValue::Number(value)) => format!("number:{:016x}", value.to_bits()),
         Scalar(JsValue::Boolean(value)) => format!("boolean:{value}"),

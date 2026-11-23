@@ -6,7 +6,12 @@ Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?` produces `14.0`.
 `Script::evaluate_primitive()` returns `PrimitiveValue::Scalar(Value)` or
 `PrimitiveValue::String(&[u16])` (facade: `JsPrimitiveValue`). The String
-slice borrows immutable Script storage. `evaluate_value()` still returns
+slice borrows immutable Script storage. A final runtime String (even empty)
+returns `RuntimeStringResultRequiresScratch` from that API. To accept either
+kind of String, use `Script::evaluate_primitive_with_scratch(&mut scratch)`
+with `EvalScratch` (facade: `JsEvalScratch`); the result borrows both inputs.
+Each call clears the scratch's logical length without zeroizing its storage
+and can reuse retained capacity. `evaluate_value()` still returns
 `Value::Number`, `Value::Boolean`, `Value::Null`, or `Value::Undefined` without
 coercion; a String result yields `NonScalarResult`. `evaluate()` returns
 `NonNumericResult` for any non-Number. An unbound read of `undefined` returns
@@ -214,8 +219,19 @@ Mixed loose equality with Numbers or Booleans and mixed String/scalar ordering
 compare numerically instead. For example, `'10' < '2'` is true, but `'10' < 2`
 is false. Mixed ordering treats `null` as `+0` and `undefined` as NaN; a NaN
 operand makes all four relations false. Mixed comparisons spend no code-unit
-pairs. String concatenation and binary subtraction on Strings are unsupported. An unsupported String operation is an evaluation error only
-when it executes.
+pairs.
+
+Binary `+` and `+=` concatenate two Strings in left-to-right UTF-16 order,
+without normalizing code units. Their result may have at most 4,094 code
+units; each evaluation may append at most 32,768 code units, including
+intermediate results that are overwritten or discarded. These inclusive caps
+produce `StringConcatenationLengthLimitExceeded` and
+`StringConcatenationBudgetExceeded`, respectively, and are independent of
+dispatch, comparison, and conversion budgets. Reached, nonempty concatenations
+may grow the scratch allocation fallibly. Empty or skipped concatenations do
+not allocate String storage. This scratch is not a GC heap. Mixed String/scalar
+`+` and `+=`, and binary `-` and `-=` on Strings, remain unsupported only when
+executed.
 
 Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`, `<<`,
 `>>`, and `>>>` (including their compound assignments) convert Strings to
@@ -235,8 +251,8 @@ Their compound forms read the old left-hand value before the right-hand side
 runs and store the result only if the operation succeeds. Name updates convert
 once before adding or subtracting one. Prefix expressions return the new Number;
 postfix expressions return the old converted Number, including signed zero or
-NaN. Consuming updates store the result without yielding it. Binary `+` and `-`
-and their compound forms still reject String operands.
+NaN. Consuming updates store the result without yielding it. Concatenation
+does not convert either String operand to a Number.
 
 Each evaluation has 262,144 conversion credits, separate from comparison
 and dispatch limits. A reached String conversion charges `1 + original

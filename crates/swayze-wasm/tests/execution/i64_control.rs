@@ -51,6 +51,21 @@ fn br_if_fallthrough_keeps_the_payload_and_both_taken_branches_restore_the_targe
 }
 
 #[test]
+fn untaken_br_if_keeps_all_64_payload_bits_for_the_next_instruction() {
+    let mut body = b"\0\x02\x7e".to_vec(); // block i64
+    push_i64(&mut body, ALT);
+    body.extend(b"\x20\0\x0d\0"); // local.get 0; br_if 0
+    // XOR is zero only if every bit, including the high word, survived.
+    // A taken branch skips the XOR and leaves the original nonzero payload.
+    push_i64(&mut body, ALT);
+    body.extend(b"\x85\x0b\x50\x0b"); // i64.xor; end block; i64.eqz; end function
+    let validated = exported_function(&i32_type(1), &code_body(&body));
+    let instance = validated.instantiate().unwrap();
+    assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(1));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[1]), Ok(0));
+}
+
+#[test]
 fn br_table_transfers_to_if_or_block_and_else_br_uses_the_shared_if_label() {
     let mut body = vec![0];
     push_i64(&mut body, PREFIX);
@@ -187,16 +202,19 @@ fn br_table_reports_the_first_incompatible_label_even_in_dead_code() {
     // Labels: 0 void loop, 1 i32 block, 2 i64 block, 3 i32 function.
     for (table, label, kind) in [
         (
-            &[2, 1, 2, 1][..],
-            2,
+            // Padded count and first entry; the mismatching explicit depth
+            // occupies bytes 4..7. Report its start, not its last byte.
+            &[0x82, 0, 0x81, 0, 0x82, 0x80, 0, 1][..],
+            4,
             BranchTableTypeMismatch {
                 expected: I32,
                 actual: I64,
             },
         ),
         (
-            &[1, 2, 3],
-            2,
+            // The mismatching default depth occupies bytes 3..8.
+            &[1, 0x82, 0, 0x83, 0x80, 0x80, 0x80, 0],
+            3,
             BranchTableTypeMismatch {
                 expected: I64,
                 actual: I32,

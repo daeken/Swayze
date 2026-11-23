@@ -210,6 +210,7 @@ pub(crate) enum Instruction {
     Multiply,
     Divide,
     Remainder,
+    Exponentiate,
     Positive,
     Negate,
     Not,
@@ -320,6 +321,7 @@ enum Operator {
     Multiply,
     Divide,
     Remainder,
+    Exponentiate,
     Positive,
     Negate,
     Not,
@@ -344,7 +346,8 @@ impl Operator {
             Self::ShiftLeft | Self::ShiftRight | Self::ShiftRightUnsigned => 8,
             Self::Add | Self::Subtract => 9,
             Self::Multiply | Self::Divide | Self::Remainder => 10,
-            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void => 11,
+            Self::Exponentiate => 11,
+            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void => 12,
         }
     }
 
@@ -377,6 +380,7 @@ impl Operator {
             Self::Multiply => Instruction::Multiply,
             Self::Divide => Instruction::Divide,
             Self::Remainder => Instruction::Remainder,
+            Self::Exponentiate => Instruction::Exponentiate,
             Self::Positive => Instruction::Positive,
             Self::Negate => Instruction::Negate,
             Self::Not => Instruction::Not,
@@ -634,7 +638,7 @@ impl Lexer<'_> {
             ':' => TokenKind::Colon,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
-            '+' | '-' | '*' | '/' | '%' => self.operator(c, start)?,
+            '+' | '-' | '*' | '/' | '%' => self.operator(c)?,
             _ => {
                 return Err(Error::unsupported(
                     first,
@@ -792,24 +796,14 @@ impl Lexer<'_> {
         ))
     }
 
-    fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
+    fn operator(&mut self, c: char) -> Result<TokenKind, Error> {
         if matches!(c, '+' | '-' | '*') && self.peek() == Some(c) {
             self.consume(c)?;
-            match c {
-                '+' => return Ok(TokenKind::Update(Update::Increment)),
-                '-' => return Ok(TokenKind::Update(Update::Decrement)),
-                _ => {}
-            }
-            if self.peek() == Some('=') {
-                self.consume('=')?;
-            }
-            return Err(Error::unsupported(
-                Span {
-                    start,
-                    end: self.offset,
-                },
-                "longer punctuator is outside the arithmetic subset",
-            ));
+            return match c {
+                '+' => Ok(TokenKind::Update(Update::Increment)),
+                '-' => Ok(TokenKind::Update(Update::Decrement)),
+                _ => self.operator_or_assignment(Operator::Exponentiate),
+            };
         }
         self.operator_or_assignment(match c {
             '+' => Operator::Add,
@@ -2415,6 +2409,19 @@ impl Parser<'_> {
                 jump,
                 join_depth,
             }
+        } else if matches!(op, Operator::Exponentiate) {
+            // Only prefix operators bind more tightly. A prefix on this level
+            // is still pending, while a prefix inside a closed group is not.
+            if let Some((Pending::Op(previous), _)) = self.pending.last()
+                && previous.precedence() > op.precedence()
+            {
+                return Err(Error::malformed(
+                    span,
+                    "a unary base of exponentiation requires parentheses",
+                ));
+            }
+            // Keep equal precedence pending: `**` associates to the right.
+            Pending::Op(op)
         } else {
             self.reduce_operators(op.precedence())?;
             Pending::Op(op)
@@ -2577,6 +2584,7 @@ impl Parser<'_> {
             | Instruction::Multiply
             | Instruction::Divide
             | Instruction::Remainder
+            | Instruction::Exponentiate
             | Instruction::BitwiseAnd
             | Instruction::BitwiseXor
             | Instruction::BitwiseOr

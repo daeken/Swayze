@@ -10,6 +10,7 @@ fn compound_operators_reuse_binary_coercion_and_preserve_number_bits() {
         ("null", "*=-2", -0.0),
         ("-0", "/=true", -0.0),
         ("-6", "%=(false || 3)", -0.0),
+        ("-0", "**=(true ? 3 : 2)", -0.0),
         ("-1", "&=4294967298.9", 2.0),
         ("6", "^=(null ?? 3)", 5.0),
         ("undefined", "|=true", 1.0),
@@ -140,7 +141,7 @@ fn target_is_resolved_before_rhs_reads_and_never_skips_a_shadow() {
 #[test]
 fn rejects_other_targets_operators_and_assignment_expressions() {
     use ErrorKind::{Malformed, Unsupported};
-    for op in ["**=", "++", "--"] {
+    for op in ["++", "--"] {
         assert_diagnostic(&format!("let x=1;x@{op}@2;x"), Unsupported, "subset");
     }
     for (source, kind, message) in [

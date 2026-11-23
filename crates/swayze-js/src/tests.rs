@@ -1482,7 +1482,7 @@ fn assignments_require_explicit_semicolons_and_are_not_expressions() {
         ("let x=1; x + (x=2)", Unsupported, 15, 16),
         ("let x=1; let y=(x=2); y", Unsupported, 17, 18),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
-        ("let x=1; x**=2; x", Unsupported, 10, 13),
+        ("let x=1; (x**=2)", Unsupported, 11, 14),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),
         ("let x=1; x/*🚧", Malformed, 10, 16),
@@ -1570,21 +1570,131 @@ fn malformed_subset_and_unsupported_constructs() {
 #[test]
 fn operator_lexical_boundaries_are_conservative() {
     use ErrorKind::Unsupported;
-    for source in ["1--2", "1++2", "1**2", "1-=2", "1/=2", "1%=2"] {
+    for source in ["1--2", "1++2", "1-=2", "1/=2", "1%=2"] {
         assert_error(source, Unsupported, 1, 3);
     }
     assert_error("++2", Unsupported, 0, 2);
     assert_error("--2", Unsupported, 0, 2);
     assert_error("1**=2", Unsupported, 1, 4);
-    assert_error("-1**2", Unsupported, 2, 4);
-    assert_error("(-1)**2", Unsupported, 4, 6);
-    assert_error("1\n**2", Unsupported, 2, 4);
     assert_postfix("1/*comment*/+2", &[Number(1.), Number(2.), Add], 2);
     assert_postfix("1//2", &[Number(1.)], 1);
     assert_postfix("-/*comment*/1", &[Number(1.), Negate], 1);
     assert_error("/2/", Unsupported, 0, 1);
     assert_error("8 / /2/", Unsupported, 4, 5);
     assert_error("+ /2/", Unsupported, 2, 3);
+}
+
+#[test]
+fn exponentiation_emits_right_associative_postfix_with_a_unary_exponent() {
+    use Instruction::Exponentiate;
+    assert_postfix(
+        "2*3**4**-5",
+        &[
+            Number(2.0),
+            Number(3.0),
+            Number(4.0),
+            Number(5.0),
+            Negate,
+            Exponentiate,
+            Exponentiate,
+            Multiply,
+        ],
+        4,
+    );
+    assert_postfix(
+        "let x=2; x**=x**3; x",
+        &[
+            Number(2.0),
+            init_let(0),
+            LoadBinding(0),
+            LoadBinding(0),
+            Number(3.0),
+            Exponentiate,
+            Exponentiate,
+            Instruction::StoreBinding(0),
+            LoadBinding(0),
+        ],
+        3,
+    );
+}
+
+#[test]
+fn exponentiation_token_and_work_costs_match_existing_accounting() {
+    let limits = Limits {
+        max_source_bytes: 7,
+        max_tokens: 5,
+        max_work: 17, // Seven bytes, three conversions, two pushes, five emissions.
+        max_nesting_depth: 0,
+    };
+    let source = "1**1**1";
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(1.0)
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 3,
+            ..limits
+        },
+        Limit::Tokens,
+        4,
+        5,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: 16,
+            ..limits
+        },
+        Limit::Work,
+        1,
+        3,
+    );
+
+    let source = "let x=1;x**=2;x";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 10,
+        // Two conversions, seven emissions (no pending `**=`), two lookups at two units each.
+        max_work: source.len() + 13,
+        max_nesting_depth: 0,
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(1.0)
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 6,
+            ..limits
+        },
+        Limit::Tokens,
+        9,
+        10,
+    );
+    // Stop at the binary emission: 14 scanned bytes, two conversions, four earlier emissions.
+    assert_limit(
+        source,
+        Limits {
+            max_work: 20,
+            ..limits
+        },
+        Limit::Work,
+        9,
+        12,
+    );
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        14,
+        15,
+    );
 }
 
 #[test]

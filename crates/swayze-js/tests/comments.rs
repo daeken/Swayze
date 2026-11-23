@@ -16,6 +16,7 @@ fn comments_are_trivia_at_script_and_token_boundaries() {
     assert_eq!(evaluate("1+/**/+2"), 3.0);
     assert_eq!(evaluate("1-/**/-2"), 3.0);
     assert_eq!(evaluate("2*/**/3"), 6.0);
+    assert_eq!(evaluate("2/**/**3"), 8.0);
     assert_eq!(evaluate("8// not division\n/2"), 4.0);
     assert_eq!(evaluate("8/ /* divisor */2"), 4.0);
     assert_eq!(evaluate("/* outer /* inner */ 2/***/"), 2.0);
@@ -164,7 +165,6 @@ fn comments_do_not_join_tokens_or_enable_other_syntax() {
         "8 / /**/ /2/",
         "8/**//=2",
         "1/**/++2",
-        "1/**/***2",
         "1;/* comment */2\n3",
         "1; // comment\u{2028}const x=1;",
         "1/**/\nvar x=2",

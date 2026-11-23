@@ -21,28 +21,24 @@ fn conversion(src: u8, dst: u8, ops: &[u8]) -> Module {
     exported_function(&types(&[(&[src], Some(dst))]), &code_body(&body))
 }
 
+const EXACT_WIDTH_PAIRS: &[(u32, u64)] = &[
+    (0, 0),
+    (1, 0x36a0_0000_0000_0000), // Smallest f32 subnormal: 2^-149.
+    (3, 0x36b8_0000_0000_0000), // 1.5 * 2^-148, with a nonzero fraction.
+    (0x0040_0000, 0x3800_0000_0000_0000),
+    (0x007f_ffff, 0x380f_ffff_c000_0000), // Largest f32 subnormal: 2^-126 - 2^-149.
+    (0x0080_0000, 0x3810_0000_0000_0000), // Smallest f32 normal.
+    (0x0080_0001, 0x3810_0000_2000_0000),
+    (0x3fa0_0001, 0x3ff4_0000_2000_0000),
+    (0x7f7f_ffff, 0x47ef_ffff_e000_0000), // Largest finite f32.
+    (INF32, INF64),
+];
+
 #[test]
-fn widens_exactly_and_round_trips_representable_values() {
-    let modules = [
-        conversion(F32, F64, &[PROMOTE]),
-        conversion(F64, F32, &[DEMOTE]),
-        conversion(F32, F32, &[PROMOTE, DEMOTE]),
-        conversion(F64, F64, &[DEMOTE, PROMOTE]),
-    ];
-    let [promote, demote, original32, original64] =
-        modules.each_ref().map(|m| m.instantiate().unwrap());
-    for (narrow, wide) in [
-        (0, 0),
-        (1, 0x36a0_0000_0000_0000), // 2^-149.
-        (3, 0x36b8_0000_0000_0000), // 1.5 * 2^-148, with a nonzero fraction.
-        (0x0040_0000, 0x3800_0000_0000_0000),
-        (0x007f_ffff, 0x380f_ffff_c000_0000), // Largest f32 subnormal.
-        (0x0080_0000, 0x3810_0000_0000_0000), // Smallest f32 normal.
-        (0x0080_0001, 0x3810_0000_2000_0000),
-        (0x3fa0_0001, 0x3ff4_0000_2000_0000),
-        (0x7f7f_ffff, 0x47ef_ffff_e000_0000), // Largest finite f32.
-        (INF32, INF64),
-    ] {
+fn promotes_to_exact_f64_bits_including_both_subnormal_extremes() {
+    let module = conversion(F32, F64, &[PROMOTE]);
+    let promote = module.instantiate().unwrap();
+    for &(narrow, wide) in EXACT_WIDTH_PAIRS {
         for (sign32, sign64) in [(0, 0), (SIGN32, SIGN64)] {
             let v32 = Value::F32(sign32 | narrow);
             let v64 = Value::F64(sign64 | wide);
@@ -51,6 +47,22 @@ fn widens_exactly_and_round_trips_representable_values() {
                 Ok(Some(v64)),
                 "promote {v32:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn round_trips_representable_values() {
+    let modules = [
+        conversion(F64, F32, &[DEMOTE]),
+        conversion(F32, F32, &[PROMOTE, DEMOTE]),
+        conversion(F64, F64, &[DEMOTE, PROMOTE]),
+    ];
+    let [demote, original32, original64] = modules.each_ref().map(|m| m.instantiate().unwrap());
+    for &(narrow, wide) in EXACT_WIDTH_PAIRS {
+        for (sign32, sign64) in [(0, 0), (SIGN32, SIGN64)] {
+            let v32 = Value::F32(sign32 | narrow);
+            let v64 = Value::F64(sign64 | wide);
             assert_eq!(
                 demote.invoke_with_values("answer", &[v64], ResultKind::F32),
                 Ok(Some(v32)),
@@ -74,19 +86,38 @@ fn widens_exactly_and_round_trips_representable_values() {
 fn demote_rounds_midpoints_and_their_neighbors_to_exact_bits() {
     let module = conversion(F64, F32, &[DEMOTE]);
     let demote = module.instantiate().unwrap();
+    // Expected magnitude bits at the adjacent f64 values and exact tie:
+    // [one ulp below the midpoint, at the midpoint, one ulp above].
     let midpoints = [
-        (0x3690_0000_0000_0000, 0, 1), // Half of the smallest f32 subnormal.
-        (0x36a8_0000_0000_0000, 1, 2), // Odd lower subnormal.
-        (0x36b4_0000_0000_0000, 2, 3), // Even lower subnormal.
-        (0x380f_ffff_e000_0000, 0x007f_ffff, 0x0080_0000), // Subnormal/normal.
-        (0x3ff0_0000_1000_0000, 0x3f80_0000, 0x3f80_0001), // Even lower normal.
-        (0x3ff0_0000_3000_0000, 0x3f80_0001, 0x3f80_0002), // Odd lower normal.
-        (0x3fff_ffff_f000_0000, 0x3fff_ffff, 0x4000_0000), // Carry into the exponent.
-        (0x47ef_ffff_f000_0000, 0x7f7f_ffff, INF32), // 2^128 - 2^103.
+        // Half of the smallest f32 subnormal: tie to signed zero.
+        (0x3690_0000_0000_0000, [0, 0, 1]),
+        (0x36a8_0000_0000_0000, [1, 2, 2]), // Odd lower subnormal.
+        (0x36b4_0000_0000_0000, [2, 2, 3]), // Even lower subnormal.
+        // Subnormal/normal boundary: tie to smallest normal.
+        (
+            0x380f_ffff_e000_0000,
+            [0x007f_ffff, 0x0080_0000, 0x0080_0000],
+        ),
+        // Even and odd lower normals, then carry across a binade.
+        (
+            0x3ff0_0000_1000_0000,
+            [0x3f80_0000, 0x3f80_0000, 0x3f80_0001],
+        ),
+        (
+            0x3ff0_0000_3000_0000,
+            [0x3f80_0001, 0x3f80_0002, 0x3f80_0002],
+        ),
+        (
+            0x3fff_ffff_f000_0000,
+            [0x3fff_ffff, 0x4000_0000, 0x4000_0000],
+        ),
+        // 2^128 - 2^103: tie to signed infinity.
+        (0x47ef_ffff_f000_0000, [0x7f7f_ffff, INF32, INF32]),
     ];
-    let neighbors = midpoints.into_iter().flat_map(|(midpoint, lo, hi)| {
-        let even = if lo & 1 == 0 { lo } else { hi };
-        [(midpoint - 1, lo), (midpoint, even), (midpoint + 1, hi)]
+    let neighbors = midpoints.into_iter().flat_map(|(midpoint, outputs)| {
+        [midpoint - 1, midpoint, midpoint + 1]
+            .into_iter()
+            .zip(outputs)
     });
     for (bits, expected) in neighbors.chain([
         (1, 0), // Smallest f64 subnormal.

@@ -865,6 +865,20 @@ fn fixtures() -> Vec<Fixture> {
     cases.push(Fixture::new(0x7f80_0042, &[1], &select_f32));
     cases.push(Fixture::new(i32::MIN, &[0], &select_f32));
     cases.push(Fixture::new(-42, &[-42], &[0x20, 0, 0xbe, 0xbc]));
+    // Reinterpret results back to integers so even a signaling NaN is exact.
+    cases.extend([
+        Fixture::new(
+            0x7f80_0042,
+            &[0xff80_0042_u32 as i32],
+            &[0x20, 0, 0xbe, 0x8b, 0xbc],
+        ),
+        Fixture::new(i32::MIN, &[0], &[0x20, 0, 0xbe, 0x8c, 0xbc]),
+        Fixture::new(
+            0xff80_0042_u32 as i32,
+            &[0x7f80_0042, i32::MIN],
+            &[0x20, 0, 0xbe, 0x20, 1, 0xbe, 0x98, 0xbc],
+        ),
+    ]);
     cases
 }
 
@@ -909,7 +923,35 @@ fn typed_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(f64_bits)],
         },
     ];
-    add_cases.chain(void_cases).chain(float_cases)
+    let sign_cases = [
+        (&[0x99][..], f64_bits | i64::MIN, f64_bits), // abs
+        (&[0x9a][..], 0, i64::MIN),                   // neg
+        (
+            &[0x44, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xa6][..],
+            f64_bits,
+            f64_bits | i64::MIN,
+        ), // copysign
+    ]
+    .into_iter()
+    .map(|(operations, arg, expected)| {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7e\x01\x7e\
+                          \x03\x02\x01\0\x07\x05\x01\x01x\0\0"
+            .to_vec();
+        let len = 6 + u8::try_from(operations.len()).unwrap();
+        bytes.extend([10, len + 2, 1, len, 0, 0x20, 0, 0xbf]);
+        bytes.extend(operations);
+        bytes.extend([0xbd, 0x0b]);
+        Fixture {
+            expected: Outcome::I64Invocation(Ok(expected)),
+            bytes,
+            export: "x",
+            args: vec![WasmValue::I64(arg)],
+        }
+    });
+    add_cases
+        .chain(void_cases)
+        .chain(float_cases)
+        .chain(sign_cases)
 }
 
 fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {

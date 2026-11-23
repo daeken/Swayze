@@ -19,6 +19,7 @@
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
+//! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
 //! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
 //! `i64.div_s`, `i64.div_u`, `i64.rem_s`, `i64.rem_u`,
@@ -146,12 +147,16 @@
 //! the body frame. Each pushes one operand holding the exact IEEE 754 bits.
 //! The four reinterpretations (`0xbc` through `0xbf` in the order listed above)
 //! consume one operand and change only its type, between i32 and f32 or between
-//! i64 and f64. Constants and reinterpretations each count as one dispatch;
-//! they do not perform floating-point arithmetic, quiet signaling NaNs, or
-//! canonicalize any bits. Floats are operand-only: function signatures (and
-//! thus exports and host arguments/results), locals, globals, control label
-//! results, floating-point memory instructions, and other floating-point
-//! numeric instructions remain unsupported.
+//! i64 and f64. For both widths, `abs` clears the sign bit and `neg` flips it;
+//! each consumes one operand and produces one of the same type. `copysign`
+//! consumes two operands of its width, taking the magnitude bits from the first
+//! (lhs) and only the sign bit from the second (rhs). Constants, reinterpretations,
+//! and sign operations each count as one dispatch. None uses native floating-point
+//! arithmetic or quiets signaling NaNs; sign operations leave all non-sign bits,
+//! including NaN payloads, unchanged. Floats are operand-only: function signatures
+//! (and thus exports and host arguments/results), locals, globals, control label
+//! results, floating-point memory instructions, and other floating-point numeric
+//! instructions remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -434,6 +439,10 @@
 //! on arm64 macOS found unchanged operand slots (16 bytes), call frames (856
 //! bytes each), and validation scratch layouts, including the decoded-instruction
 //! array (4,064 bytes), in both debug and release.
+//! Float sign-operation tests compare integer-reinterpreted results for both
+//! signs of zero, infinities, normals, subnormals, and quiet and signaling NaNs.
+//! They check `copysign` operand order, typed live and dead operands and floor
+//! diagnostics, and shared stack, instruction, and dispatch limits.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

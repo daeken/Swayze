@@ -221,7 +221,7 @@ fn comparison_tokens_charge_each_byte_and_each_push_and_emission_once() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
-    assert_eq!(error.span(), Span { start: 9, end: 12 });
+    assert_eq!(error.span(), Span { start: 8, end: 9 }); // Deferred name comparison.
 
     // Even a rejected punctuator is one token and charges all its bytes.
     for (work, kind, start) in [

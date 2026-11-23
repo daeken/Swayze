@@ -81,6 +81,25 @@ fn for_sequences_run_after_leading_updates_in_order_and_follow_loop_jumps() {
 }
 
 #[test]
+fn postfix_comma_updater_respects_comment_line_breaks_and_loop_jumps() {
+    for (jump, expected) in [("continue", 12.0), ("break", 0.0)] {
+        let source = format!("let i=0,seen=0;for(;i<1;i/*💡*/++,seen=i+1){{{jump};}}i*10+seen");
+        // Continue runs the postfix store before the suffix reads i; break
+        // leaves both bindings untouched.
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+        assert_error(
+            &source.replace("/*💡*/++", "/*💡\n*/@++@"),
+            ErrorKind::Unsupported,
+            "a line terminator cannot precede a postfix update",
+        );
+    }
+}
+
+#[test]
 fn for_update_sequence_delimiters_and_targets_keep_their_diagnostics() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, message) in [

@@ -1,5 +1,5 @@
 use swayze_js::{
-    ErrorKind, EvalError, Limit, Limits, Span, parse_script, parse_script_with_limits,
+    ErrorKind, EvalError, Limit, Limits, Span, Value, parse_script, parse_script_with_limits,
 };
 
 #[test]
@@ -100,6 +100,87 @@ fn clauses_see_enclosing_bindings_not_fresh_body_bindings() {
     assert_eq!(script.evaluate(), Ok(274.0));
 }
 
+#[test]
+fn let_header_has_its_own_scope_enclosing_a_distinct_body_scope() {
+    let script = parse_script(
+        "let i=9; let step=8; let sum=0; const seed=2;
+         for (let i=seed-2, step=(i ? 99 : 2); i<5; i+=step) {
+             const i=7;
+             let step=3;
+             sum+=i+step;
+             step++;
+         }
+         sum*100+i*10+step",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(3098.0));
+    assert_eq!(script.evaluate(), Ok(3098.0));
+
+    // A sibling loop and the enclosing Script can both reuse the header name.
+    assert_eq!(
+        parse_script("for(let i;false;){} for(let i=1;i;i--){} let i=42; i")
+            .unwrap()
+            .evaluate(),
+        Ok(42.0)
+    );
+}
+
+#[test]
+fn let_header_and_body_reinitialize_at_their_respective_entries() {
+    let script = parse_script(
+        "let trace=0;
+         for (let w=0; w<2; ++w) {
+             for (let i=1, step=i, spare; i<4; i+=step) {
+                 let local;
+                 trace=trace*10+(local ?? spare ?? i);
+                 local=9;
+                 if (i<3) { continue; }
+                 spare=8;
+                 break;
+             }
+         }
+         trace",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(123123.0));
+    assert_eq!(script.evaluate(), Ok(123123.0));
+}
+
+#[test]
+fn let_headers_support_omitted_clauses_and_the_existing_jump_rules() {
+    for (statement, expected) in [
+        (
+            "for(let i=0;;seen=i){if(i===2){i=99;break;}i++;continue;}",
+            2.0,
+        ),
+        ("for(let i=0;i<2;){i++;seen=i;continue;}", 2.0),
+        ("for(let i=2;;){seen=i;break;}", 2.0),
+        ("for(let i=2, stop=false;stop;seen=99){seen=i;}", 0.0),
+    ] {
+        let source = format!("let seen=0;{statement}seen");
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn loop_undefined_can_shadow_the_root_without_affecting_implicit_initialization() {
+    let script = parse_script(
+        "let result=0; let sentinel;
+         for (let undefined=40, x, y=undefined+2; !x; ++x) {
+             result=y;
+             x=0;
+         }
+         result===42 && undefined===sentinel",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(true)));
+    assert_error_at("let undefined;0", ErrorKind::Malformed, "undefined");
+}
+
 fn assert_error_at(source: &str, kind: ErrorKind, marked: &str) {
     // A prefix before '|' disambiguates identical tokens at different sites.
     let (prefix, needle) = marked.split_once('|').unwrap_or(("", marked));
@@ -153,7 +234,7 @@ fn requires_braces_delimiters_and_assignment_clauses() {
         ("for(){}42", Malformed, ")"),
         ("for(;;;){}42", Malformed, ";;|;"),
         ("for(0;false;){}42", Unsupported, "0"),
-        ("for(let i=0;false;){}42", Unsupported, "let"),
+        ("for(const i=0;false;){}42", Unsupported, "const"),
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "**="),
@@ -185,6 +266,85 @@ fn requires_braces_delimiters_and_assignment_clauses() {
             .evaluate(),
         Ok(5.0)
     );
+}
+
+#[test]
+fn let_header_names_are_checked_even_in_inactive_code() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, marked) in [
+        ("for(let i=0;false;){}i", Unsupported, "}|i"),
+        ("for(let i=0;false;){}i=7;42", Unsupported, "}|i"),
+        ("for(let i;false;){}for(;i;){}0", Unsupported, ";|i"),
+        ("if(false){for(let i,i=0;;){}}0", Malformed, ",|i"),
+        ("let i=42;for(let i=i;false;){}0", Unsupported, "i=|i"),
+        (
+            "let i=42;if(false){for(let x=false&&i,i;false;){}}0",
+            Unsupported,
+            "&&|i",
+        ),
+        (
+            "for(let x=undefined,undefined;false;){}0",
+            Unsupported,
+            "x=|undefined",
+        ),
+        (
+            "for(let undefined=undefined;false;){}0",
+            Unsupported,
+            "=|undefined",
+        ),
+        (
+            "for(let i=outer;false;){}let outer=0;0",
+            Unsupported,
+            "i=|outer",
+        ),
+        (
+            "for(let i=body;false;){let body=0;}0",
+            Unsupported,
+            "i=|body",
+        ),
+        ("for(let i;body;){let body=0;}0", Unsupported, ";|body"),
+        (
+            "for(let i;false;i=body){let body=0;}0",
+            Unsupported,
+            "i=|body",
+        ),
+        (
+            "for(let i;false;i=0){break;i=1;let i;}0",
+            Unsupported,
+            "break;|i",
+        ),
+        ("for(let i;false;i=unknown){}0", Unsupported, "unknown"),
+        ("const n=0;for(let i;false;n+=i){}0", Unsupported, "+="),
+    ] {
+        assert_error_at(source, kind, marked);
+    }
+}
+
+#[test]
+fn let_headers_require_declarators_and_both_for_semicolons() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, marked) in [
+        ("for(var i=0;false;){}0", Unsupported, "var"),
+        ("for(let i in j){}0", Unsupported, "in"),
+        ("for(let i of j){}0", Unsupported, "of"),
+        ("for(let i=0 in j){}0", Unsupported, "in"),
+        ("for(let {i}=x;false;){}0", Unsupported, "let |{"),
+        ("for(let [i]=x;false;){}0", Unsupported, "["),
+        ("for(let ;false;){}0", Malformed, "let |;"),
+        ("for(let i,;false;){}0", Malformed, ",|;"),
+        ("for(let i=0,;false;){}0", Malformed, ",|;"),
+        ("for(let i=;false;){}0", Malformed, "i=|;"),
+        ("for(let i+=0;false;){}0", Unsupported, "+="),
+        ("for(let i=(0,1);false;){}0", Unsupported, ","),
+        ("for(let i=0){}0", Malformed, ")"),
+        ("for(let i=0\ntrue;){}0", Malformed, "true"),
+        ("for(let i\ntrue;){}0", Malformed, "true"),
+        ("for(let i;false){}0", Malformed, ")"),
+        ("for(let i;false;let j){}0", Unsupported, "false;|let"),
+        ("for(let i;;)break;0", Malformed, "break"),
+    ] {
+        assert_error_at(source, kind, marked);
+    }
 }
 
 #[test]
@@ -341,5 +501,156 @@ fn for_dispatches_share_the_inclusive_execution_ceiling() {
             parse_script(source).unwrap().evaluate(),
             Err(EvalError::DispatchLimitExceeded)
         );
+    }
+}
+
+#[test]
+fn let_header_has_exact_source_token_nesting_and_work_costs() {
+    let source = "for(let a,b=a;false;){break;}0";
+    // In addition to the source bytes: one each for the header, header scope,
+    // statement frame, decimal conversion and break patch; 9 emissions; 2
+    // for duplicate checking b against a; 4 to look up a through b and a.
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 17,
+        max_nesting_depth: 1,
+        max_work: source.len() + 20,
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits).unwrap().evaluate(),
+        Ok(0.0)
+    );
+    for (limits, ceiling, start) in [
+        (
+            Limits {
+                max_source_bytes: limits.max_source_bytes - 1,
+                ..limits
+            },
+            Limit::SourceBytes,
+            source.len() - 1,
+        ),
+        (
+            Limits {
+                max_tokens: limits.max_tokens - 1,
+                ..limits
+            },
+            Limit::Tokens,
+            source.len() - 1,
+        ),
+        (
+            Limits {
+                max_nesting_depth: 0,
+                ..limits
+            },
+            Limit::NestingDepth,
+            source.find('(').unwrap(),
+        ),
+        (
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+            Limit::Work,
+            source.find("=a").unwrap() + 1,
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(ceiling));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            }
+        );
+    }
+
+    // The header, explicit group, and pending conditional share the same limit.
+    let source = "for(let x=(true?0:1),y=x;false;){}0";
+    let limits = Limits {
+        max_nesting_depth: 3,
+        ..Limits::default()
+    };
+    assert!(parse_script_with_limits(source, limits).is_ok());
+    let error = parse_script_with_limits(
+        source,
+        Limits {
+            max_nesting_depth: 2,
+            ..limits
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+    assert_eq!(&source[error.span().start..error.span().end], "?");
+}
+
+#[test]
+fn let_header_and_body_use_only_one_active_statement_frame() {
+    let open = "for(let i;false;){";
+    let limits = Limits {
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for depth in [128, 129] {
+        let source = format!("{}break;{}0", open.repeat(depth), "}".repeat(depth));
+        let result = parse_script_with_limits(&source, limits);
+        if depth == 128 {
+            let script = result.unwrap();
+            assert_eq!(script.max_stack_depth(), 1);
+            assert_eq!(script.evaluate(), Ok(0.0));
+        } else {
+            let error = result.unwrap_err();
+            let start = open.len() * 128;
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+            assert_eq!(
+                error.span(),
+                Span {
+                    start,
+                    end: start + 3
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn let_header_items_count_toward_prepared_instructions_and_binding_slots() {
+    use std::fmt::Write;
+
+    // 2,046 distinct bindings at two instructions each, plus four for
+    // the test, loop back edge and final expression. Flat items add no nesting.
+    let mut source = String::from("for(let a0000");
+    for i in 1..2046 {
+        write!(source, ",a{i:04}").unwrap();
+    }
+    let limits = Limits {
+        max_tokens: 5_000,
+        max_work: 13_000_000,
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for (suffix, instructions, expected) in [
+        (";false;){}42", 4096, Ok(42.0)),
+        (";false;){}+42", 4097, Err(EvalError::LimitExceeded)),
+        (",a2046;false;){}42", 4098, Err(EvalError::LimitExceeded)),
+    ] {
+        let script = parse_script_with_limits(&format!("{source}{suffix}"), limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.evaluate(), expected);
+    }
+}
+
+#[test]
+fn let_header_dispatches_share_the_inclusive_execution_ceiling() {
+    // Four for the two items, 11 per continuing iteration, four for the last
+    // (falsy) test and one for the final literal, before the extra unary ops.
+    for (prefixes, expected) in [(7, Ok(0.0)), (8, Err(EvalError::DispatchLimitExceeded))] {
+        let source = format!(
+            "for(let i=0,step=1;i<1488;i+=step){{continue;}}{}0",
+            "+ ".repeat(prefixes)
+        );
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.evaluate(), expected);
+        assert_eq!(script.evaluate(), expected);
     }
 }

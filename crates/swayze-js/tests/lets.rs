@@ -192,7 +192,7 @@ fn declarations_still_require_explicit_semicolons_and_name_targets() {
         ("let x;|", 0, Unsupported),
         ("let |{x}; x", 1, Unsupported),
         ("|var x; x", 3, Unsupported),
-        ("for(|let x;;){} 0", 3, Unsupported),
+        ("for(let x|){} 0", 1, Malformed),
         ("for(;false;|let x){} 0", 3, Unsupported),
     ] {
         error_at(source, len, kind);

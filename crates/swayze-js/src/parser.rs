@@ -279,6 +279,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         pending: Vec::new(),
         statement_frames: Vec::new(),
         innermost_loop: None,
+        for_header_scope: None,
         instructions: Vec::new(),
         scopes: Vec::new(),
         bindings: Vec::new(),
@@ -1004,7 +1005,7 @@ enum Pending {
 // All unresolved jump targets and binding operands are patched before returning a Script.
 const UNPATCHED: usize = usize::MAX;
 
-// Root is index 0; every block (including each else arm) gets its own index.
+// Root is index 0. Each braced body and each `for` header with `let` gets its own scope.
 struct Scope {
     parent: Option<usize>,
     last_binding: Option<usize>,
@@ -1035,11 +1036,19 @@ struct WriteAccess {
 enum ExpressionEnd {
     Script,
     Semicolon(&'static str),
-    Declarator(&'static str),
+    Declarator(DeclaratorEnd),
     StatementTest,
     ForSemicolon,
     ForClose,
 }
+
+#[derive(Clone, Copy)]
+enum DeclaratorEnd {
+    Statement(&'static str),
+    ForHeader,
+}
+
+const FOR_SEMICOLON: &str = "expected ';' between for clauses";
 
 const STORE_STATEMENT_END: ExpressionEnd =
     ExpressionEnd::Semicolon("assignments require explicit semicolons");
@@ -1099,6 +1108,9 @@ struct Parser<'s> {
     statement_frames: Vec<BlockFrame>,
     // Index into statement_frames; non-loop frames do not change it.
     innermost_loop: Option<usize>,
+    // Only active while parsing a `for (let ... )` header and opening its body.
+    // Once the body frame is pushed, its own scope links to this one.
+    for_header_scope: Option<usize>,
     instructions: Vec<Instruction>,
     // Parse-only scope, declaration (in slot order), and access tables.
     scopes: Vec<Scope>,
@@ -1210,7 +1222,9 @@ impl Parser<'_> {
     }
 
     fn current_scope(&self) -> usize {
-        self.statement_frames.last().map_or(0, |frame| frame.scope)
+        self.for_header_scope
+            .or_else(|| self.statement_frames.last().map(|frame| frame.scope))
+            .unwrap_or(0)
     }
 
     fn add_scope(&mut self, parent: Option<usize>, span: Span) -> Result<usize, Error> {
@@ -1253,10 +1267,7 @@ impl Parser<'_> {
                     "expected '{' to open the while body",
                 )
             }
-            TokenKind::For => (
-                self.parse_for_header()?,
-                "expected '{' to open the for body",
-            ),
+            TokenKind::For => return self.open_for(),
             TokenKind::Do => (
                 self.loop_frame(LoopLayout::PostTest {
                     body_start: self.instructions.len(),
@@ -1425,6 +1436,15 @@ impl Parser<'_> {
         }
     }
 
+    fn open_for(&mut self) -> Result<(), Error> {
+        let result = self.parse_for_header().and_then(|frame| {
+            let brace = self.require_block_open("expected '{' to open the for body")?;
+            self.open_block(frame, brace)
+        });
+        self.for_header_scope = None;
+        result
+    }
+
     fn parse_for_header(&mut self) -> Result<StatementFrame, Error> {
         let missing_open = "expected '(' after 'for'";
         let open = self.require_token(missing_open)?;
@@ -1439,16 +1459,22 @@ impl Parser<'_> {
         let init = self.require_token("expected a for initializer or ';'")?;
         let unsupported_store =
             "for initializers and updates must assign to, increment or decrement a name";
-        if matches!(init.kind, TokenKind::Close) {
-            return Err(Error::malformed(
-                init.span,
-                "expected ';' between for clauses",
-            ));
-        }
-        if !matches!(init.kind, TokenKind::Semicolon) {
-            self.parse_required_store(init, ExpressionEnd::ForSemicolon, unsupported_store)?;
+        match init.kind {
+            TokenKind::Close => return Err(Error::malformed(init.span, FOR_SEMICOLON)),
+            TokenKind::Semicolon => {}
+            TokenKind::Declaration(BindingKind::Let) => {
+                self.lexer.charge(1, init.span)?;
+                let scope = self.add_scope(Some(self.current_scope()), init.span)?;
+                self.for_header_scope = Some(scope);
+                self.parse_declaration_list(BindingKind::Let, DeclaratorEnd::ForHeader)?;
+            }
+            _ => {
+                self.parse_required_store(init, ExpressionEnd::ForSemicolon, unsupported_store)?;
+            }
         }
 
+        // Loop back edges skip the initializer. Reentering the statement
+        // executes its InitBinding instructions again, in the same fixed slots.
         let test = self.instructions.len();
         let first = self.require_token("expected a for test or ';'")?;
         let end = if matches!(first.kind, TokenKind::Semicolon) {
@@ -1662,13 +1688,25 @@ impl Parser<'_> {
     }
 
     fn parse_declaration(&mut self, kind: BindingKind) -> Result<(), Error> {
-        while self.parse_declarator(kind)? {}
+        let missing_semicolon = match kind {
+            BindingKind::Const => "const declarations require explicit semicolons",
+            BindingKind::Let => "let declarations require explicit semicolons",
+        };
+        self.parse_declaration_list(kind, DeclaratorEnd::Statement(missing_semicolon))
+    }
+
+    fn parse_declaration_list(
+        &mut self,
+        kind: BindingKind,
+        end: DeclaratorEnd,
+    ) -> Result<(), Error> {
+        while self.parse_declarator(kind, end)? {}
         Ok(())
     }
 
     // Emit and record one binding before reading the next; true means a comma
     // was consumed and another binding name is required.
-    fn parse_declarator(&mut self, kind: BindingKind) -> Result<bool, Error> {
+    fn parse_declarator(&mut self, kind: BindingKind, mode: DeclaratorEnd) -> Result<bool, Error> {
         let name = self.require_token("expected a binding name")?;
         match name.kind {
             TokenKind::Identifier => {}
@@ -1712,7 +1750,7 @@ impl Parser<'_> {
         }
         let scope = self.current_scope();
         // The classic Script global scope cannot lexically redeclare its
-        // non-configurable `undefined` property. Block scopes can shadow it.
+        // non-configurable `undefined` property. Nested scopes can shadow it.
         if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
             return Err(Error::malformed(
                 name.span,
@@ -1735,11 +1773,7 @@ impl Parser<'_> {
             }
             TokenKind::Assignment(None) => {
                 let first = self.require_token("expected a binding initializer")?;
-                let missing_semicolon = match kind {
-                    BindingKind::Const => "const declarations require explicit semicolons",
-                    BindingKind::Let => "let declarations require explicit semicolons",
-                };
-                self.parse_expression(first, ExpressionEnd::Declarator(missing_semicolon))?
+                self.parse_expression(first, ExpressionEnd::Declarator(mode))?
             }
             TokenKind::Assignment(Some(_)) => {
                 return Err(Error::unsupported(
@@ -1817,7 +1851,7 @@ impl Parser<'_> {
                 ExpressionEnd::ForSemicolon,
                 None | Some(TokenKind::Close | TokenKind::OpenBrace | TokenKind::CloseBrace),
             ) => {
-                return Err(Error::malformed(span, "expected ';' between for clauses"));
+                return Err(Error::malformed(span, FOR_SEMICOLON));
             }
             (
                 ExpressionEnd::ForClose,
@@ -2031,12 +2065,15 @@ impl Parser<'_> {
         let base_depth = self.stack_depth;
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
         let for_delimiter = match end_kind {
-            ExpressionEnd::ForSemicolon => Some("expected ';' between for clauses"),
+            ExpressionEnd::ForSemicolon | ExpressionEnd::Declarator(DeclaratorEnd::ForHeader) => {
+                Some(FOR_SEMICOLON)
+            }
             ExpressionEnd::ForClose => Some("expected ')' after the for update"),
             _ => None,
         };
         let missing_semicolon = match end_kind {
-            ExpressionEnd::Semicolon(message) | ExpressionEnd::Declarator(message) => Some(message),
+            ExpressionEnd::Semicolon(message)
+            | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
             _ => None,
         };
         let mut needs_operand = true;

@@ -82,9 +82,13 @@ unsupported, even in code that would not run; it never falls back to an outer
 binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. `for (init; test; update)` permits any clause
-to be empty; a missing test is true. The initializer and update, when present,
-must be supported assignments, increments, or decrements of an existing
-mutable binding in the enclosing scope. `break;` skips the update.
+to be empty; a missing test is true. The initializer can be a `let` declaration
+list. Its bindings are visible in the initializer, test, update, and body, but
+not after the loop. The initializer runs once each time execution enters the
+loop statement, not on each iteration. The update and any non-declaration
+initializer must be a supported assignment, increment, or decrement of an
+initialized mutable binding. `break;` skips the update. The subset has no
+closures and does not model their observable per-iteration environments.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`
 jumps to the test; `break;` skips it. Untaken arms and skipped loop bodies

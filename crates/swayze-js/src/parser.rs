@@ -1278,8 +1278,8 @@ const EXPRESSION_STATEMENT_SEMICOLON: &str = "expression statements require expl
 const ASSIGNMENT_STATEMENT_SEMICOLON: &str = "assignments require explicit semicolons";
 const UPDATE_STATEMENT_SEMICOLON: &str = "increments and decrements require explicit semicolons";
 
-// One frame per active standalone block or control statement, reused for `else {}`.
-// Every test starts and every block enters and joins at operand depth zero.
+// One frame per active standalone block or control statement, reused across
+// if arms. All tests and statement bodies enter and join at operand depth zero.
 #[derive(Clone, Copy)]
 struct StatementFrame {
     kind: StatementKind,
@@ -1293,19 +1293,39 @@ enum StatementKind {
     Block,
     IfThen {
         branch: usize,
+        arm: StatementBody,
     },
     IfElse {
         join: usize,
-    },
-    // The then-arm scope has closed, but this if is still active until its
-    // nested `else if` finishes.
-    IfAwaitJoin {
-        join: usize,
+        arm: StatementBody,
     },
     Loop {
         layout: LoopLayout,
         enclosing_loop: Option<usize>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum StatementBody {
+    Braced,
+    // Dispatch exactly one statement. If it opens a frame, the if stays
+    // suspended below that frame until the entire child statement finishes.
+    Single,
+}
+
+impl StatementKind {
+    fn has_single_arm(self) -> bool {
+        matches!(
+            self,
+            Self::IfThen {
+                arm: StatementBody::Single,
+                ..
+            } | Self::IfElse {
+                arm: StatementBody::Single,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1330,9 +1350,9 @@ enum LoopLayout {
     },
 }
 
-struct BlockFrame {
+struct ActiveStatement {
     statement: StatementFrame,
-    // The open body's scope, or the enclosing scope for IfAwaitJoin.
+    // A braced body owns this scope; a single arm inherits it.
     scope: usize,
 }
 
@@ -1344,7 +1364,7 @@ struct Parser<'s> {
     max_nesting_depth: usize,
     nesting_depth: usize,
     pending: Vec<(Pending, Span)>,
-    statement_frames: Vec<BlockFrame>,
+    statement_frames: Vec<ActiveStatement>,
     // Indices into statement_frames. Unlabeled jumps need only the loop chain.
     innermost_loop: Option<usize>,
     // Includes all loops, labeled standalone blocks, and labeled if chains.
@@ -1371,7 +1391,7 @@ impl Parser<'_> {
         let mut in_directive_prologue = true;
         let exit = loop {
             if !self.statement_frames.is_empty() {
-                self.parse_block_item()?;
+                self.parse_body_item()?;
                 continue;
             }
             let Some(first) = self.next_token(TokenPosition::Operand)? else {
@@ -1513,10 +1533,10 @@ impl Parser<'_> {
             }
             TokenKind::If => {
                 let branch = self.parse_statement_test("expected '(' after 'if'")?;
-                (
-                    self.optional_target_frame(StatementKind::IfThen { branch }, label_start),
-                    "expected '{' to open an if branch",
-                )
+                let (arm, start) = self.read_if_arm("expected a statement after the if test")?;
+                let frame =
+                    self.optional_target_frame(StatementKind::IfThen { branch, arm }, label_start);
+                return self.push_statement(frame, arm, start);
             }
             TokenKind::While => {
                 let test = self.instructions.len();
@@ -1549,17 +1569,39 @@ impl Parser<'_> {
         self.open_block(frame, brace)
     }
 
+    fn read_if_arm(&mut self, missing: &'static str) -> Result<(StatementBody, Span), Error> {
+        let token = self.require_token(TokenPosition::Operand, missing)?;
+        match token.kind {
+            TokenKind::OpenBrace => Ok((StatementBody::Braced, token.span)),
+            TokenKind::CloseBrace | TokenKind::Else => Err(Error::malformed(token.span, missing)),
+            _ => {
+                let start = token.span;
+                self.lookahead = Some(Some(token));
+                Ok((StatementBody::Single, start))
+            }
+        }
+    }
+
     fn open_block(&mut self, frame: StatementFrame, brace: Span) -> Result<(), Error> {
-        self.lexer.charge(1, brace)?;
+        self.push_statement(frame, StatementBody::Braced, brace)
+    }
+
+    fn push_statement(
+        &mut self,
+        frame: StatementFrame,
+        body: StatementBody,
+        start: Span,
+    ) -> Result<(), Error> {
+        self.lexer.charge(1, start)?;
         let index = self.statement_frames.len();
-        let scope = self.add_scope(Some(self.current_scope()), brace)?;
+        let scope = self.body_scope(body, self.current_scope(), start)?;
         try_push(
             &mut self.statement_frames,
-            BlockFrame {
+            ActiveStatement {
                 statement: frame,
                 scope,
             },
-            brace,
+            start,
         )?;
         if frame.target.is_some() {
             self.innermost_target = Some(index);
@@ -1570,107 +1612,103 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn close_block(&mut self, close: Span) -> Result<(), Error> {
-        let index = self
-            .statement_frames
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| Error::malformed(close, "unmatched closing brace"))?;
-        let kind = self.statement_frames[index].statement.kind;
-        match kind {
-            StatementKind::Block | StatementKind::Loop { .. } => {}
-            StatementKind::IfThen { branch } => {
-                // Only this freshly closed then-arm can take the next `else`.
-                // In particular, a `}` belongs to the parent, so leave it cached.
-                let next = self.next_token(TokenPosition::Operand)?;
-                if let Some(Token {
-                    kind: TokenKind::Else,
-                    span,
-                    ..
-                }) = next
-                {
-                    let join = self.instructions.len();
-                    self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
-                    self.patch_if_jump(branch, span)?;
-                    let missing = "expected '{' or 'if' after 'else'";
-                    let arm = self.require_token(TokenPosition::Plain, missing)?;
-                    let parent = self.statement_frames[..index]
-                        .last()
-                        .map_or(0, |frame| frame.scope);
-                    if matches!(arm.kind, TokenKind::If) {
-                        // The next test sees the enclosing scope, but this if
-                        // still occupies a frame when opening the nested if.
-                        let frame = &mut self.statement_frames[index];
-                        frame.statement.kind = StatementKind::IfAwaitJoin { join };
-                        frame.scope = parent;
-                        // The outer frame keeps any label prefix; the next
-                        // arm opens without a target of its own.
-                        return self.open_statement(arm, self.labels.len());
+    fn finish_body(&mut self, mut end: Span) -> Result<(), Error> {
+        loop {
+            let index = self.statement_frames.len() - 1;
+            let kind = self.statement_frames[index].statement.kind;
+            match kind {
+                StatementKind::IfThen { branch, .. } => {
+                    if self.open_else_arm(index, branch)? {
+                        return Ok(());
                     }
-                    let brace = Self::block_open(arm, missing)?;
-                    // Same control frame, disjoint lexical scope.
-                    let scope = self.add_scope(Some(parent), brace)?;
-                    let frame = &mut self.statement_frames[index];
-                    frame.statement.kind = StatementKind::IfElse { join };
-                    frame.scope = scope;
-                    return Ok(());
+                    self.patch_if_jump(branch, end)?;
                 }
-                self.lookahead = Some(next);
-                self.patch_if_jump(branch, close)?;
-                return self.close_if_chain(close);
+                StatementKind::IfElse { join, .. } => self.patch_if_jump(join, end)?,
+                StatementKind::Block | StatementKind::Loop { .. } => {}
             }
-            StatementKind::IfElse { join } => {
-                self.patch_if_jump(join, close)?;
-                return self.close_if_chain(close);
+            let break_head = self.pop_frame();
+            let close = end;
+            if let StatementKind::Loop {
+                layout,
+                enclosing_loop,
+            } = kind
+            {
+                self.innermost_loop = enclosing_loop;
+                end = self.finish_loop(layout, close)?;
             }
-            StatementKind::IfAwaitJoin { .. } => {
-                unreachable!("a brace always closes an open body");
+            self.patch_pending_jumps(break_head, close)?;
+            // A completed child is the whole body of a single-arm parent,
+            // but only one item in a braced parent. Unwind without recursion.
+            if !self
+                .statement_frames
+                .last()
+                .is_some_and(|frame| frame.statement.kind.has_single_arm())
+            {
+                return Ok(());
             }
         }
-        // A trailing test resolves names in the surrounding scope, not
-        // the just-closed body, even when entered by a continue.
-        let break_head = self.pop_frame();
-        if let StatementKind::Loop {
-            layout,
-            enclosing_loop,
-        } = kind
-        {
-            self.innermost_loop = enclosing_loop;
-            let (back_target, exit, end) = match layout {
-                LoopLayout::PreTest {
-                    continue_target,
-                    exit,
-                } => (continue_target, exit, close),
-                LoopLayout::PostTest {
-                    body_start,
-                    continue_head,
-                } => {
-                    self.patch_pending_jumps(continue_head, close)?;
-                    let (exit, end) = self.parse_do_tail()?;
-                    (body_start, exit, end)
-                }
-            };
-            self.emit(Instruction::LoopBack(back_target), end)?;
-            self.patch_jump(exit, end)?;
-        }
-        // A block needs no exit instruction; join at the current frontier.
-        self.patch_pending_jumps(break_head, close)
     }
 
-    fn close_if_chain(&mut self, close: Span) -> Result<(), Error> {
-        // Only suspended `else if` ancestors close here, not any enclosing
-        // braced body. All arms and named breaks share one empty-stack join.
-        loop {
-            let break_head = self.pop_frame();
-            self.patch_pending_jumps(break_head, close)?;
-            let Some(BlockFrame { statement, .. }) = self.statement_frames.last() else {
-                return Ok(());
-            };
-            let StatementKind::IfAwaitJoin { join } = statement.kind else {
-                return Ok(());
-            };
-            self.patch_if_jump(join, close)?;
+    fn open_else_arm(&mut self, index: usize, branch: usize) -> Result<bool, Error> {
+        // Check the nearest unfinished then-arm first. Leave any other
+        // lookahead (including EOF) cached for an outer arm or the next item.
+        let next = self.next_token(TokenPosition::Operand)?;
+        let Some(Token {
+            kind: TokenKind::Else,
+            span,
+            ..
+        }) = next
+        else {
+            self.lookahead = Some(next);
+            return Ok(false);
+        };
+        let join = self.instructions.len();
+        self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
+        self.patch_if_jump(branch, span)?;
+        let (arm, start) = self.read_if_arm("expected a statement after 'else'")?;
+        let parent = self.statement_frames[..index]
+            .last()
+            .map_or(0, |frame| frame.scope);
+        let scope = self.body_scope(arm, parent, start)?;
+        // Same frame and jump target, but no visibility into the then-arm.
+        let frame = &mut self.statement_frames[index];
+        frame.statement.kind = StatementKind::IfElse { join, arm };
+        frame.scope = scope;
+        Ok(true)
+    }
+
+    fn body_scope(
+        &mut self,
+        body: StatementBody,
+        parent: usize,
+        start: Span,
+    ) -> Result<usize, Error> {
+        match body {
+            StatementBody::Braced => self.add_scope(Some(parent), start),
+            StatementBody::Single => Ok(parent),
         }
+    }
+
+    fn finish_loop(&mut self, layout: LoopLayout, close: Span) -> Result<Span, Error> {
+        // The body has been popped. A trailing test sees the surrounding
+        // scope, not the body's scope, even when entered by a continue.
+        let (back_target, exit, end) = match layout {
+            LoopLayout::PreTest {
+                continue_target,
+                exit,
+            } => (continue_target, exit, close),
+            LoopLayout::PostTest {
+                body_start,
+                continue_head,
+            } => {
+                self.patch_pending_jumps(continue_head, close)?;
+                let (exit, end) = self.parse_do_tail()?;
+                (body_start, exit, end)
+            }
+        };
+        self.emit(Instruction::LoopBack(back_target), end)?;
+        self.patch_jump(exit, end)?;
+        Ok(end)
     }
 
     fn pop_frame(&mut self) -> usize {
@@ -1898,25 +1936,39 @@ impl Parser<'_> {
     fn block_open(open: Token, missing_open: &'static str) -> Result<Span, Error> {
         match open.kind {
             TokenKind::OpenBrace => Ok(open.span),
-            TokenKind::If => Err(Error::unsupported(
-                open.span,
-                "if branches and loop bodies require braces",
-            )),
+            TokenKind::If => Err(Error::unsupported(open.span, "loop bodies require braces")),
             _ => Err(Error::malformed(open.span, missing_open)),
         }
     }
 
-    fn parse_block_item(&mut self) -> Result<(), Error> {
+    fn parse_body_item(&mut self) -> Result<(), Error> {
+        let depth = self.statement_frames.len();
+        let single_arm = self.statement_frames[depth - 1]
+            .statement
+            .kind
+            .has_single_arm();
         let first = self.require_token(
             TokenPosition::Operand,
             "expected a statement or '}' in the block",
         )?;
         self.check_statement_boundary(first.span)?;
-        if matches!(first.kind, TokenKind::CloseBrace) {
-            return self.close_block(first.span);
+        if !single_arm && matches!(first.kind, TokenKind::CloseBrace) {
+            return self.finish_body(first.span);
         }
-        if let Some(start) = self.parse_non_expression_statement(first)? {
-            self.parse_discarded_expression(start, ExpressionEnd::ExpressionStatement)?;
+        if single_arm && matches!(first.kind, TokenKind::Declaration(_)) {
+            return Err(Error::unsupported(
+                first.span,
+                "declarations in if arms require braces",
+            ));
+        }
+        let end = if let Some(start) = self.parse_non_expression_statement(first)? {
+            self.parse_discarded_expression(start, ExpressionEnd::ExpressionStatement)?
+        } else {
+            // Leaf statements consume their semicolon and leave no lookahead.
+            Span::at(self.lexer.offset)
+        };
+        if single_arm && self.statement_frames.len() == depth {
+            self.finish_body(end)?;
         }
         Ok(())
     }
@@ -2002,7 +2054,7 @@ impl Parser<'_> {
             }
             return Err(Error::unsupported(
                 first.span,
-                "a label must directly precede a braced block, if, or loop",
+                "a label must directly precede a block, if, or braced loop",
             ));
         }
     }

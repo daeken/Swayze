@@ -154,15 +154,14 @@ fn delimiters_and_the_required_final_expression() {
         ("if (true {} 1", Malformed),
         ("if ((true) {} 1", Malformed),
         ("if (true;) {} 1", Malformed),
-        ("if (true) 1", Malformed),
-        ("let x=0; if (true) x=1; x", Malformed),
-        ("let x=0; if (true) {} else x=1; x", Malformed),
+        ("if (true) 1", Unsupported),
+        ("if (true) else;", Malformed),
+        ("{ if (true) } 1", Malformed),
         ("if (true) {} else", Malformed),
         ("if (true) {} else if false {} 1", Malformed),
-        ("if (true) {} else if (false) ; 1", Malformed),
-        ("let x=0; if (true) {} else if (false) x=1; x", Malformed),
+        ("{ if (true) ; else } 1", Malformed),
         ("if (true) {} else if (false)", Malformed),
-        ("if (true) {} else if (false) {} else 1", Malformed),
+        ("if (true) {} else if (false) {} else 1", Unsupported),
         ("if (true) {", Malformed),
         ("if (true) {}", Unsupported),
         ("let x=0; if (true) {x=2;}", Unsupported),
@@ -180,19 +179,6 @@ fn delimiters_and_the_required_final_expression() {
     ] {
         assert_eq!(parse_script(source).unwrap_err().kind(), kind, "{source}");
     }
-    // An unbraced nested `if` is still disallowed unless it follows `else`.
-    let source = "if (false) {} else if (true) if (false) {} 1";
-    let error = parse_script(source).unwrap_err();
-    let start = source.rfind("if").unwrap();
-    assert_eq!(error.kind(), Unsupported);
-    assert_eq!(
-        error.span(),
-        Span {
-            start,
-            end: start + 2
-        }
-    );
-    assert!(error.message().contains("require braces"));
 }
 
 #[test]

@@ -139,8 +139,9 @@ without coercion. Each discard costs one instruction dispatch. Comma
 expressions are allowed in expression statements, the final expression, and control tests;
 within a ternary arm or an assignment right-hand side they require grouping.
 
-Standalone blocks, empty statements (`;`), expression statements, and braced `if`, `while`,
-`do…while`, and `for` statements may precede the required final expression.
+Standalone blocks, empty statements (`;`), expression statements, `if`, and
+braced `while`, `do…while`, and `for` statements may precede the required final
+expression.
 Braced bodies can contain `let` and `const` declarations,
 assignments and updates to earlier visible `let` bindings, and other supported
 statements. Empty statements and standalone braces emit no instructions. A block-local declaration shadows enclosing
@@ -150,7 +151,7 @@ unsupported, even in code that would not run; it never falls back to an outer
 binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. One or more ASCII identifier labels can
-precede a standalone block, a braced `if` chain, or a `while`, `do`, or
+precede a standalone block, an `if` statement, or a `while`, `do`, or
 classic `for` loop. All labels on a statement share the same target, and an
 `if` label is active in every arm. `break name;` exits the whole labeled
 statement; `continue name;` can target only a loop. Neither permits a line
@@ -172,9 +173,11 @@ closures and does not model their observable per-iteration environments.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`
 jumps to the test; `break;` skips it. Untaken arms and skipped loop bodies
-are still checked. An `else if` chain tests conditions in order, skips later
-arms once one matches, and requires braces around every arm body. Each test
-uses the enclosing scope, not the preceding arm's scope. The parser uses at
+are still checked. Each `if` arm can be a block or a single supported
+statement. A single arm does not introduce a lexical scope and cannot be a
+bare `let` or `const` declaration. `else` binds to the nearest unmatched
+`if`. An `else if` chain tests conditions in order and skips later arms once
+one matches. Each test uses the enclosing scope, not the preceding arm's scope. The parser uses at
 most 128 active statement frames, separately from the expression nesting
 limit. Each `if` in a chain counts as a frame, and each `if` branch fixup
 costs one unit of parse work, including in a plain `if`.

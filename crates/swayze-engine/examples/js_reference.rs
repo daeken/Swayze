@@ -619,6 +619,12 @@ fn fixtures() -> Vec<String> {
             r#"`\uD800${'\uDC00'}\${x}`"#,
             "`${''}${``}` === ''",
             "let s = 'a' + 'b'; `${s}${s + 'c'}${s}`",
+            "if (1); 7",
+            "let n = 0; if (true) if (false) n = 1; else n = 2; n",
+            "let n = 0; if (false) { if (true) n = 1; } else n = 2; n",
+            "let n = 0; if (true) do { ++n; } while (n < 3); else n = 9; n",
+            "let n = 0; a: b: if (true) if (true) break a; else n = 9; n",
+            "let n = 0; for (; n < 4; ++n) { if (n < 3) continue; break; } n",
         ]
         .map(str::to_owned),
     );

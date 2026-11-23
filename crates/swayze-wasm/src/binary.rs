@@ -20,15 +20,18 @@ pub struct Error {
 /// Why the input was not accepted. Unsupported does not imply valid Wasm.
 ///
 /// `UnexpectedElse` indicates a stray or duplicate `else`; `MissingElse`
-/// indicates an i32-result `if` closed by `end` without an `else`. The depth in
-/// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
-/// active frame's entry stack floor. The latter is reported at a delimiter if
-/// the depth differs from the frame's result arity (zero for void, one for i32),
-/// unless a missing result is supplied by an unreachable frame's polymorphic
-/// floor. `TypeMismatch` is reported at the consuming opcode or delimiter.
-/// `BranchTableArityMismatch` compares a `br_table` target's result arity to
-/// that of the first target. `InvalidStartSignature` reports the parameter
-/// count and result kind of a start target that is not `() -> ()`.
+/// indicates a value-producing `if` closed by `end` without an `else`. The
+/// depth in `StackUnderflow` and `InvalidResultDepth` counts only operands
+/// above the active frame's entry stack floor. The latter is reported at a
+/// delimiter if the depth differs from the frame's result arity (zero for
+/// void, one for i32 or i64), unless a missing result is supplied by an
+/// unreachable frame's polymorphic floor. `TypeMismatch` is reported at the
+/// consuming opcode or delimiter.
+/// `BranchTableArityMismatch` and `BranchTableTypeMismatch` compare a
+/// `br_table` target's result to that of the first target. The former is
+/// reported for void versus a value, the latter for i32 versus i64.
+/// `InvalidStartSignature` reports the parameter count and result kind of a
+/// start target that is not `() -> ()`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -72,6 +75,7 @@ pub enum ErrorKind {
     UnexpectedElse,
     MissingElse,
     BranchTableArityMismatch { expected: usize, actual: usize },
+    BranchTableTypeMismatch { expected: ValType, actual: ValType },
     StackUnderflow { depth: usize },
     TypeMismatch { expected: ValType, actual: ValType },
     InvalidResultDepth { depth: usize },
@@ -290,11 +294,17 @@ impl fmt::Display for Error {
             TrailingBodyBytes => f.write_str("trailing bytes after code body end"),
             UnsupportedOpcode { opcode } => write!(f, "unsupported opcode {opcode:#04x}"),
             UnexpectedElse => f.write_str("else without a matching then arm"),
-            MissingElse => f.write_str("i32-result if requires an else arm"),
+            MissingElse => f.write_str("value-producing if requires an else arm"),
             BranchTableArityMismatch { expected, actual } => {
                 write!(
                     f,
                     "br_table label has result arity {actual}, expected {expected}"
+                )
+            }
+            BranchTableTypeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "br_table label has result type {actual}, expected {expected}"
                 )
             }
             StackUnderflow { depth } => {
@@ -354,8 +364,9 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
 /// the immediate. A `br_table` with more than 16 explicit entries is reported
 /// as [`ErrorKind::UnsupportedCount`] with [`IntegerField::BranchTableCount`].
-/// [`ErrorKind::BranchTableArityMismatch`] points to the first table label
-/// immediate (including the default) whose arity differs from the first label's.
+/// [`ErrorKind::BranchTableArityMismatch`] and [`ErrorKind::BranchTableTypeMismatch`]
+/// point to the first table label immediate (including the default) whose
+/// result differs from the first label's.
 /// Oversized table counts, entry bounds, or element segment counts are reported
 /// as [`ErrorKind::UnsupportedCount`], and a reversed table bounds pair as
 /// [`ErrorKind::InvalidTableLimits`] at the start of the maximum field.
@@ -889,10 +900,10 @@ const MAX_BR_TABLE_ENTRIES: u32 = 16;
 const MAX_BODY_TABLE_TARGETS: usize = Limit::CodeBodyBytes.maximum();
 
 impl ResultKind {
-    fn count(self) -> usize {
+    fn value_type(self) -> Option<ValType> {
         match self {
-            Self::Void => 0,
-            Self::I32 => 1,
+            Self::Void => None,
+            Self::I32 => Some(ValType::I32),
         }
     }
 }
@@ -996,7 +1007,7 @@ struct BranchEdge {
 
 #[derive(Clone, Copy, Debug)]
 enum BranchTarget {
-    End { pc: usize, result: ResultKind },
+    End { pc: usize, result: Option<ValType> },
     Loop(LoopTarget),
     Function,
 }
@@ -1247,14 +1258,14 @@ impl I64BinaryOp {
 /// mutability, every stack effect, and the complete body frame. Each local
 /// index is below the exact parameter-plus-declaration bound, and writes
 /// preserve the slot's declared tag. Block and if jump targets are strictly
-/// later decoded instruction indices or the
-/// one-past-last index. Block and if exits carry their target floor and result
-/// arity. Loop continues target an in-body index at or before the branch.
-/// Function exits target the one-past-last index with the signature's result
-/// arity. A table refers to consecutive edges of the same result arity, with
-/// its default at the end. Implicit operands are validation-only: no execution falls
-/// through `unreachable`, `br`, `br_table`, or `return`, and transfers establish
-/// the target's concrete stack depth.
+/// later decoded instruction indices or the one-past-last index. Block and if
+/// exits carry their target floor and result type, if any. Loop continues
+/// target an in-body index at or before the branch. Function exits target the
+/// one-past-last index with the signature's result type, if any. A table refers
+/// to consecutive edges of the same label type, with its default at the end.
+/// Implicit operands are validation-only: no execution falls through
+/// `unreachable`, `br`, `br_table`, or `return`, and transfers establish the
+/// target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     signature: FunctionType,
@@ -1319,17 +1330,18 @@ impl CallFrame {
     fn take_branch(&mut self, edge: BranchEdge, code: &ValidatedCode) {
         let (pc, result) = match edge.target {
             BranchTarget::End { pc, result } => (pc, result),
-            BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultKind::Void),
-            BranchTarget::Function => (code.instructions.len(), code.signature.result),
+            BranchTarget::Loop(LoopTarget(pc)) => (pc, None),
+            BranchTarget::Function => (code.instructions.len(), code.signature.result.value_type()),
         };
-        let value = match result {
-            ResultKind::Void => None,
-            ResultKind::I32 => Some(self.pop_i32()),
-        };
+        let value = result.map(|ty| {
+            let value = self.pop();
+            debug_assert_eq!(value.operand_type(), ty);
+            value
+        });
         // Restore the target's prefix, not the active frame's.
         self.depth = edge.floor;
         if let Some(value) = value {
-            self.push_i32(value);
+            self.push(value);
         }
         self.pc = pc;
     }
@@ -1388,7 +1400,10 @@ pub(super) fn execute(
             // Fallthrough and function exits leave exactly the declared results
             // in this frame. Completing the call requires no dispatch.
             debug_assert_eq!(frame.pc, code.instructions.len());
-            debug_assert_eq!(frame.depth, code.signature.result.count());
+            debug_assert_eq!(
+                frame.depth,
+                usize::from(code.signature.result.value_type().is_some())
+            );
             let value = match code.signature.result {
                 ResultKind::Void => None,
                 ResultKind::I32 => Some(frame.operands[0].as_i32()),
@@ -1517,6 +1532,8 @@ pub(super) fn execute(
             }
             Instruction::Jump { target } => frame.pc = target,
             Instruction::Branch { edge, conditional } => {
+                // A conditional fallthrough pops only the test; any tagged
+                // payload is already in the right slot.
                 if !conditional || frame.pop_i32() != 0 {
                     frame.take_branch(edge, code);
                 }
@@ -1559,7 +1576,8 @@ fn decode_locals(
 #[derive(Clone, Copy)]
 struct ControlFrame {
     base: usize,
-    result: ResultKind,
+    // A control frame may yield an i64; function signatures remain i32/void.
+    result: Option<ValType>,
     kind: ControlKind,
     last_branch: Option<BranchSlot>,
     unreachable: bool,
@@ -1569,7 +1587,7 @@ impl ControlFrame {
     fn function(result: ResultKind) -> Self {
         Self {
             base: 0,
-            result,
+            result: result.value_type(),
             kind: ControlKind::Function,
             last_branch: None,
             unreachable: false,
@@ -1583,9 +1601,9 @@ impl ControlFrame {
 
     fn pop_result(self, stack: &mut OperandStack, offset: usize) -> Result<(), Error> {
         let depth = stack.depth - self.base;
-        let expected = self.result.count();
+        let expected = usize::from(self.result.is_some());
         if depth == expected || (self.unreachable && depth < expected) {
-            stack.pop(self, expected, Some(ValType::I32), offset)
+            stack.pop(self, expected, self.result, offset)
         } else {
             Err(Error {
                 offset,
@@ -1716,6 +1734,22 @@ impl OperandStack {
         Ok(())
     }
 
+    fn pop_transfer(
+        &mut self,
+        frame: ControlFrame,
+        has_selector: bool,
+        result: Option<ValType>,
+        offset: usize,
+    ) -> Result<(), Error> {
+        let count = usize::from(result.is_some());
+        if has_selector {
+            // Preserve underflow-before-type diagnostics across both operands.
+            self.depth_after_pop(frame, 1 + count, offset)?;
+            self.pop(frame, 1, Some(ValType::I32), offset)?;
+        }
+        self.pop(frame, count, result, offset)
+    }
+
     fn select(&mut self, frame: ControlFrame, offset: usize) -> Result<(), Error> {
         // As with other consumers, report underflow before checking types.
         let remaining = self.depth_after_pop(frame, 3, offset)?;
@@ -1770,7 +1804,7 @@ fn validate_plain_stack(
                 CallTarget::Direct(index) => (environment.functions[index as usize], 0),
                 CallTarget::Indirect(expected) => (expected, 1),
             };
-            let result = (signature.result == ResultKind::I32).then_some(I32);
+            let result = signature.result.value_type();
             (signature.parameters as usize + selectors, i32_type, result)
         }
         Instruction::LocalSet(index) => (1, Some(local_zeros[index as usize].operand_type()), None),
@@ -2058,7 +2092,7 @@ fn validate_body(
             mut last_branch,
             ..
         } = frame;
-        let requires_else = result == ResultKind::I32 && matches!(kind, ControlKind::Then { .. });
+        let requires_else = result.is_some() && matches!(kind, ControlKind::Then { .. });
         let opcode = body.byte().ok_or_else(|| {
             let expected = if requires_else { ELSE } else { END };
             body.error(ErrorKind::TruncatedByte { expected })
@@ -2073,8 +2107,8 @@ fn validate_body(
             frame.pop_result(&mut operands, offset)?;
             // Push the declared result onto the parent's stack as a concrete
             // value, even if the child supplied it only by polymorphism.
-            if result == ResultKind::I32 {
-                operands.push(I32, offset)?;
+            if let Some(ty) = result {
+                operands.push(ty, offset)?;
             }
             // Forward edges target the next decoded slot, possibly the final
             // one-past-last index. All sources are in the decoded prefix.
@@ -2127,7 +2161,7 @@ fn validate_body(
             BLOCK | LOOP | IF => {
                 let result = if opcode == LOOP {
                     body.expect_byte(EMPTY_BLOCK_TYPE)?;
-                    ResultKind::Void
+                    None
                 } else {
                     body.block_result()?
                 };
@@ -2183,14 +2217,13 @@ fn validate_body(
                 // Pop against the active floor. Only execution of the taken
                 // branch uses the target floor.
                 let conditional = opcode == BR_IF;
-                let results = target.result.count(); // Supported loops are void.
-                operands.pop(frame, usize::from(conditional) + results, Some(I32), offset)?;
+                operands.pop_transfer(frame, conditional, target.result, offset)?;
                 decoded[pc] = Instruction::Branch { edge, conditional };
                 if !conditional {
                     operands.depth = frames[nesting].mark_unreachable();
-                } else if results != 0 {
+                } else if let Some(ty) = target.result {
                     // Fallthrough restores the result, even if it was implicit.
-                    operands.push(I32, offset)?;
+                    operands.push(ty, offset)?;
                 }
             }
             BR_TABLE => {
@@ -2208,9 +2241,14 @@ fn validate_body(
                     if target.result != expected {
                         return Err(Error {
                             offset: label_offset,
-                            kind: ErrorKind::BranchTableArityMismatch {
-                                expected: expected.count(),
-                                actual: target.result.count(),
+                            kind: match (expected, target.result) {
+                                (Some(expected), Some(actual)) => {
+                                    ErrorKind::BranchTableTypeMismatch { expected, actual }
+                                }
+                                _ => ErrorKind::BranchTableArityMismatch {
+                                    expected: usize::from(expected.is_some()),
+                                    actual: usize::from(target.result.is_some()),
+                                },
                             },
                         });
                     }
@@ -2224,8 +2262,8 @@ fn validate_body(
                     );
                     target_count += 1;
                 }
-                let results = common.expect("every table has a default").count();
-                operands.pop(frame, 1 + results, Some(I32), offset)?;
+                let result = common.expect("every table has a default");
+                operands.pop_transfer(frame, true, result, offset)?;
                 decoded[pc] = Instruction::BranchTable {
                     first,
                     explicit_count,
@@ -2359,12 +2397,13 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn block_result(&mut self) -> Result<ResultKind, Error> {
+    fn block_result(&mut self) -> Result<Option<ValType>, Error> {
         let offset = self.position();
         // Preserve the original expected byte in errors for block and if.
         match self.byte() {
-            Some(EMPTY_BLOCK_TYPE) => Ok(ResultKind::Void),
-            Some(I32) => Ok(ResultKind::I32),
+            Some(EMPTY_BLOCK_TYPE) => Ok(None),
+            Some(I32) => Ok(Some(ValType::I32)),
+            Some(I64) => Ok(Some(ValType::I64)),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {

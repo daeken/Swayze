@@ -81,6 +81,10 @@ fn nested_conditionals_close_only_the_assignments_in_the_finished_arm() {
              x*100+y*10+z",
             333.0,
         ),
+        (
+            "let x, y, z; z = true ? x = false ? 1 : y = 2 : 99; x * 100 + y * 10 + z",
+            222.0,
+        ),
         ("let x,y; (10 + (true ? x=1 : y=2))", 11.0),
         ("let x=10,y; (x /= false ? y=1 : y=2)*10+y", 52.0),
     ] {
@@ -90,10 +94,16 @@ fn nested_conditionals_close_only_the_assignments_in_the_finished_arm() {
 
 #[test]
 fn comma_ownership_is_decided_after_the_conditional_joins() {
+    assert_marked_error(
+        "let test=true,x,y=7,z=2; (test ? x = 1@,@ y : z)",
+        ErrorKind::Malformed,
+        "expected ':' before ','",
+    );
     for (source, expected) in [
         ("let x,y; const v=x=false ? y=1 : y=2,z=x+y; z+v", 6.0),
         ("let x,y; true ? x=(1,2) : y=3, x", 2.0),
         ("let x,y; false ? x=1 : y=2, y", 2.0),
+        ("let test=true,x,y=7,z=2; (test ? x = 1 : z, x + y)", 8.0),
         (
             "let x; for(let y=false ? x=1 : x=2,z=y; z===x; ) { break; } x",
             2.0,

@@ -23,7 +23,8 @@ pub struct Error {
 /// the depth differs from the frame's result arity (zero for void, one for i32),
 /// unless a missing result is supplied by an unreachable frame's implicit i32.
 /// `BranchTableArityMismatch` compares a `br_table` target's result arity to
-/// that of the first target.
+/// that of the first target. `VoidFunctionExport` indicates that a function
+/// export names a function with no result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -44,6 +45,7 @@ pub enum ErrorKind {
     TruncatedData { declared: usize, available: usize },
     InvalidUtf8Name,
     DuplicateExportName,
+    VoidFunctionExport { index: u32 },
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
     TruncatedMemoryLimitsFlags,
@@ -199,6 +201,9 @@ impl fmt::Display for Error {
             ),
             InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
             DuplicateExportName => f.write_str("duplicate export name"),
+            VoidFunctionExport { index } => {
+                write!(f, "cannot export function {index} without an i32 result")
+            }
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
             TruncatedMemoryLimitsFlags => f.write_str("missing memory limits flags"),
@@ -282,6 +287,8 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
+/// [`ErrorKind::VoidFunctionExport`] points to the start of the exported
+/// function's index immediate.
 /// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
 /// (including the implicit function label) is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
@@ -318,9 +325,9 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     read_header(&mut module)?;
 
     let mut last_standard = 0;
-    let mut type_arities = [0; MAX_TYPES as usize];
+    let mut types = [FunctionType::PLACEHOLDER; MAX_TYPES as usize];
     let mut type_count = None;
-    let mut function_arities = [0; MAX_FUNCTIONS as usize];
+    let mut function_types = [FunctionType::PLACEHOLDER; MAX_FUNCTIONS as usize];
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
@@ -361,28 +368,31 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             });
         }
         match id {
-            1 => type_count = Some(validate_types(&mut section, &mut type_arities)?),
+            1 => type_count = Some(validate_types(&mut section, &mut types)?),
             3 => {
                 let count = section.count(IntegerField::FunctionCount, 1..=MAX_FUNCTIONS)?;
                 // Without a type section, use a placeholder zero-arg type at
                 // index zero while checking framing and order. Reject its absence
                 // in the final required-section check.
                 let bound = type_count.unwrap_or(1);
-                for arity in &mut function_arities[..count as usize] {
+                for signature in &mut function_types[..count as usize] {
                     let index = section.index(IntegerField::TypeIndex, bound)?;
-                    *arity = type_arities[index as usize];
+                    *signature = types[index as usize];
                 }
                 function_count = Some(count);
             }
             5 => memory_bytes = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
-            7 => exports = validate_exports(&mut section, function_count)?,
+            7 => {
+                let declarations = function_count.map(|count| &function_types[..count as usize]);
+                exports = validate_exports(&mut section, declarations)?;
+            }
             10 => {
-                let declarations = function_count.map(|count| &function_arities[..count as usize]);
+                let declarations = function_count.map(|count| &function_types[..count as usize]);
                 functions = validate_code(
                     &mut section,
                     declarations,
-                    type_arities[0],
+                    types[0],
                     memory_bytes.is_some(),
                     &globals[..global_count],
                 )?;
@@ -466,20 +476,38 @@ const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 
+#[derive(Clone, Copy, Debug)]
+struct FunctionType {
+    parameters: u32,
+    result: ResultArity,
+}
+
+impl FunctionType {
+    // Keep the existing framing checks for a module missing its type section.
+    const PLACEHOLDER: Self = Self {
+        parameters: 0,
+        result: ResultArity::I32,
+    };
+}
+
 fn validate_types(
     section: &mut Reader<'_>,
-    arities: &mut [u32; MAX_TYPES as usize],
+    types: &mut [FunctionType; MAX_TYPES as usize],
 ) -> Result<u32, Error> {
     let count = section.count(IntegerField::TypeCount, 1..=MAX_TYPES)?;
-    for arity in &mut arities[..count as usize] {
+    for signature in &mut types[..count as usize] {
         section.expect_byte(0x60)?; // functype
-        let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
-        for _ in 0..parameter_count {
+        let parameters = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
+        for _ in 0..parameters {
             section.expect_byte(I32)?;
         }
-        section.count(IntegerField::ResultCount, 1..=1)?;
-        section.expect_byte(I32)?;
-        *arity = parameter_count;
+        let result = if section.count(IntegerField::ResultCount, 0..=1)? == 0 {
+            ResultArity::Void
+        } else {
+            section.expect_byte(I32)?;
+            ResultArity::I32
+        };
+        *signature = FunctionType { parameters, result };
     }
     Ok(count)
 }
@@ -550,7 +578,7 @@ fn validate_globals(
 
 fn validate_exports(
     section: &mut Reader<'_>,
-    function_count: Option<u32>,
+    declarations: Option<&[FunctionType]>,
 ) -> Result<Vec<Export>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
@@ -568,8 +596,16 @@ fn validate_exports(
             });
         }
         section.expect_byte(0x00)?; // function export descriptor
-        let index = if let Some(bound) = function_count {
-            section.index(IntegerField::FunctionIndex, bound)?
+        let index = if let Some(declarations) = declarations {
+            let index_offset = section.position();
+            let index = section.index(IntegerField::FunctionIndex, declarations.len() as u32)?;
+            if declarations[index as usize].result == ResultArity::Void {
+                return Err(Error {
+                    offset: index_offset,
+                    kind: ErrorKind::VoidFunctionExport { index },
+                });
+            }
+            index
         } else {
             // No valid target without a function section. Preserve framing and
             // order checks before the final required-section check rejects it.
@@ -818,14 +854,14 @@ impl BinaryOp {
 /// jump targets are strictly later decoded instruction indices or the
 /// one-past-last index. Block and if exits carry their target floor and result
 /// arity. Loop continues target an in-body index at or before the branch.
-/// Function exits target the one-past-last index with just one result. A table
-/// refers to consecutive edges, including its default at the end, all with the
-/// same result arity. Implicit operands are validation-only: no execution falls
+/// Function exits target the one-past-last index with the signature's result
+/// arity. A table refers to consecutive edges of the same result arity, with
+/// its default at the end. Implicit operands are validation-only: no execution falls
 /// through `unreachable`, `br`, `br_table`, or `return`, and transfers establish
 /// the target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
-    parameter_count: usize,
+    signature: FunctionType,
     instructions: Vec<Instruction>,
     table_targets: Vec<BranchEdge>,
 }
@@ -866,11 +902,11 @@ impl CallFrame {
         self.operands[self.depth]
     }
 
-    fn take_branch(&mut self, edge: BranchEdge, function_end: usize) {
+    fn take_branch(&mut self, edge: BranchEdge, code: &ValidatedCode) {
         let (pc, result) = match edge.target {
             BranchTarget::End { pc, result } => (pc, result),
             BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
-            BranchTarget::Function => (function_end, ResultArity::I32),
+            BranchTarget::Function => (code.instructions.len(), code.signature.result),
         };
         let value = match result {
             ResultArity::Void => None,
@@ -891,7 +927,7 @@ pub(super) fn execute(
     args: &[i32],
 ) -> Result<i32, InvokeError> {
     let module = instance.module;
-    let parameter_count = module.functions[function_index].parameter_count;
+    let parameter_count = module.functions[function_index].signature.parameters as usize;
     if args.len() != parameter_count {
         return Err(InvokeError::ArityMismatch {
             expected: parameter_count,
@@ -907,16 +943,21 @@ pub(super) fn execute(
         // Export and call indices are bounded by the exact decoded body count.
         let code = &module.functions[frame.function_index];
         let Some(&instruction) = code.instructions.get(frame.pc) else {
-            // At the one-past-last PC, whether by fallthrough or a function
-            // exit, there is one result. Resuming the caller needs no fuel.
+            // Fallthrough and function exits leave exactly the declared results
+            // in this frame. Completing the call requires no dispatch.
             debug_assert_eq!(frame.pc, code.instructions.len());
-            debug_assert_eq!(frame.depth, 1);
-            let value = frame.operands[0];
+            debug_assert_eq!(frame.depth, code.signature.result.count());
+            let value = match code.signature.result {
+                ResultArity::Void => None,
+                ResultArity::I32 => Some(frame.operands[0]),
+            };
             if active == 0 {
-                return Ok(value);
+                return Ok(value.expect("validated exports return one i32"));
             }
             active -= 1;
-            frames[active].push(value);
+            if let Some(value) = value {
+                frames[active].push(value);
+            }
             continue;
         };
         if remaining_dispatches == 0 {
@@ -956,7 +997,7 @@ pub(super) fn execute(
                 // parameter order. Reset reused frame storage before entering.
                 let index = index as usize;
                 let end = frame.depth;
-                frame.depth -= module.functions[index].parameter_count;
+                frame.depth -= module.functions[index].signature.parameters as usize;
                 let callee = CallFrame::new(index, &frame.operands[frame.depth..end]);
                 active += 1;
                 frames[active] = callee;
@@ -994,7 +1035,7 @@ pub(super) fn execute(
             Instruction::Jump { target } => frame.pc = target,
             Instruction::Branch { edge, conditional } => {
                 if !conditional || frame.pop() != 0 {
-                    frame.take_branch(edge, code.instructions.len());
+                    frame.take_branch(edge, code);
                 }
             }
             Instruction::BranchTable {
@@ -1006,7 +1047,7 @@ pub(super) fn execute(
                 // explicit_count + 1 edges starting at first, so first + index
                 // is below table_targets.len() (at most MAX_BODY_TABLE_TARGETS).
                 let index = (frame.pop() as u32).min(explicit_count) as usize;
-                frame.take_branch(code.table_targets[first + index], code.instructions.len());
+                frame.take_branch(code.table_targets[first + index], code);
             }
         }
     }
@@ -1036,13 +1077,15 @@ struct ControlFrame {
 }
 
 impl ControlFrame {
-    const FUNCTION: Self = Self {
-        base: 0,
-        result: ResultArity::I32,
-        kind: ControlKind::Function,
-        last_branch: None,
-        unreachable: false,
-    };
+    fn function(result: ResultArity) -> Self {
+        Self {
+            base: 0,
+            result,
+            kind: ControlKind::Function,
+            last_branch: None,
+            unreachable: false,
+        }
+    }
 
     fn mark_unreachable(&mut self) -> usize {
         self.unreachable = true;
@@ -1249,14 +1292,14 @@ fn decode_plain(
 
 fn validate_code(
     section: &mut Reader<'_>,
-    declarations: Option<&[u32]>,
-    first_type_arity: u32,
+    declarations: Option<&[FunctionType]>,
+    first_type: FunctionType,
     has_memory: bool,
     globals: &[Global],
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
-    let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |arities| {
-        let count = arities.len() as u32;
+    let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |types| {
+        let count = types.len() as u32;
         count..=count
     });
     let count = section.count(IntegerField::CodeCount, allowed_counts)?;
@@ -1265,17 +1308,17 @@ fn validate_code(
         .try_reserve_exact(count as usize)
         .map_err(|_| allocation_error)?;
     for index in 0..count {
-        let (parameter_count, function_arities) = match declarations {
-            Some(arities) => (arities[index as usize], arities),
+        let (signature, function_types) = match declarations {
+            Some(types) => (types[index as usize], types),
             // Preserve framing and ordering diagnostics for incomplete modules:
             // without declarations there are no call targets, and the first type
-            // gives the placeholder arity until the final required-section check.
-            None => (first_type_arity, &[][..]),
+            // gives the placeholder signature until the final required-section check.
+            None => (first_type, &[][..]),
         };
         functions.push(validate_body(
             section,
-            parameter_count,
-            function_arities,
+            signature,
+            function_types,
             has_memory,
             globals,
         )?);
@@ -1285,8 +1328,8 @@ fn validate_code(
 
 fn validate_body(
     section: &mut Reader<'_>,
-    parameter_count: u32,
-    function_arities: &[u32],
+    signature: FunctionType,
+    function_types: &[FunctionType],
     has_memory: bool,
     globals: &[Global],
 ) -> Result<ValidatedCode, Error> {
@@ -1299,7 +1342,7 @@ fn validate_body(
             available,
         },
     })?;
-    let local_bound = parameter_count + validate_locals(&mut body)?;
+    let local_bound = signature.parameters + validate_locals(&mut body)?;
     // Forward transfers reserve slots that their matching delimiters backpatch.
     // Each block or if chains its incoming edges, each visited once at the
     // target's end. Loop edges resolve immediately to the PC saved at entry.
@@ -1313,7 +1356,7 @@ fn validate_body(
     let mut count = 0;
     let mut depth = 0usize;
     // Slot zero is the function frame, which does not count against the cap.
-    let mut frames = [ControlFrame::FUNCTION; Limit::ControlDepth.maximum() + 1];
+    let mut frames = [ControlFrame::function(signature.result); Limit::ControlDepth.maximum() + 1];
     let mut nesting = 0;
     let end_offset = loop {
         let offset = body.position();
@@ -1518,7 +1561,7 @@ fn validate_body(
                     opcode,
                     offset,
                     local_bound,
-                    function_arities.len() as u32,
+                    function_types.len() as u32,
                     has_memory,
                     globals,
                 )?;
@@ -1531,7 +1574,8 @@ fn validate_body(
                     | Instruction::GlobalGet(_)
                     | Instruction::MemorySize => depth + 1,
                     Instruction::Call(index) => {
-                        consume(function_arities[index as usize] as usize)? + 1
+                        let callee = function_types[index as usize];
+                        consume(callee.parameters as usize)? + callee.result.count()
                     }
                     Instruction::Drop | Instruction::LocalSet(_) | Instruction::GlobalSet(_) => {
                         consume(1)?
@@ -1571,7 +1615,7 @@ fn validate_body(
     instructions.extend_from_slice(&decoded[..count]);
     retained_targets.extend_from_slice(&table_targets[..target_count]);
     Ok(ValidatedCode {
-        parameter_count: parameter_count as usize,
+        signature,
         instructions,
         table_targets: retained_targets,
     })

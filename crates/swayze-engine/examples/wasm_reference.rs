@@ -284,6 +284,20 @@ fn fixtures() -> Vec<Fixture> {
             args,
         });
     }
+    // Export x keeps an operand live across a call to a private void helper.
+    // The helper stores its argument in a global and explicitly returns.
+    let void_helper = b"\0asm\x01\0\0\0\x01\x0a\x02\x60\x01\x7f\x01\x7f\x60\x01\x7f\0\
+                        \x03\x03\x02\0\x01\x06\x06\x01\x7f\x01\x41\0\x0b\x07\x05\x01\x01x\0\0\
+                        \x0a\x15\x02\x0b\0\x41\x03\x20\0\x10\x01\x23\0\x6a\x0b\
+                        \x07\0\x20\0\x24\0\x0f\x0b";
+    for (input, expected) in [(39, 42), (-8, -5), (i32::MAX, i32::MIN + 2)] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(expected)),
+            bytes: void_helper.to_vec(),
+            export: "x",
+            args: vec![input],
+        });
+    }
     // A taken branch keeps 39, discards 7, and preserves 3 below the block.
     // Fallthrough adds 7 and 39 before returning the block result.
     let branch = [

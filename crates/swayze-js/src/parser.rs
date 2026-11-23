@@ -220,6 +220,7 @@ pub(crate) enum Instruction {
     Boolean(bool),
     Null,
     Undefined,
+    StringLength,
     LoadBinding(usize),
     InitBinding {
         slot: usize,
@@ -481,6 +482,7 @@ enum TokenKind {
     OpenBrace,
     CloseBrace,
     Question,
+    Dot,
     Colon,
     Comma,
     Semicolon,
@@ -516,6 +518,18 @@ pub(crate) fn is_trivia_space(c: char) -> bool {
 
 fn is_identifier_start(c: char) -> bool {
     c.is_ascii_alphabetic() || matches!(c, '_' | '$')
+}
+
+fn is_identifier_continue(c: char) -> bool {
+    is_identifier_start(c) || c.is_ascii_digit()
+}
+
+fn is_outside_ascii_name(c: char) -> bool {
+    c == '\\' || (!c.is_ascii() && !is_trivia_space(c))
+}
+
+fn unsupported_token(span: Span) -> Error {
+    Error::unsupported(span, "token is outside the arithmetic subset")
 }
 
 fn is_excluded_name(name: &str) -> bool {
@@ -608,7 +622,15 @@ impl Lexer<'_> {
         ))
     }
 
-    fn next(&mut self) -> Result<Option<Token>, Error> {
+    fn charge_token(&mut self, first: Span) -> Result<(), Error> {
+        self.tokens_left = self
+            .tokens_left
+            .checked_sub(1)
+            .ok_or_else(|| Error::limit(first, Limit::Tokens))?;
+        Ok(())
+    }
+
+    fn next(&mut self, allow_dot: bool) -> Result<Option<Token>, Error> {
         let after_line_break = self.skip_trivia()?;
         let Some(c) = self.peek() else {
             return Ok(None);
@@ -618,15 +640,13 @@ impl Lexer<'_> {
             start,
             end: start + c.len_utf8(),
         };
-        self.tokens_left = self
-            .tokens_left
-            .checked_sub(1)
-            .ok_or_else(|| Error::limit(first, Limit::Tokens))?;
+        self.charge_token(first)?;
         self.consume(c)?;
 
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
+            '.' if allow_dot => TokenKind::Dot,
             '\'' | '"' => TokenKind::String(self.string_literal(c, start)?),
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
@@ -649,12 +669,7 @@ impl Lexer<'_> {
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
             '+' | '-' | '*' | '/' | '%' => self.operator(c)?,
-            _ => {
-                return Err(Error::unsupported(
-                    first,
-                    "token is outside the arithmetic subset",
-                ));
-            }
+            _ => return Err(unsupported_token(first)),
         };
         Ok(Some(Token {
             kind,
@@ -666,18 +681,38 @@ impl Lexer<'_> {
         }))
     }
 
-    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
-        while let Some(c) = self
-            .peek()
-            .filter(|&c| is_identifier_start(c) || c.is_ascii_digit())
+    fn consume_length(&mut self, dot: Span) -> Result<(), Error> {
+        const LENGTH: &str = "length";
+        self.skip_trivia()?;
+        // This is a fixed-size probe, not generic property-name lexing. In
+        // particular, neither escaped nor longer names are aliases, and all
+        // other properties retain the unsupported diagnostic at the dot.
+        let Some(rest) = self.rest().strip_prefix(LENGTH) else {
+            return Err(unsupported_token(dot));
+        };
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| is_identifier_continue(c) || is_outside_ascii_name(c))
         {
+            return Err(unsupported_token(dot));
+        }
+        self.charge_token(Span {
+            start: self.offset,
+            end: self.offset + 1,
+        })?;
+        for c in LENGTH.chars() {
+            self.consume(c)?;
+        }
+        Ok(())
+    }
+
+    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
+        while let Some(c) = self.peek().filter(|&c| is_identifier_continue(c)) {
             self.consume(c)?;
         }
         // Don't mistake the ASCII prefix of a Unicode or escaped name for a keyword.
-        if let Some(c) = self
-            .peek()
-            .filter(|&c| c == '\\' || (!c.is_ascii() && !is_trivia_space(c)))
-        {
+        if let Some(c) = self.peek().filter(|&c| is_outside_ascii_name(c)) {
             let span = self.consume(c)?;
             return Err(Error::unsupported(
                 span,
@@ -1277,9 +1312,16 @@ impl Parser<'_> {
     }
 
     fn next_token(&mut self) -> Result<Option<Token>, Error> {
+        self.next_token_with_dot(false)
+    }
+
+    fn next_token_with_dot(&mut self, allow_dot: bool) -> Result<Option<Token>, Error> {
         match self.lookahead.take() {
+            Some(Some(token)) if !allow_dot && matches!(token.kind, TokenKind::Dot) => {
+                Err(unsupported_token(token.span))
+            }
             Some(next) => Ok(next),
-            None => self.lexer.next(),
+            None => self.lexer.next(allow_dot),
         }
     }
 
@@ -1654,7 +1696,7 @@ impl Parser<'_> {
                 first.span,
                 UpdateResult::New,
             ),
-            TokenKind::Identifier => match self.next_token()? {
+            TokenKind::Identifier => match self.next_token_with_dot(true)? {
                 Some(Token {
                     kind: TokenKind::Assignment(op),
                     span,
@@ -1755,7 +1797,7 @@ impl Parser<'_> {
                 let name = self.parse_update_target(first.span)?;
                 return self.parse_statement_update(name, op, first.span, UpdateResult::New);
             }
-            TokenKind::Identifier => match self.next_token()? {
+            TokenKind::Identifier => match self.next_token_with_dot(true)? {
                 Some(Token {
                     kind: TokenKind::Colon,
                     ..
@@ -2607,6 +2649,9 @@ impl Parser<'_> {
             } = token;
             let group_start =
                 after_open && matches!(self.pending.last(), Some((Pending::Group, _)));
+            // Operand completeness is not sufficient: a name update or a
+            // read that already took a suffix cannot take another dot.
+            let mut allow_dot = false;
             match (needs_operand, kind) {
                 (true, TokenKind::Update(op)) => {
                     let name = self.parse_update_target(span)?;
@@ -2670,27 +2715,35 @@ impl Parser<'_> {
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
+                (false, TokenKind::Dot) => {
+                    self.lexer.consume_length(span)?;
+                    self.emit(Instruction::StringLength, span)?;
+                }
                 (true, TokenKind::String(range)) => {
                     self.emit(Instruction::String(range), span)?;
                     needs_operand = false;
+                    allow_dot = true;
                 }
                 (true, TokenKind::Number(value)) => {
                     self.emit(Instruction::Number(value), span)?;
                     needs_operand = false;
+                    allow_dot = true;
                 }
                 (true, TokenKind::Boolean(value)) => {
                     self.emit(Instruction::Boolean(value), span)?;
                     needs_operand = false;
+                    allow_dot = true;
                 }
                 (true, TokenKind::Null) => {
                     self.emit(Instruction::Null, span)?;
                     needs_operand = false;
+                    allow_dot = true;
                 }
                 (true, TokenKind::Identifier) => {
                     // Charge the load, assignment marker or update at the name
                     // before looking ahead, preserving the read's work order.
                     self.lexer.charge(1, span)?;
-                    match self.next_token()? {
+                    match self.next_token_with_dot(true)? {
                         Some(Token {
                             kind: TokenKind::Assignment(op),
                             span: operator,
@@ -2714,6 +2767,7 @@ impl Parser<'_> {
                             self.lookahead = Some(following);
                             self.record_access(span, None)?;
                             self.emit_charged(Instruction::LoadBinding(UNPATCHED), span)?;
+                            allow_dot = true;
                         }
                     }
                     needs_operand = false;
@@ -2845,7 +2899,10 @@ impl Parser<'_> {
                             // Do not consume the opening brace or do-while semicolon.
                             break (span, Some(kind));
                         }
-                        Some((Pending::Group, _)) => self.nesting_depth -= 1,
+                        Some((Pending::Group, _)) => {
+                            self.nesting_depth -= 1;
+                            allow_dot = true;
+                        }
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(
                                 span,
@@ -2903,7 +2960,7 @@ impl Parser<'_> {
                 kind,
                 TokenKind::Question | TokenKind::Colon | TokenKind::Comma
             );
-            next = self.next_token()?;
+            next = self.next_token_with_dot(allow_dot)?;
         };
         let at_eof = delimiter.is_none();
         self.reduce_expression(end)?;
@@ -3148,7 +3205,8 @@ impl Parser<'_> {
             | Instruction::Negate
             | Instruction::Not
             | Instruction::BitwiseNot
-            | Instruction::Void => (1, 1),
+            | Instruction::Void
+            | Instruction::StringLength => (1, 1),
             Instruction::UpdateNumber(_)
             | Instruction::Add
             | Instruction::Subtract

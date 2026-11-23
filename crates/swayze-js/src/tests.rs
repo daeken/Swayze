@@ -39,6 +39,34 @@ fn assert_limit(source: &str, limits: Limits, limit: Limit, start: usize, end: u
 }
 
 #[test]
+fn string_length_is_an_atomic_primary_continuation() {
+    use Instruction::{Exponentiate, StringLength};
+    let script = parse_script("2 ** -((('ab'))).length").unwrap();
+    assert!(matches!(
+        script.instructions(),
+        [
+            Number(2.0),
+            Instruction::String(_),
+            StringLength,
+            Negate,
+            Exponentiate
+        ]
+    ));
+    assert_eq!(script.max_stack_depth(), 2);
+    assert_postfix(
+        "let s; ((s = null)).length",
+        &[
+            Instruction::Undefined,
+            init_let(0),
+            Instruction::Null,
+            Instruction::StoreBindingKeep(0),
+            StringLength,
+        ],
+        1,
+    );
+}
+
+#[test]
 fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
     use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, StoreBinding};
 

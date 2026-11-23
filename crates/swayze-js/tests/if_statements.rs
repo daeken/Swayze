@@ -139,24 +139,18 @@ fn delimiters_and_the_required_final_expression() {
     ] {
         assert_eq!(parse_script(source).unwrap_err().kind(), kind, "{source}");
     }
-    for source in [
-        "if (true) {if (false) {}} 1",
-        "if (false) {} else {if (true) {}} 1",
-        "if (false) {} else if (true) {} 1",
-    ] {
-        let error = parse_script(source).unwrap_err();
-        let start = source.rfind("if").unwrap();
-        assert_eq!(error.kind(), Unsupported, "{source}");
-        assert_eq!(
-            error.span(),
-            Span {
-                start,
-                end: start + 2
-            },
-            "{source}"
-        );
-        assert!(error.message().contains("nested if"), "{source}");
-    }
+    let source = "if (false) {} else if (true) {} 1";
+    let error = parse_script(source).unwrap_err();
+    let start = source.rfind("if").unwrap();
+    assert_eq!(error.kind(), Unsupported);
+    assert_eq!(
+        error.span(),
+        Span {
+            start,
+            end: start + 2
+        }
+    );
+    assert!(error.message().contains("else if"));
 }
 
 #[test]
@@ -177,7 +171,6 @@ fn validates_both_bodies_even_when_untaken() {
         ("x=1+;", Malformed),
         ("x=(x=1);", Unsupported),
         ("x+=1;", Unsupported),
-        ("while (false) {}", Unsupported),
         ("function f() {}", Unsupported),
     ] {
         for statement in [

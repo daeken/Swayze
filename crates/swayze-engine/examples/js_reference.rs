@@ -172,6 +172,11 @@ fn fixtures() -> Vec<String> {
             "let x = -0; while (x || 0 / 0) { x = 42; } x",
             "let x = 4; let y = 0; while (x !== 0 && true) { y = y + x; x = x - 1; } y",
             "let x = 0; while (false) {} while (x < 2) { x = x + 1; } if (x) { x = x * 21; } x",
+            "let x = 0; if (true) { if (false) { x = 9; } else { x = 42; } } else { x = 7; } x",
+            "let x = 0; if (true) { if (false) { x = 9; } } else { x = 7; } x",
+            "let x = 3; let y = 0; while (x) { if (x > 1) { y = y + x; } else { y = y * 2; } x = x - 1; } y",
+            "let x = 3; let y = 0; let z = 0; while (x) { y = x; while (y) { z = z + 1; y = y - 1; } x = x - 1; } z",
+            "let x = -0; if (false) { while (true) { x = 42; } } else { while (x) { x = false; } } x",
         ]
         .map(str::to_owned),
     );

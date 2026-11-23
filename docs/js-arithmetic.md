@@ -33,13 +33,13 @@ true. The same truthiness drives `!`, `&&`, and `||`. `!` returns a Boolean;
 Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
 All operands and arms must use supported syntax and bindings.
 
-Top-level `if (test) { ... }` statements may precede the final expression.
-Braced arms hold simple assignments to earlier `let` bindings. Only the
-selected arm runs; a false test with no `else` leaves the bindings unchanged.
-Both arms are checked without executing them. Top-level `while (test) { ... }`
-statements reevaluate the test before each iteration and run the braced
-assignments only while it is truthy. Nested control statements, `else if`,
-and declarations in branches or loop bodies are outside the subset.
+`if (test) { ... }` and `while (test) { ... }` statements may precede the final
+expression. Braced bodies hold simple assignments to earlier `let` bindings
+and nested `if` and `while` statements. Only the selected `if` arm runs; a false
+test with no `else` skips the body. A `while` reevaluates its test before each
+iteration. Untaken arms and skipped loop bodies are still checked. The parser
+uses at most 128 active statement frames, separate from the expression nesting
+limit. Unbraced `else if` and declarations in these bodies are unsupported.
 
 The evaluator sees only private instructions, not the original source. Before
 allocating, it checks a ceiling of 4,096 prepared instructions, counting

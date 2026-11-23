@@ -3,6 +3,9 @@ use std::fmt;
 // Fixed ceiling for decimal literals with a point or exponent.
 const MAX_DECIMAL_LITERAL_BYTES: usize = 4096;
 
+// Independent of the caller's expression nesting limit.
+const MAX_STATEMENT_FRAMES: usize = 128;
+
 /// A half-open UTF-8 byte range in the original source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
@@ -27,7 +30,7 @@ pub struct Limits {
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
     /// Maximum combined depth of open parentheses (including statement tests)
-    /// and pending conditional expressions.
+    /// and pending conditional expressions. Statement frames have a separate fixed cap.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
     pub max_work: usize,
@@ -49,6 +52,7 @@ impl Default for Limits {
 pub enum Limit {
     SourceBytes,
     Tokens,
+    /// The caller's expression nesting limit or the fixed statement frame cap.
     NestingDepth,
     Work,
     /// Fixed byte ceiling for a decimal literal with a point or exponent.
@@ -242,6 +246,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         max_nesting_depth: limits.max_nesting_depth,
         nesting_depth: 0,
         pending: Vec::new(),
+        statement_frames: Vec::new(),
         instructions: Vec::new(),
         bindings: Vec::new(),
         stack_depth: 0,
@@ -791,6 +796,15 @@ enum ExpressionEnd {
     StatementTest,
 }
 
+// One frame per active statement, including across both arms of an if.
+// Every test starts and every arm enters and joins at operand depth zero.
+#[derive(Clone, Copy)]
+enum StatementFrame {
+    IfThen { branch: usize },
+    IfElse { join: usize },
+    While { test: usize, exit: usize },
+}
+
 struct Parser<'s> {
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) after a top-level name or
@@ -799,6 +813,7 @@ struct Parser<'s> {
     max_nesting_depth: usize,
     nesting_depth: usize,
     pending: Vec<(Pending, Span)>,
+    statement_frames: Vec<StatementFrame>,
     instructions: Vec<Instruction>,
     // Parse-only declarations in slot order; never retained by Script.
     bindings: Vec<Binding>,
@@ -809,6 +824,10 @@ struct Parser<'s> {
 impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
         loop {
+            if !self.statement_frames.is_empty() {
+                self.parse_block_item()?;
+                continue;
+            }
             let first = self.next_token()?.ok_or_else(|| {
                 Error::unsupported(
                     Span::at(self.lexer.offset),
@@ -819,17 +838,14 @@ impl Parser<'_> {
                     },
                 )
             })?;
+            self.check_statement_boundary(first.span)?;
             match first.kind {
                 TokenKind::Declaration(kind) => {
                     self.parse_declaration(kind)?;
                     continue;
                 }
-                TokenKind::If => {
-                    self.parse_if()?;
-                    continue;
-                }
-                TokenKind::While => {
-                    self.parse_while()?;
+                TokenKind::If | TokenKind::While => {
+                    self.open_statement(first)?;
                     continue;
                 }
                 TokenKind::Identifier => {
@@ -875,35 +891,81 @@ impl Parser<'_> {
             .ok_or_else(|| Error::malformed(Span::at(self.lexer.offset), message))
     }
 
-    fn parse_if(&mut self) -> Result<(), Error> {
-        let branch = self.parse_statement_test("expected '(' after 'if'")?;
-        let end = self.parse_assignment_block("expected '{' to open an if branch")?;
-
-        let next = self.next_token()?;
-        if let Some(Token {
-            kind: TokenKind::Else,
-            span,
-            ..
-        }) = next
-        {
-            let jump = self.instructions.len();
-            self.emit(Instruction::Jump(UNPATCHED), span)?;
-            self.patch_jump(branch, span)?;
-            let end = self.parse_assignment_block("expected '{' after 'else'")?;
-            self.patch_jump(jump, end)
-        } else {
-            self.lookahead = Some(next);
-            self.patch_jump(branch, end)
+    fn check_statement_boundary(&self, span: Span) -> Result<(), Error> {
+        if self.stack_depth != 0 || !self.pending.is_empty() || self.nesting_depth != 0 {
+            return Err(Error::malformed(
+                span,
+                "statement boundaries must have no pending expression or operands",
+            ));
         }
+        Ok(())
     }
 
-    fn parse_while(&mut self) -> Result<(), Error> {
-        let test = self.instructions.len();
-        let branch = self.parse_statement_test("expected '(' after 'while'")?;
-        let end = self.parse_assignment_block("expected '{' to open the while body")?;
-        // The block leaves an empty stack, the same depth as at test entry.
-        self.emit(Instruction::LoopBack(test), end)?;
-        self.patch_jump(branch, end)
+    fn open_statement(&mut self, keyword: Token) -> Result<(), Error> {
+        if self.statement_frames.len() == MAX_STATEMENT_FRAMES {
+            return Err(Error {
+                message: "statement nesting ceiling exceeded",
+                ..Error::limit(keyword.span, Limit::NestingDepth)
+            });
+        }
+        let (frame, missing_brace) = match keyword.kind {
+            TokenKind::If => {
+                let branch = self.parse_statement_test("expected '(' after 'if'")?;
+                (
+                    StatementFrame::IfThen { branch },
+                    "expected '{' to open an if branch",
+                )
+            }
+            TokenKind::While => {
+                let test = self.instructions.len();
+                let exit = self.parse_statement_test("expected '(' after 'while'")?;
+                (
+                    StatementFrame::While { test, exit },
+                    "expected '{' to open the while body",
+                )
+            }
+            _ => unreachable!("not a control statement keyword"),
+        };
+        let brace = self.require_block_open(missing_brace)?;
+        self.lexer.charge(1, brace)?;
+        try_push(&mut self.statement_frames, frame, brace)
+    }
+
+    fn close_block(&mut self, close: Span) -> Result<(), Error> {
+        let index = self
+            .statement_frames
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| Error::malformed(close, "unmatched closing brace"))?;
+        match self.statement_frames[index] {
+            StatementFrame::IfThen { branch } => {
+                // Only this freshly closed then-arm can take the next `else`.
+                // In particular, a `}` belongs to the parent, so leave it cached.
+                let next = self.next_token()?;
+                if let Some(Token {
+                    kind: TokenKind::Else,
+                    span,
+                    ..
+                }) = next
+                {
+                    let join = self.instructions.len();
+                    self.emit(Instruction::Jump(UNPATCHED), span)?;
+                    self.patch_jump(branch, span)?;
+                    self.require_block_open("expected '{' after 'else'")?;
+                    self.statement_frames[index] = StatementFrame::IfElse { join };
+                    return Ok(());
+                }
+                self.lookahead = Some(next);
+                self.patch_jump(branch, close)?;
+            }
+            StatementFrame::IfElse { join } => self.patch_jump(join, close)?,
+            StatementFrame::While { test, exit } => {
+                self.emit(Instruction::LoopBack(test), close)?;
+                self.patch_jump(exit, close)?;
+            }
+        }
+        self.statement_frames.pop();
+        Ok(())
     }
 
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
@@ -918,53 +980,38 @@ impl Parser<'_> {
         Ok(branch)
     }
 
-    fn parse_assignment_block(&mut self, missing_open: &'static str) -> Result<Span, Error> {
+    fn require_block_open(&mut self, missing_open: &'static str) -> Result<Span, Error> {
         let open = self.require_token(missing_open)?;
         match open.kind {
-            TokenKind::OpenBrace => {}
-            TokenKind::If => {
-                return Err(Error::unsupported(
-                    open.span,
-                    "nested if and else if are outside the subset",
-                ));
-            }
-            _ => return Err(Error::malformed(open.span, missing_open)),
+            TokenKind::OpenBrace => Ok(open.span),
+            TokenKind::If => Err(Error::unsupported(
+                open.span,
+                "if branches and while bodies require braces; else if is outside the subset",
+            )),
+            _ => Err(Error::malformed(open.span, missing_open)),
         }
-        loop {
-            let first = self.require_token("expected an assignment or '}' in the block")?;
-            match first.kind {
-                TokenKind::CloseBrace => {
-                    if self.stack_depth != 0 {
-                        return Err(Error::malformed(
-                            first.span,
-                            "assignment blocks must leave no operands",
-                        ));
-                    }
-                    return Ok(first.span);
-                }
-                TokenKind::If | TokenKind::While => {
+    }
+
+    fn parse_block_item(&mut self) -> Result<(), Error> {
+        let first = self.require_token("expected an assignment, if, while, or '}' in the block")?;
+        self.check_statement_boundary(first.span)?;
+        match first.kind {
+            TokenKind::CloseBrace => self.close_block(first.span),
+            TokenKind::If | TokenKind::While => self.open_statement(first),
+            TokenKind::Identifier => {
+                let equals = self.require_token("expected '=' after the assignment name")?;
+                if !matches!(equals.kind, TokenKind::Equals) {
                     return Err(Error::unsupported(
-                        first.span,
-                        "nested if and while statements are outside the subset",
-                    ));
-                }
-                TokenKind::Identifier => {
-                    let equals = self.require_token("expected '=' after the assignment name")?;
-                    if !matches!(equals.kind, TokenKind::Equals) {
-                        return Err(Error::unsupported(
-                            equals.span,
-                            "only simple assignments are supported in these blocks",
-                        ));
-                    }
-                    self.parse_assignment(first.span, equals.span)?;
-                }
-                _ => {
-                    return Err(Error::unsupported(
-                        first.span,
+                        equals.span,
                         "only simple assignments are supported in these blocks",
                     ));
                 }
+                self.parse_assignment(first.span, equals.span)
             }
+            _ => Err(Error::unsupported(
+                first.span,
+                "only simple assignments, if, and while are supported in these blocks",
+            )),
         }
     }
 
@@ -1407,6 +1454,17 @@ impl Parser<'_> {
             }
             Instruction::Number(_) | Instruction::Boolean(_) | Instruction::LoadBinding(_) => {
                 (0, 1)
+            }
+            Instruction::JumpIfFalseStatement(_) if self.stack_depth != 1 => {
+                return Err(Error::malformed(
+                    span,
+                    "expected one statement test operand",
+                ));
+            }
+            Instruction::LoopBack(target)
+                if target >= self.instructions.len() || self.stack_depth != 0 =>
+            {
+                return Err(Error::malformed(span, "invalid loop back edge"));
             }
             Instruction::InitBinding(_)
             | Instruction::StoreBinding(_)

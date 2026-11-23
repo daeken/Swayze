@@ -1027,15 +1027,8 @@ enum Pending {
     },
     StatementTest,
     Group,
-    AssignmentGroup {
-        access: usize,
-        tail: AssignmentTail,
-        rhs_base_depth: usize,
-    },
-    SimpleAssignment {
-        access: usize,
-        rhs_base_depth: usize,
-    },
+    AssignmentGroup(ExpressionAssignment),
+    Assignment(ExpressionAssignment),
     Consequent {
         branch: usize,
         base_depth: usize,
@@ -1044,6 +1037,13 @@ enum Pending {
         jump: usize,
         join_depth: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+struct ExpressionAssignment {
+    access: usize,
+    tail: AssignmentTail,
+    rhs_base_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2216,11 +2216,12 @@ impl Parser<'_> {
         )
     }
 
-    fn begin_group_assignment(
+    fn begin_expression_assignment(
         &mut self,
         name: Span,
         op: Option<Operator>,
         operator: Span,
+        grouped: bool,
     ) -> Result<(), Error> {
         let access = self.begin_write(name, operator, op.is_some())?;
         // The assignment operator is not part of the RHS expression grammar.
@@ -2235,44 +2236,44 @@ impl Parser<'_> {
                 _ => AssignmentTail::Eager(op),
             },
         };
-        let Some(group @ (Pending::Group, _)) = self.pending.last_mut() else {
-            return Err(Error::malformed(operator, "expected an assignment group"));
+        let assignment = ExpressionAssignment {
+            access,
+            tail,
+            // An eager compound keeps its loaded target below the RHS. A
+            // logical compound has popped it on the fallthrough path.
+            rhs_base_depth: self.stack_depth,
         };
-        *group = (
-            Pending::AssignmentGroup {
-                access,
-                tail,
-                // An eager compound keeps its loaded target below the RHS. A
-                // logical compound has popped it on the fallthrough path.
-                rhs_base_depth: self.stack_depth,
-            },
-            operator,
-        );
-        Ok(())
+        if grouped {
+            let Some(group @ (Pending::Group, _)) = self.pending.last_mut() else {
+                return Err(Error::malformed(operator, "expected an assignment group"));
+            };
+            *group = (Pending::AssignmentGroup(assignment), operator);
+            Ok(())
+        } else {
+            self.open_pending(Pending::Assignment(assignment), operator)
+        }
     }
 
     fn finish_group_assignment(&mut self, end: Span) -> Result<(), Error> {
         if let Some((pending, operator)) = self.pending.last_mut()
-            && let Pending::AssignmentGroup {
-                access,
-                tail,
-                rhs_base_depth,
-            } = *pending
+            && let Pending::AssignmentGroup(assignment) = *pending
         {
             // The assignment ends here, but only ')' can close the group.
             // Reuse the marker and its nesting slot for the rest of the sequence.
             *pending = Pending::Group;
             let operator = *operator;
-            self.finish_expression_assignment(access, tail, rhs_base_depth, operator, end)?;
+            self.finish_expression_assignment(assignment, operator, end)?;
         }
         Ok(())
     }
 
     fn finish_expression_assignment(
         &mut self,
-        access: usize,
-        tail: AssignmentTail,
-        rhs_base_depth: usize,
+        ExpressionAssignment {
+            access,
+            tail,
+            rhs_base_depth,
+        }: ExpressionAssignment,
         operator: Span,
         end: Span,
     ) -> Result<(), Error> {
@@ -2288,7 +2289,8 @@ impl Parser<'_> {
         self.finish_write(access, end, true)?;
         if let AssignmentTail::ShortCircuit(skip) = tail {
             // Both paths leave one value above rhs_base_depth:
-            // the old value on skip, or the RHS after the store.
+            // the old value on skip, or the RHS after the store. Join here,
+            // before the enclosing arm jump, assignment tail or discard.
             self.patch_jump(skip, end)?;
         }
         Ok(())
@@ -2460,16 +2462,16 @@ impl Parser<'_> {
         let mut needs_operand = true;
         // Statement tests receive their already checked opening parenthesis.
         // Meter it like a group, but let it own the test's close and comma
-        // sequence without admitting a grouped (possibly compound) assignment.
+        // sequence without reusing the test marker for an assignment.
         let (mut next, mut after_open) = if statement_test {
             self.open_pending(Pending::StatementTest, first.span)?;
             (self.next_token()?, true)
         } else {
             (Some(first), false)
         };
-        // Bare simple prefixes can start a test, RHS, ternary arm, or
+        // Bare assignment prefixes can start a test, RHS, ternary arm, or
         // noninitial sequence operand, but not an operator operand.
-        let mut allow_simple_assignment = statement_test
+        let mut allow_assignment = statement_test
             || matches!(
                 end_kind,
                 ExpressionEnd::ForTest
@@ -2579,21 +2581,10 @@ impl Parser<'_> {
                             kind: TokenKind::Assignment(op),
                             span: operator,
                             ..
-                        }) if group_start || (allow_simple_assignment && op.is_none()) => {
-                            if group_start {
-                                self.begin_group_assignment(span, op, operator)?;
-                            } else {
-                                let access = self.begin_write(span, operator, false)?;
-                                self.open_pending(
-                                    Pending::SimpleAssignment {
-                                        access,
-                                        rhs_base_depth: self.stack_depth,
-                                    },
-                                    operator,
-                                )?;
-                            }
+                        }) if group_start || allow_assignment => {
+                            self.begin_expression_assignment(span, op, operator, group_start)?;
                             after_open = false;
-                            allow_simple_assignment = true;
+                            allow_assignment = true;
                             next = self.next_token()?;
                             continue;
                         }
@@ -2786,7 +2777,7 @@ impl Parser<'_> {
             after_open = matches!(kind, TokenKind::Open);
             // Only a comma that emitted Discard reaches here; separators
             // and commas rejected by the surrounding production do not.
-            allow_simple_assignment = matches!(
+            allow_assignment = matches!(
                 kind,
                 TokenKind::Question | TokenKind::Colon | TokenKind::Comma
             );
@@ -2796,12 +2787,10 @@ impl Parser<'_> {
         self.reduce_expression(end)?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
-                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup { .. }
-                    if at_eof =>
-                {
+                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup(_) if at_eof => {
                     "expected a closing parenthesis before end of source"
                 }
-                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup { .. } => {
+                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup(_) => {
                     "semicolon inside a parenthesized expression"
                 }
                 _ => "expected ':' to complete conditional expression",
@@ -2914,7 +2903,7 @@ impl Parser<'_> {
     }
 
     // At a delimiter, finish conditionals and ungrouped assignments inside out.
-    // '?' drained operators at its level, and a simple assignment began at
+    // '?' drained operators at its level, and an assignment began at
     // a test, RHS, arm or sequence operand prefix, so neither marker has
     // operators immediately beneath it. An arm's assignments finish before
     // its conditional joins; an assignment whose RHS is that conditional
@@ -2934,17 +2923,8 @@ impl Parser<'_> {
                     self.patch_jump(jump, span)?;
                     self.nesting_depth -= 1;
                 }
-                Pending::SimpleAssignment {
-                    access,
-                    rhs_base_depth,
-                } => {
-                    self.finish_expression_assignment(
-                        access,
-                        AssignmentTail::Simple,
-                        rhs_base_depth,
-                        span,
-                        end,
-                    )?;
+                Pending::Assignment(assignment) => {
+                    self.finish_expression_assignment(assignment, span, end)?;
                     self.nesting_depth -= 1;
                 }
                 _ => break,

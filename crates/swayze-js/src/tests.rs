@@ -1709,6 +1709,44 @@ fn grouped_assignment_sequence_stores_after_its_rhs_join_and_before_discard() {
 }
 
 #[test]
+fn logical_arm_skips_target_the_consequent_jump_or_outer_compound_tail() {
+    use crate::parser::ShortCircuitCondition::{Falsy, Truthy};
+    use Instruction::{Boolean, Jump, JumpIfFalse, ShortCircuit, StoreBindingKeep};
+    assert_postfix(
+        "let x=1,y=2; const v=x+=true?y||=3:y&&=4;v",
+        &[
+            Number(1.0),
+            init_let(0),
+            Number(2.0),
+            init_let(1),
+            LoadBinding(0),
+            Boolean(true),
+            JumpIfFalse(12),
+            LoadBinding(1),
+            ShortCircuit {
+                target: 11,
+                condition: Truthy,
+            },
+            Number(3.0),
+            StoreBindingKeep(1),
+            Jump(16),
+            LoadBinding(1),
+            ShortCircuit {
+                target: 16,
+                condition: Falsy,
+            },
+            Number(4.0),
+            StoreBindingKeep(1),
+            Add,
+            StoreBindingKeep(0),
+            init_const(2),
+            LoadBinding(2),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn grouped_logical_assignment_skip_targets_the_sequence_discard() {
     use crate::parser::ShortCircuitCondition::{Falsy, NonNullish, Truthy};
     use Instruction::{Boolean, Discard, ShortCircuit, StoreBindingKeep};

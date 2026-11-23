@@ -413,40 +413,8 @@ fn rejects_targets_and_positions_outside_the_slice() {
             "assignment expressions",
         ),
         ("let x;((x)@||=@1)", Unsupported, "assignment expressions"),
-        ("let x;(0,x@??=@1)", Unsupported, "assignment expressions"),
         (
-            "let x;let y=x@||=@1;y",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x; if(x@??=@1){} x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        ("let x,y;(x+=y@*=@2)", Unsupported, "assignment expressions"),
-        (
-            "let x;false && (0,x@>>>=@1)",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x; if(x@+=@1){} x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;while(x@**=@1){}x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;do{}while(x@|=@1);x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;for(;x@&=@1;){}x",
+            "let x;false && (0,x+1@>>>=@1)",
             Unsupported,
             "assignment expressions",
         ),
@@ -458,7 +426,7 @@ fn rejects_targets_and_positions_outside_the_slice() {
         ),
         ("let x;(0,+x@=@42)", Unsupported, "assignment expressions"),
         (
-            "let x;(x=true ? x@+=@1 : 2)",
+            "let x;(x=true ? (x)@+=@1 : 2)",
             Unsupported,
             "assignment expressions",
         ),

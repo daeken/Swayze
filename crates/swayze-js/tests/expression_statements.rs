@@ -93,7 +93,7 @@ fn requires_explicit_boundaries_and_a_root_final_expression() {
 fn statement_expressions_do_not_enable_other_syntax() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, width, message) in [
-        ("let x=1; {x, x@+=2;} x", 2, "assignment expressions"),
+        ("let x=1; {x, -x@+=2;} x", 2, "assignment expressions"),
         (
             "let x=1; x@++ + 1; x",
             2,

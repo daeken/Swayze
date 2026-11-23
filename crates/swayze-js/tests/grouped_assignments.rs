@@ -40,6 +40,7 @@ fn the_expression_and_binding_preserve_the_same_tagged_value() {
 fn nested_writes_run_in_order_and_evaluate_the_rhs_only_once() {
     for (source, expected) in [
         ("let x; let y; const z=(x=(y=4)); x*100+y*10+z", 444.0),
+        ("let x=0, y=0; (x = (y = y + 1))*100 + x*10 + y", 111.0),
         ("let x=1; (x=(x=2)+x) * 10 + x", 44.0),
         ("let a=0,x; 10+(x=((a=a+1),a+3)) + x*100 + a*1000", 1414.0),
         ("let x=0; ((x = true ? 2 : 3), x + 4)", 6.0),
@@ -60,7 +61,6 @@ fn nested_writes_run_in_order_and_evaluate_the_rhs_only_once() {
 #[test]
 fn branches_join_with_value_and_skip_untaken_writes() {
     for (source, expected) in [
-        ("let x=1; false && (x=2); x", Value::Number(1.0)),
         ("let x=1; true || (x=2); x", Value::Number(1.0)),
         ("let x=1; false ?? (x=2); x", Value::Number(1.0)),
         ("let x=1; 0 ? (x=2) : x", Value::Number(1.0)),
@@ -112,11 +112,21 @@ fn assert_marked_error(marked: &str, kind: ErrorKind, message: &str) {
 }
 
 #[test]
+fn skipped_write_checks_the_target_but_does_not_mutate_a_let() {
+    assert_marked_error(
+        "const x=0; false && (x/*☃*/@=@1); x",
+        ErrorKind::Unsupported,
+        "assignment to const",
+    );
+    let script = parse_script("let x=0; false && (x/*☃*/=1); x").unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Number(0.0)));
+}
+
+#[test]
 fn target_checks_are_deferred_and_apply_even_to_skipped_code() {
     let tdz = "before lexical binding initialization";
     let immutable = "assignment to const";
     for (marked, message) in [
-        ("const x=0; false && (x/*☃*/@=@1)", immutable),
         ("let x=0; if (false) { const x=1; (x@=@2); } x", immutable),
         ("let a=0; const b=1; a &&= (b@=@2); a", immutable),
         ("const x=0; true ? 0 : (x@=@missing)", immutable),
@@ -161,7 +171,11 @@ fn rejects_targets_and_positions_outside_the_slice() {
             Unsupported,
             "assignment expressions",
         ),
-        ("let x;if(x@=@1){}x", Unsupported, "assignment expressions"),
+        (
+            "let x, a=1; if (x @=@ a) {} x",
+            Unsupported,
+            "assignment expressions",
+        ),
         (
             "let x;while(x@=@1){}x",
             Unsupported,
@@ -178,7 +192,7 @@ fn rejects_targets_and_positions_outside_the_slice() {
             "assignment expressions",
         ),
         (
-            "let x;(x=0@,@1)",
+            "let x, a=1, b=2; (x = a@,@ b)",
             Unsupported,
             "sequence in an assignment RHS",
         ),

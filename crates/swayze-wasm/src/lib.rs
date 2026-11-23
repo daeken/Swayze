@@ -21,7 +21,7 @@
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
-//! `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`,
+//! `memory.grow` (`0x40`), `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`,
 //! `call_indirect` (`0x11`), `if`, `block`, `loop`, `br <depth>` (`0x0c`),
 //! `br_if <depth>`, `br_table` (`0x0e`), and `return` (`0x0f`). Local indices
 //! start at zero and address parameters first, then locals in declaration order.
@@ -57,17 +57,18 @@
 //!
 //! If present, the memory section follows any function and table sections and
 //! precedes any global, export, start, element, and code sections. It may be
-//! empty (a zero-length vector) or declare one private, unshared memory32. The limits use
-//! flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
+//! empty (a zero-length vector) or declare one private, unshared memory32. The
+//! limits use flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
 //! unsigned LEB32 page counts. The minimum and any explicit maximum must be zero
-//! or one 64-KiB page, and the maximum must not be less than the minimum. The minimum
-//! is the fixed instance size. Loads, stores, and `memory.size` require a
-//! defined memory, which may have zero pages. Loads and stores take an unsigned
-//! LEB32 alignment exponent and an unsigned LEB32 byte offset. The exponent
+//! or one 64-KiB page, and the maximum must not be less than the minimum. The
+//! minimum is the initial size; an omitted maximum has an effective limit of one
+//! page. Loads, stores, `memory.size`, and `memory.grow` require a defined
+//! memory, even in dead code; a zero-page memory qualifies. Loads and stores
+//! take an unsigned LEB32 alignment exponent and an unsigned LEB32 byte offset. The exponent
 //! must be 0 for byte accesses, at most 1 for 16-bit accesses, and at most 2 for
 //! 32-bit accesses.
-//! `memory.size` takes a literal reserved byte `0x00`, not a general LEB32 index.
-//! Other memory instructions, including `memory.grow`, are unsupported.
+//! `memory.size` and `memory.grow` take a literal reserved byte `0x00`, not a
+//! general LEB32 index. Other memory instructions are unsupported.
 //!
 //! The optional global section (ID 6) follows any type, function, table, and
 //! memory sections and precedes any export, start, element, and code sections.
@@ -134,6 +135,12 @@
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
+//! `memory.grow` consumes an i32 page delta as unsigned and pushes the old
+//! page count on success or `-1` on failure. A zero delta always succeeds
+//! without allocating; the only permitted positive growth is from zero to
+//! one page if the maximum allows it. That transition fallibly reserves a
+//! single 64-KiB page and initializes it to zero. An excessive delta or a
+//! failed reserve leaves memory unchanged and does not trap.
 //! `if` pops an i32 condition in the enclosing frame and saves the remaining
 //! depth as the floor for both arms. `block` and `loop`
 //! save the current depth as their floor without consuming any operands.
@@ -179,11 +186,13 @@
 //! declarations before decoding any body. It checks the entire input, even
 //! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
 //! with private decoded bodies, their signatures, named export entries, an
-//! optional start index, the table and memory sizes (if defined), global initial
-//! values, and active element and data segments. It does not allocate linear
-//! memory. A separate fallible [`Module::instantiate`] step checks all segment
-//! ranges before initializing either table or memory. The first out-of-bounds
-//! element segment takes precedence over the first out-of-bounds data segment,
+//! optional start index, the table size and declared memory limits (if defined),
+//! global initial values, and active element and data segments. It does not
+//! allocate linear memory. A separate fallible [`Module::instantiate`] step
+//! checks all segment ranges against the initial sizes, before initializing
+//! either table or memory. Growth cannot make an out-of-bounds active data
+//! segment valid. The first out-of-bounds element segment takes precedence over
+//! the first out-of-bounds data segment,
 //! and both take precedence over memory allocation failure. Offsets are
 //! interpreted as `u32` bits and widened before adding the segment length.
 //! An empty segment may
@@ -198,15 +207,19 @@
 //! Only after preflight, allocation, and all initialization succeed does it run
 //! the optional start function once by index, with no host authority and with
 //! the same execution budgets as an explicit invocation. Completed start stores
-//! are visible on success. A guest trap ([`InstantiationError::StartTrap`]) or
+//! and memory growth are visible on success. A guest trap
+//! ([`InstantiationError::StartTrap`]) or
 //! host execution limit ([`InstantiationError::StartLimitExceeded`]) discards
 //! the unpublished instance. No instantiation failure exposes an instance.
 //! [`Instance::invoke_i32_with_args`] and [`Instance::invoke_void_with_args`]
 //! scan at most eight export names for an exact match, then check the argument
 //! count and declared result kind, in that order, before executing any guest
 //! instruction or making any guest state change. A wrong result kind is
-//! [`InvokeError::ResultMismatch`], not a trap. Execution does not allocate or
-//! recurse in Rust. Zero selects the else arm (or skips straight to the join if
+//! [`InvokeError::ResultMismatch`], not a trap. Execution does not recurse in
+//! Rust. The only guest execution allocation is the fallible single-page
+//! reserve for an eligible `memory.grow`, during start or invocation. After a
+//! page is installed, it is never resized or reallocated. A failed reserve can
+//! be retried by a later dispatch within the same execution limits. Zero selects the else arm (or skips straight to the join if
 //! no `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames with explicit result arities.
 //! Each `block` and `if` label keeps a linked chain of incoming branch edges in
@@ -293,8 +306,9 @@
 //! bounds, null, and signature checks take precedence over the call-depth limit.
 //! Each explicit invocation has fresh call-local state and budgets, including
 //! the first one after a successful start. All functions in an instance share
-//! its memory and globals. Completed memory and global stores persist across
-//! calls, including explicit invocations that trap or hit a host limit.
+//! its memory and globals. Completed memory and global stores and memory growth
+//! persist across calls, including explicit invocations that trap or hit a host
+//! limit.
 //! Separate instances have independent tables, memory, and globals. Empty,
 //! custom-only, and other unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
@@ -384,14 +398,17 @@
 //! guest trap. Recursive void calls and free completion and resumption are
 //! checked at the exact frame, operand, and dispatch bounds.
 //! Memory tests cover exact limits, width-specific alignment and framed memarg
-//! decoding, actual page counts and the reserved `memory.size` byte, absent and
-//! zero-page memory, ordering and unsupported features, operand floors and
+//! decoding, actual page counts and the reserved `memory.size`/`memory.grow`
+//! bytes, absent and zero-page memory, ordering, unsupported features, operand floors and
 //! validation in untaken arms and unexported bodies, and zero initialization.
 //! They exercise narrow-load sign boundaries, truncating stores, overlapping
 //! little-endian and unaligned accesses, end-of-page accesses and straddles,
 //! partial-store prevention, widened address arithmetic, independent instances,
 //! and sharing across calls and exports. They also check store persistence
 //! and suppression of later stores after guest traps or dispatch exhaustion.
+//! Growth tests check optional maxima, unsigned deltas, reserve bounds and
+//! failure, stack and dispatch limits, and persistence through exports, calls,
+//! start, and traps. Start growth cannot bypass initial data preflight.
 //! Data tests cover section order and framing, index and offset encodings, the
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap
@@ -440,7 +457,7 @@ mod table;
 
 pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, validate_module};
 
-use memory::{DataSegment, LinearMemory};
+use memory::{DataSegment, LinearMemory, MemoryLimits};
 use std::{cell::Cell, convert::Infallible, fmt};
 use table::{ElementSegment, FunctionTable};
 
@@ -450,7 +467,7 @@ use table::{ElementSegment, FunctionTable};
 /// use swayze_wasm::Module;
 /// let forged = Module {
 ///     functions: Vec::new(), exports: Vec::new(), start_function: None,
-///     memory_bytes: None, data_segments: Vec::new(),
+///     memory_limits: None, data_segments: Vec::new(),
 ///     global_initial_values: [0; 8],
 ///     table_entries: None, element_segments: Vec::new(),
 /// };
@@ -460,8 +477,8 @@ pub struct Module {
     functions: Vec<binary::ValidatedCode>,
     exports: Vec<Export>,
     start_function: Option<usize>,
-    // None means absent; Some is a validated byte length (zero or one page).
-    memory_bytes: Option<usize>,
+    // None means absent; Some may have a minimum of zero and no declared maximum.
+    memory_limits: Option<MemoryLimits>,
     global_initial_values: [i32; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
     // None means absent; Some(0) means a declared zero-entry table.
@@ -479,20 +496,21 @@ impl Module {
     /// Create an independent instance and run its optional start function.
     ///
     /// Check active segment ranges in source order within each kind: elements
-    /// before data. Neither table nor memory is initialized until all checks
-    /// pass. A one-page memory is allocated fallibly and zeroed; an absent or
-    /// zero-page memory has no allocation. A defined table uses fixed storage
-    /// and starts all null. Segments of each kind are applied in source order.
+    /// before data, using only the initial sizes. Neither table nor memory is
+    /// initialized until all checks pass. An initial page is allocated fallibly
+    /// and zeroed; an absent or initially zero-page memory allocates nothing at
+    /// this step. A defined table uses fixed storage and starts all null.
+    /// Segments of each kind are applied in source order.
     /// Global initial values are copied into fixed, independent instance slots.
     /// Once initialization succeeds, start (if specified) runs once with fresh
-    /// execution budgets. Its stores are visible on the returned instance.
+    /// execution budgets. Its stores and memory growth are visible on the
+    /// returned instance.
     /// A start trap or execution limit discards the instance instead.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
-        let memory_bytes = self.memory_bytes.unwrap_or(0);
         FunctionTable::preflight(self.table_entries.unwrap_or(0), &self.element_segments)?;
-        LinearMemory::preflight(memory_bytes, &self.data_segments)?;
+        LinearMemory::preflight(self.memory_limits, &self.data_segments)?;
 
-        let memory = LinearMemory::new_preflighted(memory_bytes, &self.data_segments)?;
+        let memory = LinearMemory::new_preflighted(self.memory_limits, &self.data_segments)?;
         let table = self
             .table_entries
             .map(|len| FunctionTable::new_preflighted(len, &self.element_segments));
@@ -517,7 +535,7 @@ impl Module {
 /// Why creating an instance of a validated module failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstantiationError {
-    /// The instance's linear memory could not be reserved.
+    /// The instance's initial linear memory could not be reserved.
     MemoryAllocationFailed,
     /// An active data segment does not fit in the initial linear memory.
     DataSegmentOutOfBounds {
@@ -615,8 +633,10 @@ impl Instance<'_> {
     /// locals are initialized to zero on each invocation. A guest trap stops
     /// execution and returns [`InvokeError::Trap`]; exceeding a host execution
     /// limit returns [`InvokeError::LimitExceeded`]. Later calls start with
-    /// fresh frames and execution budgets but observe any completed memory and
-    /// global stores, including those made before a trap or limit.
+    /// fresh frames and execution budgets but observe completed memory and
+    /// global stores and memory growth, even before a trap or limit. The only
+    /// allocation during execution is an eligible `memory.grow` attempting to
+    /// reserve the single 64-KiB page of an initially empty memory.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         self.invoke(name, args, ResultKind::I32)?
             // Preflight checked the same signature that chooses the result.
@@ -647,7 +667,7 @@ impl Instance<'_> {
     /// before guest execution. Returns [`InvokeError::ResultMismatch`] for an
     /// i32 result rather than discarding it. Other errors and effects are the
     /// same as for [`Self::invoke_i32_with_args`], including persistence of
-    /// stores completed before a guest trap or host limit.
+    /// stores and growth completed before a guest trap or host limit.
     pub fn invoke_void_with_args(&self, name: &str, args: &[i32]) -> Result<(), InvokeError> {
         self.invoke(name, args, ResultKind::Void).map(|_| ())
     }

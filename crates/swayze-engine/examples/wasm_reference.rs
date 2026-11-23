@@ -610,6 +610,28 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![],
         });
     }
+    // Declare the maximum explicitly so Node and Swayze share the ceiling.
+    for (min, max, delta, old_pages) in [
+        (0, 1, 1, 0),
+        (0, 1, 0, 0),
+        (0, 1, -1, -1),
+        (0, 1, 2, -1),
+        (0, 0, 1, -1),
+        (1, 1, 1, -1),
+        (1, 1, 0, 1),
+    ] {
+        let mut bytes =
+            b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\x03\x02\x01\0\x05\x04\x01\x01"
+                .to_vec();
+        bytes.extend([min, max]);
+        bytes.extend_from_slice(b"\x07\x05\x01\x01x\0\0\x0a\x08\x01\x06\0\x20\0\x40\0\x0b");
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(old_pages)),
+            bytes,
+            export: "x",
+            args: vec![delta],
+        });
+    }
     cases
 }
 

@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "data.rs"]
 mod data;
+#[path = "memory_grow.rs"]
+mod grow;
 
 const PAGE: i32 = 64 * 1024;
 const ONE_PAGE: &[u8] = &[1, 0, 1];
@@ -231,7 +233,7 @@ fn rejects_memory_exports_and_other_memory_features() {
         }
         expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id });
     }
-    for opcode in [0x29, 0x30, 0x37, 0x3c, 0x40, 0xfc] {
+    for opcode in [0x29, 0x30, 0x37, 0x3c, 0xfc] {
         bad_memory_body(
             ONE_PAGE,
             &[0, 0x41, 0, opcode, 0, 0x0b],

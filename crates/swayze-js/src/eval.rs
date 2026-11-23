@@ -173,11 +173,11 @@ impl Script {
     /// Logical assignments (`&&=`, `||=`, `??=`) use the same tests to skip
     /// both RHS evaluation and the store on an initialized `let` target.
     /// They leave no result, and their RHS is still checked during parsing.
-    /// Standalone `++` and `--` updates (also allowed in `for` initializers
-    /// and updates) load one initialized `let`, convert its value to Number
-    /// as above, and store the result of adding or subtracting `1`. Neither
-    /// prefix nor postfix form leaves a result.
-    /// An update that occupies its own expression group, such as `(x++)`,
+    /// Consuming `++` and `--` updates (alone or followed by a comma suffix
+    /// in a statement or `for` clause) load one initialized `let`, convert
+    /// its value to Number as above, and store the result of adding or
+    /// subtracting `1`. Neither form leaves a result for the update itself.
+    /// An update used as an expression operand, such as in `x++ + 1`,
     /// performs the same write and yields a Number: the new Number for
     /// prefix, or the old coerced Number (including signed zero or NaN)
     /// for postfix.

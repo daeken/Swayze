@@ -12,6 +12,7 @@ fn root_and_braced_statements_discard_supported_expressions() {
         ("true, false ? 1 : null; (2 + 1) === 3;", Boolean(true)),
         ("1; let x=40; x; ++x; x===41; x+=1; x", Number(42.0)),
         ("let x=40; {x; x++; x+=1; void x;} x", Number(42.0)),
+        ("let x=1; x++ + 1; {x-- - 1;} x", Number(1.0)),
         ("null; {false; const x=42; x;} const y=void 1; y", Undefined),
         (
             "let x=0; if(false){null;}else if(true){true; x=42;}else{false;} x",
@@ -94,13 +95,9 @@ fn statement_expressions_do_not_enable_other_syntax() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, width, message) in [
         ("let x=1; {x, -x@+=2;} x", 2, "assignment expressions"),
+        ("let x=1; x++ + x@=2; x", 1, "assignment expressions"),
         (
-            "let x=1; x@++ + 1; x",
-            2,
-            "increment and decrement expressions",
-        ),
-        (
-            "let x=1; {x@-- - 1;} x",
+            "let x=1; {x@--();} x",
             2,
             "increment and decrement expressions",
         ),

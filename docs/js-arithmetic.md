@@ -46,9 +46,13 @@ forms cannot cross a line terminator between the name and operator, including
 a line terminator in a comment. Updates can be operands in expressions such
 as `1 + ++x`, declaration initializers such as `let y = x++;`, or control
 tests such as `if (x++)`. Prefix returns the new Number; postfix returns
-the old coerced Number, including signed zero. An update at the start of a
-statement or in a standalone `for` initializer or updater still uses the
-statement form, which does not yield a value. Assignments
+the old coerced Number, including signed zero. At the start of a root or
+block statement, a complete update followed by a supported binary operator
+or `?` starts an ordinary expression, as in `x++ + 1` or `++x ** 2`. A
+line terminator after the complete update is allowed before these operators.
+A lone update or one immediately followed by a comma still takes the
+consuming statement path; classic `for` initializer and updater dispatch
+is unchanged. Assignments
 can also appear as explicitly grouped expressions, such as `(x = a)`,
 `(x += a)`, and `(x ??= a)`. Simple assignment stores and returns its
 right-hand value. An eager compound reads the target before evaluating the

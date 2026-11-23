@@ -35,12 +35,12 @@ sh tools/run-test262.sh
 
 The opt-in wrapper builds and runs the Swayze example in debug and release.
 The example takes no arbitrary case paths, reads its committed allowlist and
-selected blobs from Git objects, and checks the exact Test262 pin. It evaluates
-these cases only through Swayze; no Test262 harness JS, includes, Node.js or
-external guest engine runs. Run with network disabled and access limited to the
-checkout and necessary tools. The wrapper itself is not a sandbox. Use
-`sh tools/run-test262.sh --self-test` for synthetic adapter checks without
-running corpus cases.
+selected blobs from Git objects, and checks the exact Test262 pin. It parses
+or evaluates these cases only through Swayze; no Test262 harness JS, includes,
+Node.js or external guest engine runs. Run with network disabled and access
+limited to the checkout and necessary tools. The wrapper itself is not a
+sandbox. Use `sh tools/run-test262.sh --self-test` for synthetic runner checks
+without loading corpus cases.
 
 An **adapted** case is a reviewed single final `assert.sameValue` call in a
 comment-only surrounding source. The adapter evaluates its parenthesized actual
@@ -52,9 +52,32 @@ a general assertion rewriter. **Raw** mode is reserved for reviewed positive
 unmodified pass: Swayze parses the original bytes and executes the resulting
 Script to normal completion, without a harness or injected value. Three more
 raw hashbang cases cover CR, LS and PS before an empty block. The summary
-counts raw and adapted passes separately. Strict variants are reported as not
-run, never as passes. No negative, module or harness-heavy
-cases are credited.
+counts adapted, raw positive and raw-negative passes separately. Strict
+variants are reported as not run, never as passes. Modules and harness-heavy
+cases remain outside the runner.
+
+**Raw-negative** is an explicit three-field manifest mode for reviewed
+negative cases, separate from positive `raw` and `adapted`. It requires one
+unambiguous, bounded frontmatter block with exact `flags: [raw]` and a `negative`
+map with one known `phase` and one recognized ECMAScript error constructor name
+as `type`. It accepts only a small subset of metadata syntax, not general YAML.
+Missing, malformed, duplicate or unknown metadata fields, unsupported flags,
+and any `includes` field are infrastructure errors for a raw-negative row.
+Resolution and runtime negatives are unsupported/not run. Parse negatives use
+Swayze's completion parser on the original blob, without a prefix, rewrite,
+evaluator, or evaluation scratch even if parsing succeeds. Only an explicit
+typed parse diagnostic matching the expected type can pass. Parse success, a
+wrong typed error, or generic `Malformed` fails. Generic `Unsupported` and
+non-allocation limits are unsupported, not passes; allocation is infrastructure.
+
+The first frontier is `test/language/comments/hashbang/preceding-whitespace.js`
+(pinned blob `03afd1b8728d23ea93f4fbef0e75754ae3895d7a`, 494 bytes). Its
+leading space before `#!` must not be removed; it expects parse `SyntaxError`
+and ends with a throw that must never be evaluated. With the unchanged engine
+it reaches the lexer but returns untyped `Unsupported`. The baseline in each
+profile is 18 passes (14 adapted, four raw positive, zero raw-negative),
+15 unsupported (14 strict not run and one attempted raw-negative), and zero
+failures or infrastructure errors.
 
 The required adapted sloppy-mode cases cover numeric separators in integer,
 fraction and exponent positions; U+2028, U+2029 and U+180E in Strings; unary

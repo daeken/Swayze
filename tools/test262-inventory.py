@@ -26,7 +26,7 @@ REVIEWED_TESTS = {
 TEST_KINDS = {'js-test', 'reviewed-test'}
 AUDIT_KINDS = {'js-fixture', 'other-fixture', 'unknown', 'reviewed-test'}
 ROLES = ('required', 'frontier')
-MODES = ('adapted', 'raw')
+MODE_FIELDS = {'adapted': (6, 7), 'raw': (3,), 'raw-negative': (3,)}
 
 
 def bounded_read(stream, max_bytes):
@@ -99,8 +99,7 @@ def manifest_paths(text, paths):
         if len(fields) < 3:
             raise ValueError(f'manifest line {line_no}: expected role, mode and path')
         role, mode, path = fields[:3]
-        sizes = {'raw': (3,), 'adapted': (6, 7)}
-        if role not in ROLES or len(fields) not in sizes.get(mode, ()):
+        if role not in ROLES or len(fields) not in MODE_FIELDS.get(mode, ()):
             raise ValueError(f'manifest line {line_no}: unexpected role, mode or fields')
         # Match the current runner's path form; the inventory can be wider.
         if (len(path) > 240 or not path.startswith('test/') or not path.endswith('.js')
@@ -174,7 +173,7 @@ def report(paths, selected, prefix, audit):
     else:
         chosen = sum(selections.values())
         yield f'Manifest: {chosen} selected test paths, {tests - chosen} not selected (not runtime outcomes)'
-        for mode in MODES:
+        for mode in MODE_FIELDS:
             required, frontier = (selections[role, mode] for role in ROLES)
             yield f'  {mode}: {required + frontier} selected ({required} required, {frontier} frontier)'
 
@@ -217,11 +216,14 @@ def self_test():
     ))
     paths = inventory(tree, {exception})
     selected = manifest_paths('# comment\r\n\r\nrequired\tadapted\ttest/a/one.js\t0:5\t0:1\t2:3\r\n'
-                              'frontier\traw\ttest/direct.js\n', paths)
+                              'frontier\traw\ttest/direct.js\n'
+                              'frontier\traw-negative\ttest/a2/other.js\n', paths)
     counts, selections, groups = summarize(paths, selected, 'test')
     assert counts == {'js-test': 4, 'reviewed-test': 1, 'js-fixture': 1,
                       'other-fixture': 1, 'unknown': 3}
-    assert selections == {('required', 'adapted'): 1, ('frontier', 'raw'): 1}
+    assert selections == {('required', 'adapted'): 1, ('frontier', 'raw'): 1,
+                          ('frontier', 'raw-negative'): 1}
+    assert '  raw-negative: 1 selected (0 required, 1 frontier)' in report(paths, selected, 'test', False)
     assert set(groups) == {'a/', 'a2/', ''} and groups['a/']['selected'] == 1
     local, choices, _ = summarize(paths, selected, 'test/a')
     assert test_count(local) == 3 and sum(choices.values()) == 1
@@ -256,6 +258,9 @@ def self_test():
     rejects('invalid path', manifest_paths, 'required\traw\ttest/a/../direct.js', paths)
     rejects('unexpected role', manifest_paths, raw.replace('raw', 'other'), paths)
     rejects('unexpected role', manifest_paths, raw.replace('raw', 'adapted'), paths)
+    negative = raw.replace('raw', 'raw-negative')
+    rejects('unexpected role', manifest_paths, negative.rstrip('\n') + '\t0:1', paths)
+    rejects('duplicate', manifest_paths, raw + negative, paths)
     rejects('unterminated', inventory, tree[:-1], set())
     rejects('unexpected', inventory, entry(b'harness/assert.js'), set())
     rejects('duplicate', inventory, tree + tree, set())

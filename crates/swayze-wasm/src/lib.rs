@@ -27,7 +27,7 @@
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
 //! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`, `f64.sqrt`,
-//! `f32.mul`, `f64.mul`,
+//! `f32.add`, `f32.sub`, `f32.mul`, `f32.div`, `f64.add`, `f64.sub`, `f64.mul`, `f64.div`,
 //! `f32.eq`, `f32.ne`, `f32.lt`, `f32.gt`, `f32.le`, `f32.ge`,
 //! `f64.eq`, `f64.ne`, `f64.lt`, `f64.gt`, `f64.le`, `f64.ge`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
@@ -209,6 +209,21 @@
 //! to nearest (ties to even; no exact midpoint is possible). The square root
 //! uses exact integer arithmetic with a radicand of at most 106 bits and at most
 //! 24 (f32) or 53 (f64) restoring steps within one guest dispatch.
+//! `add` and `sub` (`0x92`/`0x93` for f32, `0xa0`/`0xa1` for f64) consume two
+//! operands of their width and return a result of that width, in one dispatch.
+//! `sub` uses the opposite sign for the right operand. With those effective
+//! signs, two negative zeros give negative zero, other zero pairs and exact
+//! cancellation give positive zero, and conflicting infinities give the positive
+//! canonical quiet NaN. Any NaN gives that same encoding; all other infinite
+//! operands determine the infinity result, with their effective sign.
+//! Finite arithmetic either computes the exact aligned magnitude in a scalar
+//! `u128` (at most 108 bits), or returns the larger operand's magnitude when
+//! the smaller is strictly below both adjacent half-gaps: the inward spacing
+//! at a power of two can be half the outward spacing, and the outward endpoint
+//! above max finite is the hypothetical next power of two. No bits are lost
+//! before cancellation; the exact result rounds once to nearest, ties to even.
+//! Subnormal results are exact multiples of the least subnormal, and rounding
+//! can carry the significand into the next exponent or to infinity.
 //! `mul` (`0x94` for f32, `0xa2` for f64) consumes two operands and returns
 //! a result of the same width. For finite nonzero inputs it uses a full exact
 //! integer significand product (at most 48 or 106 bits) and rounds once to the
@@ -579,6 +594,14 @@
 //! classes in both operand orders and signs, live and dead typing, and exact
 //! dispatch charging. Deterministic finite pairs compared with native products
 //! provide independent evidence, not a proof.
+//! Float addition and subtraction tests pin signed zeros, infinities and NaNs,
+//! cancellation and subnormal transitions, the exponent-gap cutoff, and both
+//! sides and parities of ties, including carries at binades and overflow. They
+//! also check live and polymorphic typing and exact dispatch charging. Native
+//! sums and differences on deterministic finite pairs are evidence, not a proof.
+//! With pinned Rust on arm64 macOS, before/after probes in debug and release
+//! found unchanged sizes for the float binary op (1 byte), decoded instruction
+//! (32), operand and public value (16 each), and call frame (856).
 //! Float division tests cover the signed special-value cross product, normal
 //! results on both sides of a rounding midpoint, overflow and gradual underflow,
 //! and attainable subnormal ties and their neighbors. Exact vectors distinguish

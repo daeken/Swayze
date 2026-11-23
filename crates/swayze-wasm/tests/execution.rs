@@ -11,6 +11,8 @@ mod branch;
 mod branch_table;
 #[path = "execution/call_indirect.rs"]
 mod call_indirect;
+#[path = "execution/float_add_sub.rs"]
+mod float_add_sub;
 #[path = "execution/float_control.rs"]
 mod float_control;
 #[path = "execution/float_conversions.rs"]
@@ -2280,9 +2282,7 @@ fn rejects_every_opcode_outside_the_slice() {
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)
-            && !(0x41..=0x91).contains(&opcode)
-            && !(0x94..=0x9f).contains(&opcode)
-            && !(0xa2..=0xbf).contains(&opcode)
+            && !(0x41..=0xbf).contains(&opcode)
         {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],

@@ -1084,6 +1084,8 @@ enum StatementFrame {
     },
     Loop {
         layout: LoopLayout,
+        // Labels share the loop frame, not its binding scope.
+        label: Option<Span>,
         enclosing_loop: Option<usize>,
         // Head of a list threaded through unpatched break instructions.
         break_head: usize,
@@ -1222,12 +1224,17 @@ impl Parser<'_> {
         Ok(id)
     }
 
-    fn open_statement(&mut self, first: Token) -> Result<(), Error> {
+    fn open_statement(&mut self, first: Token, label: Option<Span>) -> Result<(), Error> {
         if self.statement_frames.len() == MAX_STATEMENT_FRAMES {
             return Err(Error {
                 message: "statement nesting ceiling exceeded",
-                ..Error::limit(first.span, Limit::NestingDepth)
+                ..Error::limit(label.unwrap_or(first.span), Limit::NestingDepth)
             });
+        }
+        if let Some(label) = label
+            && self.find_active_label(label)?.is_some()
+        {
+            return Err(Error::malformed(label, "duplicate active loop label"));
         }
         let (frame, missing_brace) = match first.kind {
             TokenKind::OpenBrace => return self.open_block(StatementFrame::Bare, first.span),
@@ -1242,19 +1249,25 @@ impl Parser<'_> {
                 let test = self.instructions.len();
                 let exit = self.parse_statement_test("expected '(' after 'while'")?;
                 (
-                    self.loop_frame(LoopLayout::PreTest {
-                        continue_target: test,
-                        exit,
-                    }),
+                    self.loop_frame(
+                        LoopLayout::PreTest {
+                            continue_target: test,
+                            exit,
+                        },
+                        label,
+                    ),
                     "expected '{' to open the while body",
                 )
             }
-            TokenKind::For => return self.open_for(),
+            TokenKind::For => return self.open_for(label),
             TokenKind::Do => (
-                self.loop_frame(LoopLayout::PostTest {
-                    body_start: self.instructions.len(),
-                    continue_head: UNPATCHED,
-                }),
+                self.loop_frame(
+                    LoopLayout::PostTest {
+                        body_start: self.instructions.len(),
+                        continue_head: UNPATCHED,
+                    },
+                    label,
+                ),
                 "expected '{' to open the do body",
             ),
             _ => unreachable!("not a block or control statement"),
@@ -1314,7 +1327,7 @@ impl Parser<'_> {
                             statement: StatementFrame::IfAwaitJoin { join },
                             scope: parent,
                         };
-                        return self.open_statement(arm);
+                        return self.open_statement(arm, None);
                     }
                     let brace = Self::block_open(arm, missing)?;
                     // Same control frame, disjoint lexical scope.
@@ -1340,6 +1353,7 @@ impl Parser<'_> {
                 layout,
                 enclosing_loop,
                 break_head,
+                ..
             } => {
                 // A trailing test resolves names in the surrounding scope, not
                 // the just-closed body, even when entered by a continue.
@@ -1388,9 +1402,10 @@ impl Parser<'_> {
         self.patch_jump(at, span)
     }
 
-    fn loop_frame(&self, layout: LoopLayout) -> StatementFrame {
+    fn loop_frame(&self, layout: LoopLayout, label: Option<Span>) -> StatementFrame {
         StatementFrame::Loop {
             layout,
+            label,
             enclosing_loop: self.innermost_loop,
             break_head: UNPATCHED,
         }
@@ -1418,8 +1433,8 @@ impl Parser<'_> {
         }
     }
 
-    fn open_for(&mut self) -> Result<(), Error> {
-        let result = self.parse_for_header().and_then(|frame| {
+    fn open_for(&mut self, label: Option<Span>) -> Result<(), Error> {
+        let result = self.parse_for_header(label).and_then(|frame| {
             let brace = self.require_block_open("expected '{' to open the for body")?;
             self.open_block(frame, brace)
         });
@@ -1427,7 +1442,7 @@ impl Parser<'_> {
         result
     }
 
-    fn parse_for_header(&mut self) -> Result<StatementFrame, Error> {
+    fn parse_for_header(&mut self, label: Option<Span>) -> Result<StatementFrame, Error> {
         let missing_open = "expected '(' after 'for'";
         let open = self.require_token(missing_open)?;
         if !matches!(open.kind, TokenKind::Open) {
@@ -1488,56 +1503,63 @@ impl Parser<'_> {
         };
         self.nesting_depth -= 1;
         self.check_statement_boundary(close)?;
-        Ok(self.loop_frame(LoopLayout::PreTest {
-            continue_target,
-            exit,
-        }))
+        Ok(self.loop_frame(
+            LoopLayout::PreTest {
+                continue_target,
+                exit,
+            },
+            label,
+        ))
     }
 
     fn parse_for_clause(&mut self, first: Token, end: ForClauseEnd) -> Result<Span, Error> {
         // Stores are standalone. Only the non-store path permits an ungrouped sequence.
-        if let Some(span) = self.parse_optional_store(&first, ExpressionEnd::ForStore(end))? {
-            return Ok(span);
+        let store_end = ExpressionEnd::ForStore(end);
+        match first.kind {
+            TokenKind::Update(op) => return self.parse_prefix_update(op, first.span, store_end),
+            TokenKind::Identifier => {
+                let next = self.next_token()?;
+                if let Some(span) = self.parse_name_store(first.span, next, store_end)? {
+                    return Ok(span);
+                }
+            }
+            _ => {}
         }
         self.parse_discarded_expression(first, ExpressionEnd::ForClause(end))
     }
 
-    fn parse_optional_store(
+    // Both statements and for clauses have already read one token after the name.
+    // If it doesn't commit to a store, leave it cached for the expression parser.
+    fn parse_name_store(
         &mut self,
-        first: &Token,
+        name: Span,
+        next: Option<Token>,
         end: ExpressionEnd,
     ) -> Result<Option<Span>, Error> {
-        match first.kind {
-            TokenKind::Update(op) => self.parse_prefix_update(op, first.span, end).map(Some),
-            TokenKind::Identifier => {
-                let next = self.next_token()?;
-                match next {
-                    Some(Token {
-                        kind: TokenKind::Assignment(op),
+        match next {
+            Some(Token {
+                kind: TokenKind::Assignment(op),
+                span,
+                ..
+            }) => self.parse_assignment(name, op, span, end).map(Some),
+            Some(Token {
+                kind: TokenKind::Update(op),
+                span,
+                after_line_break,
+            }) => {
+                // The lexer records LineTerminator trivia, including inside comments.
+                if after_line_break {
+                    return Err(Error::unsupported(
                         span,
-                        ..
-                    }) => self.parse_assignment(first.span, op, span, end).map(Some),
-                    Some(Token {
-                        kind: TokenKind::Update(op),
-                        span,
-                        after_line_break,
-                    }) => {
-                        // The lexer records LineTerminator trivia, including inside comments.
-                        if after_line_break {
-                            return Err(Error::unsupported(
-                                span,
-                                "a line terminator cannot precede a postfix update",
-                            ));
-                        }
-                        self.parse_update(first.span, op, span, end).map(Some)
-                    }
-                    _ => {
-                        self.lookahead = Some(next);
-                        Ok(None)
-                    }
+                        "a line terminator cannot precede a postfix update",
+                    ));
                 }
+                self.parse_update(name, op, span, end).map(Some)
             }
-            _ => Ok(None),
+            _ => {
+                self.lookahead = Some(next);
+                Ok(None)
+            }
         }
     }
 
@@ -1595,7 +1617,7 @@ impl Parser<'_> {
     }
 
     // If the token does not start a dedicated statement, return it as the
-    // start of an expression. Bare braces and name-based stores take priority.
+    // start of an expression. Bare braces, loop labels and stores take priority.
     fn parse_non_expression_statement(&mut self, first: Token) -> Result<Option<Token>, Error> {
         match first.kind {
             TokenKind::Semicolon => {}
@@ -1604,37 +1626,104 @@ impl Parser<'_> {
             | TokenKind::If
             | TokenKind::While
             | TokenKind::For
-            | TokenKind::Do => self.open_statement(first)?,
+            | TokenKind::Do => self.open_statement(first, None)?,
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first)?,
-            _ => {
-                if self
-                    .parse_optional_store(&first, STORE_STATEMENT_END)?
+            TokenKind::Update(op) => {
+                self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
+            }
+            TokenKind::Identifier => {
+                let next = self.next_token()?;
+                if matches!(
+                    next.as_ref().map(|token| token.kind),
+                    Some(TokenKind::Colon)
+                ) {
+                    self.open_labeled_loop(first.span)?;
+                } else if self
+                    .parse_name_store(first.span, next, STORE_STATEMENT_END)?
                     .is_none()
                 {
                     return Ok(Some(first));
                 }
             }
+            _ => return Ok(Some(first)),
+        }
+        Ok(None)
+    }
+
+    fn open_labeled_loop(&mut self, label: Span) -> Result<(), Error> {
+        let missing = "expected a loop after the label";
+        let first = self.require_token(missing)?;
+        match first.kind {
+            TokenKind::While | TokenKind::For | TokenKind::Do => {
+                self.open_statement(first, Some(label))
+            }
+            TokenKind::CloseBrace => Err(Error::malformed(first.span, missing)),
+            _ => Err(Error::unsupported(
+                first.span,
+                "a label must directly precede a while, for, or do loop",
+            )),
+        }
+    }
+
+    fn find_active_label(&mut self, name: Span) -> Result<Option<usize>, Error> {
+        // Non-loop frames cannot carry labels. Visit the active loop chain only.
+        let mut next = self.innermost_loop;
+        while let Some(index) = next {
+            self.lexer.charge(1, name)?;
+            let StatementFrame::Loop {
+                label,
+                enclosing_loop,
+                ..
+            } = self.statement_frames[index].statement
+            else {
+                unreachable!("active loop chain must refer only to loop frames");
+            };
+            if let Some(label) = label
+                && self.names_equal(name, label)?
+            {
+                return Ok(Some(index));
+            }
+            next = enclosing_loop;
         }
         Ok(None)
     }
 
     fn parse_loop_jump(&mut self, keyword: &Token) -> Result<(), Error> {
-        let next = self.next_token()?;
-        if let Some(Token {
-            kind: TokenKind::Identifier | TokenKind::Declaration(BindingKind::Let),
-            span,
-            after_line_break: false,
-        }) = next
-        {
-            return Err(Error::unsupported(
+        let (index, next) = match self.next_token()? {
+            Some(Token {
+                kind: TokenKind::Identifier,
                 span,
-                "labeled loop jumps are outside the subset",
-            ));
-        }
-        // The stored frame index bypasses any intervening if frames.
-        let index = self.innermost_loop.ok_or_else(|| {
-            Error::malformed(keyword.span, "break and continue require an enclosing loop")
-        })?;
+                after_line_break,
+            }) => {
+                if after_line_break {
+                    return Err(Error::unsupported(
+                        span,
+                        "a line terminator cannot precede a loop jump target",
+                    ));
+                }
+                let index = self.find_active_label(span)?.ok_or_else(|| {
+                    Error::malformed(span, "loop jump target is not an active label")
+                })?;
+                (index, self.next_token()?)
+            }
+            Some(Token {
+                kind: TokenKind::Declaration(BindingKind::Let),
+                span,
+                after_line_break: false,
+            }) => {
+                return Err(Error::unsupported(
+                    span,
+                    "let cannot be used as a label name",
+                ));
+            }
+            // Unlabeled jumps go directly to the stored innermost loop index.
+            next => (
+                self.innermost_loop.ok_or_else(|| {
+                    Error::malformed(keyword.span, "break and continue require an enclosing loop")
+                })?,
+                next,
+            ),
+        };
         let missing = "loop jumps require explicit semicolons";
         let Some(next) = next else {
             return Err(Error::unsupported(Span::at(self.lexer.offset), missing));
@@ -1653,7 +1742,7 @@ impl Parser<'_> {
             layout, break_head, ..
         } = &mut self.statement_frames[index].statement
         else {
-            unreachable!("innermost loop index must refer to a loop frame");
+            unreachable!("jump target index must refer to a loop frame");
         };
         let head = if matches!(keyword.kind, TokenKind::Continue) {
             match layout {
@@ -1956,21 +2045,26 @@ impl Parser<'_> {
         Ok(index)
     }
 
-    fn find_in_scope(&mut self, scope: usize, span: Span) -> Result<Option<usize>, Error> {
+    fn names_equal(&mut self, name: Span, candidate: Span) -> Result<bool, Error> {
         let source = self.lexer.source;
-        let name = &source[span.start..span.end];
+        let text = &source[name.start..name.end];
+        let other = &source[candidate.start..candidate.end];
+        if text.len() != other.len() {
+            return Ok(false);
+        }
+        self.lexer.charge(text.len(), name)?;
+        Ok(text == other)
+    }
+
+    fn find_in_scope(&mut self, scope: usize, span: Span) -> Result<Option<usize>, Error> {
         let mut next = self.scopes[scope].last_binding;
         while let Some(slot) = next {
             self.lexer.charge(1, span)?;
-            let binding = &self.bindings[slot];
-            let candidate = &source[binding.name.start..binding.name.end];
-            if name.len() == candidate.len() {
-                self.lexer.charge(name.len(), span)?;
-                if name == candidate {
-                    return Ok(Some(slot));
-                }
+            let Binding { name, previous, .. } = self.bindings[slot];
+            if self.names_equal(span, name)? {
+                return Ok(Some(slot));
             }
-            next = binding.previous;
+            next = previous;
         }
         Ok(None)
     }

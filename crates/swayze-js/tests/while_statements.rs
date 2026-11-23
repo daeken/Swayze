@@ -112,8 +112,8 @@ fn checks_the_whole_body_even_when_the_test_is_initially_false() {
         ("x=1+;", Malformed),
         ("x=(x=1);", Unsupported),
         ("c**=1;", Unsupported),
-        ("break outer;", Unsupported),
-        ("continue outer;", Unsupported),
+        ("break outer;", Malformed),
+        ("continue outer;", Malformed),
         ("{x=1}", Unsupported),
     ] {
         let source = format!("let x=0; const c=2; while (false) {{{body}}} let later=1; x");

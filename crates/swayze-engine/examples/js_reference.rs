@@ -345,7 +345,10 @@ fn fixtures() -> Vec<String> {
             "(-0) ** 9007199254740992",
             "(-0.5) ** 1075",
             "1 ** (1 / 0)",
-            "undefined ** 0"
+            "undefined ** 0",
+            "let out = 0; outer: for (let i = 0; i < 3; i++) { while (true) { { out += i; continue outer; } } } out",
+            "let out = 40; outer: while (true) { while (true) { if (true) { out += 2; break outer; } } } out",
+            "let outer = 40; outer: do { for (;;) { outer++; continue outer; } } while (outer < 42); outer: while (false) {} outer"
         ]
         .map(str::to_owned),
     );

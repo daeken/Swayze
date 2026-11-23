@@ -120,12 +120,12 @@ fn rejects_invalid_and_out_of_slice_syntax_in_loop_paths_that_never_run() {
         ("while(true){continue; while(false {}}42", Malformed, "{"),
         (
             "while(false){if(false){break outer;}}42",
-            Unsupported,
+            Malformed,
             "outer",
         ),
         (
             "while(false){if(true){}else{continue/**/outer;}}42",
-            Unsupported,
+            Malformed,
             "outer",
         ),
         (
@@ -135,7 +135,7 @@ fn rejects_invalid_and_out_of_slice_syntax_in_loop_paths_that_never_run() {
         ),
         ("while(false){break\n}42", Unsupported, "}"),
         ("while(false){continue 1;}42", Malformed, "1"),
-        ("while(false){label: break;}42", Malformed, ":"),
+        ("while(false){label: break;}42", Unsupported, "break"),
         ("switch(1){break;}42", Unsupported, "switch"),
         ("while(true){break;}42; 1 2", Malformed, "2"),
     ] {

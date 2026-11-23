@@ -115,15 +115,12 @@ fn only_simple_prefixes_at_the_test_start_are_newly_admitted() {
     for source in [
         "let x; if (false) {} else if (x @||=@ 1) {} x",
         "let x,y; if (x=y @+=@ 1) {} x",
-        "let x; if (true, x @=@ 1) {} x",
-        "let x,y; if (x=0, y @=@ 1) {} x",
-        "let x,y; for (; x=0, y @=@ 1;) {} x",
-        "let x; if ((0, x @=@ 1)) {} x",
+        "let x; if (true, x @+=@ 1) {} x",
+        "let x; for (; x=0, !x @=@ 1;) {} x",
         "let x; if ((x) @=@ 1) {} x",
         "let x; while (true && x @=@ 1) {} x",
         "let x; do {} while (!x @=@ 1); x",
         "let x; for (; x+1 @=@ 1;) {} x",
-        "let x; if (false) {} 0, x @=@ 1",
     ] {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");
     }

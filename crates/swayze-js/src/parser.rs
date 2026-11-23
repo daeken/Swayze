@@ -263,8 +263,8 @@ pub(crate) enum Instruction {
 /// semicolon. If another token follows its semicolon, it is a statement and
 /// its value is discarded. A final root expression is still required.
 ///
-/// A control test may begin with a simple name assignment chain. Any comma
-/// at test level follows the chain and starts the next sequence operand.
+/// A control test or a noninitial operand of a comma sequence may begin
+/// with a simple name assignment chain.
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
@@ -2451,8 +2451,8 @@ impl Parser<'_> {
         } else {
             (Some(first), false)
         };
-        // Bare simple prefixes are allowed at the start of a test, RHS or
-        // ternary arm, but not at the start of an operator or comma operand.
+        // Bare simple prefixes can start a test, RHS, ternary arm, or
+        // noninitial sequence operand, but not an operator operand.
         let mut allow_simple_assignment = statement_test
             || matches!(
                 end_kind,
@@ -2782,7 +2782,12 @@ impl Parser<'_> {
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
             after_open = matches!(kind, TokenKind::Open);
-            allow_simple_assignment = matches!(kind, TokenKind::Question | TokenKind::Colon);
+            // Only a comma that emitted Discard reaches here; separators
+            // and commas rejected by the surrounding production do not.
+            allow_simple_assignment = matches!(
+                kind,
+                TokenKind::Question | TokenKind::Colon | TokenKind::Comma
+            );
             next = self.next_token()?;
         };
         let at_eof = delimiter.is_none();
@@ -2907,12 +2912,12 @@ impl Parser<'_> {
     }
 
     // At a delimiter, finish conditionals and ungrouped assignments inside out.
-    // '?' drained operators at its level, and a simple assignment began at an
-    // test, RHS or arm prefix, so neither marker has operators immediately
-    // beneath it. An arm's assignments finish before its conditional joins;
-    // an assignment whose RHS is that conditional finishes after the join.
-    // Groups, the statement test's outer delimiter, and consequents still
-    // awaiting ':' stop reduction.
+    // '?' drained operators at its level, and a simple assignment began at
+    // a test, RHS, arm or sequence operand prefix, so neither marker has
+    // operators immediately beneath it. An arm's assignments finish before
+    // its conditional joins; an assignment whose RHS is that conditional
+    // finishes after the join. Groups, the statement test's outer delimiter,
+    // and consequents still awaiting ':' stop reduction.
     fn reduce_expression(&mut self, end: Span) -> Result<(), Error> {
         self.reduce_operators(0)?;
         while let Some(&(pending, span)) = self.pending.last() {

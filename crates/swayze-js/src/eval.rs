@@ -183,13 +183,14 @@ impl Script {
     /// for postfix.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. A comma sequence evaluates its operands
-    /// from left to right, discarding each but the last without coercion.
+    /// from left to right, discarding each but the last without coercion. A simple
+    /// assignment chain in an operand stores the RHS value before the sequence
+    /// advances or returns that value as its result.
     /// A standalone expression statement also discards its result without coercion.
     /// Only the required final root expression supplies the Script's result.
-    /// Statement tests use the same truthiness. A simple assignment chain at
-    /// the start of a test stores the RHS value before truthiness is checked
-    /// (or before the next comma operand is evaluated). An `if` statement
-    /// executes only the selected branch, leaving no operand stack result.
+    /// Statement tests check the final operand's truthiness after any stores.
+    /// An `if` statement executes only the selected branch, leaving no operand
+    /// stack result.
     /// A `while` statement evaluates its test before each iteration and runs its
     /// body only when the test is truthy. A `for` statement first runs its
     /// optional initializer and then tests (an omitted test is truthy). Each

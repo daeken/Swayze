@@ -103,6 +103,7 @@ fn comma_ownership_is_decided_after_the_conditional_joins() {
         ("let x,y; const v=x=false ? y=1 : y=2,z=x+y; z+v", 6.0),
         ("let x,y; true ? x=(1,2) : y=3, x", 2.0),
         ("let x,y; false ? x=1 : y=2, y", 2.0),
+        ("let x; true ? 0 : x=1, x=2, x", 2.0),
         ("let test=true,x,y=7,z=2; (test ? x = 1 : z, x + y)", 8.0),
         (
             "let x; for(let y=false ? x=1 : x=2,z=y; z===x; ) { break; } x",
@@ -224,8 +225,6 @@ fn only_direct_names_at_admitted_rhs_starts_can_begin_a_chain() {
         "let a; let x = true ? a @+=@ 1 : 0; x",
         "let a; let x = false ? 0 : a @||=@ 1; x",
         "let a; true ? 0 : +a @=@ 1",
-        "let a; true ? 0 : a=1, a @=@ 2",
-        "let a; let x = (0, a @=@ 1); x",
         "let a; if (+a @=@ 1) {} a",
         "let a; let x = (a) @=@ 1; x",
         "let a; let x = a @||=@ 1; x",

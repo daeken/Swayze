@@ -181,6 +181,10 @@ fn fixtures() -> Vec<String> {
             "let x = 4; let y = 0; while (x) { x = x - 1; if (x === 2) { continue; } y = y + x; } y",
             "let x = 2; let y = 0; while (x) { while (true) { y = y + x; break; } x = x - 1; } y",
             "let x = 0; while (x < 6) { x = x + 1; if (x < 3) { continue; } else { break; } } x",
+            "let out = 0; if (true) { const item = 42; out = item; } else { let item = 1; out = item; } out",
+            "let out = 0; if (false) { const item = 42; out = item; } else { let item = 2; item = item + 3; out = item; } out",
+            "let i = 0; let out = 0; while (i < 4) { i = i + 1; if (i === 2) { continue; } const item = i * 2; out = out + item; } out",
+            "let out = 0; while (true) { let item = 42; if (item) { out = item; break; } } out",
         ]
         .map(str::to_owned),
     );

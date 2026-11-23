@@ -34,14 +34,17 @@ Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
 All operands and arms must use supported syntax and bindings.
 
 `if (test) { ... }` and `while (test) { ... }` statements may precede the final
-expression. Braced bodies hold simple assignments to earlier `let` bindings
-and nested `if` and `while` statements. Unlabeled `break;` exits the innermost
+expression. Braced bodies can contain initialized `let` and `const`
+declarations, simple assignments to earlier visible `let` bindings, and nested
+`if` and `while` statements. A block-local binding is visible only in that
+block and its descendants after initialization. Sibling blocks can reuse a
+name; shadowing between enclosing and nested blocks is unsupported. Unlabeled `break;` exits the innermost
 `while`; `continue;` reevaluates its test. Both require explicit semicolons.
 Only the selected `if` arm runs; a false
 test with no `else` skips the body. A `while` reevaluates its test before each
 iteration. Untaken arms and skipped loop bodies are still checked. The parser
 uses at most 128 active statement frames, separate from the expression nesting
-limit. Unbraced `else if` and declarations in these bodies are unsupported.
+limit. Unbraced `else if` is unsupported.
 
 The evaluator sees only private instructions, not the original source. Before
 allocating, it checks a ceiling of 4,096 prepared instructions, counting
@@ -51,8 +54,9 @@ back edges count each time they execute; skipped paths and exiting do not.
 An evaluation that needs another dispatch returns `DispatchLimitExceeded`.
 Each literal adds one operand, and each eager binary operation consumes two
 operands and leaves one. A unary operation replaces the
-top operand. Initialization consumes a value and appends a slot; a read pushes
-that slot's value. Assignment replaces the value of a mutable slot. The
+top operand. Each declaration has its own slot, initialized on every execution
+of that declaration, including on loop reentry. A read pushes that slot's value;
+assignment replaces the value of a mutable slot. The
 evaluator checks bounds before reserving at most 2,048
 operand slots and 2,047 binding slots. Reads of uninitialized slots, missing
 operands and invalid final stack depth are rejected. Every evaluation uses

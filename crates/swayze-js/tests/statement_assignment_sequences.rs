@@ -40,6 +40,27 @@ fn logical_skip_and_take_both_run_the_suffix_with_the_stored_value() {
     }
 }
 
+#[test]
+fn leading_logical_assignment_runs_the_suffix_without_supplying_script_completion() {
+    let sequence = "let x=0,y=0; x ||= 4, y += x;";
+    let script = parse_script(&format!("{sequence} y")).unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Number(4.0)));
+    assert_marked_error(
+        &format!("{sequence}@@"),
+        ErrorKind::Unsupported,
+        "a final expression is required",
+    );
+
+    // Keep x at 3, not 4, but still add it to y in the suffix.
+    for source in [
+        "let x=3,y=0; x ||= 4, y += x; y",
+        "let x=3,y=0; { x ||= 4, y += x; } y",
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate_value(), Ok(Value::Number(3.0)), "{source}");
+    }
+}
+
 fn assert_marked_error(source: &str, kind: ErrorKind, message: &str) {
     let (before, rest) = source.split_once('@').unwrap();
     let (at, after) = rest.split_once('@').unwrap();
@@ -63,6 +84,7 @@ fn separators_require_operands_and_do_not_interrupt_a_consequent_or_declaration(
         ("let x; x=/*α*/@,@x;x", "expected an operand"),
         ("let x; x=true,/*α*/@,@x;x", "expected an operand"),
         ("let x; x=true, x=false,/*α*/@;@x", "expected an operand"),
+        ("let x=true; { x ||= 4,/*α*/@;@ } x", "expected an operand"),
         ("let x; x=true,/*α*/@@", "expected an operand"),
         (
             "let x; x=true ? x=1/*α*/@,@2 : 3; x",

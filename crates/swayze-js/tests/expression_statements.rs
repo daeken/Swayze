@@ -7,6 +7,7 @@ fn root_and_braced_statements_discard_supported_expressions() {
     use Value::{Boolean, Null, Number, Undefined};
     for (source, expected) in [
         ("1; 2", Number(2.0)),
+        ("1; \"use strict\"; 2", Number(2.0)),
         ("0o7;0x1", Number(1.0)),
         ("true; ; {} null; // final expression", Null),
         ("true, false ? 1 : null; (2 + 1) === 3;", Boolean(true)),
@@ -101,7 +102,7 @@ fn statement_expressions_do_not_enable_other_syntax() {
             2,
             "increment and decrement expressions",
         ),
-        ("1; @\"use strict\"; 2", 1, "outside"),
+        ("@\"use strict\"; 2", 12, "Use Strict Directives"),
         ("{@function f(){}; } 2", 8, "outside"),
         ("{(@{x: 1});} 2", 1, "braces are not expression tokens"),
     ] {

@@ -1384,9 +1384,9 @@ pub(super) fn execute(
             }
             Instruction::Select => {
                 let condition = frame.pop_i32();
-                let second = frame.pop_i32();
-                let first = frame.pop_i32();
-                frame.push_i32(if condition != 0 { first } else { second });
+                let second = frame.pop();
+                let first = frame.pop();
+                frame.push(if condition != 0 { first } else { second });
             }
             Instruction::Const(value) => frame.push(value),
             Instruction::Convert(op) => {
@@ -1606,19 +1606,25 @@ fn decode_branch_edge(
 }
 
 struct OperandStack {
-    types: [ValType; Limit::OperandStackDepth.maximum()],
+    // None is a type-polymorphic value in a counted slot, distinct from
+    // implicit operands at an unreachable frame's floor.
+    types: [Option<ValType>; Limit::OperandStackDepth.maximum()],
     depth: usize,
 }
 
 impl OperandStack {
     fn new() -> Self {
         Self {
-            types: [ValType::I32; Limit::OperandStackDepth.maximum()],
+            types: [None; Limit::OperandStackDepth.maximum()],
             depth: 0,
         }
     }
 
     fn push(&mut self, ty: ValType, offset: usize) -> Result<(), Error> {
+        self.push_slot(Some(ty), offset)
+    }
+
+    fn push_slot(&mut self, ty: Option<ValType>, offset: usize) -> Result<(), Error> {
         let slot = self.types.get_mut(self.depth).ok_or(Error {
             offset,
             kind: ErrorKind::LimitExceeded {
@@ -1630,16 +1636,12 @@ impl OperandStack {
         Ok(())
     }
 
-    // Each consumer checks one common type for all its inputs, except drop,
-    // which accepts any type. Check concrete operands above the floor; any
-    // remaining pops in a dead tail are implicit and consume no slots.
-    fn pop(
-        &mut self,
+    fn depth_after_pop(
+        &self,
         frame: ControlFrame,
         count: usize,
-        expected: Option<ValType>,
         offset: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
         let available = self.depth - frame.base;
         if count > available && !frame.unreachable {
             return Err(Error {
@@ -1647,9 +1649,21 @@ impl OperandStack {
                 kind: ErrorKind::StackUnderflow { depth: available },
             });
         }
-        let remaining = self.depth - count.min(available);
+        // Missing operands in a dead tail are implicit and consume no slots.
+        Ok(self.depth - count.min(available))
+    }
+
+    // All typed inputs here share an expected type. Drop accepts any type.
+    fn pop(
+        &mut self,
+        frame: ControlFrame,
+        count: usize,
+        expected: Option<ValType>,
+        offset: usize,
+    ) -> Result<(), Error> {
+        let remaining = self.depth_after_pop(frame, count, offset)?;
         if let Some(expected) = expected {
-            for &actual in self.types[remaining..self.depth].iter().rev() {
+            for &actual in self.types[remaining..self.depth].iter().rev().flatten() {
                 if actual != expected {
                     return Err(Error {
                         offset,
@@ -1660,6 +1674,28 @@ impl OperandStack {
         }
         self.depth = remaining;
         Ok(())
+    }
+
+    fn select(&mut self, frame: ControlFrame, offset: usize) -> Result<(), Error> {
+        // As with other consumers, report underflow before checking types.
+        let remaining = self.depth_after_pop(frame, 3, offset)?;
+        self.pop(frame, 1, Some(ValType::I32), offset)?;
+        // Either known candidate sets the result type, and if both are known
+        // they must agree. Implicit or unknown candidates defer.
+        let mut candidates = self.types[remaining..self.depth].iter().flatten().copied();
+        let result = candidates.next();
+        if candidates.next().is_some_and(|other| Some(other) != result) {
+            // The check is symmetric; retain the i32-only select diagnostic.
+            return Err(Error {
+                offset,
+                kind: ErrorKind::TypeMismatch {
+                    expected: ValType::I32,
+                    actual: ValType::I64,
+                },
+            });
+        }
+        self.depth = remaining;
+        self.push_slot(result, offset)
     }
 }
 
@@ -1675,7 +1711,7 @@ fn validate_plain_stack(
     let (count, expected, result) = match instruction {
         Instruction::Nop => return Ok(()),
         Instruction::Drop => (1, None, None),
-        Instruction::Select => (3, i32_type, i32_type),
+        Instruction::Select => return operands.select(frame, offset),
         Instruction::Const(value) => (0, None, Some(value.operand_type())),
         Instruction::Convert(op) => {
             let (from, to) = op.types();

@@ -24,6 +24,65 @@ fn dead_function_tails_supply_missing_operands_and_results() {
 }
 
 #[test]
+fn select_with_no_known_candidates_leaves_an_unknown_operand() {
+    for inputs in [
+        b"".as_slice(), // All inputs are implicit.
+        b"\x41\0",      // Explicit i32 condition, implicit candidates.
+        b"\x1b",        // A prior unknown result is the condition.
+        b"\x1b\x41\0",  // A prior unknown result is a candidate.
+    ] {
+        for eqz in [0x45, 0x50] {
+            // i32.eqz and i64.eqz
+            assert_body_traps(&[b"\0\x00".as_slice(), inputs, &[0x1b, eqz, 0x0b]].concat());
+        }
+    }
+}
+
+#[test]
+fn select_with_one_known_candidate_leaves_a_result_of_that_type() {
+    use swayze_wasm::ValType::{I32, I64};
+    for head in [
+        b"\0\x00".as_slice(), // The first candidate is implicit.
+        b"\0\x00\x1b",        // The first candidate is a counted unknown.
+    ] {
+        for (constant, eqz, wrong_eqz, expected, actual) in
+            [(0x41, 0x45, 0x50, I64, I32), (0x42, 0x50, 0x45, I32, I64)]
+        {
+            let mut body = [head, &[constant, 0, 0x41, 0, 0x1b, eqz, 0x0b]].concat();
+            assert_body_traps(&body);
+            let consumer = body.len() - 2;
+            body[consumer] = wrong_eqz;
+            bad_body(
+                &body,
+                consumer,
+                ErrorKind::TypeMismatch { expected, actual },
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_select_results_obey_the_frame_floor_and_operand_cap() {
+    // Even an unknown cannot fill in for a candidate below the child floor.
+    bad_body(
+        b"\0\x00\x1b\x02\x40\x42\0\x41\0\x1b\x1a\x0b\x0b",
+        9,
+        ErrorKind::StackUnderflow { depth: 2 },
+    );
+
+    // The dead block cannot borrow its frozen i32s as candidates, and the
+    // unknown result still needs a slot even though all inputs are implicit.
+    let limit = Limit::OperandStackDepth;
+    let mut body = vec![0];
+    body.extend([0x41, 0].repeat(limit.maximum() - 1));
+    let block = body.len();
+    body.extend(b"\x02\x40\x00\x1b\x50\x1a\x0b\x00\x0b");
+    assert_body_traps(&body);
+    body.splice(block..block, [0x41, 0]);
+    bad_body(&body, block + 5, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
 fn block_floor_preserves_prefix_and_taken_branch_bypasses_dead_tail() {
     let body = [
         0, 0x41, 40, 0x02, 0x7f, // Save 40 below the block's floor.

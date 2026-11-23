@@ -135,13 +135,14 @@
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
 //! i64 remains limited to internal operands: signatures, locals, globals,
-//! control labels, `select`, and memory instructions do not accept i64.
+//! control labels, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
-//! Untyped `select` consumes three i32 operands pushed in first-value,
-//! second-value, condition order. It pushes the first value for any nonzero
-//! condition and the second for zero. Unlike `if`, `select` does not skip
-//! either value's computation; a producer may trap even if its result would be
-//! unselected or dropped.
+//! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
+//! i64) and an i32 condition, pushed in first-candidate, second-candidate,
+//! condition order above the active floor. In one dispatch it pushes the first
+//! candidate for any nonzero condition and the second for zero. Unlike `if`,
+//! `select` does not skip either candidate's computation; a producer may trap
+//! even if its result would be unselected or dropped.
 //! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one i32 and
 //! push one i32; the i32 binary operators consume two i32s and push one i32.
 //! `call` consumes as many i32s as the target function's type has parameters
@@ -164,10 +165,13 @@
 //! For validation, `unreachable`, `br`, `br_table`, and `return` discard
 //! operands above the active floor and mark only that frame unreachable, after
 //! checking any required operands. A pop at the floor of an unreachable frame
-//! supplies an implicit operand of the required type without reducing the depth;
-//! pushes remain concrete and count against the stack cap. No operand access
-//! crosses the active floor. At `else` or `end`, an unreachable frame may supply
-//! a missing i32 result implicitly, but a concrete result of the wrong type or
+//! supplies an implicit operand of the required type without reducing the depth.
+//! In a dead tail, any known candidate type determines the `select` result;
+//! mismatched known candidates still fail at `select`. Without a known candidate
+//! type, the result is unknown and can satisfy either type. Every push, including
+//! an unknown result, occupies a slot and counts against the stack cap. No operand
+//! access crosses the active floor. At `else` or `end`, an unreachable frame may
+//! supply a missing i32 result implicitly, but a known result of the wrong type or
 //! any excess operands are still rejected. Every new frame starts reachable,
 //! even inside an unreachable frame. `else` checks the then result and starts
 //! a reachable else arm at the same floor. `end` checks the final result, then
@@ -196,8 +200,8 @@
 //! limits are 256 body bytes (including the locals vector and all delimiters),
 //! 127 decoded instructions (including `unreachable`, `nop`,
 //! `drop`, `select`, `if`, `else`, `br`, `br_if`, `br_table`, and `return`, but
-//! not `block`, `loop`, or `end`), 32 explicitly stacked operands of either
-//! type including those below floors, and 16 simultaneously open `block`,
+//! not `block`, `loop`, or `end`), 32 stacked operands including unknown results
+//! and operands below floors, and 16 simultaneously open `block`,
 //! `loop`, and `if` frames combined, excluding the function frame.
 //!
 //! Validation resolves every function's type index and validates all global
@@ -368,11 +372,15 @@
 //! values and `i32::MIN`, signed and unsigned right shifts, preserved operand
 //! prefixes, underflow at control floors (including both untaken arms), and
 //! exact decoded-instruction and dispatch budget boundaries.
-//! Stack-operation tests check selection order and zero, positive, and negative
-//! conditions (including signed extrema), discarded values and eager producer
-//! traps, preserved operands across mixed control, exact underflow offsets
-//! including in skipped code, and exact body byte, instruction, operand, and
-//! dispatch limits with `nop`, including limit precedence over a guest trap.
+//! Stack-operation tests check selection order for both types, including i64
+//! candidates with identical low words, and zero, positive, and negative i32
+//! conditions. They check eager producer traps for either unselected candidate,
+//! preserved operands across mixed control, exact underflow offsets including
+//! in skipped code, and exact body byte, instruction, operand, and dispatch
+//! limits, including limit precedence over a guest trap. Dead-tail tests check
+//! mixed-candidate and condition diagnostics at `select`, use of unknown results
+//! as either type or as inputs to later selects, concretization by a known
+//! candidate, and depth and floor accounting for unknown results.
 //! i64 operand tests check exact extended and wrapped values, signed LEB64
 //! padding, terminal bytes and frame offsets, i32-only boundaries in live and
 //! dead code, and preservation through control and calls. They distinguish

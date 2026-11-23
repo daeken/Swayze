@@ -75,6 +75,17 @@ fn truthiness_does_not_coerce_the_stored_value_and_rhs_runs_once() {
 }
 
 #[test]
+fn test_assignment_precedes_comma_but_cannot_start_its_right_operand() {
+    let source = "let x = 7; if (x = 0, true) { x += 42; } x";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(42.0));
+    assert_marked_error(
+        "let x = 7; if (true, x @=@ 0) {} x",
+        ErrorKind::Unsupported,
+        "assignment expressions",
+    );
+}
+
+#[test]
 fn comma_discards_the_completed_assignment_then_uses_the_last_value() {
     for source in [
         "let x=1,hit=0; if (x=0, true) { hit++; } x*10+hit",
@@ -115,7 +126,6 @@ fn only_simple_prefixes_at_the_test_start_are_newly_admitted() {
     for source in [
         "let x; if (false) {} else if (x @||=@ 1) {} x",
         "let x,y; if (x=y @+=@ 1) {} x",
-        "let x; if (true, x @=@ 1) {} x",
         "let x,y; if (x=0, y @=@ 1) {} x",
         "let x,y; for (; x=0, y @=@ 1;) {} x",
         "let x; if ((0, x @=@ 1)) {} x",
@@ -228,22 +238,43 @@ fn old_and_new_test_costs_are_inclusive_with_exact_failure_spans() {
     assert_eq!(script.instruction_count(), 5);
     assert_eq!(script.max_stack_depth(), 1);
     assert_eq!(script.evaluate_value(), Ok(Value::Undefined));
-    let error = parse_script_with_limits(
-        old,
-        Limits {
-            max_work: old_limits.max_work - 1,
-            ..old_limits
-        },
-    )
-    .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
-    assert_eq!(
-        error.span(),
-        Span {
-            start: old.len() - 1,
-            end: old.len()
-        }
-    );
+    for (limits, limit, start) in [
+        (
+            Limits {
+                max_tokens: old_limits.max_tokens - 1,
+                ..old_limits
+            },
+            Limit::Tokens,
+            old.len() - 1,
+        ),
+        (
+            Limits {
+                max_work: old_limits.max_work - 1,
+                ..old_limits
+            },
+            Limit::Work,
+            old.len() - 1,
+        ),
+        (
+            Limits {
+                max_nesting_depth: old_limits.max_nesting_depth - 1,
+                ..old_limits
+            },
+            Limit::NestingDepth,
+            old.find('(').unwrap(),
+        ),
+    ] {
+        let error = parse_script_with_limits(old, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit), "{error}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            },
+            "{error}"
+        );
+    }
 
     let source = "let x;if(x/*α*/=x=true){}x";
     let limits = Limits {

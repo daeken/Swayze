@@ -85,7 +85,6 @@ fn rejects_malformed_delimiters_missing_final_expression_and_trailing_input() {
         ("let x=0; while (false) x=1; x", Malformed),
         ("while (false) {", Malformed),
         ("while (false) {}", Unsupported),
-        ("while (false) {}; 1", Unsupported),
         ("while (false) {} else {} 1", Unsupported),
         ("1; while (false) {}", Unsupported),
         ("while (false) {} 1; 2", Unsupported),
@@ -107,7 +106,6 @@ fn checks_the_whole_body_even_when_the_test_is_initially_false() {
         ("let y=;", Malformed),
         ("const y=1", Unsupported),
         ("x;", Unsupported),
-        (";", Unsupported),
         ("x=1\n", Unsupported),
         ("x=1\nx=2;", Unsupported),
         ("x=;", Malformed),
@@ -116,7 +114,7 @@ fn checks_the_whole_body_even_when_the_test_is_initially_false() {
         ("x**=1;", Unsupported),
         ("break outer;", Unsupported),
         ("continue outer;", Unsupported),
-        ("{x=1;}", Unsupported),
+        ("{x=1}", Unsupported),
     ] {
         let source = format!("let x=0; const c=2; while (false) {{{body}}} let later=1; x");
         assert_eq!(parse_script(&source).unwrap_err().kind(), kind, "{source}");

@@ -1087,7 +1087,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const [x]=1; x", Unsupported, 6, 7),
         ("const {x}=1; x", Unsupported, 6, 7),
         ("const x=(1;); x", Malformed, 10, 11),
-        ("const x=1;; x", Unsupported, 10, 11),
+        ("const x=1;;", Unsupported, 11, 11),
         ("const x=1; x; x", Unsupported, 14, 15),
         ("const x=1; x; const y=1; y", Unsupported, 14, 19),
         ("const x=1; x=2", Unsupported, 14, 14),
@@ -1266,7 +1266,7 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
         ("let x=1; const x=2; x", Malformed, 15, 16),
         ("const x=1; let x=2; x", Malformed, 15, 16),
         ("let x=1; x=0; let x=2; x", Malformed, 18, 19),
-        ("{let x=1;} x", Unsupported, 0, 1),
+        ("{let x=1;} x", Unsupported, 11, 12),
     ] {
         assert_error(source, kind, start, end);
     }
@@ -1365,7 +1365,7 @@ fn malformed_subset_and_unsupported_constructs() {
     assert_error("(1;)", Malformed, 2, 3);
     assert_error("(1\n2)", Malformed, 3, 4);
     assert_error("", Unsupported, 0, 0);
-    assert_error(";", Unsupported, 0, 1);
+    assert_error(";", Unsupported, 1, 1);
     assert_error("-", Malformed, 1, 1);
     assert_error("(+)", Malformed, 2, 3);
     assert_error("1/", Malformed, 2, 2);

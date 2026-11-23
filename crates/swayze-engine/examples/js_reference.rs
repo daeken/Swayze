@@ -291,6 +291,11 @@ fn fixtures() -> Vec<String> {
             "let n = 1; n /* no line break */ ++; ++/*\n*/n; n",
             "let n = 0; let sum = 0; for (n++; n < 5; ++n) { if (n < 3) { continue; } sum += n; } sum",
             "let n = 5; let sum = 0; for (--n; n > 0; n--) { if (n === 1) { break; } sum += n; } sum",
+            ";{};{;;{}};42",
+            "let x = 1; let out = 0; { let x = 20; out += x; } { let x = 21; out += x; } out + x",
+            "let out = 0; { let undefined = 42; { out = undefined; } } out",
+            "let n = 0; let sum = 0; while (true) { { n++; if (n < 3) { continue; } if (n > 4) { break; } sum += n; } } sum",
+            "let n = 0; let out = 0; do { { let base = 1; base += n; out += base; } ++n; } while (n < 3); out",
         ]
         .map(str::to_owned),
     );

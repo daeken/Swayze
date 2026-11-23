@@ -67,15 +67,13 @@ fn checks_every_nested_block_even_if_never_reached() {
         ("const y=1; let y=2;", Malformed),
         ("break", Unsupported),
         ("continue\n", Unsupported),
-        ("{x=1;}", Unsupported),
+        ("{x;}", Unsupported),
         ("1;", Unsupported),
         ("x=1", Unsupported),
         ("x=1\nx=2;", Unsupported),
         ("x=;", Malformed),
         ("if(true)x=1;", Malformed),
         ("while(false)x=1;", Malformed),
-        ("if(true){};", Unsupported),
-        ("while(false){};", Unsupported),
     ] {
         let source = format!(
             "let x=0; const c=2;

@@ -67,10 +67,11 @@ It is left-associative, binds between bitwise OR and `?:`, and cannot mix with
 `&&` or `||` without parentheses at the same expression level. All operands
 and arms must use supported syntax and bindings.
 
-Braced `if`, `while`, `do…while`, and `for` statements may precede the final expression.
-Their bodies can contain initialized `let` and `const` declarations,
-assignments to earlier visible `let` bindings, and nested
-control statements. A block-local declaration shadows enclosing
+Standalone blocks, empty statements (`;`), and braced `if`, `while`,
+`do…while`, and `for` statements may precede the required final expression.
+Braced bodies can contain initialized `let` and `const` declarations,
+assignments and updates to earlier visible `let` bindings, and other supported
+statements. Empty statements and standalone braces emit no instructions. A block-local declaration shadows enclosing
 bindings throughout its block. The parser resolves every access to the nearest
 lexical declaration after parsing the script. Access before initialization is
 unsupported, even in code that would not run; it never falls back to an outer

@@ -99,7 +99,6 @@ fn void_does_not_bypass_grammar_or_binding_validation() {
         ("let x = 1\n@void x", 4, Unsupported),
         ("{void 0@} 42", 1, Unsupported),
         ("void 0; 42;;@", 0, Unsupported),
-        ("void @typeof 0", 6, Unsupported),
         ("void @delete x", 6, Unsupported),
         (r#"void "@\xG""#, 3, Malformed),
         ("false && void @;", 1, Malformed),

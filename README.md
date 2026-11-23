@@ -48,6 +48,8 @@ This checks the revision and sample paths; it does **not** run JavaScript. See [
 
 With Node.js on `PATH`, `sh tools/check-js-reference.sh` and `sh tools/check-wasm-reference.sh` compare generated fixtures against an independent engine. The Wasm check uses Node.js v22, compares `i64` values as BigInts, and compares copies from memory exports byte-for-byte. Neither check is required by the local merge gate.
 
+`node tools/number-format-oracle.mjs` is a separate opt-in Node.js 22 check. It uses exact BigInt arithmetic to check shortest binary64 decimal formatting on fixed synthetic inputs. `--tsv` emits the verified bit patterns and expected strings for other test tools. This does not test Swayze's evaluator or enable mixed String/scalar addition.
+
 ## Push and merge policy
 
 Push commits to their working branch by default. For a PR, run the internal gate on a clean checkout of the proposed merge with current `main`. Initialize Test262 as above, then run:

@@ -1,5 +1,6 @@
 use swayze_js::{
-    ErrorKind, EvalError, Limit, Limits, Value, parse_script, parse_script_with_limits,
+    ErrorKind, EvalError, Limit, Limits, PrimitiveValue, Value, parse_script,
+    parse_script_with_limits,
 };
 
 fn unary(op: &str, text: &str) -> f64 {
@@ -127,6 +128,114 @@ fn unary_conversions_evaluate_operands_once_in_source_order() {
     )
     .unwrap();
     assert_eq!(script.evaluate(), Ok(-7.0));
+}
+
+const BINARY_OPS: [&str; 4] = ["*", "/", "%", "**"];
+
+fn assert_number(source: &str, expected: f64) {
+    let script = parse_script(source).unwrap_or_else(|err| panic!("{source}: {err}"));
+    let Ok(PrimitiveValue::Scalar(Value::Number(result))) = script.evaluate_primitive() else {
+        panic!("expected Number from {source}");
+    };
+    if expected.is_nan() {
+        assert!(result.is_nan(), "{source}: got {result}");
+    } else {
+        assert_eq!(result.to_bits(), expected.to_bits(), "{source}");
+    }
+}
+
+#[test]
+fn multiplicative_and_power_operands_coerce_mixed_tags_to_numbers() {
+    for (source, expected) in [
+        ("' 0x10 ' * '2.5'", 40.0),
+        ("'6' * true", 6.0),
+        ("false * '-2'", -0.0),
+        ("'0b1100' / 2", 6.0),
+        ("2 / '0b1100'", 1.0 / 6.0),
+        ("'9' / '4'", 2.25),
+        ("'8' / null", f64::INFINITY),
+        ("null / '-8'", -0.0),
+        ("'11' % 4", 3.0),
+        ("4 % '11'", 4.0),
+        ("'11' % '4'", 3.0),
+        ("'6' % undefined", f64::NAN),
+        ("undefined % '6'", f64::NAN),
+        ("'3' ** 2", 9.0),
+        ("2 ** '3'", 8.0),
+        ("'2' ** '3' ** '2'", 512.0),
+    ] {
+        assert_number(source, expected);
+    }
+}
+
+#[test]
+fn multiplicative_and_power_preserve_number_special_cases() {
+    for (source, expected) in [
+        ("'-0' * '2'", -0.0),
+        ("'-0' * '-2'", 0.0),
+        ("'+Infinity' * '0'", f64::NAN),
+        ("'not numeric' * '2'", f64::NAN),
+        ("'1' / '-0'", f64::NEG_INFINITY),
+        ("'1' / '-Infinity'", -0.0),
+        ("'-0' / '-2'", 0.0),
+        ("'Infinity' / 'Infinity'", f64::NAN),
+        ("'-6' % '3'", -0.0),
+        ("'6' % '-3'", 0.0),
+        ("'-7' % '3'", -1.0),
+        ("'-7' % 'Infinity'", -7.0),
+        ("'Infinity' % '3'", f64::NAN),
+        ("'1' % '-0'", f64::NAN),
+        ("'not numeric' ** '-0'", 1.0),
+        ("'0' ** 'not numeric'", f64::NAN),
+        ("'not numeric' ** '2'", f64::NAN),
+        ("'-1' ** 'Infinity'", f64::NAN),
+        ("'-2' ** '.5'", f64::NAN),
+        ("'-0' ** '3'", -0.0),
+        ("'-0' ** '-3'", f64::NEG_INFINITY),
+        ("'-0' ** '-2'", f64::INFINITY),
+        ("'-Infinity' ** '3'", f64::NEG_INFINITY),
+        ("'-Infinity' ** '-3'", -0.0),
+        ("'-Infinity' ** '-2'", 0.0),
+        ("'-1' ** '9007199254740991'", -1.0),
+        ("'-1' ** '9007199254740993'", 1.0), // Rounded to even before testing parity.
+    ] {
+        assert_number(source, expected);
+    }
+}
+
+#[test]
+fn binary_expressions_run_once_left_to_right_and_compounds_snapshot_before_rhs() {
+    for (op, expected) in BINARY_OPS.into_iter().zip([18.0, 4.5, 1.0, 81.0]) {
+        assert_number(
+            &format!(
+                "let x = '9', order = 0; \
+                 const result = (order = order * 10 + 1, x) {op} \
+                                (order = order * 10 + 2, x = '2'); \
+                 order === 12 && x === '2' ? result : -1"
+            ),
+            expected,
+        );
+        assert_number(
+            &format!("let x = '9', n = 0; x {op}= (n++, x = '2'); n === 1 ? x : -1"),
+            expected,
+        );
+        assert_number(
+            &format!(
+                "let x = '9', n = 0; const result = (x {op}= (n++, x = '2')); \
+                 n === 1 && x === result ? result : -1"
+            ),
+            expected,
+        );
+    }
+    // The inner power stores first; the outer division uses its earlier snapshot.
+    assert_number(
+        "let x = '16', y = '2'; const result = x /= y **= (x = '3'); \
+         x === 2 && y === 8 ? result : -1",
+        2.0,
+    );
+    // Invalid numeric text produces a Number NaN, which is still written.
+    assert_number("let x = 'bad'; x *= 2; x", f64::NAN);
+    assert_number("let x = '-0'; (x **= '-3'), x", f64::NEG_INFINITY);
 }
 
 #[test]
@@ -375,6 +484,97 @@ fn exact_conversion_budget_is_shared_inclusive_and_fresh() {
     }
 }
 
+fn unary_budget_prefix(padding: usize) -> String {
+    // 64 * 4,095 credits for the loop, plus padding + 1.
+    format!(
+        "const ws = '{}'; let i = 0; while (i++ < 64) {{ +ws; }} ~'{}'; ",
+        " ".repeat(4094),
+        " ".repeat(padding),
+    )
+}
+
+#[test]
+fn unary_and_binary_share_credits_and_charge_both_strings_once() {
+    // Two credits are enough for two empty Strings, but one is not. Use the
+    // same range twice to ensure aliasing doesn't waive the second charge.
+    let exact = unary_budget_prefix(61);
+    let one_short = unary_budget_prefix(62);
+    let error = EvalError::StringNumericConversionLimitExceeded;
+    for (op, expected) in BINARY_OPS.into_iter().zip([0.0, f64::NAN, f64::NAN, 1.0]) {
+        for expr in [format!("empty {op} empty"), format!("(empty {op}= empty)")] {
+            let suffix = format!("let empty = ''; {expr}");
+            assert_number(&format!("{exact}{suffix}"), expected);
+            let over = parse_script(&format!("{one_short}{suffix}")).unwrap();
+            assert_eq!(over.evaluate(), Err(error), "{suffix}");
+            // A subsequent unary conversion must see the credits spent by the binary op.
+            let over = parse_script(&format!("{exact}{suffix}, -''")).unwrap();
+            assert_eq!(over.evaluate_primitive(), Err(error), "{suffix}");
+        }
+    }
+}
+
+#[test]
+fn rhs_errors_precede_coercion_and_skipped_binary_operators_do_not_convert() {
+    let exhausted = unary_budget_prefix(63);
+    for op in BINARY_OPS {
+        for source in [
+            format!("{exhausted}'' {op} ('' + '')"),
+            format!("{exhausted}let x = ''; x {op}= ('' + ''); x"),
+        ] {
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Err(EvalError::UnsupportedStringOperation),
+                "{op}: the RHS fails before coercing the left operand"
+            );
+        }
+        assert_number(
+            &format!(
+                "{exhausted}let x = 'untouched', n = 0; \
+                 false && '' {op} (n++, ''); true || (x {op}= ''); '' ?? '' {op} ''; \
+                 true ? 0 : x {op}= ''; if (false) {{ x {op}= ''; }} \
+                 for (; false; x {op}= '') {{}} x ||= '' {op} (n++, ''); \
+                 n === 0 && x === 'untouched' ? 42 : -1"
+            ),
+            42.0,
+        );
+        assert_eq!(
+            parse_script(&format!(r"true || '' {op} '\u{{}}'"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Malformed
+        );
+        assert_eq!(
+            parse_script(&format!("const x = ''; true || (x {op}= '')"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+    }
+}
+
+#[test]
+fn binary_dispatch_precedes_conversion_at_the_exact_boundary() {
+    for (padding, succeeds) in [(61, true), (62, false)] {
+        let prefix = format!(
+            "{}let k = 0; while (k++ < 3170) {{}} ",
+            unary_budget_prefix(padding)
+        );
+        // One literal statement then a binary expression use the last five
+        // dispatches; only the extra unary `+` puts the binary op over the limit.
+        let exact = format!("{prefix}0; '' ** ''");
+        if succeeds {
+            assert_number(&exact, 1.0);
+        } else {
+            assert_eq!(
+                parse_script(&exact).unwrap().evaluate(),
+                Err(EvalError::StringNumericConversionLimitExceeded)
+            );
+        }
+        let over = parse_script(&format!("{prefix}+0; '' ** ''")).unwrap();
+        assert_eq!(over.evaluate(), Err(EvalError::DispatchLimitExceeded));
+    }
+}
+
 #[test]
 fn sign_only_candidate_must_pay_the_surcharge_before_returning_nan() {
     // The loop spends 63 * 4095 credits. The next base-only conversion
@@ -423,14 +623,13 @@ fn dispatch_precedes_conversion_and_comparisons_have_an_independent_budget() {
         "const x = '{}'; let i = 0; while (i++ < 64) {{ x === x; }} ",
         "z".repeat(1024)
     );
-    assert_eq!(
-        parse_script(&format!("{prefix}+'42'")).unwrap().evaluate(),
-        Ok(42.0)
-    );
-    assert_eq!(
-        parse_script(&format!("{prefix}+'42', x < x"))
-            .unwrap()
-            .evaluate(),
-        Err(EvalError::StringComparisonLimitExceeded)
-    );
+    for expr in ["+'42'", "'84' / '2'"] {
+        assert_number(&format!("{prefix}{expr}"), 42.0);
+        assert_eq!(
+            parse_script(&format!("{prefix}{expr}, x < x"))
+                .unwrap()
+                .evaluate(),
+            Err(EvalError::StringComparisonLimitExceeded)
+        );
+    }
 }

@@ -2,14 +2,15 @@ use std::fmt;
 
 use crate::{
     Script,
-    parser::{BindingKind, Instruction, ShortCircuitCondition, Update, UpdateResult},
+    parser::{BindingKind, Instruction, ShortCircuitCondition, StringRange, Update, UpdateResult},
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
 const MAX_INSTRUCTIONS: usize = 4096;
 const MAX_DISPATCHES: usize = 16_384;
+const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
 
-/// A result or intermediate value in the supported JavaScript subset.
+/// A scalar value in the supported JavaScript subset.
 ///
 /// The derived [`PartialEq`] compares Rust enum variants and their payloads.
 /// Number equality treats signed zeros as equal and NaN as unequal to itself.
@@ -24,6 +25,39 @@ pub enum Value {
     Null,
     /// The JavaScript `undefined` value.
     Undefined,
+}
+
+/// A supported primitive result. String results borrow the prepared Script's
+/// immutable UTF-16 storage and may contain unpaired surrogates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PrimitiveValue<'script> {
+    /// Number, Boolean, `null`, or `undefined`.
+    Scalar(Value),
+    /// JavaScript String code units, without normalization or replacement.
+    String(&'script [u16]),
+}
+
+#[derive(Clone, Copy)]
+enum Operand {
+    Scalar(Value),
+    // Checked on literal dispatch; moves only copy the range into the same pool.
+    String(StringRange),
+}
+
+impl Operand {
+    fn require_scalar(self) -> Result<Value, EvalError> {
+        match self {
+            Self::Scalar(value) => Ok(value),
+            Self::String(_) => Err(EvalError::UnsupportedStringOperation),
+        }
+    }
+
+    fn to_boolean(self) -> bool {
+        match self {
+            Self::Scalar(value) => value.to_boolean(),
+            Self::String(range) => !range.is_empty(),
+        }
+    }
 }
 
 impl Value {
@@ -88,16 +122,16 @@ impl Value {
 }
 
 impl ShortCircuitCondition {
-    fn skips_rhs(self, lhs: Value) -> bool {
+    fn skips_rhs(self, lhs: Operand) -> bool {
         match self {
             Self::Falsy => !lhs.to_boolean(),
             Self::Truthy => lhs.to_boolean(),
-            Self::NonNullish => !matches!(lhs, Value::Null | Value::Undefined),
+            Self::NonNullish => !matches!(lhs, Operand::Scalar(Value::Null | Value::Undefined)),
         }
     }
 }
 
-/// Failure to evaluate a prepared script or obtain a Number result from it.
+/// Failure to evaluate a prepared script or obtain the requested result type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EvalError {
@@ -111,6 +145,12 @@ pub enum EvalError {
     AllocationFailed,
     /// The numeric convenience API received a non-Number result.
     NonNumericResult,
+    /// The scalar convenience API received a String result.
+    NonScalarResult,
+    /// Execution reached an operator whose String behavior is outside the subset.
+    UnsupportedStringOperation,
+    /// A String equality test would exceed the evaluation's 65,536-pair budget.
+    StringComparisonLimitExceeded,
 }
 
 impl fmt::Display for EvalError {
@@ -121,6 +161,11 @@ impl fmt::Display for EvalError {
             Self::InvalidScript => "invalid prepared JavaScript instruction sequence",
             Self::AllocationFailed => "could not allocate JavaScript operand or binding storage",
             Self::NonNumericResult => "script result is not a Number",
+            Self::NonScalarResult => "script result is not a scalar",
+            Self::UnsupportedStringOperation => {
+                "operator on a JavaScript String is outside the subset"
+            }
+            Self::StringComparisonLimitExceeded => "JavaScript string comparison limit exceeded",
         })
     }
 }
@@ -130,16 +175,29 @@ impl std::error::Error for EvalError {}
 impl Script {
     /// Evaluate the Script and return its Number result without coercing it.
     ///
-    /// Use [`Script::evaluate_value`] to accept any supported value.
+    /// Use [`Script::evaluate_primitive`] to accept any supported value.
     ///
     /// # Errors
     ///
-    /// Returns any error from [`Script::evaluate_value`], or
+    /// Returns any error from [`Script::evaluate_primitive`], or
     /// [`EvalError::NonNumericResult`] if the final value is not a Number.
     pub fn evaluate(&self) -> Result<f64, EvalError> {
-        match self.evaluate_value()? {
-            Value::Number(value) => Ok(value),
-            Value::Boolean(_) | Value::Null | Value::Undefined => Err(EvalError::NonNumericResult),
+        match self.evaluate_primitive()? {
+            PrimitiveValue::Scalar(Value::Number(value)) => Ok(value),
+            _ => Err(EvalError::NonNumericResult),
+        }
+    }
+
+    /// Evaluate the Script and return a scalar result without coercing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Script::evaluate_primitive`], or
+    /// [`EvalError::NonScalarResult`] if the final value is a String.
+    pub fn evaluate_value(&self) -> Result<Value, EvalError> {
+        match self.evaluate_primitive()? {
+            PrimitiveValue::Scalar(value) => Ok(value),
+            PrimitiveValue::String(_) => Err(EvalError::NonScalarResult),
         }
     }
 
@@ -161,12 +219,17 @@ impl Script {
     /// Equality and inequality return Booleans. Strict equality (`===`) never
     /// coerces. Loose equality (`==`) uses strict equality for matching tags,
     /// equates `null` with `undefined`, and compares a Number and a Boolean
-    /// numerically after converting the Boolean. Other mixed tags are unequal.
-    /// `!==` and `!=` negate their corresponding equality results.
+    /// numerically after converting the Boolean. Strings compare code units with
+    /// other Strings; mixed strict equality and String/nullish loose equality
+    /// are false. `!==` and `!=` negate their corresponding equality results.
+    /// String/Number and String/Boolean loose equality, String arithmetic
+    /// (including concatenation), bitwise operations, relational comparison,
+    /// and Number coercions in updates and eager compounds are unsupported.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
-    /// either signed zero, and NaN are falsy; all other supported values are truthy.
+    /// either signed zero, NaN, and the empty String are falsy; all other
+    /// supported values are truthy. Every String is non-nullish.
     /// `!` returns a Boolean. `&&` returns a falsy left operand, `||` returns a
     /// truthy left operand, and `??` returns a left operand that is neither `null`
     /// nor `undefined`. Otherwise they evaluate and return the right operand.
@@ -210,6 +273,10 @@ impl Script {
     /// skipped paths. Each call can dispatch at most 16,384 instructions; each
     /// execution of an instruction counts once, including tests, jumps, and
     /// repeated loop instructions.
+    /// Each call also allows 65,536 String code-unit pairs for equality tests.
+    /// Two Strings of equal length charge their entire length before comparison,
+    /// even for aliases or an early mismatch. Different lengths cost no pairs.
+    /// String operands only copy ranges; evaluation allocates no String storage.
     ///
     /// # Errors
     ///
@@ -217,11 +284,15 @@ impl Script {
     /// [`EvalError::DispatchLimitExceeded`] if another dispatch would exceed
     /// its budget, [`EvalError::InvalidScript`] for an invalid instruction
     /// sequence, or [`EvalError::AllocationFailed`] if storage cannot be allocated.
-    pub fn evaluate_value(&self) -> Result<Value, EvalError> {
+    /// Returns [`EvalError::UnsupportedStringOperation`] if execution reaches an
+    /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
+    /// if a comparison would exceed its pair budget.
+    pub fn evaluate_primitive(&self) -> Result<PrimitiveValue<'_>, EvalError> {
         evaluate(
             self.instructions(),
             self.max_stack_depth(),
             self.binding_slots(),
+            self.string_units(),
         )
     }
 }
@@ -229,14 +300,15 @@ impl Script {
 struct Slot {
     init_at: usize,
     kind: BindingKind,
-    value: Value,
+    value: Operand,
 }
 
-fn evaluate(
+fn evaluate<'script>(
     ops: &[Instruction],
     max_operands: usize,
     binding_slots: usize,
-) -> Result<Value, EvalError> {
+    string_units: &'script [u16],
+) -> Result<PrimitiveValue<'script>, EvalError> {
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
@@ -270,6 +342,7 @@ fn evaluate(
 
     // `ops.len()` denotes exit, which is not a dispatch and needs no fuel.
     let mut remaining = MAX_DISPATCHES;
+    let mut string_pairs_left = MAX_STRING_COMPARISON_PAIRS;
     let mut ip = 0;
     while ip != ops.len() {
         remaining = remaining
@@ -279,13 +352,29 @@ fn evaluate(
         ip += 1;
         match op {
             Instruction::Number(value) => {
-                push_operand(&mut stack, max_operands, Value::Number(value))?;
+                push_operand(
+                    &mut stack,
+                    max_operands,
+                    Operand::Scalar(Value::Number(value)),
+                )?;
+            }
+            Instruction::String(range) => {
+                range.get(string_units).ok_or(EvalError::InvalidScript)?;
+                push_operand(&mut stack, max_operands, Operand::String(range))?;
             }
             Instruction::Boolean(value) => {
-                push_operand(&mut stack, max_operands, Value::Boolean(value))?;
+                push_operand(
+                    &mut stack,
+                    max_operands,
+                    Operand::Scalar(Value::Boolean(value)),
+                )?;
             }
-            Instruction::Null => push_operand(&mut stack, max_operands, Value::Null)?,
-            Instruction::Undefined => push_operand(&mut stack, max_operands, Value::Undefined)?,
+            Instruction::Null => {
+                push_operand(&mut stack, max_operands, Operand::Scalar(Value::Null))?
+            }
+            Instruction::Undefined => {
+                push_operand(&mut stack, max_operands, Operand::Scalar(Value::Undefined))?
+            }
             Instruction::LoadBinding(slot) => {
                 let binding = bindings
                     .get(slot)
@@ -319,7 +408,7 @@ fn evaluate(
             }
             Instruction::UpdateBinding { slot, op, result } => {
                 let value = writable_binding(&mut bindings, slot)?;
-                let old = value.to_number();
+                let old = value.require_scalar()?.to_number();
                 let new = match op {
                     Update::Increment => old + 1.0,
                     Update::Decrement => old - 1.0,
@@ -328,8 +417,12 @@ fn evaluate(
                     UpdateResult::New => new,
                     UpdateResult::Old => old,
                 };
-                push_operand(&mut stack, max_operands, Value::Number(result))?;
-                *value = Value::Number(new);
+                push_operand(
+                    &mut stack,
+                    max_operands,
+                    Operand::Scalar(Value::Number(result)),
+                )?;
+                *value = Operand::Scalar(Value::Number(new));
             }
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
@@ -345,47 +438,53 @@ fn evaluate(
             Instruction::BitwiseXor => apply_bitwise(&mut stack, |lhs, rhs| lhs ^ rhs)?,
             Instruction::BitwiseOr => apply_bitwise(&mut stack, |lhs, rhs| lhs | rhs)?,
             // Rust's wrapping shifts use only the low five count bits for i32/u32.
-            Instruction::ShiftLeft => apply_binary(&mut stack, |lhs, rhs| {
+            Instruction::ShiftLeft => apply_scalar_binary(&mut stack, |lhs, rhs| {
                 Value::Number(f64::from(lhs.to_int32().wrapping_shl(rhs.to_uint32())))
             })?,
-            Instruction::ShiftRight => apply_binary(&mut stack, |lhs, rhs| {
+            Instruction::ShiftRight => apply_scalar_binary(&mut stack, |lhs, rhs| {
                 Value::Number(f64::from(lhs.to_int32().wrapping_shr(rhs.to_uint32())))
             })?,
-            Instruction::ShiftRightUnsigned => apply_binary(&mut stack, |lhs, rhs| {
+            Instruction::ShiftRightUnsigned => apply_scalar_binary(&mut stack, |lhs, rhs| {
                 Value::Number(f64::from(lhs.to_uint32().wrapping_shr(rhs.to_uint32())))
             })?,
-            Instruction::LooseEqual => apply_binary(&mut stack, |lhs, rhs| {
-                Value::Boolean(lhs.loosely_equals(rhs))
-            })?,
-            Instruction::LooseNotEqual => apply_binary(&mut stack, |lhs, rhs| {
-                Value::Boolean(!lhs.loosely_equals(rhs))
-            })?,
-            Instruction::StrictEqual => apply_binary(&mut stack, |lhs, rhs| {
-                Value::Boolean(lhs.strictly_equals(rhs))
-            })?,
-            Instruction::StrictNotEqual => apply_binary(&mut stack, |lhs, rhs| {
-                Value::Boolean(!lhs.strictly_equals(rhs))
-            })?,
+            Instruction::LooseEqual
+            | Instruction::LooseNotEqual
+            | Instruction::StrictEqual
+            | Instruction::StrictNotEqual => {
+                let strict = matches!(op, Instruction::StrictEqual | Instruction::StrictNotEqual);
+                let negate = matches!(op, Instruction::LooseNotEqual | Instruction::StrictNotEqual);
+                apply_binary(&mut stack, |lhs, rhs| {
+                    let equal =
+                        operands_equal(lhs, rhs, strict, string_units, &mut string_pairs_left)?;
+                    Ok(Value::Boolean(equal ^ negate))
+                })?;
+            }
             // Direct binary64 comparisons all return false for unordered operands.
             Instruction::LessThan => apply_relational(&mut stack, |lhs, rhs| lhs < rhs)?,
             Instruction::LessThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs <= rhs)?,
             Instruction::GreaterThan => apply_relational(&mut stack, |lhs, rhs| lhs > rhs)?,
             Instruction::GreaterThanOrEqual => apply_relational(&mut stack, |lhs, rhs| lhs >= rhs)?,
             Instruction::Positive => {
-                apply_unary(&mut stack, |value| Value::Number(value.to_number()))?;
+                apply_unary(&mut stack, |value| {
+                    Ok(Value::Number(value.require_scalar()?.to_number()))
+                })?;
             }
             Instruction::Negate => {
-                apply_unary(&mut stack, |value| Value::Number(-value.to_number()))?;
+                apply_unary(&mut stack, |value| {
+                    Ok(Value::Number(-value.require_scalar()?.to_number()))
+                })?;
             }
             Instruction::Not => {
-                apply_unary(&mut stack, |value| Value::Boolean(!value.to_boolean()))?;
+                apply_unary(&mut stack, |value| Ok(Value::Boolean(!value.to_boolean())))?;
             }
             Instruction::BitwiseNot => {
                 apply_unary(&mut stack, |value| {
-                    Value::Number(f64::from(!value.to_int32()))
+                    Ok(Value::Number(f64::from(
+                        !value.require_scalar()?.to_int32(),
+                    )))
                 })?;
             }
-            Instruction::Void => apply_unary(&mut stack, |_| Value::Undefined)?,
+            Instruction::Void => apply_unary(&mut stack, |_| Ok(Value::Undefined))?,
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
@@ -434,12 +533,51 @@ fn evaluate(
     }
 
     match stack.as_slice() {
-        [value] => Ok(*value),
+        [Operand::Scalar(value)] => Ok(PrimitiveValue::Scalar(*value)),
+        [Operand::String(range)] => range
+            .get(string_units)
+            .map(PrimitiveValue::String)
+            .ok_or(EvalError::InvalidScript),
         _ => Err(EvalError::InvalidScript),
     }
 }
 
-fn writable_binding(bindings: &mut [Option<Slot>], slot: usize) -> Result<&mut Value, EvalError> {
+fn operands_equal(
+    lhs: Operand,
+    rhs: Operand,
+    strict: bool,
+    string_units: &[u16],
+    string_pairs_left: &mut usize,
+) -> Result<bool, EvalError> {
+    match (lhs, rhs) {
+        (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(if strict {
+            lhs.strictly_equals(rhs)
+        } else {
+            lhs.loosely_equals(rhs)
+        }),
+        (Operand::String(lhs), Operand::String(rhs)) => {
+            let lhs = lhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            let rhs = rhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            if lhs.len() != rhs.len() {
+                return Ok(false);
+            }
+            *string_pairs_left = string_pairs_left
+                .checked_sub(lhs.len())
+                .ok_or(EvalError::StringComparisonLimitExceeded)?;
+            Ok(lhs == rhs)
+        }
+        (Operand::String(_), Operand::Scalar(scalar))
+        | (Operand::Scalar(scalar), Operand::String(_)) => {
+            if strict || matches!(scalar, Value::Null | Value::Undefined) {
+                Ok(false)
+            } else {
+                Err(EvalError::UnsupportedStringOperation)
+            }
+        }
+    }
+}
+
+fn writable_binding(bindings: &mut [Option<Slot>], slot: usize) -> Result<&mut Operand, EvalError> {
     match bindings.get_mut(slot) {
         Some(Some(Slot {
             kind: BindingKind::Let,
@@ -459,9 +597,9 @@ fn check_forward_target(next: usize, target: usize, exit: usize) -> Result<usize
 }
 
 fn push_operand(
-    stack: &mut Vec<Value>,
+    stack: &mut Vec<Operand>,
     max_operands: usize,
-    value: Value,
+    value: Operand,
 ) -> Result<(), EvalError> {
     if stack.len() == max_operands {
         return Err(EvalError::InvalidScript);
@@ -470,27 +608,39 @@ fn push_operand(
     Ok(())
 }
 
-fn apply_unary(stack: &mut [Value], op: impl FnOnce(Value) -> Value) -> Result<(), EvalError> {
+fn apply_unary(
+    stack: &mut [Operand],
+    op: impl FnOnce(Operand) -> Result<Value, EvalError>,
+) -> Result<(), EvalError> {
     let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *value = op(*value);
+    *value = Operand::Scalar(op(*value)?);
     Ok(())
 }
 
 fn apply_binary(
-    stack: &mut Vec<Value>,
-    op: impl FnOnce(Value, Value) -> Value,
+    stack: &mut Vec<Operand>,
+    op: impl FnOnce(Operand, Operand) -> Result<Value, EvalError>,
 ) -> Result<(), EvalError> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
     let lhs = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *lhs = op(*lhs, rhs);
+    *lhs = Operand::Scalar(op(*lhs, rhs)?);
     Ok(())
 }
 
-fn apply_arithmetic(
-    stack: &mut Vec<Value>,
-    op: impl FnOnce(f64, f64) -> f64,
+fn apply_scalar_binary(
+    stack: &mut Vec<Operand>,
+    op: impl FnOnce(Value, Value) -> Value,
 ) -> Result<(), EvalError> {
     apply_binary(stack, |lhs, rhs| {
+        Ok(op(lhs.require_scalar()?, rhs.require_scalar()?))
+    })
+}
+
+fn apply_arithmetic(
+    stack: &mut Vec<Operand>,
+    op: impl FnOnce(f64, f64) -> f64,
+) -> Result<(), EvalError> {
+    apply_scalar_binary(stack, |lhs, rhs| {
         Value::Number(op(lhs.to_number(), rhs.to_number()))
     })
 }
@@ -541,19 +691,19 @@ fn exponentiate(base: f64, exponent: f64) -> f64 {
 }
 
 fn apply_bitwise(
-    stack: &mut Vec<Value>,
+    stack: &mut Vec<Operand>,
     op: impl FnOnce(i32, i32) -> i32,
 ) -> Result<(), EvalError> {
-    apply_binary(stack, |lhs, rhs| {
+    apply_scalar_binary(stack, |lhs, rhs| {
         Value::Number(f64::from(op(lhs.to_int32(), rhs.to_int32())))
     })
 }
 
 fn apply_relational(
-    stack: &mut Vec<Value>,
+    stack: &mut Vec<Operand>,
     op: impl FnOnce(f64, f64) -> bool,
 ) -> Result<(), EvalError> {
-    apply_binary(stack, |lhs, rhs| {
+    apply_scalar_binary(stack, |lhs, rhs| {
         Value::Boolean(op(lhs.to_number(), rhs.to_number()))
     })
 }
@@ -561,6 +711,14 @@ fn apply_relational(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the scalar instruction fixtures independent of the String pool.
+    fn evaluate(ops: &[Instruction], peak: usize, slots: usize) -> Result<Value, EvalError> {
+        match super::evaluate(ops, peak, slots, &[])? {
+            PrimitiveValue::Scalar(value) => Ok(value),
+            PrimitiveValue::String(_) => panic!("unexpected String in scalar fixture"),
+        }
+    }
 
     const INIT_CONST: Instruction = Instruction::InitBinding {
         slot: 0,
@@ -570,6 +728,26 @@ mod tests {
         slot: 0,
         kind: BindingKind::Let,
     };
+
+    #[test]
+    fn string_literal_dispatch_checks_range_even_if_empty_or_discarded() {
+        use Instruction::{Discard, JumpStatement, Number};
+        let script = crate::parse_script("'a', ''").unwrap();
+        let [nonempty, Discard, empty] = script.instructions() else {
+            panic!("expected two literal instructions and a discard");
+        };
+        for &literal in [nonempty, empty] {
+            assert_eq!(
+                evaluate(&[literal, Discard, Number(1.0)], 1, 0),
+                Err(EvalError::InvalidScript),
+            );
+            assert_eq!(
+                evaluate(&[JumpStatement(3), literal, Discard, Number(1.0)], 1, 0),
+                Ok(Value::Number(1.0)),
+            );
+        }
+        assert_eq!(script.evaluate_primitive(), Ok(PrimitiveValue::String(&[])));
+    }
 
     #[test]
     fn rejects_malformed_postfix() {

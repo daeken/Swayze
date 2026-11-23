@@ -4,8 +4,11 @@
 Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 `Script` if a Number result is required. For example,
 `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?` produces `14.0`.
-`Script::evaluate_value()` returns `Value::Number`, `Value::Boolean`,
-`Value::Null`, or `Value::Undefined` without coercion. `evaluate()` returns
+`Script::evaluate_primitive()` returns `PrimitiveValue::Scalar(Value)` or
+`PrimitiveValue::String(&[u16])` (facade: `JsPrimitiveValue`). The String
+slice borrows immutable Script storage. `evaluate_value()` still returns
+`Value::Number`, `Value::Boolean`, `Value::Null`, or `Value::Undefined` without
+coercion; a String result yields `NonScalarResult`. `evaluate()` returns
 `NonNumericResult` for any non-Number. An unbound read of `undefined` returns
 the default value, but a block-local declaration of that name takes precedence.
 A top-level declaration of `undefined` is malformed in a classic script.
@@ -183,6 +186,31 @@ arithmetic. Signed zero is preserved; overflow to infinity and arithmetic that
 produces NaN return numeric values, not evaluation errors. No specific NaN bit
 pattern is promised.
 
+## String literals
+
+Single- and double-quoted literals decode to exact UTF-16 during parsing,
+including raw Unicode, `\xHH`, `\uHHHH`, `\u{…}`, lone escaped surrogates,
+and NUL. Backslash line continuations add no units; raw CR or LF is malformed
+inside a literal. Legacy decimal and octal escapes and root `use strict`
+directives are outside the subset. Source ingress and diagnostic offsets
+remain UTF-8; a Script does not retain source text.
+
+Each quoted token may occupy up to 4,096 UTF-8 bytes, including the quotes.
+All literals in a script together may decode to at most 16,384 UTF-16 code
+units, including literals in skipped code. Exhaustive `Limit`/`JsLimit`
+matches must handle `StringLiteralBytes` and `StringLiteralUnits`; the
+caller-configurable `Limits`/`JsLimits` fields did not change. Evaluation
+allocates no String storage and moves only private checked ranges.
+
+Only the empty String is falsy, and every String is non-nullish. Same-tag
+String equality compares code units, without normalization, and charges the
+full length of each equal-length pair before comparing, even on early mismatch.
+Each evaluation allows 65,536 such code-unit pairs, separate from the dispatch
+budget. Strings compare strictly unequal to other types and loosely unequal to
+`null` and `undefined`. Mixed loose equality with Numbers or Booleans, ordering,
+concatenation, numeric coercion and updates on Strings are unsupported. An
+unsupported String operation is an evaluation error only when it executes.
+
 ## Evidence and limits
 
 `cargo test -p swayze-js --frozen` exercises the parse-to-result path for arithmetic,
@@ -192,6 +220,7 @@ and NaN. These are focused implementation tests, not a proof of correctness or
 ECMAScript conformance. They do not run Test262, and there is no JIT in this path.
 
 With Node.js installed, `sh tools/check-js-reference.sh` independently compares
-synthetic fixtures in debug and release, comparing Boolean values exactly and
-Numbers by their binary64 bits except for NaN payloads. It does not execute Test262 or user-supplied code and is
+synthetic fixtures in debug and release, comparing value tags, Boolean values,
+String UTF-16 code units, and Number bits except for NaN payloads. It does not
+execute Test262 or user-supplied code and is
 not required by the normal merge gate.

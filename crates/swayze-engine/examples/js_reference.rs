@@ -1,10 +1,10 @@
 //! Opt-in differential JS value smoke check: run tools/check-js-reference.sh.
 
-use std::{error::Error, process::Command};
-use swayze_engine::{JsValue, parse_script};
+use std::{error::Error, fmt::Write, process::Command};
+use swayze_engine::{JsPrimitiveValue, JsValue, parse_script};
 
 // Evaluate complete Scripts (including optional semicolons), not expressions
-// rewritten by the harness. Print binary64 in big-endian hex; ignore NaN payloads.
+// rewritten by the harness. Print binary64 and UTF-16 in hex; ignore NaN payloads.
 const REFERENCE: &str = r#"
 const { runInNewContext } = require('node:vm');
 const bytes = Buffer.alloc(8);
@@ -20,6 +20,12 @@ for (const [i, source] of process.argv.slice(1).entries()) {
     } else if (typeof value === 'number') {
         bytes.writeDoubleBE(value);
         console.log(`number:${Number.isNaN(value) ? 'nan' : bytes.toString('hex')}`);
+    } else if (typeof value === 'string') {
+        let encoded = 'string:';
+        for (let j = 0; j < value.length; j++) {
+            encoded += value.charCodeAt(j).toString(16).padStart(4, '0');
+        }
+        console.log(encoded);
     } else {
         throw new Error(`fixture ${i + 1} returned unsupported type ${typeof value}`);
     }
@@ -460,11 +466,45 @@ fn fixtures() -> Vec<String> {
         format!("0b{}_1_{}", leading, "0".repeat(970)),
         format!("0.{}00", "0_".repeat(2046)),
     ]);
+    cases.extend(
+        [
+            "''",
+            "let s='💡'; s",
+            r#"let s="\uD800\0\u{DFFF}"; s"#,
+            r#"'\u{00000010ffff}'"#,
+            "'a\u{2028}b\u{2029}'",
+            "'a\\\r\nb\\\u{2028}c'",
+            r#"let s='\uD83D\uDCA1'; s === '💡'"#,
+            r#"'\u00e9' != 'e\u0301'"#,
+            "let s=''; s ??= 'wrong'; s ||= 'ok'; s",
+            "let s=''; if (!s) { s = 'ok'; } s && s",
+            "false ? 'unreached' + 1 : 'kept'",
+            "void 'literal'",
+            "1; 'use strict'; 'not a directive'",
+        ]
+        .map(str::to_owned),
+    );
     cases
 }
 
-fn evaluate(source: &str) -> Result<JsValue, Box<dyn Error>> {
-    Ok(parse_script(source)?.evaluate_value()?)
+fn evaluate(source: &str) -> Result<String, Box<dyn Error>> {
+    use JsPrimitiveValue::{Scalar, String};
+    let script = parse_script(source)?;
+    let actual = match script.evaluate_primitive()? {
+        Scalar(JsValue::Number(value)) if value.is_nan() => "number:nan".to_owned(),
+        Scalar(JsValue::Number(value)) => format!("number:{:016x}", value.to_bits()),
+        Scalar(JsValue::Boolean(value)) => format!("boolean:{value}"),
+        Scalar(JsValue::Null) => "null".to_owned(),
+        Scalar(JsValue::Undefined) => "undefined".to_owned(),
+        String(units) => {
+            let mut encoded = "string:".to_owned();
+            for unit in units {
+                write!(encoded, "{unit:04x}")?;
+            }
+            encoded
+        }
+    };
+    Ok(actual)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -492,15 +532,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("Node returned {count} results for {} fixtures", cases.len()).into());
     }
     for (i, (source, reference)) in cases.iter().zip(lines).enumerate() {
-        let value =
+        let actual =
             evaluate(source).map_err(|error| format!("fixture {} {source:?}: {error}", i + 1))?;
-        let actual = match value {
-            JsValue::Number(value) if value.is_nan() => "number:nan".to_owned(),
-            JsValue::Number(value) => format!("number:{:016x}", value.to_bits()),
-            JsValue::Boolean(value) => format!("boolean:{value}"),
-            JsValue::Null => "null".to_owned(),
-            JsValue::Undefined => "undefined".to_owned(),
-        };
         if actual != reference {
             return Err(format!(
                 "fixture {} {source:?}: Swayze {actual}, Node {version} {reference}",
@@ -510,7 +543,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (exact value tags and payloads, ignoring NaN payload bits)"
+        "Matched all {count} fixtures against Node {version} (exact value tags, UTF-16 code units, and scalar payloads except NaN bits)"
     );
     Ok(())
 }

@@ -1,5 +1,8 @@
 use std::fmt;
 
+mod string_literal;
+pub(crate) use string_literal::StringRange;
+
 // Fixed ceiling on source bytes (including separators) in decimals with a point or exponent.
 const MAX_DECIMAL_LITERAL_BYTES: usize = 4096;
 
@@ -58,6 +61,10 @@ pub enum Limit {
     Work,
     /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
+    /// Fixed source-byte ceiling for one String literal, including its quotes.
+    StringLiteralBytes,
+    /// Fixed aggregate ceiling on decoded UTF-16 units of all String literals.
+    StringLiteralUnits,
     Allocation,
 }
 
@@ -115,6 +122,8 @@ impl Error {
             Limit::NestingDepth => "expression nesting ceiling exceeded",
             Limit::Work => "parse work ceiling exceeded",
             Limit::DecimalLiteralBytes => "decimal literal byte ceiling exceeded",
+            Limit::StringLiteralBytes => "string literal byte ceiling exceeded",
+            Limit::StringLiteralUnits => "aggregate string literal UTF-16 unit ceiling exceeded",
             Limit::Allocation => "unable to allocate parser storage",
         };
         Self {
@@ -145,6 +154,7 @@ impl std::error::Error for Error {}
 /// A validated Script in the supported primitive-value subset. Only the parser constructs it.
 pub struct Script {
     instructions: Vec<Instruction>,
+    string_units: Vec<u16>,
     max_stack_depth: usize,
     binding_slots: usize,
 }
@@ -163,6 +173,10 @@ impl Script {
 
     pub(crate) fn instructions(&self) -> &[Instruction] {
         &self.instructions
+    }
+
+    pub(crate) fn string_units(&self) -> &[u16] {
+        &self.string_units
     }
 
     pub(crate) fn binding_slots(&self) -> usize {
@@ -196,6 +210,7 @@ pub(crate) enum ShortCircuitCondition {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
+    String(StringRange),
     Boolean(bool),
     Null,
     Undefined,
@@ -289,6 +304,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
             offset: 0,
             tokens_left: limits.max_tokens,
             work_left: limits.max_work,
+            string_units: Vec::new(),
         },
         lookahead: None,
         max_nesting_depth: limits.max_nesting_depth,
@@ -437,6 +453,7 @@ fn check_postfix_line_break(operator: Span, after_line_break: bool) -> Result<()
 #[derive(Clone, Copy)]
 enum TokenKind {
     Number(f64),
+    String(StringRange),
     Boolean(bool),
     Null,
     Identifier,
@@ -472,6 +489,7 @@ struct Lexer<'s> {
     offset: usize,
     tokens_left: usize,
     work_left: usize,
+    string_units: Vec<u16>,
 }
 
 #[derive(Default)]
@@ -656,6 +674,7 @@ impl Lexer<'_> {
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
+            '\'' | '"' => TokenKind::String(self.string_literal(c, start)?),
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
             '&' | '|' | '^' => self.bitwise_or_logical(c)?,
@@ -1238,6 +1257,7 @@ impl Parser<'_> {
     fn parse(mut self) -> Result<Script, Error> {
         self.add_scope(None, Span::at(0))?;
         let mut saw_statement = false;
+        let mut in_directive_prologue = true;
         loop {
             if !self.statement_frames.is_empty() {
                 self.parse_block_item()?;
@@ -1257,10 +1277,31 @@ impl Parser<'_> {
             // Reaching this loop's EOF check again means a statement was parsed,
             // even if it emitted nothing. The final expression exits the loop.
             saw_statement = true;
+            let directive = (in_directive_prologue && matches!(first.kind, TokenKind::String(_)))
+                .then_some(first.span);
             let Some(start) = self.parse_non_expression_statement(first)? else {
+                in_directive_prologue = false;
                 continue;
             };
+            let before = self.instructions.len();
             let (end, delimiter) = self.parse_expression(start, ExpressionEnd::Script)?;
+            // A bare literal emits one instruction. Any expression that STARTS
+            // with that token and continues (even across a newline) emits more;
+            // an expression that starts with a group doesn't qualify at all.
+            // Use the raw spelling, not the decoded UTF-16, for Use Strict.
+            if let Some(span) = directive.filter(|_| self.instructions.len() - before == 1) {
+                if matches!(
+                    &self.lexer.source[span.start..span.end],
+                    "'use strict'" | "\"use strict\""
+                ) {
+                    return Err(Error::unsupported(
+                        span,
+                        "Use Strict Directives are outside the subset",
+                    ));
+                }
+            } else {
+                in_directive_prologue = false;
+            }
             if delimiter.is_none() {
                 break;
             }
@@ -1276,6 +1317,7 @@ impl Parser<'_> {
         self.resolve_accesses()?;
         Ok(Script {
             instructions: self.instructions,
+            string_units: self.lexer.string_units,
             max_stack_depth: self.max_stack_depth,
             binding_slots: self.bindings.len(),
         })
@@ -2681,6 +2723,10 @@ impl Parser<'_> {
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
+                (true, TokenKind::String(range)) => {
+                    self.emit(Instruction::String(range), span)?;
+                    needs_operand = false;
+                }
                 (true, TokenKind::Number(value)) => {
                     self.emit(Instruction::Number(value), span)?;
                     needs_operand = false;
@@ -2877,6 +2923,7 @@ impl Parser<'_> {
                 (
                     false,
                     TokenKind::Number(_)
+                    | TokenKind::String(_)
                     | TokenKind::Boolean(_)
                     | TokenKind::Null
                     | TokenKind::Identifier
@@ -3114,6 +3161,7 @@ impl Parser<'_> {
                 return Err(Error::malformed(span, "invalid Number literal value"));
             }
             Instruction::Number(_)
+            | Instruction::String(_)
             | Instruction::Boolean(_)
             | Instruction::Null
             | Instruction::Undefined

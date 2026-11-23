@@ -1313,15 +1313,19 @@ fn sqrt_bits(
     } else {
         (implicit_bit | fraction, field - bias)
     };
-    // The exact root is sqrt(N) * 2^(floor(e/2)-h). N has at most
+    // Split e = 2k + p with k = e.div_euclid(2) and p = e & 1 in {0, 1}.
+    // This gives k rounded down and p = 1 even for negative odd e (e.g. -3 = -4 + 1).
+    // The exact root is sqrt(N) * 2^(k-h) for N = m << (h+p). N has at most
     // 2(h+1) bits (48 or 106), so u128 covers the radicand and all intermediates.
     let n = u128::from(m) << (fraction_bits + (e & 1) as u32);
     let mut root = 0;
     let mut remainder = 0;
     // One guest dispatch, with exactly h+1 (24 or 53) restoring steps here.
-    // For each processed prefix, root is its floor square root and remainder
-    // is the prefix minus root^2. Bring down two bits and try growing to
-    // 2*root+1; its square exceeds (2*root)^2 by 4*root+1.
+    // Invariant: N_prefix = q^2 + r and 0 <= r < 2q+1, where q = root and
+    // r = remainder, so q = floor(sqrt(N_prefix)). This starts at q = r = 0.
+    // Appending two bits d makes the prefix 4*N_prefix+d, with floor root 2q
+    // or 2q+1. Compare 4r+d to (2q+1)^2 - (2q)^2 = 4q+1 to pick the root
+    // and subtract only when the trial square fits, preserving the invariant.
     for pair in (0..=fraction_bits).rev() {
         remainder = (remainder << 2) | ((n >> (2 * pair)) & 3);
         let trial = (root << 2) | 1;
@@ -1335,9 +1339,11 @@ fn sqrt_bits(
     // and is above the midpoint exactly when remainder > root.
     root += u128::from(remainder > root);
 
-    // The minimum output exponents (-75 and -537) are normal. At the
-    // upper end N <= (2^(h+1)-1)*2^(h+1), still 1/4 below the squared
-    // midpoint to 2^(h+1), so rounding cannot carry into the exponent.
+    // N >= 2^(2h) so root >= 2^h, and removing the implicit bit cannot
+    // underflow. The output exponent k stays normal: -75..=63 for f32 and
+    // -537..=511 for f64. At the upper end of the significand range,
+    // N <= (2^(h+1)-1)*2^(h+1), which is 1/4 below (2^(h+1)-1/2)^2.
+    // Rounding therefore cannot carry the significand into the next binade.
     let exponent = (e.div_euclid(2) + bias) as u64;
     (exponent << fraction_bits) | (root as u64 - implicit_bit)
 }

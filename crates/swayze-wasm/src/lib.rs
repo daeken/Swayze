@@ -82,7 +82,7 @@
 //!
 //! If present, the memory section follows any function and table sections and
 //! precedes any global, export, start, element, and code sections. It may be
-//! empty (a zero-length vector) or declare one private, unshared memory32. The
+//! empty (a zero-length vector) or declare one unshared memory32. The
 //! limits use flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
 //! unsigned LEB32 page counts. The minimum and any explicit maximum must be zero
 //! or one 64-KiB page, and the maximum must not be less than the minimum. The
@@ -135,13 +135,15 @@
 //! memory, and global offsets are unsupported.
 //!
 //! An optional export section after any table, memory, and globals and before
-//! any start, elements, and code may contain zero to eight function exports.
-//! Tables, memory, and globals cannot be exported. Name matching is exact (no
-//! Unicode normalization), and duplicate export names are rejected. Each export
-//! refers to a defined function by its zero-based declaration index. Exports
-//! can use any supported function signature. Distinct names may refer to the
-//! same function.
-//! Both export and custom names must be UTF-8.
+//! any start, elements, code, and data may contain zero to eight names total
+//! across function and memory exports. Matching is exact (no Unicode normalization),
+//! and duplicate names are rejected across both kinds. An export descriptor is
+//! either `0x00` followed by a defined function index or `0x02` followed by the
+//! defined memory index zero. Both indices are unsigned LEB32 and accept valid
+//! padding. Distinct names may refer to the same function or memory. A nonempty
+//! list of only memory exports does not require type, function, or code sections;
+//! a present empty export section retains their existing requirement. Tables and
+//! globals cannot be exported. Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
 //! are rejected, even when empty.
@@ -389,8 +391,9 @@
 //! returns `None` for void or the exact tagged numeric result. Float arguments
 //! and results carry raw IEEE 754 bits, not native floats. The i32-argument
 //! methods share the same preflight: scan at most eight export names for an
-//! exact match, check arity, check the declared result kind, then check each
-//! positional argument type from first to last. There is no numeric coercion.
+//! exact match, require a function export, check arity and the declared result
+//! kind, then check each positional argument type from first to last. There is
+//! no numeric coercion.
 //! Any preflight error returns before executing a guest instruction
 //! or changing guest state. Execution does not recurse in Rust. The only guest
 //! execution allocation is the fallible single-page
@@ -504,6 +507,11 @@
 //! limit.
 //! Separate instances have independent tables, memory, and globals. Empty,
 //! custom-only, and other unexported modules have no callable exports.
+//! [`Instance::read_memory`] copies bytes from an explicitly named memory export
+//! into a caller-provided slice, without exposing a borrow of guest memory or a
+//! way to write it. It checks the exact name and export kind before checking the
+//! full range against the instance's current size. It does not dispatch guest
+//! instructions or use guest fuel, allocate, or retain the destination.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -731,6 +739,12 @@
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap
 //! order, and reinitialization from the same module into independent instances.
+//! Memory export tests cover mixed kinds, exact UTF-8 names and aliases, shared
+//! name caps and diagnostics, and function-section precedence. Host copies are
+//! checked at zero pages and exact page edges, and after data initialization,
+//! start, and explicit execution, including stores before a guest trap. They
+//! check that errors leave the destination intact, private memory remains
+//! hidden, invocation fuel is unchanged, and Debug still shows only counts.
 //! Table and element tests cover exact caps, frame and padded LEB32 decoding,
 //! malformed and unsupported encodings, validation of every referenced function,
 //! absent versus zero-entry tables, null slots, overlap order, fresh instances,
@@ -823,7 +837,13 @@ pub struct Module {
 
 struct Export {
     name: String,
-    function_index: usize,
+    target: ExportTarget,
+}
+
+#[derive(Clone, Copy)]
+enum ExportTarget {
+    Function(usize),
+    Memory,
 }
 
 impl fmt::Debug for Module {
@@ -833,6 +853,13 @@ impl fmt::Debug for Module {
 }
 
 impl Module {
+    fn find_export(&self, name: &str) -> Option<ExportTarget> {
+        self.exports
+            .iter()
+            .find(|export| export.name == name)
+            .map(|export| export.target)
+    }
+
     fn fmt_metadata(&self, f: &mut fmt::Formatter<'_>, type_name: &str) -> fmt::Result {
         f.debug_struct(type_name)
             .field("function_count", &self.functions.len())
@@ -942,7 +969,7 @@ impl std::error::Error for InstantiationError {
     }
 }
 
-/// An instance of a validated module, with a private table, memory, and globals.
+/// An instance of a validated module, with its own table, memory, and globals.
 ///
 /// Invocation through `&self` can change this state. An instance is `Send`
 /// (it can move to another thread when its module borrow permits), but not
@@ -966,6 +993,50 @@ impl fmt::Debug for Instance<'_> {
 }
 
 impl Instance<'_> {
+    /// Copy bytes from an exact named memory export into `dest`.
+    ///
+    /// Checks for an exact name, then a memory export, then that the full range
+    /// starting at the unsigned byte `offset` fits within the instance's current
+    /// memory size. An empty destination is allowed at the current end, including
+    /// offset zero for a zero-page memory. On error `dest` is unchanged.
+    ///
+    /// The copy observes completed data initialization, guest stores, and memory
+    /// growth, including changes made before an invocation traps. It does not
+    /// allocate, run guest code, consume guest fuel, or expose any way to borrow
+    /// or mutate the instance's memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadMemoryError::ExportNotFound`] for a missing name,
+    /// [`ReadMemoryError::ExportNotMemory`] for a function export, or
+    /// [`ReadMemoryError::OutOfBounds`] for an invalid range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use swayze_wasm::validate_module;
+    /// // (module (memory (export "mem") 1) (data (i32.const 0) "hi"))
+    /// let bytes = b"\0asm\x01\0\0\0\x05\x03\x01\0\x01\x07\x07\x01\x03mem\x02\0\
+    ///               \x0b\x08\x01\0\x41\0\x0b\x02hi";
+    /// let module = validate_module(bytes)?;
+    /// let mut dest = [0; 2];
+    /// module.instantiate()?.read_memory("mem", 0, &mut dest)?;
+    /// assert_eq!(&dest, b"hi");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn read_memory(
+        &self,
+        name: &str,
+        offset: u32,
+        dest: &mut [u8],
+    ) -> Result<(), ReadMemoryError> {
+        match self.module.find_export(name) {
+            None => Err(ReadMemoryError::ExportNotFound),
+            Some(ExportTarget::Function(_)) => Err(ReadMemoryError::ExportNotMemory),
+            Some(ExportTarget::Memory) => self.memory.copy_out(offset, dest),
+        }
+    }
+
     /// Invoke the exact named export as a `() -> i32` function.
     /// See [`Self::invoke_i32_with_args`] for signature checks and runtime errors.
     ///
@@ -984,7 +1055,8 @@ impl Instance<'_> {
     /// Invoke the exact named i32-result export, passing arguments in parameter order.
     ///
     /// Checks, in order, for a matching name ([`InvokeError::ExportNotFound`]),
-    /// the declared argument count ([`InvokeError::ArityMismatch`]), an i32
+    /// a function export ([`InvokeError::ExportNotFunction`]), the declared
+    /// argument count ([`InvokeError::ArityMismatch`]), an i32
     /// result ([`InvokeError::ResultMismatch`]), and that all parameters are
     /// i32 ([`InvokeError::ArgumentTypeMismatch`]). These checks happen before
     /// executing any guest instruction or changing memory or globals.
@@ -1021,8 +1093,8 @@ impl Instance<'_> {
 
     /// Invoke the exact named void export, passing arguments in parameter order.
     ///
-    /// Checks the name, argument count, declared result kind, and that all
-    /// parameters are i32, in that order, before guest execution. Returns
+    /// Checks the name, export kind, argument count, declared result kind, and
+    /// that all parameters are i32, in that order, before guest execution. Returns
     /// [`InvokeError::ResultMismatch`] for a value result rather than discarding
     /// it. Other errors and effects are the same as for
     /// [`Self::invoke_i32_with_args`], including persistence of stores and
@@ -1034,10 +1106,11 @@ impl Instance<'_> {
 
     /// Invoke an exact named export with up to four tagged arguments in parameter order.
     ///
-    /// Checks the name, argument count, declared result kind, and argument types,
-    /// in that order. The first argument of the wrong type is reported with its
-    /// zero-based index. No guest instructions run and no guest state changes
-    /// unless all checks pass. No argument or result is coerced or truncated.
+    /// Checks the name, export kind, argument count, declared result kind, and
+    /// argument types, in that order. The first argument of the wrong type is
+    /// reported with its zero-based index. No guest instructions run and no guest
+    /// state changes unless all checks pass. No argument or result is coerced or
+    /// truncated.
     /// Float arguments and results are passed as exact IEEE 754 bits in
     /// [`Value::F32`] and [`Value::F64`], preserving signed zeros and NaN encodings
     /// at the host boundary without using native floating-point values.
@@ -1071,15 +1144,38 @@ impl Instance<'_> {
         args: impl ExactSizeIterator<Item = Value> + Clone,
         expected: ResultKind,
     ) -> Result<Option<Value>, InvokeError> {
-        let export = self
-            .module
-            .exports
-            .iter()
-            .find(|export| export.name == name)
-            .ok_or(InvokeError::ExportNotFound)?;
-        binary::invoke_index(self, export.function_index, args, expected)
+        match self.module.find_export(name) {
+            None => Err(InvokeError::ExportNotFound),
+            Some(ExportTarget::Memory) => Err(InvokeError::ExportNotFunction),
+            Some(ExportTarget::Function(index)) => {
+                binary::invoke_index(self, index, args, expected)
+            }
+        }
     }
 }
+
+/// Why a host copy from an explicitly named memory export failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadMemoryError {
+    /// This module has no export with the requested name.
+    ExportNotFound,
+    /// The named export exists but is not a memory.
+    ExportNotMemory,
+    /// The requested byte range does not fit within the current memory size.
+    OutOfBounds,
+}
+
+impl fmt::Display for ReadMemoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ExportNotFound => "WebAssembly export not found",
+            Self::ExportNotMemory => "WebAssembly export is not a memory",
+            Self::OutOfBounds => "WebAssembly memory read is out of bounds",
+        })
+    }
+}
+
+impl std::error::Error for ReadMemoryError {}
 
 /// A result kind supported by a typed invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1115,6 +1211,8 @@ impl fmt::Display for ResultKind {
 pub enum InvokeError {
     /// This module has no export with the requested name.
     ExportNotFound,
+    /// The named export exists but is not a function.
+    ExportNotFunction,
     /// The export exists but the supplied argument count does not match its type.
     ArityMismatch { expected: usize, actual: usize },
     /// The invocation method expects a different result kind than the export declares.
@@ -1143,6 +1241,7 @@ impl fmt::Display for InvokeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ExportNotFound => f.write_str("WebAssembly export not found"),
+            Self::ExportNotFunction => f.write_str("WebAssembly export is not a function"),
             Self::ArityMismatch { expected, actual } => {
                 write!(
                     f,
@@ -1178,6 +1277,7 @@ impl std::error::Error for InvokeError {
         match self {
             Self::Trap(trap) => Some(trap),
             Self::ExportNotFound
+            | Self::ExportNotFunction
             | Self::ArityMismatch { .. }
             | Self::ResultMismatch { .. }
             | Self::ArgumentTypeMismatch { .. }

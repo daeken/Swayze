@@ -213,17 +213,7 @@ fn rejects_bad_limits_and_checks_the_entire_memory_section() {
 }
 
 #[test]
-fn rejects_memory_exports_and_other_memory_features() {
-    let mut bytes = module(&[(1, TYPE), (3, FUNCTION), (5, ONE_PAGE)]);
-    let start = push_section(&mut bytes, 7, b"\x01\x01m\x02\x00");
-    expect_error(
-        &bytes,
-        start + 3,
-        ErrorKind::UnexpectedByte {
-            expected: 0,
-            found: 2,
-        },
-    );
+fn rejects_other_memory_features() {
     // Import and data count are rejected even alongside a defined memory.
     for id in [2, 12] {
         let mut bytes = HEADER.to_vec();

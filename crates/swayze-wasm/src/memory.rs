@@ -1,4 +1,4 @@
-use crate::{InstantiationError, Trap};
+use crate::{InstantiationError, ReadMemoryError, Trap};
 use std::{
     cell::{Cell, OnceCell},
     collections::TryReserveError,
@@ -159,6 +159,21 @@ impl LinearMemory {
 
     fn bytes(&self) -> &[Cell<u8>] {
         self.page.get().map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn copy_out(&self, offset: u32, dest: &mut [u8]) -> Result<(), ReadMemoryError> {
+        let start = usize::try_from(offset).map_err(|_| ReadMemoryError::OutOfBounds)?;
+        let end = start
+            .checked_add(dest.len())
+            .ok_or(ReadMemoryError::OutOfBounds)?;
+        let bytes = self
+            .bytes()
+            .get(start..end)
+            .ok_or(ReadMemoryError::OutOfBounds)?;
+        for (dst, byte) in dest.iter_mut().zip(bytes) {
+            *dst = byte.get();
+        }
+        Ok(())
     }
 
     fn access(&self, base: i32, offset: u32, width: AccessWidth) -> Result<&[Cell<u8>], Trap> {

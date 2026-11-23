@@ -19,6 +19,7 @@
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
+//! `f32.demote_f64`, `f64.promote_f32`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
 //! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`, `f64.sqrt`,
@@ -156,7 +157,15 @@
 //! the body frame. Each pushes one operand holding the exact IEEE 754 bits.
 //! The four reinterpretations (`0xbc` through `0xbf` in the order listed above)
 //! consume one operand and change only its type, between i32 and f32 or between
-//! i64 and f64. For both widths, `abs` clears the sign bit and `neg` flips it;
+//! i64 and f64. In contrast, `f64.promote_f32` (`0xbb`) and `f32.demote_f64`
+//! (`0xb6`) consume one float and convert its numeric value to the other width.
+//! Promotion is exact for all finite inputs, including subnormals. Demotion
+//! rounds to nearest with ties to even, including at subnormal and overflow
+//! boundaries; underflow to zero and overflow to infinity retain the input sign.
+//! Both operations preserve signed zeros and infinities and map every NaN to
+//! the destination width's positive canonical quiet NaN, discarding its sign
+//! and payload.
+//! For both widths, `abs` clears the sign bit and `neg` flips it;
 //! each consumes one operand and produces one of the same type. `copysign`
 //! consumes two operands of its width, taking the magnitude bits from the first
 //! (lhs) and only the sign bit from the second (rhs). Sign operations leave all
@@ -188,12 +197,13 @@
 //! only `ne` returns 1. Positive and negative zero compare equal; all other
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
-//! sign operations, rounding, square root, `min`/`max`, and comparisons each
-//! count as one dispatch. None uses native floating-point operations. Floats are
-//! supported as operands, private globals, locals, `block` and `if` results, and
-//! function parameters and results, including across the host boundary. Fallthrough,
-//! `return`, and branch exits preserve all result bits. Loop results and
-//! floating-point numeric instructions beyond those listed remain unsupported.
+//! width conversions, sign operations, rounding, square root, `min`/`max`, and
+//! comparisons each count as one dispatch. None uses native floating-point
+//! operations. Floats are supported as operands, private globals, locals, `block`
+//! and `if` results, and function parameters and results, including across the
+//! host boundary. Fallthrough, `return`, and branch exits preserve all result bits.
+//! Loop results and floating-point numeric instructions beyond those listed
+//! remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -509,6 +519,11 @@
 //! finite input. Deterministic per-exponent samples compared with native roots
 //! are evidence, not a proof. Validation checks include live and dead floors
 //! and concrete operand and result types; execution checks the dispatch limit.
+//! Float width-conversion tests check exact round trips, signed zeros and
+//! infinities, canonical NaNs, and both neighbors of ties at normal, subnormal,
+//! underflow, and overflow boundaries. They also cover live and dead typing
+//! and exact dispatch charging. Deterministic finite samples compared with
+//! native casts provide independent evidence, not a proof.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

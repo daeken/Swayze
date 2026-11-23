@@ -1124,6 +1124,8 @@ enum Conversion {
     WrapI64,
     ExtendI32S,
     ExtendI32U,
+    DemoteF64,
+    PromoteF32,
     I32ReinterpretF32,
     I64ReinterpretF64,
     F32ReinterpretI32,
@@ -1136,6 +1138,8 @@ impl Conversion {
         match self {
             Self::WrapI64 => (I64, I32),
             Self::ExtendI32S | Self::ExtendI32U => (I32, I64),
+            Self::DemoteF64 => (F64, F32),
+            Self::PromoteF32 => (F32, F64),
             Self::I32ReinterpretF32 => (F32, I32),
             Self::I64ReinterpretF64 => (F64, I64),
             Self::F32ReinterpretI32 => (I32, F32),
@@ -1148,6 +1152,8 @@ impl Conversion {
             Self::WrapI64 => Operand::I32(value.as_i64() as i32),
             Self::ExtendI32S => Operand::I64(i64::from(value.as_i32())),
             Self::ExtendI32U => Operand::I64(i64::from(value.as_i32() as u32)),
+            Self::DemoteF64 => Operand::F32(demote_f64_bits(value.f64_bits())),
+            Self::PromoteF32 => Operand::F64(promote_f32_bits(value.f32_bits())),
             Self::I32ReinterpretF32 => Operand::I32(value.f32_bits() as i32),
             Self::I64ReinterpretF64 => Operand::I64(value.f64_bits() as i64),
             Self::F32ReinterpretI32 => Operand::F32(value.as_i32() as u32),
@@ -1162,6 +1168,75 @@ const F32_INFINITY: u32 = 0x7f80_0000;
 const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
 const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
 const F64_CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+fn promote_f32_bits(bits: u32) -> u64 {
+    let sign = u64::from(bits & F32_SIGN) << 32;
+    let magnitude = bits & !F32_SIGN;
+    match magnitude {
+        0 => return sign,
+        F32_INFINITY => return sign | F64_INFINITY,
+        n if n > F32_INFINITY => return F64_CANONICAL_NAN,
+        _ => {}
+    }
+
+    let field = u64::from(magnitude >> 23);
+    let fraction = u64::from(magnitude & ((1 << 23) - 1));
+    let (field, fraction) = if field == 0 {
+        // A subnormal is fraction * 2^-149. Its leading one is at 0..=22,
+        // so the unbiased exponent -149..=-127 is normal in f64. Remove
+        // that leading one and place the rest with a u64 shift of 30..=52.
+        let leading = fraction.ilog2();
+        (
+            u64::from(leading) + (1023 - 149),
+            (fraction ^ (1 << leading)) << (52 - leading),
+        )
+    } else {
+        // Normal f32 exponents -126..=127 are all normal in f64 as well.
+        (field + (1023 - 127), fraction << (52 - 23))
+    };
+    sign | (field << 52) | fraction
+}
+
+fn demote_f64_bits(bits: u64) -> u32 {
+    let sign = ((bits & F64_SIGN) >> 32) as u32;
+    let magnitude = bits & !F64_SIGN;
+    if magnitude > F64_INFINITY {
+        return F32_CANONICAL_NAN;
+    }
+    let exponent = (magnitude >> 52) as i32 - 1023;
+    if exponent < -150 {
+        // Strictly below half the smallest f32 subnormal, including all
+        // f64 subnormals and zeros (field zero).
+        return sign;
+    }
+    if exponent > 127 {
+        // At least 2^128, including infinities. The overflow midpoint
+        // 2^128 - 2^103 is handled by rounding at exponent 127.
+        return sign | F32_INFINITY;
+    }
+
+    // The surviving inputs are normal f64: significand * 2^(exponent-52).
+    // Keep 24 significand bits for a normal f32 (shift 29). For exponents
+    // -150..=-127 round in units of 2^-149 instead (shift 30..=53).
+    // All shifts (including midpoint and mask) are below the u64 width.
+    let significand = (1 << 52) | (magnitude & ((1 << 52) - 1));
+    let shift = 29 + (-126 - exponent).max(0);
+    let truncated = significand >> shift;
+    let discarded = significand & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    let round_up = discarded > half || (discarded == half && truncated & 1 != 0);
+    let rounded = truncated as u32 + u32::from(round_up);
+    let magnitude = if exponent < -126 {
+        // At most 2^23: a carry out of the fraction encodes the least normal.
+        rounded
+    } else {
+        // Strip the leading one (rounded is in 2^23..=2^24). Addition
+        // propagates any carry into the exponent, including to infinity
+        // at the midpoint above max finite (odd retained significand).
+        (((exponent + 127) as u32) << 23) + (rounded - (1 << 23))
+    };
+    sign | magnitude
+}
 
 #[derive(Clone, Copy, Debug)]
 enum FloatWidth {
@@ -2605,6 +2680,8 @@ fn decode_plain(
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),
+        0xb6 => Instruction::Convert(Conversion::DemoteF64),
+        0xbb => Instruction::Convert(Conversion::PromoteF32),
         0xbc => Instruction::Convert(Conversion::I32ReinterpretF32),
         0xbd => Instruction::Convert(Conversion::I64ReinterpretF64),
         0xbe => Instruction::Convert(Conversion::F32ReinterpretI32),

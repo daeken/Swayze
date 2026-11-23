@@ -5,6 +5,13 @@ pub(super) const MAX_INSTANCE_MEMORY_PAGES: u32 = 2;
 pub(super) const MEMORY32_MAX_PAGES: u32 = 65_536;
 pub(super) const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 
+// Amortize the push loop without a page-sized temporary. The arrays have
+// byte alignment and no padding; each page contains exactly 64 chunks.
+const CHUNK_BYTES: usize = 1024;
+const CHUNKS_PER_PAGE: usize = MEMORY_PAGE_BYTES / CHUNK_BYTES;
+const _: () = assert!(MEMORY_PAGE_BYTES.is_multiple_of(CHUNK_BYTES));
+type Chunk = [u8; CHUNK_BYTES];
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MemoryLimits {
     pub(super) minimum_pages: u32,
@@ -65,7 +72,7 @@ impl fmt::Debug for DataSegment {
 pub(super) struct LinearMemory {
     // A whole number of pages, never larger than `cap_pages`. No view escapes,
     // and no allocation, deallocation, or guest dispatch holds a borrow.
-    bytes: RefCell<Vec<u8>>,
+    chunks: RefCell<Vec<Chunk>>,
     cap_pages: u32,
 }
 
@@ -99,7 +106,7 @@ impl LinearMemory {
     fn new_preflighted_with(
         limits: Option<MemoryLimits>,
         segments: &[DataSegment],
-        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
     ) -> Result<Self, InstantiationError> {
         let (minimum_pages, cap_pages) = limits.map_or((0, 0), |limits| {
             (
@@ -110,35 +117,37 @@ impl LinearMemory {
                     .min(MAX_INSTANCE_MEMORY_PAGES),
             )
         });
-        let byte_len = minimum_pages as usize * MEMORY_PAGE_BYTES;
-        let mut bytes = Vec::new();
-        if byte_len != 0 {
-            reserve(&mut bytes, byte_len)
+        let chunk_len = minimum_pages as usize * CHUNKS_PER_PAGE;
+        let mut chunks = Vec::new();
+        if chunk_len != 0 {
+            reserve(&mut chunks, chunk_len)
                 .map_err(|_| InstantiationError::MemoryAllocationFailed)?;
-            Self::zero_tail(&mut bytes, byte_len);
+            Self::zero_tail(&mut chunks, chunk_len);
         }
         // The preflight guarantees these conversions and ranges fit. Copy in
         // source order so later segments overwrite any earlier overlapping bytes.
+        let bytes = chunks.as_flattened_mut();
         for segment in segments {
             let start = segment.offset as usize;
             bytes[start..start + segment.bytes.len()].copy_from_slice(&segment.bytes);
         }
         Ok(Self {
-            bytes: RefCell::new(bytes),
+            chunks: RefCell::new(chunks),
             cap_pages,
         })
     }
 
-    fn zero_tail(bytes: &mut Vec<u8>, byte_len: usize) {
+    fn zero_tail(chunks: &mut Vec<Chunk>, chunk_len: usize) {
         // Vec::push is guaranteed not to allocate while capacity suffices.
-        assert!(bytes.capacity() >= byte_len);
-        while bytes.len() < byte_len {
-            bytes.push(0);
+        assert!(chunks.capacity() >= chunk_len);
+        while chunks.len() < chunk_len {
+            chunks.push([0; CHUNK_BYTES]);
         }
     }
 
     pub(super) fn size_in_pages(&self) -> i32 {
-        (self.bytes.borrow().len() / MEMORY_PAGE_BYTES) as i32
+        let chunk_len = self.chunks.borrow().len();
+        (chunk_len / CHUNKS_PER_PAGE) as i32
     }
 
     pub(super) fn grow(&self, delta: u32) -> i32 {
@@ -148,7 +157,7 @@ impl LinearMemory {
     fn grow_with(
         &self,
         delta: u32,
-        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
     ) -> i32 {
         let previous = self.size_in_pages();
         if delta == 0 {
@@ -160,31 +169,32 @@ impl LinearMemory {
         if delta > self.cap_pages - previous_pages {
             return -1;
         }
-        let byte_len = (previous_pages + delta) as usize * MEMORY_PAGE_BYTES;
+        let chunk_len = (previous_pages + delta) as usize * CHUNKS_PER_PAGE;
         let mut replacement = Vec::new();
-        if reserve(&mut replacement, byte_len).is_err() {
+        if reserve(&mut replacement, chunk_len).is_err() {
             return -1;
         }
         // We have reserved the complete new length, from an empty Vec. With
         // no reentry the old length still matches the preflight and is
         // strictly smaller. Use Vec::push's no-allocation guarantee rather
         // than relying on the current allocation behavior of a bulk method.
-        assert!(replacement.is_empty() && replacement.capacity() >= byte_len);
+        assert!(replacement.is_empty() && replacement.capacity() >= chunk_len);
         {
-            let old = self.bytes.borrow();
-            assert_eq!(old.len(), previous_pages as usize * MEMORY_PAGE_BYTES);
-            for &byte in old.iter() {
-                replacement.push(byte);
+            let old = self.chunks.borrow();
+            assert_eq!(old.len(), previous_pages as usize * CHUNKS_PER_PAGE);
+            for chunk in old.iter() {
+                replacement.push(*chunk);
             }
         }
-        Self::zero_tail(&mut replacement, byte_len);
-        let old = self.bytes.replace(replacement);
+        Self::zero_tail(&mut replacement, chunk_len);
+        let old = self.chunks.replace(replacement);
         drop(old); // RefCell::replace has ended its mutable borrow before deallocation.
         previous
     }
 
     pub(super) fn copy_out(&self, offset: u32, dest: &mut [u8]) -> Result<(), ReadMemoryError> {
-        let bytes = self.bytes.borrow();
+        let chunks = self.chunks.borrow();
+        let bytes = chunks.as_flattened();
         let start = u64::from(offset);
         let end = start
             .checked_add(dest.len() as u64)
@@ -214,7 +224,8 @@ impl LinearMemory {
     pub(super) fn load(&self, base: i32, offset: u32, kind: LoadKind) -> Result<i64, Trap> {
         let mut le = [0; 8];
         {
-            let bytes = self.bytes.borrow();
+            let chunks = self.chunks.borrow();
+            let bytes = chunks.as_flattened();
             let range = Self::access_range(bytes.len(), base, offset, kind.width())?;
             le[..range.len()].copy_from_slice(&bytes[range]);
         }
@@ -239,7 +250,8 @@ impl LinearMemory {
         value: i64,
     ) -> Result<(), Trap> {
         let le = value.to_le_bytes();
-        let mut bytes = self.bytes.borrow_mut();
+        let mut chunks = self.chunks.borrow_mut();
+        let bytes = chunks.as_flattened_mut();
         let range = Self::access_range(bytes.len(), base, offset, width)?;
         bytes[range].copy_from_slice(&le[..width as usize]);
         Ok(())
@@ -248,7 +260,7 @@ impl LinearMemory {
 
 impl fmt::Debug for LinearMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let byte_len = self.bytes.borrow().len();
+        let byte_len = self.chunks.borrow().len() * CHUNK_BYTES;
         f.debug_struct("LinearMemory")
             .field("byte_len", &byte_len)
             .finish_non_exhaustive()
@@ -275,9 +287,78 @@ mod tests {
         let instance = module.instantiate().unwrap();
         for memory in [&memory, &instance.memory] {
             assert_eq!(memory.size_in_pages(), 0);
-            assert_eq!(memory.bytes.borrow().capacity(), 0);
+            let chunks = memory.chunks.borrow();
+            assert_eq!((chunks.len(), chunks.capacity()), (0, 0));
             assert_eq!(memory.cap_pages, 2);
         }
+    }
+
+    #[test]
+    fn initialization_reserves_exact_chunk_count_and_reports_failure() {
+        for minimum_pages in 1..=MAX_INSTANCE_MEMORY_PAGES {
+            let limits = Some(MemoryLimits {
+                minimum_pages,
+                maximum_pages: Some(MEMORY32_MAX_PAGES),
+            });
+            let expected_chunks = minimum_pages as usize * CHUNKS_PER_PAGE;
+            let memory = LinearMemory::new_preflighted_with(limits, &[], |fresh, requested| {
+                assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
+                assert_eq!(requested, expected_chunks);
+                fresh.try_reserve_exact(requested)
+            })
+            .unwrap();
+            assert_eq!(memory.chunks.borrow().len(), expected_chunks);
+            assert_eq!(memory.size_in_pages(), minimum_pages as i32);
+
+            let error = LinearMemory::new_preflighted_with(limits, &[], |fresh, requested| {
+                assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
+                assert_eq!(requested, expected_chunks);
+                fresh.try_reserve_exact(usize::MAX)
+            })
+            .unwrap_err();
+            assert_eq!(error, InstantiationError::MemoryAllocationFailed);
+        }
+    }
+
+    #[test]
+    fn unaligned_access_and_data_cross_an_internal_chunk_seam() {
+        let start = CHUNK_BYTES as u32 - 3;
+        let segments = [
+            DataSegment {
+                offset: start,
+                bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            },
+            DataSegment {
+                offset: start + 2,
+                bytes: vec![9, 10, 11],
+            },
+        ];
+        let limits = Some(MemoryLimits {
+            minimum_pages: 1,
+            maximum_pages: None,
+        });
+        LinearMemory::preflight(limits, &segments).unwrap();
+        let memory = LinearMemory::new_preflighted(limits, &segments).unwrap();
+        assert_eq!(
+            memory.load(start as i32, 0, LoadKind::Doubleword),
+            Ok(0x0807_060b_0a09_0201)
+        );
+
+        memory
+            .store(
+                start as i32,
+                0,
+                AccessWidth::Doubleword,
+                0x7654_3210_fedc_ba98,
+            )
+            .unwrap();
+        let mut snapshot = [0xff; 10];
+        let expected = [0, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76, 0];
+        memory.copy_out(start - 1, &mut snapshot).unwrap();
+        assert_eq!(snapshot, expected);
+        assert_eq!(memory.grow(1), 1);
+        memory.copy_out(start - 1, &mut snapshot).unwrap();
+        assert_eq!(snapshot, expected);
     }
 
     #[test]
@@ -292,31 +373,31 @@ mod tests {
             )
             .unwrap()
         };
-        let no_reserve = |_: &mut Vec<u8>, _| panic!("this delta must never request a reserve");
+        let no_reserve = |_: &mut Vec<Chunk>, _| panic!("this delta must never request a reserve");
         assert_eq!(make_memory(0, Some(0)).grow_with(1, no_reserve), -1);
         assert_eq!(make_memory(1, Some(1)).grow_with(1, no_reserve), -1);
 
         let memory = make_memory(0, Some(MEMORY32_MAX_PAGES));
-        assert_eq!(memory.bytes.borrow().capacity(), 0);
+        assert_eq!(memory.chunks.borrow().capacity(), 0);
         let tail = MEMORY_PAGE_BYTES as i32 - 4;
         for previous in 0..=1 {
-            let base = memory.bytes.borrow().as_ptr();
+            let base = memory.chunks.borrow().as_ptr();
             assert_eq!(memory.grow_with(0, no_reserve), previous);
             for delta in [MAX_INSTANCE_MEMORY_PAGES - previous as u32 + 1, u32::MAX] {
                 assert_eq!(memory.grow_with(delta, no_reserve), -1);
             }
-            let expected_len = (previous + 1) as usize * MEMORY_PAGE_BYTES;
+            let expected_chunks = (previous + 1) as usize * CHUNKS_PER_PAGE;
             for _ in 0..2 {
-                let fail = |fresh: &mut Vec<u8>, requested| {
+                let fail = |fresh: &mut Vec<Chunk>, requested| {
                     assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
-                    assert_eq!(requested, expected_len);
-                    assert!(memory.bytes.try_borrow_mut().is_ok()); // No live borrow at reserve.
+                    assert_eq!(requested, expected_chunks);
+                    assert!(memory.chunks.try_borrow_mut().is_ok()); // No live borrow at reserve.
                     // Capacity overflow supplies a TryReserveError without real OOM.
                     fresh.try_reserve_exact(usize::MAX)
                 };
                 assert_eq!(memory.grow_with(1, fail), -1);
                 assert_eq!(memory.size_in_pages(), previous);
-                assert_eq!(memory.bytes.borrow().as_ptr(), base);
+                assert_eq!(memory.chunks.borrow().as_ptr(), base);
                 assert_eq!(
                     memory.load(tail, 0, LoadKind::WordUnsigned),
                     if previous == 0 {
@@ -328,11 +409,12 @@ mod tests {
             }
             assert_eq!(memory.grow(1), previous);
             {
-                let bytes = memory.bytes.borrow();
-                assert_eq!(bytes.len(), expected_len);
+                let chunks = memory.chunks.borrow();
+                assert_eq!(chunks.len(), expected_chunks);
                 // Scan the entire new page, including after a failed attempt.
                 assert!(
-                    bytes[previous as usize * MEMORY_PAGE_BYTES..]
+                    chunks[previous as usize * CHUNKS_PER_PAGE..]
+                        .as_flattened()
                         .iter()
                         .all(|&b| b == 0)
                 );

@@ -1681,9 +1681,9 @@ fn block_requires_a_new_result_and_checks_all_fallthrough_code() {
         ErrorKind::InvalidResultDepth { depth: 2 },
     );
     bad_body(
-        &[&branch[..], &[0x03, 0x7f, 0x0b, 0x0b]].concat(),
+        &[&branch[..], &[0x0c, 0, 0x0b, 0x0b]].concat(),
         branch.len(),
-        ErrorKind::UnsupportedOpcode { opcode: 0x03 },
+        ErrorKind::UnsupportedOpcode { opcode: 0x0c },
     );
     bad_body(
         &[&branch[..], &[0x0d, 0x80]].concat(),
@@ -1753,32 +1753,37 @@ fn validates_block_type_and_delimiters_at_the_body_boundary() {
 }
 
 #[test]
-fn validates_branch_label_leb_and_only_accepts_zero_in_a_block() {
+fn validates_branch_label_leb_and_only_accepts_zero_in_a_block_or_loop() {
     let field = IntegerField::LabelIndex;
-    let prefix = &[0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d][..];
-    for (label, index) in [(&[1][..], 1), (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX)] {
-        let body = [prefix, label, &[0x0b, 0x0b, 0x0b]].concat();
-        bad_body(
-            &body,
-            prefix.len(),
-            ErrorKind::InvalidIndex { field, index },
-        );
-    }
-    for fifth in [0x10, 0x80] {
-        let body = [
-            prefix,
-            &[0x80, 0x80, 0x80, 0x80, fifth, 0, 0x0b, 0x0b, 0x0b],
-        ]
-        .concat();
-        bad_body(
-            &body,
-            prefix.len() + 4,
-            ErrorKind::IntegerOverflow { field },
-        );
+    for opener in [[0x02, 0x7f], [0x03, 0x40]] {
+        let prefix = [&[0][..], &opener, &opener, &[0x41, 7, 0x41, 1, 0x0d]].concat();
+        for (label, index) in [(&[1][..], 1), (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX)] {
+            let body = [&prefix[..], label, &[0x0b, 0x0b, 0x0b]].concat();
+            bad_body(
+                &body,
+                prefix.len(),
+                ErrorKind::InvalidIndex { field, index },
+            );
+        }
+        for fifth in [0x10, 0x80] {
+            let body = [
+                &prefix[..],
+                &[0x80, 0x80, 0x80, 0x80, fifth, 0, 0x0b, 0x0b, 0x0b],
+            ]
+            .concat();
+            bad_body(
+                &body,
+                prefix.len() + 4,
+                ErrorKind::IntegerOverflow { field },
+            );
+        }
+        let body = [&prefix[..], &[0x80]].concat();
+        bad_body(&body, body.len(), ErrorKind::TruncatedInteger { field });
     }
     for prefix in [
         &[0][..],                                             // Function label.
         &[0, 0x41, 1, 0x04, 0x7f],                            // Then label.
+        &[0, 0x03, 0x40, 0x41, 1, 0x04, 0x7f],                // Then label, even inside a loop.
         &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05], // Else label, even inside a block.
     ] {
         let branch = [prefix, &[0x41, 7, 0x41, 1, 0x0d]].concat();
@@ -1896,9 +1901,230 @@ fn charges_taken_br_if_but_not_its_skipped_tail_or_block_delimiters() {
 }
 
 #[test]
+fn loop_continues_preserve_locals_and_prefix_but_not_temporaries() {
+    let body = [
+        1, 1, 0x7f, 0x41, 39, 0x02, 0x7f, // Keep 39 below the block floor.
+        0x41, 1, 0x03, 0x40, // Keep a second value below the loop floor.
+        0x20, 1, 0x41, 1, 0x6a, 0x21, 1, // Count trips in the declared local.
+        0x41, 7, 0x41, 3, // Temporary operands, discarded only on a taken edge.
+        0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x41, 0, 0x4a, // --param > 0
+        0x0d, 0x80, 0, // Padded label zero resumes at the first local.get.
+        0x6a, 0x20, 1, 0x6a, 0x21, 1, // On fallthrough add 7 + 3 to the trip count.
+        0x0b, 0x20, 1, 0x6a, 0x0b, 0x6a, 0x0b, // Add the two preserved values.
+    ];
+    let module = exported_function(&i32_type(1), &code_body(&body));
+    let instance = module.instantiate();
+    // 40 trips would overflow the operand storage if each kept its temporaries.
+    // With arg 1, even the first condition is false.
+    for (arg, expected) in [(40, 90), (1, 51), (5, 55), (1, 51)] {
+        assert_eq!(
+            instance.invoke_i32_with_args("answer", &[arg]),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn loops_compose_with_forward_block_exits_and_if_joins() {
+    let body = [
+        1, 1, 0x7f, 0x41, 40, 0x03, 0x40, 0x03, 0x40,
+        0x0b, // The elided empty inner loop shares the body start PC.
+        0x20, 0, 0x04, 0x7f, // If the parameter is nonzero, forward-exit with 2.
+        0x02, 0x7f, 0x41, 8, 0x41, 2, 0x41, 0x7f, 0x0d, 0, 0x6a, 0x0b, 0x05, 0x41, 1,
+        0x0b, // Otherwise produce 1.
+        0x20, 1, 0x6a, 0x21, 1, // Add the if result to the local.
+        0x20, 0, 0x41, 0, 0x21, 0, 0x0d, 0, // Continue using the old parameter value.
+        0x0b, 0x20, 1, 0x6a, 0x0b,
+    ];
+    let module = exported_function(&i32_type(1), &code_body(&body));
+    let instance = module.instantiate();
+    assert_eq!(instance.invoke_i32_with_args("answer", &[-1]), Ok(43));
+    assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(41));
+}
+
+#[test]
+fn rejects_loop_floor_violations_and_nonempty_results() {
+    let prefix = &[0, 0x41, 42, 0x03, 0x40][..];
+    for (ops, op, available) in [
+        (&[0x0d, 0][..], 0, 0), // The saved prefix is not a condition.
+        (&[0x45], 0, 0),        // A loop cannot read its prefix even if the depth would recover.
+        (&[0x41, 1, 0x6a], 2, 1),
+    ] {
+        let body = [prefix, ops, &[0x0b, 0x0b]].concat();
+        bad_body(
+            &body,
+            prefix.len() + op,
+            ErrorKind::StackUnderflow { depth: available },
+        );
+    }
+    // Even a literal nonzero condition does not waive checks on fallthrough.
+    let branch = [prefix, &[0x41, 1, 0x0d, 0]].concat();
+    for (tail, offset, kind) in [
+        (
+            &[0x41, 7, 0x0b, 0x0b][..],
+            2,
+            ErrorKind::InvalidResultDepth { depth: 1 },
+        ),
+        (
+            &[0x0c, 0, 0x0b, 0x0b],
+            0,
+            ErrorKind::UnsupportedOpcode { opcode: 0x0c },
+        ),
+        (&[0x0b, 0x0b, 0x0b], 2, ErrorKind::TrailingBodyBytes),
+    ] {
+        bad_body(&[&branch[..], tail].concat(), branch.len() + offset, kind);
+    }
+    // A zero-result loop does not relax the function's one-result requirement.
+    bad_body(
+        &[0, 0x03, 0x40, 0x0b, 0x0b],
+        4,
+        ErrorKind::InvalidResultDepth { depth: 0 },
+    );
+}
+
+#[test]
+fn validates_loop_type_and_delimiters_within_the_body_frame() {
+    for found in [0x7f, 0x7e, 0, 0xc0] {
+        bad_body(
+            &[0, 0x03, found],
+            2,
+            ErrorKind::UnexpectedByte {
+                expected: 0x40,
+                found,
+            },
+        );
+    }
+    let mut code = code_body(&[0, 0x03]);
+    let boundary = code.len();
+    code.extend([0x40, 0x0b]); // A block type outside the body can't complete it.
+    bad_code(&code, boundary, ErrorKind::TruncatedByte { expected: 0x40 });
+    let prefix = &[0, 0x41, 42, 0x03, 0x40][..];
+    for (tail, offset, kind) in [
+        (&[][..], 0, ErrorKind::TruncatedByte { expected: 0x0b }),
+        (&[0x0b], 1, ErrorKind::TruncatedByte { expected: 0x0b }),
+        (&[0x05, 0x0b, 0x0b], 0, ErrorKind::UnexpectedElse),
+    ] {
+        bad_body(&[prefix, tail].concat(), prefix.len() + offset, kind);
+    }
+}
+
+#[test]
+fn loops_share_the_control_depth_cap_with_both_forward_constructs() {
+    let limit = Limit::ControlDepth;
+    let nested = |depth: usize| {
+        let mut body = vec![1, 1, 0x7f];
+        let opener = |level| [0x03, 0x02, 0x04][level % 3];
+        let mut last_open = 0;
+        for level in 0..depth {
+            let op = opener(level);
+            if op == 0x04 {
+                body.extend([0x41, 1]);
+            }
+            last_open = body.len();
+            body.extend([op, if op == 0x03 { 0x40 } else { 0x7f }]);
+        }
+        for level in (0..depth).rev() {
+            let op = opener(level);
+            if op != 0x03 {
+                body.extend([0x41, 7]);
+                if op == 0x04 {
+                    body.extend([0x05, 0x41, 8]);
+                }
+            }
+            body.push(0x0b);
+            if op != 0x03 {
+                body.extend([0x21, 0]); // Consume the nested block or if result in its parent.
+            }
+        }
+        body.extend([0x20, 0, 0x0b]);
+        (body, last_open)
+    };
+    assert_body_result(&nested(limit.maximum()).0, 7);
+    let (body, last_open) = nested(limit.maximum() + 1);
+    bad_body(&body, last_open, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn counts_loop_delimiters_in_body_bytes_but_not_decoded_instructions() {
+    let limit = Limit::BodyInstructions;
+    let mut body = vec![0, 0x41, 9, 0x03, 0x40, 0x41, 0];
+    body.extend(std::iter::repeat_n(0x45, limit.maximum() - 3));
+    let branch = body.len();
+    // Branch is decoded instruction 127. An empty loop can follow at the cap.
+    body.extend([0x0d, 0, 0x0b, 0x03, 0x40, 0x0b, 0x0b]);
+    assert_body_result(&body, 9);
+    body.insert(branch, 0x45);
+    bad_body(&body, branch + 1, ErrorKind::LimitExceeded { limit });
+
+    let limit = Limit::CodeBodyBytes;
+    let ops = [0x41, 9, 0x03, 0x40, 0x41, 0, 0x0d, 0x80, 0, 0x0b, 0x0b];
+    let groups = (limit.maximum() - 1 - ops.len()) / 2;
+    let mut body = vec![u8::try_from(groups).unwrap()];
+    body.extend([0, 0x7f].repeat(groups));
+    body.extend(ops);
+    assert_eq!(body.len(), limit.maximum());
+    assert_body_result(&body, 9);
+    body.insert(body.len() - 3, 0x80); // Add another label padding byte.
+    bad_code(&code_body(&body), 1, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn loop_operand_cap_includes_the_frozen_prefix() {
+    let limit = Limit::OperandStackDepth;
+    let floor = limit.maximum() - 1;
+    let mut body = vec![1, 1, 0x7f];
+    body.extend([0x41, 1].repeat(floor));
+    body.extend([0x03, 0x40]);
+    let condition = body.len();
+    body.extend([0x41, 0, 0x0d, 0, 0x0b]);
+    body.extend(std::iter::repeat_n(0x6a, floor - 1));
+    body.push(0x0b);
+    assert_body_result(&body, floor as i32);
+    // Keep one temporary until after br_if, then consume it on fallthrough.
+    body.splice(
+        condition..condition + 4,
+        [0x41, 7, 0x41, 0, 0x0d, 0, 0x21, 0],
+    );
+    bad_body(&body, condition + 2, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
+    let limit = ExecutionLimit::InstructionDispatches;
+    assert_eq!(limit.maximum(), 1024);
+    let module = exported_functions(
+        1,
+        &[(b"exact", 0), (b"over", 1), (b"spin", 3)],
+        &[
+            b"\0\x20\0\x22\0\x10\x02\x0b",       // local.get, local.tee, call
+            b"\0\x20\0\x22\0\x22\0\x10\x02\x0b", // Same, with one extra local.tee.
+            // Preserve 42 and repeat (get, const, sub, tee, br_if) until --param == 0.
+            b"\0\x41\x2a\x03\x40\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b\x0b",
+            b"\0\x41\x2a\x03\x40\x41\x01\x0d\0\x0b\x0b", // Always continue.
+        ],
+    );
+    let instance = module.instantiate();
+    let invoke = |name, arg| instance.invoke_i32_with_args(name, &[arg]);
+    // 3 caller dispatches + 1 const + 204 * 5 = 1024. The final false br_if
+    // uses the last dispatch; both returns are free. With an extra caller op,
+    // the budget runs out just before that br_if.
+    assert_eq!(invoke("exact", 204), Ok(42));
+    assert_eq!(
+        invoke("over", 204),
+        Err(InvokeError::LimitExceeded { limit })
+    );
+    assert_eq!(invoke("over", 1), Ok(42));
+    assert_eq!(invoke("spin", 0), Err(InvokeError::LimitExceeded { limit }));
+    assert_eq!(invoke("exact", 204), Ok(42));
+}
+
+#[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x02, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
+        if ![
+            0x02, 0x03, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x41,
+        ]
+        .contains(&opcode)
             && !(0x45..=0x4f).contains(&opcode)
             && !(0x6a..=0x70).contains(&opcode)
         {

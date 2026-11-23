@@ -270,6 +270,19 @@ fn fixtures() -> Vec<Fixture> {
     for (condition, expected) in [(0, 49), (1, 42), (-1, 42)] {
         cases.push(Fixture::new(expected, &[condition], &branch));
     }
+    // Sum a positive countdown in local 1, keeping 3 below the loop floor.
+    let countdown = [
+        0x41, 3, 0x03, 0x40, 0x20, 1, 0x20, 0, 0x6a, 0x21, 1, 0x20, 0, 0x41, 1, 0x6b, 0x22, 0,
+        0x0d, 0, 0x0b, 0x20, 1, 0x6a,
+    ];
+    for (arg, expected) in [(1, 4), (4, 13), (8, 39)] {
+        cases.push(Fixture::with_locals(
+            expected,
+            &[arg],
+            &[1, 1, 0x7f],
+            &countdown,
+        ));
+    }
     cases
 }
 

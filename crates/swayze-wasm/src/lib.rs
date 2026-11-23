@@ -16,16 +16,17 @@
 //! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
 //! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `call`,
-//! `if (result i32) ... else ... end`, `block (result i32) ... end`, and
-//! `br_if 0`. Local indices start at zero and address parameters first, then
-//! locals in declaration order. Both can be assigned. `call` takes an unsigned
-//! LEB32 index into the exact function declarations, including forward and self
-//! references. `if` and `block` may nest together, accept only block type byte
-//! `0x7f` (one i32 result, no block parameters), and `if` requires both arms.
-//! `br_if` takes an unsigned LEB32 label index, which must be zero with a
-//! `block` as the innermost control frame. Other label indices, `if` and
-//! function label targets, void blocks, `loop`, `br`, `return`, `unreachable`,
-//! and indirect calls are unsupported.
+//! `if (result i32) ... else ... end`, `block (result i32) ... end`,
+//! `loop ... end`, and `br_if 0`. Local indices start at zero and address
+//! parameters first, then locals in declaration order. Both can be assigned.
+//! `call` takes an unsigned LEB32 index into the exact function declarations,
+//! including forward and self references. The control constructs may nest
+//! together. `if` and `block` accept only block type byte `0x7f` (one i32 result,
+//! no block parameters), and `if` requires both arms. `loop` accepts only `0x40`
+//! (no block parameters or results). `br_if` takes an unsigned LEB32 label
+//! index, which must be zero with a `block` or `loop` as the innermost control
+//! frame. Other label indices, `if` and function label targets, other block
+//! types, `br`, `return`, `unreachable`, and indirect calls are unsupported.
 //! An optional export section between function and code may contain zero to
 //! eight function exports. Name matching is exact (no Unicode normalization),
 //! and duplicate export names are rejected. Each export refers to a defined
@@ -45,21 +46,25 @@
 //! and saves the remaining depth as the floor for both arms. `else` checks for
 //! exactly one new result and resets validation to the saved depth, and the
 //! matching `end` checks that the else arm also leaves exactly one new result.
-//! `block` saves the current depth as its floor without consuming any operand;
-//! its normal exit must leave exactly one i32 above that floor. Every operand
-//! access must stay above the active floor. `br_if` pops an i32 condition and
-//! requires an i32 result beneath it and above the block's floor. With a zero
-//! condition, execution continues with all other operands unchanged. With a
-//! nonzero condition, execution keeps the result and operands below the floor,
-//! discards any other operands above the floor, and resumes after the matching
-//! block `end`. Both `if` arms and the entire `br_if` fallthrough path are
-//! validated regardless of the condition.
+//! `block` and `loop` save the current depth as their floor without consuming
+//! any operands. A `block` must leave exactly one new i32 at its normal exit;
+//! a `loop` must leave none. Every operand access must stay above the active
+//! floor. `br_if` pops an i32 condition. With a zero condition, execution
+//! continues with all other operands unchanged. For a block target, it also
+//! requires an i32 result beneath the condition and above the floor; with a
+//! nonzero condition, it keeps that result and the prefix below the floor,
+//! discards all other operands, and resumes after the matching block `end`.
+//! A loop target requires only the condition. If nonzero, `br_if` discards all
+//! operands above the loop floor and resumes at the start of the loop body
+//! with the prefix and locals intact. Both `if` arms and the entire `br_if`
+//! fallthrough path are validated regardless of the condition.
 //! The function has a floor of zero; its own `end` must be the final byte of
 //! the body frame and leave exactly one result. The inclusive limits are 256
 //! body bytes (including the locals vector and all delimiters), 127 decoded
-//! instructions (including `if`, `else`, and `br_if`, but not `block` or `end`),
-//! 32 live i32 operands including those below floors, and 16 simultaneously
-//! open `block` or `if` frames combined, excluding the function frame.
+//! instructions (including `if`, `else`, and `br_if`, but not `block`, `loop`,
+//! or `end`), 32 live i32 operands including those below floors, and 16
+//! simultaneously open `block`, `loop`, and `if` frames combined, excluding
+//! the function frame.
 //!
 //! Validation resolves every function's type index before decoding any body,
 //! and checks the entire input, including every body even if unexported. It
@@ -69,11 +74,12 @@
 //! scans at most eight export names for an exact match, then checks the selected
 //! function's arity and begins execution without allocating or recursing
 //! in Rust. Zero selects the else arm; every nonzero i32 selects the then arm.
-//! Validation uses a fixed stack of control frames and backpatches private jump
-//! targets at matching delimiters. Each jump target is a strictly later decoded
-//! instruction index or the one-past-last index in the same body. For `br_if`,
-//! the decoded instruction also stores the target block's operand floor.
-//! Execution never visits untaken arms or block tails skipped by a branch.
+//! Validation uses a fixed stack of control frames. It backpatches `if` and
+//! `block` targets at matching delimiters to strictly later decoded instruction
+//! indices or the one-past-last index in the same body. Loop continues have a
+//! separate target at or before the branch, resolved from the loop's saved
+//! body start. Each decoded `br_if` also stores its target's operand floor.
+//! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
 //! declared locals start at zero for every frame. A callee starts with no
@@ -98,10 +104,12 @@
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
 //! including a `call`, `if` test, executed `else` jump, or `br_if` with either
-//! outcome. Skipped instructions, `block` and `end` delimiters, and returning
-//! from frames cost nothing. An invocation can return just after its last
-//! allowed dispatch. If the next instruction would exceed the dispatch budget,
-//! that limit takes precedence over executing it.
+//! outcome. Skipped instructions, `block`, `loop`, and `end` delimiters, and
+//! returning from frames cost nothing. A continue does not reset the budget:
+//! all loop iterations and calls share it, including recursive guest calls.
+//! An invocation can return just after its last allowed dispatch. If the next
+//! instruction would exceed the dispatch budget, that limit takes precedence
+//! over executing it.
 //! The same instance can be invoked again with fresh call-local state and budgets.
 //! Empty, custom-only, and unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
@@ -138,6 +146,10 @@
 //! Block and branch tests cover mixed nesting and floors, taken truncation vs.
 //! fallthrough, multiple exits, skipped traps and rejected skipped syntax,
 //! label immediates and delimiter errors, and exact body and execution budgets.
+//! Loop tests cover mixed nesting with forward edges, preserved locals and
+//! stack prefix, different taken and fallthrough stack effects, full body
+//! validation, shared caps, and the exact dispatch boundary in a called loop
+//! and instance reuse after hitting the limit.
 //! Parsing uses fixed scratch tables for up to eight type arities and eight
 //! resolved function arities. It checks local group counts against the remaining
 //! local budget without expanding groups, uses bounded borrowed frames, and

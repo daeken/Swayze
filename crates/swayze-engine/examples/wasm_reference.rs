@@ -1378,6 +1378,57 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
         bytes.extend([op, 0x0b]);
         bytes
     };
+    // Division: below/above subnormal midpoints, exact overflow boundary,
+    // and a signed infinity without a trap. Use integer encodings at both widths.
+    for (h, one, two, infinity, negative, ty, opcode) in [
+        (
+            23,
+            0x3f80_0000_u64,
+            0x4000_0000,
+            0x7f80_0000,
+            0x8000_0000,
+            0x7d,
+            0x95,
+        ),
+        (
+            52,
+            0x3ff0_0000_0000_0000,
+            0x4000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0x7c,
+            0xa3,
+        ),
+    ] {
+        let normal = 1_u64 << h;
+        for (lhs, rhs, expected) in [
+            (negative | 1, two, negative),
+            (2 * normal - 2, two - 1, normal - 1),
+            (2 * normal - 1, two + 1, normal - 1),
+            (2 * normal - 1, two, normal),
+            (infinity - 1, one, infinity - 1),
+            (infinity - 1, one - 1, infinity),
+            (one, negative, infinity | negative),
+        ] {
+            let (expected, args) = if ty == 0x7d {
+                (
+                    Outcome::F32Invocation(Ok(expected as u32)),
+                    vec![WasmValue::F32(lhs as u32), WasmValue::F32(rhs as u32)],
+                )
+            } else {
+                (
+                    Outcome::F64Invocation(Ok(expected)),
+                    vec![WasmValue::F64(lhs), WasmValue::F64(rhs)],
+                )
+            };
+            cases.push(Fixture {
+                expected,
+                bytes: binary_module(ty, opcode),
+                export: "x",
+                args,
+            });
+        }
+    }
     // Exact signed-zero ties, adjacent values, and carry into normal or infinity.
     for (lhs, rhs, expected) in [
         (1, 0x3eff_ffff, 0),

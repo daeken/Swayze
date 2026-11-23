@@ -400,12 +400,6 @@ fn unsupported_operations_fail_only_when_dispatched() {
         "'a' + 'b'",
         "1 + '2'",
         "'2' - 1",
-        "'2' & 1",
-        "1 ^ ''",
-        "'' | 1",
-        "'' << 1",
-        "1 >> ''",
-        "'' >>> 1",
         "'' == 0",
         "0 != ''",
         "'' != false",
@@ -431,7 +425,7 @@ fn unsupported_operations_fail_only_when_dispatched() {
             );
         }
     }
-    for op in ["+=", "-=", "&=", "|=", "^=", "<<=", ">>=", ">>>="] {
+    for op in ["+=", "-="] {
         for source in [
             format!("let x = '2'; x {op} 1; 0"),
             format!("let x = 1; (x {op} '2')"),

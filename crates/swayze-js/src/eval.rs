@@ -82,14 +82,6 @@ impl Value {
         }
     }
 
-    fn to_uint32(self) -> u32 {
-        number_to_uint32(self.to_number())
-    }
-
-    fn to_int32(self) -> i32 {
-        number_to_int32(self.to_number())
-    }
-
     fn to_boolean(self) -> bool {
         match self {
             Self::Number(value) => value != 0.0 && !value.is_nan(),
@@ -233,14 +225,15 @@ impl Script {
     /// return a Boolean, always `false` if either operand is NaN. Two Strings
     /// are ordered lexicographically by UTF-16 code units, with a proper prefix
     /// sorting before the longer String.
-    /// Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, and `**` (including
-    /// their eager compound forms) convert Strings to Numbers using
+    /// Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`,
+    /// `<<`, `>>`, and `>>>` (including their eager compound forms) convert
+    /// Strings to Numbers using
     /// ECMAScript's whitespace, signed decimal and `Infinity`
     /// forms, and unsigned `0x`, `0o`, and `0b` integer forms. Empty or
     /// whitespace-only Strings become `+0`; invalid numeric text becomes NaN.
     /// Unary `+` returns the Number and unary `-` negates it, including signed
     /// zero. Unary `~` applies bitwise NOT after converting the rounded Number
-    /// to a signed 32-bit integer. The four supported binary operators convert
+    /// to a signed 32-bit integer. These binary operators convert
     /// the left operand and then the right, after evaluating both operand
     /// expressions. Their compounds use the value loaded before the RHS runs
     /// and store the Number only after the operation succeeds.
@@ -260,9 +253,9 @@ impl Script {
     /// other Strings; mixed strict equality and String/nullish loose equality
     /// are false. `!==` and `!=` negate their corresponding equality results.
     /// String/Number and String/Boolean loose equality, mixed String/scalar
-    /// relational comparison, binary `+` (including concatenation), binary `-`,
-    /// and binary bitwise operations on Strings remain unsupported, including
-    /// the corresponding eager compounds and all name updates on Strings.
+    /// relational comparison, binary `+` (including concatenation), and binary
+    /// `-` remain unsupported on Strings, as do the corresponding compounds and
+    /// all name updates on Strings.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -317,12 +310,13 @@ impl Script {
     /// before comparison, even for aliases or an early mismatch; skipped
     /// comparisons cost nothing.
     /// String-to-Number conversion has a separate 262,144-credit budget per
-    /// call, shared by unary `+`, `-`, and `~` and binary `*`, `/`, `%`, and
-    /// `**` (including their eager compound forms). After dispatch, operand
-    /// arity checks, and validation of the operand's String range, each
-    /// conversion charges `1 +` the original UTF-16 length. Trimmed-empty
-    /// text, exact optionally signed `Infinity`, and recognized unsigned radix
-    /// prefixes only pay this base charge. All other candidates additionally pay
+    /// call, shared by unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`,
+    /// `&`, `^`, `|`, `<<`, `>>`, and `>>>` (including their eager compound
+    /// forms). After dispatch, operand arity checks, and validation of the
+    /// operand's String range, each conversion charges `1 +` the original
+    /// UTF-16 length. Trimmed-empty text, exact optionally signed `Infinity`,
+    /// and recognized unsigned radix prefixes only pay this base charge.
+    /// All other candidates additionally pay
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
     /// before validating decimal syntax. Skipped instructions and scalar operands
     /// cost no conversion credits.
@@ -508,19 +502,43 @@ fn evaluate<'script>(
                 &mut string_conversion_credits_left,
                 exponentiate,
             )?,
-            Instruction::BitwiseAnd => apply_bitwise(&mut stack, |lhs, rhs| lhs & rhs)?,
-            Instruction::BitwiseXor => apply_bitwise(&mut stack, |lhs, rhs| lhs ^ rhs)?,
-            Instruction::BitwiseOr => apply_bitwise(&mut stack, |lhs, rhs| lhs | rhs)?,
+            Instruction::BitwiseAnd => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                signed_bitwise(|lhs, rhs| lhs & rhs),
+            )?,
+            Instruction::BitwiseXor => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                signed_bitwise(|lhs, rhs| lhs ^ rhs),
+            )?,
+            Instruction::BitwiseOr => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                signed_bitwise(|lhs, rhs| lhs | rhs),
+            )?,
             // Rust's wrapping shifts use only the low five count bits for i32/u32.
-            Instruction::ShiftLeft => apply_scalar_binary(&mut stack, |lhs, rhs| {
-                Value::Number(f64::from(lhs.to_int32().wrapping_shl(rhs.to_uint32())))
-            })?,
-            Instruction::ShiftRight => apply_scalar_binary(&mut stack, |lhs, rhs| {
-                Value::Number(f64::from(lhs.to_int32().wrapping_shr(rhs.to_uint32())))
-            })?,
-            Instruction::ShiftRightUnsigned => apply_scalar_binary(&mut stack, |lhs, rhs| {
-                Value::Number(f64::from(lhs.to_uint32().wrapping_shr(rhs.to_uint32())))
-            })?,
+            Instruction::ShiftLeft => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shl(number_to_uint32(rhs))),
+            )?,
+            Instruction::ShiftRight => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shr(number_to_uint32(rhs))),
+            )?,
+            Instruction::ShiftRightUnsigned => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| f64::from(number_to_uint32(lhs).wrapping_shr(number_to_uint32(rhs))),
+            )?,
             Instruction::LooseEqual
             | Instruction::LooseNotEqual
             | Instruction::StrictEqual
@@ -749,21 +767,14 @@ fn apply_binary(
     Ok(())
 }
 
-fn apply_scalar_binary(
-    stack: &mut Vec<Operand>,
-    op: impl FnOnce(Value, Value) -> Value,
-) -> Result<(), EvalError> {
-    apply_binary(stack, |lhs, rhs| {
-        Ok(op(lhs.require_scalar()?, rhs.require_scalar()?))
-    })
-}
-
 fn apply_scalar_arithmetic(
     stack: &mut Vec<Operand>,
     op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<(), EvalError> {
-    apply_scalar_binary(stack, |lhs, rhs| {
-        Value::Number(op(lhs.to_number(), rhs.to_number()))
+    apply_binary(stack, |lhs, rhs| {
+        let lhs = lhs.require_scalar()?;
+        let rhs = rhs.require_scalar()?;
+        Ok(Value::Number(op(lhs.to_number(), rhs.to_number())))
     })
 }
 
@@ -773,7 +784,7 @@ fn apply_numeric_binary(
     credits_left: &mut usize,
     op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<(), EvalError> {
-    // Both expressions have run; apply_binary checks arity before coercion.
+    // Both expressions have run; check arity before coercing left then right.
     apply_binary(stack, |lhs, rhs| {
         let lhs = lhs.to_number(string_units, credits_left)?;
         let rhs = rhs.to_number(string_units, credits_left)?;
@@ -826,13 +837,8 @@ fn exponentiate(base: f64, exponent: f64) -> f64 {
     if negative_result { -result } else { result }
 }
 
-fn apply_bitwise(
-    stack: &mut Vec<Operand>,
-    op: impl FnOnce(i32, i32) -> i32,
-) -> Result<(), EvalError> {
-    apply_scalar_binary(stack, |lhs, rhs| {
-        Value::Number(f64::from(op(lhs.to_int32(), rhs.to_int32())))
-    })
+fn signed_bitwise(op: impl FnOnce(i32, i32) -> i32) -> impl FnOnce(f64, f64) -> f64 {
+    move |lhs, rhs| f64::from(op(number_to_int32(lhs), number_to_int32(rhs)))
 }
 
 #[cfg(test)]

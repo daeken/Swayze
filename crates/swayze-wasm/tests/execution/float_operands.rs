@@ -555,7 +555,7 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
 }
 
 #[test]
-fn float_signatures_globals_labels_memory_and_other_numeric_ops_stay_unsupported() {
+fn float_signatures_labels_memory_and_other_numeric_ops_stay_unsupported() {
     let unexpected = |expected, found| ErrorKind::UnexpectedByte { expected, found };
     for ty in [0x7d, 0x7c] {
         bad_payload(1, &[1, 0x60, 1, ty, 0], 3, unexpected(0x7f, ty));
@@ -565,7 +565,6 @@ fn float_signatures_globals_labels_memory_and_other_numeric_ops_stay_unsupported
             push_section(&mut exported, id, payload);
         }
         expect_error(&exported, start + 4, unexpected(0x7f, ty));
-        bad_payload(6, &[1, ty, 0], 1, unexpected(0x7f, ty));
         bad_body(&[0, 0x02, ty, 0x0b, 0x0b], 2, unexpected(0x7f, ty));
         bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
         bad_body(&[0, 0x41, 0, 0x04, ty, 0x0b, 0x0b], 4, unexpected(0x7f, ty));

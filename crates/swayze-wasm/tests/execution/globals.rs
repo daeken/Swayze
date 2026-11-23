@@ -5,6 +5,9 @@ use super::{
 };
 use swayze_wasm::ValType::{I32, I64};
 
+#[path = "globals/float.rs"]
+mod float;
+
 const MUTABLE: &[u8] = &[1, 0x7f, 1, 0x41, 42, 0x0b];
 const IMMUTABLE: &[u8] = &[1, 0x7f, 0, 0x41, 42, 0x0b];
 const MUTABLE_I64: &[u8] = &[1, 0x7e, 1, 0x42, 42, 0x0b];
@@ -132,11 +135,11 @@ fn rejects_malformed_global_declarations_and_counts_at_the_section_boundary() {
         ),
         (&[1], 1, TruncatedByte { expected: 0x7f }),
         (
-            &[1, 0x7d],
+            &[1, 0x70],
             1,
             UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7d,
+                found: 0x70,
             },
         ),
         (&[1, 0x7f], 2, TruncatedGlobalMutability),

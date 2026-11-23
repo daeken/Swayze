@@ -89,10 +89,12 @@
 //! The optional global section (ID 6) follows any type, function, table, and
 //! memory sections and precedes any export, start, element, and code sections.
 //! It may contain zero to eight private globals total, indexed from zero in
-//! declaration order. Each declaration uses value type byte `0x7f` (i32) or
-//! `0x7e` (i64), literal mutability byte `0x00` (immutable) or `0x01` (mutable),
-//! and exactly the matching `i32.const <signed LEB32> end` or
-//! `i64.const <signed LEB64> end`. Valid LEB padding is accepted; the
+//! declaration order. Each declaration uses a value type byte (`0x7f` for i32,
+//! `0x7e` for i64, `0x7d` for f32, or `0x7c` for f64) and a literal mutability
+//! byte (`0x00` for immutable or `0x01` for mutable). The initializer is exactly
+//! the matching `i32.const`, `i64.const`, `f32.const`, or `f64.const`, followed
+//! by `end`. Integer immediates are signed LEB32 or LEB64 with valid padding
+//! accepted; float immediates are four or eight little-endian bytes. The
 //! initializer cannot read past the global section frame. Every body can read
 //! any declared global and can set only mutable globals. Global imports,
 //! exports, and initializer reads are unsupported.
@@ -141,7 +143,8 @@
 //! `local.tee` stores it and leaves it on the stack. These moves preserve all
 //! bits, including the sign of zero and signaling NaN payloads.
 //! `global.get` pushes the declared type; `global.set` consumes that type.
-//! Local and global stack effects are checked even in dead code.
+//! Like local moves, global reads and writes preserve all bits. Local and
+//! global stack effects are checked even in dead code.
 //! `i32.const` pushes one i32.
 //! `i64.const` pushes one i64 and accepts valid padding within ten signed LEB128
 //! bytes. In a ten-byte encoding the terminal byte must be `0x00` or `0x7f` to
@@ -164,9 +167,10 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! sign operations, and comparisons each count as one dispatch. None uses native
 //! floating-point operations or quiets signaling NaNs. Floats are supported as
-//! operands and private declared locals only. Float function signatures (and
-//! thus host arguments and results), globals, control label results, memory
-//! instructions, and other floating-point numeric instructions remain unsupported.
+//! operands, private globals, and private declared locals only. Float function
+//! signatures (and thus host arguments and results), control label results,
+//! memory instructions, and other floating-point numeric instructions remain
+//! unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -315,8 +319,8 @@
 //! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and separate fixed
-//! local storage. Both hold private tagged values, including raw f32 and f64
-//! encodings. Globals still hold only tagged i32/i64 values. Each frame starts
+//! local storage. Operand, local, and instance global slots use the same
+//! private tagged values, including raw f32 and f64 encodings. Each frame starts
 //! by copying a fixed array of typed zeros, including the exact +0 encoding
 //! for every float local, even when reusing a frame slot. Integer arguments
 //! then fill the parameter prefix. A callee starts with no operands. A callee
@@ -569,6 +573,8 @@
 //! exports, and global offsets. They exercise full-width reads and writes,
 //! shared state across start, exports and calls, fresh instances, and
 //! suppression of later writes after a trap or exhausted dispatch budget.
+//! Mixed global tests check exact signed-zero and signaling NaN bits using
+//! integer reinterpretations, including writes by start and before traps.
 //! Start tests cover section order, exact framing, padded and invalid indices,
 //! signature errors and validation precedence, private and exported targets,
 //! one automatic execution per instance, independence, and visibility of start
@@ -624,7 +630,7 @@ pub struct Module {
     start_function: Option<usize>,
     // None means absent; Some may have a minimum of zero and no declared maximum.
     memory_limits: Option<MemoryLimits>,
-    global_initial_values: [Value; binary::MAX_GLOBALS as usize],
+    global_initial_values: [binary::Operand; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
     // None means absent; Some(0) means a declared zero-entry table.
     table_entries: Option<usize>,
@@ -749,7 +755,7 @@ pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
     // Validation allows stores only to mutable slots and with the initial value's type.
-    globals: [Cell<Value>; binary::MAX_GLOBALS as usize],
+    globals: [Cell<binary::Operand>; binary::MAX_GLOBALS as usize],
     table: Option<FunctionTable>,
 }
 

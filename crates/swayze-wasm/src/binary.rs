@@ -409,7 +409,9 @@ impl std::error::Error for Error {}
 /// bytes are reported as [`ErrorKind::InvalidGlobalMutability`] or
 /// [`ErrorKind::TruncatedGlobalMutability`] before checking the initializer.
 /// An initializer opcode that does not match the declared type reports
-/// [`ErrorKind::UnexpectedByte`] at that opcode. After index validation,
+/// [`ErrorKind::UnexpectedByte`] at that opcode. A short float initializer
+/// immediate reports [`ErrorKind::TruncatedFloatConst`] at the section end.
+/// After index validation,
 /// [`ErrorKind::ImmutableGlobal`] points to the start of the `global.set`
 /// index field and takes precedence over operand errors.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
@@ -755,13 +757,13 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Err
 
 #[derive(Clone, Copy)]
 struct Global {
-    initial_value: Value,
+    initial_value: Operand,
     mutable: bool,
 }
 
 impl Global {
     const EMPTY: Self = Self {
-        initial_value: Value::I32(0),
+        initial_value: Operand::I32(0),
         mutable: false,
     };
 
@@ -776,7 +778,7 @@ fn validate_globals(
 ) -> Result<usize, Error> {
     let count = section.count(IntegerField::GlobalCount, 0..=MAX_GLOBALS)? as usize;
     for global in &mut globals[..count] {
-        let ty = section.integer_type()?;
+        let ty = section.storage_type()?;
         let offset = section.position();
         let mutable = match section.byte() {
             Some(0) => false,
@@ -790,10 +792,7 @@ fn validate_globals(
             None => return Err(section.error(ErrorKind::TruncatedGlobalMutability)),
         };
         *global = Global {
-            initial_value: match ty {
-                IntegerType::I32 => Value::I32(section.i32_const_expr()?),
-                IntegerType::I64 => Value::I64(section.i64_const_expr()?),
-            },
+            initial_value: section.global_initializer(ty)?,
             mutable,
         };
     }
@@ -1006,13 +1005,6 @@ pub enum Value {
 }
 
 impl Value {
-    fn zero(ty: IntegerType) -> Self {
-        match ty {
-            IntegerType::I32 => Self::I32(0),
-            IntegerType::I64 => Self::I64(0),
-        }
-    }
-
     fn integer_type(self) -> IntegerType {
         match self {
             Self::I32(_) => IntegerType::I32,
@@ -1025,10 +1017,10 @@ impl Value {
     }
 }
 
-// Private stack and local slots keep IEEE 754 encodings in integer storage
-// so even signaling NaNs pass through without a native float operation.
+// Private stack, local, and global slots keep IEEE 754 encodings in integer
+// storage so even signaling NaNs pass through without a native float operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Operand {
+pub(super) enum Operand {
     I32(i32),
     I64(i64),
     F32(u32),
@@ -1045,11 +1037,20 @@ impl From<Value> for Operand {
 }
 
 impl Operand {
+    fn zero(ty: ValType) -> Self {
+        match ty {
+            ValType::I32 => Self::I32(0),
+            ValType::I64 => Self::I64(0),
+            ValType::F32 => Self::F32(0),
+            ValType::F64 => Self::F64(0),
+        }
+    }
+
     fn into_integer(self) -> Value {
         match self {
             Self::I32(value) => Value::I32(value),
             Self::I64(value) => Value::I64(value),
-            _ => unreachable!("validated integer storage or function boundary"),
+            _ => unreachable!("validated integer function boundary"),
         }
     }
 
@@ -1707,12 +1708,8 @@ pub(super) fn execute(
             Instruction::LocalTee(index) => {
                 frame.locals[index as usize] = frame.operands[frame.depth - 1];
             }
-            Instruction::GlobalGet(index) => {
-                frame.push(instance.globals[index as usize].get().into())
-            }
-            Instruction::GlobalSet(index) => {
-                instance.globals[index as usize].set(frame.pop().into_integer());
-            }
+            Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
+            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
             Instruction::Call(target) => {
                 let index = match target {
                     CallTarget::Direct(index) => index as usize,
@@ -1843,13 +1840,13 @@ fn decode_locals(
     let mut bound = u32::from(signature.parameter_count);
     let limit = bound + MAX_DECLARED_LOCALS;
     for (zero, &ty) in zeros.iter_mut().zip(signature.parameters()) {
-        *zero = Value::zero(ty).into();
+        *zero = Operand::zero(ty.into());
     }
     // Every group consumes at least two bytes of the bounded body, even if its
     // count is zero. Expand only checked counts into the fixed slot array.
     for _ in 0..groups {
         let count = body.count(IntegerField::LocalCount, 0..=limit - bound)?;
-        let zero = body.local_zero()?;
+        let zero = Operand::zero(body.storage_type()?);
         let end = bound + count;
         zeros[bound as usize..end as usize].fill(zero);
         bound = end;
@@ -2292,14 +2289,10 @@ fn decode_plain(
                 Instruction::MemoryGrow
             }
         }
-        I32_CONST => Instruction::Const(Operand::I32(body.integer(IntegerField::I32Const)? as i32)),
-        I64_CONST => Instruction::Const(Operand::I64(body.i64_const()?)),
-        F32_CONST => Instruction::Const(Operand::F32(u32::from_le_bytes(
-            body.float_const_bytes(ValType::F32)?,
-        ))),
-        F64_CONST => Instruction::Const(Operand::F64(u64::from_le_bytes(
-            body.float_const_bytes(ValType::F64)?,
-        ))),
+        I32_CONST => Instruction::Const(body.const_operand(ValType::I32)?),
+        I64_CONST => Instruction::Const(body.const_operand(ValType::I64)?),
+        F32_CONST => Instruction::Const(body.const_operand(ValType::F32)?),
+        F64_CONST => Instruction::Const(body.const_operand(ValType::F64)?),
         0x45 => Instruction::Unary(UnaryOp::Eqz),
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
@@ -2762,15 +2755,15 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn local_zero(&mut self) -> Result<Operand, Error> {
+    fn storage_type(&mut self) -> Result<ValType, Error> {
         let offset = self.position();
-        // Only local declarations accept float types here; signatures and
-        // globals still use integer_type. Keep the existing error byte.
+        // Locals and globals may be floats; signatures still use integer_type.
+        // Keep the existing error byte for unsupported and missing types.
         match self.byte() {
-            Some(I32) => Ok(Operand::I32(0)),
-            Some(I64) => Ok(Operand::I64(0)),
-            Some(0x7d) => Ok(Operand::F32(0)),
-            Some(0x7c) => Ok(Operand::F64(0)),
+            Some(I32) => Ok(ValType::I32),
+            Some(I64) => Ok(ValType::I64),
+            Some(0x7d) => Ok(ValType::F32),
+            Some(0x7c) => Ok(ValType::F64),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {
@@ -2807,11 +2800,25 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    fn i64_const_expr(&mut self) -> Result<i64, Error> {
-        self.expect_byte(I64_CONST)?;
-        let value = self.i64_const()?;
+    fn global_initializer(&mut self, ty: ValType) -> Result<Operand, Error> {
+        self.expect_byte(match ty {
+            ValType::I32 => I32_CONST,
+            ValType::I64 => I64_CONST,
+            ValType::F32 => F32_CONST,
+            ValType::F64 => F64_CONST,
+        })?;
+        let value = self.const_operand(ty)?;
         self.expect_byte(END)?;
         Ok(value)
+    }
+
+    fn const_operand(&mut self, ty: ValType) -> Result<Operand, Error> {
+        Ok(match ty {
+            ValType::I32 => Operand::I32(self.integer(IntegerField::I32Const)? as i32),
+            ValType::I64 => Operand::I64(self.i64_const()?),
+            ValType::F32 => Operand::F32(u32::from_le_bytes(self.float_const_bytes(ty)?)),
+            ValType::F64 => Operand::F64(u64::from_le_bytes(self.float_const_bytes(ty)?)),
+        })
     }
 
     fn name(&mut self, field: LengthField) -> Result<&'a str, Error> {

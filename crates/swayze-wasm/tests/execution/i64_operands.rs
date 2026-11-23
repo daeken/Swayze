@@ -55,6 +55,132 @@ fn both_extensions_dispatch_and_wrap_back_to_i32_for_existing_ops() {
     }
 }
 
+fn push_i64(body: &mut Vec<u8>, mut value: i64) {
+    body.push(0x42);
+    // Use ten-byte signed LEB64 so the fixture keeps the entire 64-bit pattern.
+    for _ in 0..9 {
+        body.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    body.push(value as u8 & 0x7f);
+}
+
+#[test]
+fn compares_full_width_i64_values_and_produces_exact_i32_booleans() {
+    for (value, truth) in [(0, 1), (i64::MIN, 0), (1, 0)] {
+        let mut body = vec![0];
+        push_i64(&mut body, value);
+        body.extend([0x50, 0x0b]);
+        assert_body_result(&body, truth);
+    }
+
+    // MIN and zero have the same low word, but opposite signed/unsigned order.
+    // The equal case also distinguishes strict from inclusive comparisons.
+    for (lhs, rhs, results) in [
+        (i64::MIN, 0, [0, 1, 1, 0, 0, 1, 1, 0, 0, 1]),
+        (0, i64::MIN, [0, 1, 0, 1, 1, 0, 0, 1, 1, 0]),
+        (i64::MIN, i64::MIN, [1, 0, 0, 0, 0, 0, 1, 1, 1, 1]),
+    ] {
+        let mut operands = vec![0];
+        push_i64(&mut operands, lhs);
+        push_i64(&mut operands, rhs);
+        for (opcode, expected) in (0x51..=0x5a).zip(results) {
+            assert_body_result(&[&operands[..], &[opcode, 0x0b]].concat(), expected);
+        }
+    }
+}
+
+#[test]
+fn each_i64_arithmetic_op_wraps_and_keeps_the_full_i64_result() {
+    for (opcode, lhs, rhs, expected) in [
+        (0x7c, i64::MAX, 1, i64::MIN),
+        (0x7c, -1, 1, 0),
+        (0x7d, i64::MIN, 1, i64::MAX),
+        (0x7d, 0, 1, -1),
+        (0x7e, i64::MAX, 2, -2),
+        (0x7e, 1 << 32, 1 << 32, 0),
+    ] {
+        let mut body = vec![0];
+        push_i64(&mut body, lhs);
+        push_i64(&mut body, rhs);
+        body.push(opcode);
+        push_i64(&mut body, expected);
+        body.extend([0x51, 0x0b]); // Compare all 64 result bits, not only i32.wrap_i64.
+        assert_body_result(&body, 1);
+    }
+}
+
+fn numeric_ops() -> impl Iterator<Item = (u8, usize)> {
+    (0x50..=0x5a)
+        .chain(0x7c..=0x7e)
+        .map(|opcode| (opcode, if opcode == 0x50 { 1 } else { 2 }))
+}
+
+#[test]
+fn i64_numeric_ops_check_live_and_dead_concrete_inputs_at_the_opcode() {
+    for (op, arity) in numeric_ops() {
+        let inputs = b"\x42\0".repeat(arity);
+        for head in [&b"\0"[..], b"\0\0"] {
+            for operand in 0..arity {
+                let mut body = [head, &inputs, &[op, 0x0b]].concat();
+                body[head.len() + 2 * operand] = 0x41;
+                bad_body(&body, head.len() + inputs.len(), NEED_I64);
+            }
+        }
+
+        // Frozen operands cannot make up a missing input in a reachable block.
+        let inside = &inputs[2..];
+        let body = [&b"\0"[..], &inputs, b"\x02\x40", inside, &[op, 0x0b]].concat();
+        bad_body(
+            &body,
+            body.len() - 2,
+            ErrorKind::StackUnderflow { depth: arity - 1 },
+        );
+        if arity == 2 {
+            // A missing lhs may be polymorphic; a concrete rhs is still checked.
+            bad_body(&[0, 0x00, 0x41, 0, op, 0x0b], 4, NEED_I64);
+        }
+    }
+}
+
+#[test]
+fn i64_numeric_ops_accept_polymorphic_inputs_but_push_concrete_results() {
+    for (op, arity) in numeric_ops() {
+        let (consumer, wrong_consumer, mismatch) = if op >= 0x7c {
+            (0xa7, 0x45, NEED_I32)
+        } else {
+            (0x45, 0xa7, NEED_I64)
+        };
+        for concrete in 0..arity {
+            // Skip a dead tail whose i64 inputs can be partly or wholly implicit.
+            let mut body = b"\0\x02\x7f\x41\x2a\x0c\0".to_vec();
+            body.extend(b"\x42\0".repeat(concrete));
+            body.extend([op, consumer, 0x0b, 0x0b]);
+            assert_body_result(&body, 42);
+            let offset = body.len() - 3;
+            body[offset] = wrong_consumer;
+            bad_body(&body, offset, mismatch);
+        }
+    }
+}
+
+#[test]
+fn other_i64_numeric_and_memory_opcodes_remain_unsupported() {
+    for opcode in [0x29, 0x37]
+        .into_iter()
+        .chain(0x79..=0x7b) // clz, ctz, popcnt
+        .chain(0x7f..=0x8a) // div/rem, bitwise, shifts/rotates
+        .chain(0xc2..=0xc4)
+    // post-Core-1.0 sign extensions
+    {
+        bad_body(
+            &[0, 0x00, opcode, 0x0b],
+            2,
+            ErrorKind::UnsupportedOpcode { opcode },
+        );
+    }
+}
+
 #[test]
 fn sleb64_rejects_every_bad_tenth_byte_and_stays_inside_nested_frames() {
     let field = IntegerField::I64Const;
@@ -283,8 +409,8 @@ fn mixed_operands_share_the_exact_stack_cap_including_frozen_prefixes() {
 #[test]
 fn counts_i64_instruction_slots_and_all_padded_body_bytes() {
     let mut body = vec![0];
-    body.extend([0x01; 124]);
-    body.extend(b"\x42\0\xa7\x45\x0b");
+    body.extend([0x01; 123]);
+    body.extend(b"\x42\0\x42\0\x7e\x50\x0b");
     assert_body_result(&body, 1);
     let extra = body.len() - 1;
     body.insert(extra, 0xa7);
@@ -307,7 +433,66 @@ fn counts_i64_instruction_slots_and_all_padded_body_bytes() {
 }
 
 #[test]
-fn all_four_new_opcodes_spend_one_dispatch_each() {
+fn i64_numeric_ops_share_the_exact_stack_limit_even_at_control_floors() {
+    let limit = Limit::OperandStackDepth;
+    assert_eq!(limit.maximum(), 32);
+    for (op, arity) in numeric_ops() {
+        let prefix = limit.maximum() - arity;
+        let mut body = b"\0\x41\x2a".to_vec();
+        for slot in 1..prefix {
+            body.extend([if slot % 2 == 0 { 0x41 } else { 0x42 }, 0]);
+        }
+        body.extend(b"\x02\x40");
+        body.extend(b"\x42\0".repeat(arity));
+        let peak = body.len();
+        body.extend([op, 0x1a, 0x0b]);
+        body.extend(std::iter::repeat_n(0x1a, prefix - 1));
+        body.push(0x0b);
+        assert_body_result(&body, 42);
+        body.splice(peak..peak, [0x42, 0]);
+        bad_body(&body, peak, ErrorKind::LimitExceeded { limit });
+
+        // Implicit inputs consume no slots, but the concrete result needs a slot.
+        let mut dead = vec![0];
+        dead.extend(b"\x42\0".repeat(limit.maximum()));
+        dead.extend([0x02, 0x40, 0x00, op, 0x0b]);
+        bad_body(&dead, dead.len() - 2, ErrorKind::LimitExceeded { limit });
+    }
+}
+
+#[test]
+fn every_i64_numeric_op_spends_exactly_one_dispatch() {
+    let limit = ExecutionLimit::InstructionDispatches;
+    assert_eq!(limit.maximum(), 1024);
+    for (op, arity) in numeric_ops() {
+        let mut base = b"\0\x41\x2a\x03\x40".to_vec();
+        base.extend(b"\x42\0".repeat(arity));
+        base.extend([op, 0x1a]);
+        base.extend(b"\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b");
+        // One dispatch before the loop, seven plus arity per iteration.
+        let per_iteration = 7 + arity;
+        let iterations = (limit.maximum() - 1) / per_iteration;
+        let nops = (limit.maximum() - 1) % per_iteration;
+        for (nops, expected) in [
+            (nops, Ok(42)),
+            (nops + 1, Err(InvokeError::LimitExceeded { limit })),
+        ] {
+            let body = [&base[..], &vec![0x01; nops], &[0x0b]].concat();
+            let module = exported_function(&i32_type(1), &code_body(&body));
+            assert_eq!(
+                module
+                    .instantiate()
+                    .unwrap()
+                    .invoke_i32_with_args("answer", &[i32::try_from(iterations).unwrap()]),
+                expected,
+                "opcode {op:#x} with {nops} trailing nops"
+            );
+        }
+    }
+}
+
+#[test]
+fn i64_const_and_conversions_spend_one_dispatch_each() {
     let limit = ExecutionLimit::InstructionDispatches;
     assert_eq!(limit.maximum(), 1024);
     let base = b"\0\x41\x2a\x03\x40\x42\0\x1a\x41\x7f\xac\xa7\xad\xa7\x1a\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b";

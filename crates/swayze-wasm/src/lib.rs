@@ -16,6 +16,8 @@
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
+//! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
+//! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
 //! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.clz`, `i32.ctz`, `i32.popcnt`,
 //! `i32.add`, `i32.sub`, `i32.mul`, `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`,
@@ -125,19 +127,22 @@
 //! byte must be `0x00` or `0x7f` to match the sign bit. The immediate cannot read
 //! beyond its body frame. The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
-//! and pushes its low 32 bits as i32. i64 is limited to internal operands:
-//! signatures, locals, globals, and control label types do not change.
+//! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
+//! one i32. The other i64 comparisons consume two i64s and push one i32;
+//! `i64.add`, `i64.sub`, and `i64.mul` consume two i64s and push one i64.
+//! i64 remains limited to internal operands: signatures, locals, globals,
+//! control labels, `select`, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` consumes three i32 operands pushed in first-value,
 //! second-value, condition order. It pushes the first value for any nonzero
 //! condition and the second for zero. Unlike `if`, `select` does not skip
 //! either value's computation; a producer may trap even if its result would be
 //! unselected or dropped.
-//! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one and push
-//! one; the binary operators consume two and push one. `call` consumes as many
-//! i32s as the target function's type has parameters (the top operand is the
-//! last parameter) and pushes one `i32` for a result function or nothing for
-//! a void function. `call_indirect` consumes an i32 selector above the arguments
+//! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one i32 and
+//! push one i32; the i32 binary operators consume two i32s and push one i32.
+//! `call` consumes as many i32s as the target function's type has parameters
+//! (the top operand is the last parameter) and pushes one i32 for a result
+//! function or nothing for a void function. `call_indirect` consumes an i32 selector above the arguments
 //! and uses the immediate's type for the parameter count and result kind.
 //! Both calls validate their operands above the active frame's entry floor.
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
@@ -268,15 +273,17 @@
 //! machinery as `call`.
 //! [`Instance::invoke_i32`] and [`Instance::invoke_void`] are equivalent to
 //! passing an empty argument slice to their respective typed methods.
-//! The top operand is the right-hand side of each binary
-//! operation. `i32.eqz` tests for zero, and `i32.eq` and `i32.ne` compare the
-//! operand bits for equality or inequality. Ordering comparisons interpret the
-//! bits as signed `i32` for `_s` and unsigned `u32` for `_u`. These tests and
-//! comparisons do not trap and return exactly `1` if true or `0` if false.
-//! Addition, subtraction, and multiplication wrap modulo 2³². Signed
-//! division truncates toward zero, and a nonzero signed remainder has the sign
-//! of the dividend. Unsigned division and remainder interpret the operand bits
-//! as `u32` and preserve the result bits in the returned `i32` value.
+//! The top operand is the right-hand side of each binary operation. At either
+//! width, `eqz` tests for zero, and `eq` and `ne` compare all operand bits for
+//! equality or inequality. Ordering comparisons interpret the bits as signed
+//! for `_s` and unsigned for `_u`, at the input width. These tests and
+//! comparisons do not trap and return an i32 `1` if true or `0` if false.
+//! Addition, subtraction, and multiplication wrap modulo 2³² for i32 and 2⁶⁴
+//! for i64. No i64 numeric operations beyond those listed above are supported.
+//! Signed i32 division truncates
+//! toward zero, and a nonzero signed remainder has the sign of the dividend.
+//! Unsigned i32 division and remainder interpret the operand bits as `u32`
+//! and preserve the result bits in the returned `i32` value.
 //! The bit operations do not trap. `i32.clz` and `i32.ctz` count leading and
 //! trailing zero bits in a 32-bit value (both return 32 for zero); `i32.popcnt`
 //! counts set bits. `i32.and`, `i32.or`, and `i32.xor` operate independently on
@@ -361,8 +368,12 @@
 //! dispatch limits with `nop`, including limit precedence over a guest trap.
 //! i64 operand tests check exact extended and wrapped values, signed LEB64
 //! padding, terminal bytes and frame offsets, i32-only boundaries in live and
-//! dead code, preservation through control and calls, and shared stack and
-//! dispatch budgets.
+//! dead code, and preservation through control and calls. They distinguish
+//! signed and unsigned comparisons with equal low words, verify all 64 result
+//! bits for each wrapping arithmetic operation, and check concrete input and
+//! result types in polymorphic tails. Boundary tests cover the shared 32-slot
+//! stack (including frozen prefixes) and one dispatch per i64 opcode at the
+//! 1024-dispatch limit.
 //! Conditional tests exercise zero and nonzero conditions, nested joins,
 //! preserved outer operands and selected-arm effects, suppression of untaken
 //! traps, rejection of untaken invalid code, arm result counts and floor

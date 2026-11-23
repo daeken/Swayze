@@ -22,6 +22,8 @@ pub struct Error {
 /// active frame's entry stack floor. The latter is reported at a delimiter if
 /// the depth differs from the frame's result arity (zero for void, one for i32),
 /// unless a missing result is supplied by an unreachable frame's implicit i32.
+/// `BranchTableArityMismatch` compares a `br_table` target's result arity to
+/// that of the first target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -59,6 +61,7 @@ pub enum ErrorKind {
     UnsupportedOpcode { opcode: u8 },
     UnexpectedElse,
     MissingElse,
+    BranchTableArityMismatch { expected: usize, actual: usize },
     StackUnderflow { depth: usize },
     InvalidResultDepth { depth: usize },
     AllocationFailed,
@@ -100,6 +103,8 @@ pub enum IntegerField {
     LocalIndex,
     GlobalIndex,
     LabelIndex,
+    /// Number of explicit `br_table` labels, excluding the mandatory default.
+    BranchTableCount,
     I32Const,
     /// Number of declared locals in one group.
     LocalCount,
@@ -116,8 +121,8 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded operations across the whole body, including `if`, `else`, `br`, and `br_if`,
-    /// but not `block`, `loop`, or `end`.
+    /// Decoded operations across the whole body, including `if`, `else`, `br`, `br_if`,
+    /// and `br_table`, but not `block`, `loop`, or `end`.
     BodyInstructions,
     /// Peak number of explicitly stacked i32 operands during body validation.
     OperandStackDepth,
@@ -226,6 +231,12 @@ impl fmt::Display for Error {
             UnsupportedOpcode { opcode } => write!(f, "unsupported opcode {opcode:#04x}"),
             UnexpectedElse => f.write_str("else without a matching then arm"),
             MissingElse => f.write_str("i32-result if requires an else arm"),
+            BranchTableArityMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "br_table label has result arity {actual}, expected {expected}"
+                )
+            }
             StackUnderflow { depth } => {
                 write!(
                     f,
@@ -253,10 +264,12 @@ impl std::error::Error for Error {}
 /// Success checks the complete input and returns an owned module without
 /// executing it. Work is at most linear in the input length under the fixed
 /// section and vector caps. Allocations retain up to eight bodies bounded by
-/// [`Limit::BodyInstructions`] and eight export entries with names bounded by
-/// [`Limit::ExportNameBytes`], plus up to eight active data segments bounded in
-/// total by [`Limit::DataBytes`]. Validation neither allocates linear memory
-/// nor checks that the data ranges fit; both belong to instantiation.
+/// [`Limit::BodyInstructions`], with a separate table-target array per body (at
+/// most one target per [`Limit::CodeBodyBytes`] byte). There are up to eight
+/// export entries with names bounded by [`Limit::ExportNameBytes`], plus up
+/// to eight active data segments bounded in total by [`Limit::DataBytes`].
+/// Validation neither allocates linear memory nor checks that the data ranges
+/// fit; both belong to instantiation.
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -269,9 +282,13 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// A `br` or `br_if` depth that does not name an enclosing label (including the
-/// implicit function label) is reported as [`ErrorKind::InvalidIndex`] with
-/// [`IntegerField::LabelIndex`] at the start of the immediate.
+/// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
+/// (including the implicit function label) is reported as
+/// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
+/// the immediate. A `br_table` with more than 16 explicit entries is reported
+/// as [`ErrorKind::UnsupportedCount`] with [`IntegerField::BranchTableCount`].
+/// [`ErrorKind::BranchTableArityMismatch`] points to the first table label
+/// immediate (including the default) whose arity differs from the first label's.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -629,8 +646,14 @@ const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR: u8 = 0x0c;
 const BR_IF: u8 = 0x0d;
+const BR_TABLE: u8 = 0x0e;
 const RETURN: u8 = 0x0f;
 const I32_CONST: u8 = 0x41;
+
+const MAX_BR_TABLE_ENTRIES: u32 = 16;
+// Separate per-body pool, including defaults. Each target uses at least one
+// byte of its body's frame, independent of the decoded instruction count.
+const MAX_BODY_TABLE_TARGETS: usize = Limit::CodeBodyBytes.maximum();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResultArity {
@@ -662,26 +685,19 @@ enum Instruction {
     Call(u32),
     Unary(UnaryOp),
     Binary(BinaryOp),
-    LoadI32 {
-        kind: LoadKind,
-        offset: u32,
-    },
-    StoreI32 {
-        width: AccessWidth,
-        offset: u32,
-    },
+    LoadI32 { kind: LoadKind, offset: u32 },
+    StoreI32 { width: AccessWidth, offset: u32 },
     MemorySize,
-    JumpIfZero {
-        target: usize,
-    },
-    Jump {
-        target: usize,
-    },
-    Branch {
-        target: BranchTarget,
-        floor: usize,
-        conditional: bool,
-    },
+    JumpIfZero { target: usize },
+    Jump { target: usize },
+    Branch { edge: BranchEdge, conditional: bool },
+    BranchTable { first: usize, explicit_count: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BranchEdge {
+    target: BranchTarget,
+    floor: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -800,15 +816,18 @@ impl BinaryOp {
 /// Only the decoder constructs this, after checking all indices, global set
 /// mutability, every stack effect, and the complete body frame. Block and if
 /// jump targets are strictly later decoded instruction indices or the
-/// one-past-last index. Block exits carry their target floor and result arity.
-/// Loop continues target an in-body index at or before the branch. Function
-/// exits target the one-past-last index with just one result. Implicit operands
-/// are validation-only: no execution falls through `unreachable`, `br`, or
-/// `return`, and transfers establish the target's concrete stack depth.
+/// one-past-last index. Block and if exits carry their target floor and result
+/// arity. Loop continues target an in-body index at or before the branch.
+/// Function exits target the one-past-last index with just one result. A table
+/// refers to consecutive edges, including its default at the end, all with the
+/// same result arity. Implicit operands are validation-only: no execution falls
+/// through `unreachable`, `br`, `br_table`, or `return`, and transfers establish
+/// the target's concrete stack depth.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
     instructions: Vec<Instruction>,
+    table_targets: Vec<BranchEdge>,
 }
 
 struct CallFrame {
@@ -845,6 +864,24 @@ impl CallFrame {
     fn pop(&mut self) -> i32 {
         self.depth -= 1;
         self.operands[self.depth]
+    }
+
+    fn take_branch(&mut self, edge: BranchEdge, function_end: usize) {
+        let (pc, result) = match edge.target {
+            BranchTarget::End { pc, result } => (pc, result),
+            BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
+            BranchTarget::Function => (function_end, ResultArity::I32),
+        };
+        let value = match result {
+            ResultArity::Void => None,
+            ResultArity::I32 => Some(self.pop()),
+        };
+        // Restore the target's prefix, not the active frame's.
+        self.depth = edge.floor;
+        if let Some(value) = value {
+            self.push(value);
+        }
+        self.pc = pc;
     }
 }
 
@@ -955,28 +992,18 @@ pub(super) fn execute(
                 }
             }
             Instruction::Jump { target } => frame.pc = target,
-            Instruction::Branch {
-                target,
-                floor,
-                conditional,
-            } => {
+            Instruction::Branch { edge, conditional } => {
                 if !conditional || frame.pop() != 0 {
-                    let (pc, result) = match target {
-                        BranchTarget::End { pc, result } => (pc, result),
-                        BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
-                        BranchTarget::Function => (code.instructions.len(), ResultArity::I32),
-                    };
-                    let value = match result {
-                        ResultArity::Void => None,
-                        ResultArity::I32 => Some(frame.pop()),
-                    };
-                    // Restore the target's prefix, not the active frame's.
-                    frame.depth = floor;
-                    if let Some(value) = value {
-                        frame.push(value);
-                    }
-                    frame.pc = pc;
+                    frame.take_branch(edge, code.instructions.len());
                 }
+            }
+            Instruction::BranchTable {
+                first,
+                explicit_count,
+            } => {
+                // A selector at or above the explicit length chooses the default.
+                let index = (frame.pop() as u32).min(explicit_count) as usize;
+                frame.take_branch(code.table_targets[first + index], code.instructions.len());
             }
         }
     }
@@ -1001,7 +1028,7 @@ struct ControlFrame {
     base: usize,
     result: ResultArity,
     kind: ControlKind,
-    last_branch: Option<usize>,
+    last_branch: Option<BranchSlot>,
     unreachable: bool,
 }
 
@@ -1039,6 +1066,47 @@ enum ControlKind {
     Loop { body_pc: usize },
     Then { if_pc: usize },
     Else { else_pc: usize },
+}
+
+// Ordinary branches have one inline edge; a table can have several incoming
+// edges to the same or different labels. Link by edge slot rather than source PC.
+#[derive(Clone, Copy)]
+enum BranchSlot {
+    Inline(usize),
+    Table(usize),
+}
+
+impl BranchSlot {
+    fn link_index(self) -> usize {
+        match self {
+            Self::Inline(pc) => pc,
+            Self::Table(index) => Limit::BodyInstructions.maximum() + index,
+        }
+    }
+}
+
+fn decode_branch_edge(
+    target: &mut ControlFrame,
+    pc: usize,
+    slot: BranchSlot,
+    previous_branch: &mut [Option<BranchSlot>],
+) -> BranchEdge {
+    let destination = match target.kind {
+        ControlKind::Block | ControlKind::Then { .. } | ControlKind::Else { .. } => {
+            previous_branch[slot.link_index()] = target.last_branch.replace(slot);
+            // The target's end backpatches the forward PC.
+            BranchTarget::End {
+                pc: 0,
+                result: target.result,
+            }
+        }
+        ControlKind::Loop { body_pc } => BranchTarget::Loop(LoopTarget::at_branch(body_pc, pc)),
+        ControlKind::Function => BranchTarget::Function,
+    };
+    BranchEdge {
+        target: destination,
+        floor: target.base,
+    }
 }
 
 fn check_operand_depth(depth: usize, offset: usize) -> Result<(), Error> {
@@ -1230,11 +1298,15 @@ fn validate_body(
     })?;
     let local_bound = parameter_count + validate_locals(&mut body)?;
     // Forward transfers reserve slots that their matching delimiters backpatch.
-    // Each block or if chains its incoming branches by PC, even from nested
-    // frames; each link is visited once, at the target's end.
-    // A loop branch is resolved immediately to the PC saved at entry.
+    // Each block or if chains its incoming edges, each visited once at the
+    // target's end. Loop edges resolve immediately to the PC saved at entry.
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
-    let mut previous_branch = [None; Limit::BodyInstructions.maximum()];
+    let mut table_targets = [BranchEdge {
+        target: BranchTarget::Function,
+        floor: 0,
+    }; MAX_BODY_TABLE_TARGETS];
+    let mut target_count = 0;
+    let mut previous_branch = [None; Limit::BodyInstructions.maximum() + MAX_BODY_TABLE_TARGETS];
     let mut count = 0;
     let mut depth = 0usize;
     // Slot zero is the function frame, which does not count against the cap.
@@ -1284,16 +1356,21 @@ fn validate_body(
                     decoded[..count][if_pc] = Instruction::JumpIfZero { target: count };
                 }
             }
-            while let Some(pc) = last_branch {
-                let Instruction::Branch {
-                    target: BranchTarget::End { pc: target_pc, .. },
-                    ..
-                } = &mut decoded[..count][pc]
-                else {
-                    unreachable!("end fixups link only incoming branches");
+            while let Some(slot) = last_branch {
+                let edge = match slot {
+                    BranchSlot::Inline(pc) => {
+                        let Instruction::Branch { edge, .. } = &mut decoded[..count][pc] else {
+                            unreachable!("inline fixups link only branches");
+                        };
+                        edge
+                    }
+                    BranchSlot::Table(index) => &mut table_targets[..target_count][index],
+                };
+                let BranchTarget::End { pc: target_pc, .. } = &mut edge.target else {
+                    unreachable!("end fixups link only forward edges");
                 };
                 *target_pc = count;
-                last_branch = previous_branch[pc];
+                last_branch = previous_branch[slot.link_index()];
             }
             nesting -= 1;
             continue;
@@ -1378,37 +1455,59 @@ fn validate_body(
                     body.index(IntegerField::LabelIndex, (nesting + 1) as u32)?
                 };
                 let target = &mut frames[nesting - label as usize];
-                let destination = match target.kind {
-                    ControlKind::Block | ControlKind::Then { .. } | ControlKind::Else { .. } => {
-                        previous_branch[pc] = target.last_branch;
-                        target.last_branch = Some(pc);
-                        // The target's end backpatches the forward PC.
-                        BranchTarget::End {
-                            pc: 0,
-                            result: target.result,
-                        }
-                    }
-                    ControlKind::Loop { body_pc } => {
-                        BranchTarget::Loop(LoopTarget::at_branch(body_pc, pc))
-                    }
-                    ControlKind::Function => BranchTarget::Function,
-                };
+                let edge =
+                    decode_branch_edge(target, pc, BranchSlot::Inline(pc), &mut previous_branch);
                 // Pop against the active floor. Only execution of the taken
                 // branch uses the target floor.
                 let conditional = opcode == BR_IF;
                 let results = target.result.count(); // Supported loops are void.
                 let after_pop = consume(usize::from(conditional) + results)?;
-                decoded[pc] = Instruction::Branch {
-                    target: destination,
-                    floor: target.base,
-                    conditional,
-                };
+                decoded[pc] = Instruction::Branch { edge, conditional };
                 depth = if conditional {
                     // Fallthrough restores the result, even if it was implicit.
                     after_pop + results
                 } else {
                     frames[nesting].mark_unreachable()
                 };
+            }
+            BR_TABLE => {
+                let explicit_count =
+                    body.count(IntegerField::BranchTableCount, 0..=MAX_BR_TABLE_ENTRIES)?;
+                let first = target_count;
+                let mut common = None;
+                // Decode the declared vector and then exactly one mandatory
+                // default, even when the vector is empty or the frame is dead.
+                for _ in 0..=explicit_count {
+                    let label_offset = body.position();
+                    let label = body.index(IntegerField::LabelIndex, (nesting + 1) as u32)?;
+                    let target = &mut frames[nesting - label as usize];
+                    let expected = *common.get_or_insert(target.result);
+                    if target.result != expected {
+                        return Err(Error {
+                            offset: label_offset,
+                            kind: ErrorKind::BranchTableArityMismatch {
+                                expected: expected.count(),
+                                actual: target.result.count(),
+                            },
+                        });
+                    }
+                    // A successful label immediate used at least one byte, so
+                    // the body byte bound also bounds the cumulative index.
+                    table_targets[target_count] = decode_branch_edge(
+                        target,
+                        pc,
+                        BranchSlot::Table(target_count),
+                        &mut previous_branch,
+                    );
+                    target_count += 1;
+                }
+                let results = common.expect("every table has a default").count();
+                consume(1 + results)?;
+                decoded[pc] = Instruction::BranchTable {
+                    first,
+                    explicit_count,
+                };
+                depth = frames[nesting].mark_unreachable();
             }
             _ => {
                 let instruction = decode_plain(
@@ -1441,7 +1540,8 @@ fn validate_body(
                     Instruction::Binary(_) => consume(2)? + 1,
                     Instruction::JumpIfZero { .. }
                     | Instruction::Jump { .. }
-                    | Instruction::Branch { .. } => {
+                    | Instruction::Branch { .. }
+                    | Instruction::BranchTable { .. } => {
                         unreachable!("plain instructions do not create jumps")
                     }
                 };
@@ -1451,14 +1551,23 @@ fn validate_body(
         check_operand_depth(depth, offset)?;
     };
     let mut instructions = Vec::new();
-    instructions.try_reserve_exact(count).map_err(|_| Error {
+    let mut retained_targets = Vec::new();
+    let allocation_error = Error {
         offset: end_offset,
         kind: ErrorKind::AllocationFailed,
-    })?;
+    };
+    instructions
+        .try_reserve_exact(count)
+        .map_err(|_| allocation_error)?;
+    retained_targets
+        .try_reserve_exact(target_count)
+        .map_err(|_| allocation_error)?;
     instructions.extend_from_slice(&decoded[..count]);
+    retained_targets.extend_from_slice(&table_targets[..target_count]);
     Ok(ValidatedCode {
         parameter_count: parameter_count as usize,
         instructions,
+        table_targets: retained_targets,
     })
 }
 

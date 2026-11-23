@@ -21,9 +21,9 @@
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
 //! `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`, `if`, `block`,
-//! `loop`, `br <depth>` (`0x0c`), `br_if <depth>`, and `return` (`0x0f`). Local
-//! indices start at zero and address parameters first, then locals in declaration
-//! order. Both can be assigned.
+//! `loop`, `br <depth>` (`0x0c`), `br_if <depth>`, `br_table` (`0x0e`), and
+//! `return` (`0x0f`). Local indices start at zero and address parameters first,
+//! then locals in declaration order. Both can be assigned.
 //! `call` takes an unsigned LEB32 index into the exact function declarations,
 //! including forward and self references. The control constructs may nest
 //! together. `if` and `block` accept block type byte `0x40` (void) or `0x7f`
@@ -34,8 +34,11 @@
 //! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
 //! or the implicit function label (depth equal to the number of open explicit
 //! frames). Both arms of an `if` share one label. `return` has no immediate and
-//! always targets the function label. Other block types, typed `select`,
-//! `br_table`, and indirect calls are unsupported.
+//! always targets the function label. `br_table` takes an unsigned LEB32 count
+//! (0 to 16), exactly that many unsigned LEB32 label depths, and a mandatory
+//! unsigned LEB32 default depth. All listed labels and the default must have
+//! the same label result arity: void (including a loop continue) or one i32.
+//! Other block types, typed `select`, and indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
 //! any global, export, and code sections. It may be empty (a zero-length vector) or
@@ -98,24 +101,26 @@
 //! `if` pops an i32 condition in the enclosing frame and saves the remaining
 //! depth as the floor for both arms. `block` and `loop`
 //! save the current depth as their floor without consuming any operands.
-//! For validation, `unreachable`, `br`, and `return` discard operands above the
-//! active floor and mark only that frame unreachable, after checking any
-//! required operands. A pop at the floor of an unreachable frame supplies an
-//! implicit i32 without reducing the depth; pushes still count as explicit
-//! operands. No operand access crosses the active floor. At `else` or `end`, an
-//! unreachable frame may supply a missing i32 result implicitly, but any excess
-//! explicit operands are still rejected. Every new frame starts reachable,
+//! For validation, `unreachable`, `br`, `br_table`, and `return` discard
+//! operands above the active floor and mark only that frame unreachable, after
+//! checking any required operands. A pop at the floor of an unreachable frame
+//! supplies an implicit i32 without reducing the depth; pushes still count as
+//! explicit operands. No operand access crosses the active floor. At `else` or
+//! `end`, an unreachable frame may supply a missing i32 result implicitly, but
+//! any excess explicit operands are still rejected. Every new frame starts reachable,
 //! even inside an unreachable frame. `else` checks the then result and starts
 //! a reachable else arm at the same floor. `end` checks the final result, then
 //! leaves the declared result on the parent's stack (none for void) without
 //! changing the parent's reachability flag.
 //! A transfer to an i32-result `block`, i32-result `if`, or the function requires
-//! an i32 result; `br_if` also pops an i32 condition above any result. Validation
-//! checks these pops against the active floor, even for an outer target. Only
-//! `br_if` restores the result for fallthrough, and execution with a zero
-//! condition pops only the condition and continues. A taken branch to a `block`
-//! or `if` truncates to the target's floor, keeps the result if required, and
-//! resumes after the target's `end`.
+//! an i32 result. `br_if` also pops an i32 condition above any result, and
+//! `br_table` pops an i32 selector above any common result. Validation checks
+//! these pops against the active floor, even for an outer target. Only `br_if`
+//! restores the result for fallthrough, and execution with a zero condition pops
+//! only the condition and continues. `br_table` treats its selector as `u32`:
+//! it selects the zero-based explicit entry, or the default if out of range.
+//! A taken branch to a `block` or `if` truncates to the target's floor, keeps
+//! the result if required, and resumes after the target's `end`.
 //! A taken loop branch truncates to the target loop's floor and resumes at its
 //! body start. Both preserve the target's operand prefix and locals. A function
 //! exit discards all callee operands except the result and completes the call.
@@ -126,10 +131,10 @@
 //! must be the final byte of the body frame and checks for one i32 result. The
 //! inclusive limits are 256 body bytes (including the locals vector and all
 //! delimiters), 127 decoded instructions (including `unreachable`, `nop`,
-//! `drop`, `select`, `if`, `else`, `br`, `br_if`, and `return`, but not `block`,
-//! `loop`, or `end`), 32 explicitly stacked i32 operands including those below
-//! floors, and 16 simultaneously open `block`, `loop`, and `if` frames combined,
-//! excluding the function frame.
+//! `drop`, `select`, `if`, `else`, `br`, `br_if`, `br_table`, and `return`, but
+//! not `block`, `loop`, or `end`), 32 explicitly stacked i32 operands including
+//! those below floors, and 16 simultaneously open `block`, `loop`, and `if`
+//! frames combined, excluding the function frame.
 //!
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
@@ -151,14 +156,21 @@
 //! in Rust. Zero selects the else arm (or skips straight to the join if no
 //! `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames with explicit result arities.
-//! Each `block` and `if` label keeps a linked chain of incoming branch slots in
-//! fixed scratch storage, patched once at `end`. The chain survives `else` and
-//! is distinct from the jumps that skip untaken `if` arms. These forward edges
-//! target strictly later decoded instruction indices or the one-past-last index
-//! in the same body. Loop continues target the loop's saved body start at or
-//! before the branch. Each branch stores its target's operand floor; a `block`
-//! or `if` exit also carries the target's result arity. `return` and branches to
-//! the function label share an exit target at the one-past-last instruction index.
+//! Each `block` and `if` label keeps a linked chain of incoming branch edges in
+//! fixed scratch storage, patched once per edge at `end`. Edges are identified by
+//! slot, so a table can refer to several labels and repeat the same label. The
+//! chain survives `else` and is distinct from the jumps that skip untaken `if`
+//! arms. These forward edges target strictly later decoded instruction indices
+//! or the one-past-last index in the same body. Loop continues target the loop's
+//! saved body start at or before the branch. Each branch stores its target's
+//! operand floor; a `block` or `if` exit also carries the target's result arity.
+//! `return` and branches to the function label share an exit target at the
+//! one-past-last instruction index.
+//! Each table decodes to one instruction that indexes a separate per-body array
+//! of resolved edges. Validation retains only the actual entries and defaults,
+//! at most 256 targets per body because each depth consumes at least one of the
+//! 256 body bytes. The scratch fixup storage has one link slot per decoded
+//! instruction and one per possible table target; execution never uses it.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
@@ -201,7 +213,8 @@
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
 //! including `unreachable`, `nop`, `drop`, `select`, memory and global
 //! instructions, a `call`, an `if` test, an executed `else` jump, a `br`, a
-//! `br_if` with either outcome, or a `return`.
+//! `br_if` with either outcome, a `br_table` regardless of its length or selected
+//! target, or a `return`.
 //! An omitted `else` introduces no dispatch. Skipped instructions, `block`,
 //! `loop`, and `end` delimiters, and unwinding a completed call frame cost nothing.
 //! A continue does not reset the budget: all loop
@@ -282,6 +295,10 @@
 //! If-label tests cover shared fixups from both arms, exits across intervening
 //! frames, omitted `else`, operand floors and reachability in dead tails, and
 //! exact admission and dispatch limits.
+//! Branch-table tests cover mixed target kinds and floors, case and default
+//! selection (including empty tables and repeated labels), framed LEB32 errors,
+//! arity agreement, dead-tail validation, and exact table, body, and dispatch
+//! limits.
 //! Function-exit tests cover implicit label depths through mixed control, result
 //! preservation on conditional fallthrough, active-floor and dead-tail checks,
 //! caller resumption, and exact decoded-instruction, dispatch, and call limits.

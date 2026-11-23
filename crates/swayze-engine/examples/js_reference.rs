@@ -608,6 +608,17 @@ fn fixtures() -> Vec<String> {
             "true ? `ok` : null.length",
             "`use strict`; `still a String`",
             "`non-directive`; 'use strict'; 2",
+            "`${1}${true}${null}${undefined}`",
+            "`${-0},${0/0},${1/0},${1e-7},${1e21}`",
+            "`${`inner ${'a' + 'b'}`} outer`",
+            "let n = 0; `${n++}:${n = n + 1}:${++n}:${n}`",
+            "let n = 0; `${n = 4, n + 2}${false ? null.length : 'ok'}`",
+            "`left${true ? `😀${1}` : `skip`}right`.length",
+            "typeof `${undefined}`",
+            "`a${'b'}\r\nc${'d'}\u{2028}e`",
+            r#"`\uD800${'\uDC00'}\${x}`"#,
+            "`${''}${``}` === ''",
+            "let s = 'a' + 'b'; `${s}${s + 'c'}${s}`",
         ]
         .map(str::to_owned),
     );

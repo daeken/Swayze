@@ -9,7 +9,7 @@ required	adapted	test/language/literals/numeric/numeric-separators/numeric-separ
 required	adapted	test/language/literals/numeric/numeric-separators/numeric-separator-literal-dds-dot-dd-nsl-dd-ep-dd.js	565:605	582:592	594:603
 required	adapted	test/language/expressions/template-literal/no-sub.js	444:513	461:485	487:511
 required	adapted	test/language/expressions/template-literal/mongolian-vowel-separator.js	958:992	975:980	982:990
-frontier	adapted	test/language/expressions/template-literal/literal-expr-template.js	463:530	480:507	509:528
-frontier	adapted	test/language/expressions/template-literal/middle-list-one-expr-template.js	459:525	476:504	506:523
-frontier	adapted	test/language/expressions/template-literal/middle-list-many-expr-template.js	572:645	589:622	624:643
+required	adapted	test/language/expressions/template-literal/literal-expr-template.js	463:530	480:507	509:528
+required	adapted	test/language/expressions/template-literal/middle-list-one-expr-template.js	459:525	476:504	506:523
+required	adapted	test/language/expressions/template-literal/middle-list-many-expr-template.js	572:645	589:622	624:643
 required	raw	test/language/comments/hashbang/not-empty.js

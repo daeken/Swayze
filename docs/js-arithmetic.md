@@ -223,15 +223,22 @@ inside a literal. Legacy decimal and octal escapes and root `use strict`
 directives are outside the subset. Source ingress and diagnostic offsets
 remain UTF-8; a Script does not retain source text.
 
-An untagged backtick literal without substitutions produces a cooked UTF-16
-String. Raw CR and CRLF normalize to LF; raw LF, LS and PS are retained, and
-backslash line continuations emit no units. An escaped dollar can produce
-literal `${` text. Unescaped `${`, tagged templates and raw template access
-are outside the subset; decimal and octal escapes are malformed in these
-literals. A backtick literal is never a directive.
+An untagged backtick literal produces a cooked UTF-16 String. Raw CR and
+CRLF normalize to LF; raw LF, LS and PS are retained. Backslash line
+continuations emit no units, and `\${` produces literal `${` text. An
+unescaped `${` begins a supported primitive expression (which may itself
+contain a template). Substitutions run once, in source order, with primitive
+`ToString`; the complete expression can take `.length`. Tagged templates,
+raw access and object coercion remain outside the subset. Decimal and octal
+escapes are malformed in templates. Backticks never introduce directives.
 
-Each quoted or backtick token may occupy up to 4,096 UTF-8 bytes, including
-both delimiters.
+Each quoted token or cooked template segment may occupy up to 4,096 UTF-8
+bytes, including its delimiters. An open template with substitutions counts
+toward expression nesting. Substituted strings use evaluation scratch. Each
+substitution appends the previous prefix, the converted value and the next
+cooked segment in one dispatch. This copies the prefix on each append; all
+copies count toward the shared 4,094-unit result and 32,768-unit evaluation
+limits, so a short result can still exceed the total budget.
 All literals in a script together may decode to at most 16,384 UTF-16 code
 units, including literals in skipped code. Exhaustive `Limit`/`JsLimit`
 matches must handle `StringLiteralBytes` and `StringLiteralUnits`; the

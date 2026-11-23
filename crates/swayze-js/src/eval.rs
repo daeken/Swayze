@@ -169,11 +169,11 @@ pub enum EvalError {
     StringComparisonLimitExceeded,
     /// An operator's String-to-Number conversion would exceed the 262,144-credit evaluation budget.
     StringNumericConversionLimitExceeded,
-    /// A concatenation would produce more than 4,094 UTF-16 units.
+    /// A concatenation or template append would produce more than 4,094 UTF-16 units.
     StringConcatenationLengthLimitExceeded,
-    /// A concatenation would exceed the evaluation's 32,768 appended-unit budget.
+    /// A concatenation or template append would exceed the evaluation's 32,768 appended-unit budget.
     StringConcatenationBudgetExceeded,
-    /// The primitive convenience API received a concatenation result.
+    /// The primitive convenience API received a runtime String result.
     RuntimeStringResultRequiresScratch,
     /// A reached `.length` receiver is not a primitive String.
     /// This is a subset error, not JavaScript `undefined` or a `TypeError`.
@@ -236,7 +236,7 @@ impl Script {
     /// # Errors
     ///
     /// Returns execution errors, or [`EvalError::NonScalarResult`] if the final
-    /// value is a String (literal, `typeof` spelling, or concatenation result).
+    /// value is a String (literal, `typeof` spelling, or runtime result).
     pub fn evaluate_value(&self) -> Result<Value, EvalError> {
         match self.run(&mut EvalScratch::new())? {
             Operand::Scalar(value) => Ok(value),
@@ -350,13 +350,14 @@ impl Script {
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
     /// before validating decimal syntax. Skipped instructions, scalar operands,
     /// and noncoercing comparisons cost no conversion credits.
-    /// Concatenations may produce at most 4,094 UTF-16 units each and append at
-    /// most 32,768 units in total per call, including scalar text and discarded
-    /// results. This append budget is independent of the other budgets. A reached
-    /// `Add` can format at most one Number, using bounded binary64 arithmetic and
-    /// at most 25 UTF-16 units of stack scratch, without a separate formatting
-    /// charge. Skipped and empty concatenations append no units and do not allocate
-    /// runtime String storage.
+    /// Concatenations and template appends may produce at most 4,094 UTF-16
+    /// units each and append at most 32,768 units in total per call, including
+    /// scalar text, repeated template prefixes and discarded results. This
+    /// append budget is independent of the other budgets. A reached `Add` or
+    /// template append can format at most one Number, using bounded binary64
+    /// arithmetic and at most 25 UTF-16 units of stack scratch without a
+    /// separate formatting charge. Skipped and empty appends consume no units
+    /// and do not allocate runtime String storage.
     ///
     /// # Errors
     ///
@@ -368,7 +369,7 @@ impl Script {
     /// exceed its pair budget. Returns
     /// [`EvalError::StringNumericConversionLimitExceeded`] if an operator's
     /// String-to-Number conversion would exceed its credit budget. A reached
-    /// concatenation can return [`EvalError::StringConcatenationLengthLimitExceeded`]
+    /// concatenation or template append can return [`EvalError::StringConcatenationLengthLimitExceeded`]
     /// or [`EvalError::StringConcatenationBudgetExceeded`]. After successful
     /// execution this method returns [`EvalError::RuntimeStringResultRequiresScratch`]
     /// for a final runtime String (even an empty one). Use
@@ -615,6 +616,9 @@ fn evaluate(
             })?,
             Instruction::Add => {
                 apply_binary_operand(&mut stack, |lhs, rhs| add(lhs, rhs, string_units, scratch))?
+            }
+            Instruction::TemplateAppend(following) => {
+                append_template(&mut stack, string_units, scratch, following)?;
             }
             Instruction::Subtract => apply_numeric_binary(
                 &mut stack,
@@ -974,6 +978,26 @@ fn update_number(op: Update, old: f64) -> f64 {
     }
 }
 
+// Neither the accumulated prefix nor the stack is changed until the
+// entire substitution append succeeds. Keep this path out of dispatch.
+#[inline(never)]
+fn append_template(
+    stack: &mut Vec<Operand>,
+    literals: &[u16],
+    scratch: &mut EvalScratch,
+    following: crate::parser::StringRange,
+) -> Result<(), EvalError> {
+    let [.., lhs, rhs] = stack.as_mut_slice() else {
+        return Err(EvalError::InvalidScript);
+    };
+    let Operand::String(prefix) = *lhs else {
+        return Err(EvalError::InvalidScript);
+    };
+    *lhs = Operand::String(scratch.append_template(literals, prefix, *rhs, following)?);
+    stack.pop();
+    Ok(())
+}
+
 fn add(
     lhs: Operand,
     rhs: Operand,
@@ -1170,6 +1194,24 @@ mod tests {
         assert_eq!(
             evaluate(&[JumpStatement(2), Typeof, Number(42.0)], 1, 0),
             Ok(Value::Number(42.0))
+        );
+    }
+
+    #[test]
+    fn template_append_is_string_only_and_checks_arity_only_when_reached() {
+        let script = crate::parse_script("`${1}`").unwrap();
+        let [prefix, rhs, append @ Instruction::TemplateAppend(_)] = *script.instructions() else {
+            panic!("expected exactly one template append");
+        };
+        for ops in [&[append][..], &[prefix, append], &[rhs, prefix, append]] {
+            assert_eq!(
+                evaluate_for_error(&script, ops),
+                Err(EvalError::InvalidScript)
+            );
+        }
+        assert_eq!(
+            evaluate(&[Instruction::JumpStatement(2), append, rhs], 1, 0),
+            Ok(Value::Number(1.0))
         );
     }
 

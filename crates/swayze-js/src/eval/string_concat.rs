@@ -1,6 +1,6 @@
 use std::{collections::TryReserveError, ops::Range};
 
-use super::{EvalError, Value};
+use super::{EvalError, Operand, Value};
 use crate::{
     number_format,
     parser::{MAX_STRING_LITERAL_CODE_UNITS, StringRange},
@@ -54,9 +54,25 @@ const fn ascii_units<const N: usize>(bytes: &[u8; N]) -> [u16; N] {
     units
 }
 
+enum ScalarSpelling {
+    Units(&'static [u16]),
+    Number(f64),
+}
+
+fn scalar_spelling(value: Value) -> ScalarSpelling {
+    let units: &[u16] = match value {
+        Value::Boolean(true) => &[116, 114, 117, 101], // true
+        Value::Boolean(false) => &[102, 97, 108, 115, 101], // false
+        Value::Null => &[110, 117, 108, 108],          // null
+        Value::Undefined => TypeName::Undefined.units(),
+        Value::Number(number) => return ScalarSpelling::Number(number),
+    };
+    ScalarSpelling::Units(units)
+}
+
 /// Reusable storage for runtime Strings produced by Script evaluation.
 ///
-/// The arena starts unallocated and grows only for nonempty concatenations.
+/// The arena starts unallocated and grows only for nonempty appends.
 /// Each evaluation resets its logical length but may reuse capacity. This is
 /// not zeroization: previously written units may remain in the allocation.
 #[derive(Default)]
@@ -110,14 +126,10 @@ impl EvalScratch {
         scalar_first: bool,
     ) -> Result<StringOperand, EvalError> {
         let string = AppendSource::checked(string, literals, self.used)?;
-        let units: &[u16] = match scalar {
-            Value::Boolean(true) => &[116, 114, 117, 101], // true
-            Value::Boolean(false) => &[102, 97, 108, 115, 101], // false
-            Value::Null => &[110, 117, 108, 108],          // null
-            Value::Undefined => TypeName::Undefined.units(),
-            Value::Number(number) => return self.concatenate_number(string, number, scalar_first),
-        };
-        self.append_scalar(string, units, scalar_first)
+        match scalar_spelling(scalar) {
+            ScalarSpelling::Units(units) => self.append_scalar(string, units, scalar_first),
+            ScalarSpelling::Number(number) => self.concatenate_number(string, number, scalar_first),
+        }
     }
 
     // Keep the renderer's temporary storage off the dispatch loop and the
@@ -162,26 +174,11 @@ impl EvalScratch {
         rhs: AppendSource<'_>,
         reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
     ) -> Result<StringOperand, EvalError> {
-        let start = self.used;
         let lhs_len = lhs.len();
-        let length = lhs_len
-            .checked_add(rhs.len())
-            .filter(|&length| length <= MAX_CONCAT_UNITS)
-            .ok_or(EvalError::StringConcatenationLengthLimitExceeded)?;
-        let end = start
-            .checked_add(length)
-            .filter(|&end| end <= MAX_APPENDED_UNITS)
-            .ok_or(EvalError::StringConcatenationBudgetExceeded)?;
-        let result = StringOperand::Runtime(RuntimeRange {
-            // Both bounds fit by the inclusive aggregate check above.
-            start: start as u16,
-            end: end as u16,
-        });
-        if length == 0 {
-            return Ok(result);
-        }
-        if end > self.chunks.len() * CHUNK_UNITS {
-            self.grow(end, reserve)?;
+        let range = self.prepare_append(lhs_len.checked_add(rhs.len()), reserve)?;
+        let (start, end) = (usize::from(range.start), usize::from(range.end));
+        if start == end {
+            return Ok(StringOperand::Runtime(range));
         }
         // Borrow runtime sources only after growth. Both checked source ranges
         // lie in the old prefix, disjoint from both destinations even if the
@@ -191,7 +188,99 @@ impl EvalScratch {
         lhs.copy_to(prefix, lhs_dest);
         rhs.copy_to(prefix, rhs_dest);
         self.used = end;
-        Ok(result)
+        Ok(StringOperand::Runtime(range))
+    }
+
+    #[inline(never)]
+    pub(super) fn append_template(
+        &mut self,
+        literals: &[u16],
+        prefix: StringOperand,
+        substitution: Operand,
+        following: StringRange,
+    ) -> Result<StringOperand, EvalError> {
+        let prefix = AppendSource::checked(prefix, literals, self.used)?;
+        let following = following.get(literals).ok_or(EvalError::InvalidScript)?;
+        let substitution = match substitution {
+            Operand::String(string) => AppendSource::checked(string, literals, self.used)?,
+            Operand::Scalar(scalar) => match scalar_spelling(scalar) {
+                ScalarSpelling::Units(units) => AppendSource::Borrowed(units),
+                ScalarSpelling::Number(number) => {
+                    return self.append_template_number(prefix, number, following);
+                }
+            },
+        };
+        self.append_three(prefix, substitution, following, Vec::try_reserve_exact)
+    }
+
+    #[inline(never)]
+    fn append_template_number(
+        &mut self,
+        prefix: AppendSource<'_>,
+        number: f64,
+        following: &[u16],
+    ) -> Result<StringOperand, EvalError> {
+        let mut buffer = [0; number_format::MAX_UNITS];
+        let units = number_format::format_bits(number.to_bits(), &mut buffer);
+        self.append_three(
+            prefix,
+            AppendSource::Borrowed(units),
+            following,
+            Vec::try_reserve_exact,
+        )
+    }
+
+    fn append_three(
+        &mut self,
+        lhs: AppendSource<'_>,
+        rhs: AppendSource<'_>,
+        following: &[u16],
+        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
+    ) -> Result<StringOperand, EvalError> {
+        let lhs_len = lhs.len();
+        let rhs_len = rhs.len();
+        let length = lhs_len
+            .checked_add(rhs_len)
+            .and_then(|sum| sum.checked_add(following.len()));
+        let range = self.prepare_append(length, reserve)?;
+        // As with the pair path, runtime indices point strictly into the old
+        // logical prefix (or are empty at its end), even if they alias each
+        // other. The three destinations are disjoint from it and each other.
+        if range.start != range.end {
+            let (prefix, tail) = self.chunks.as_flattened_mut()[..usize::from(range.end)]
+                .split_at_mut(usize::from(range.start));
+            let (lhs_dest, tail) = tail.split_at_mut(lhs_len);
+            let (rhs_dest, following_dest) = tail.split_at_mut(rhs_len);
+            lhs.copy_to(prefix, lhs_dest);
+            rhs.copy_to(prefix, rhs_dest);
+            following_dest.copy_from_slice(following);
+            self.used = usize::from(range.end);
+        }
+        Ok(StringOperand::Runtime(range))
+    }
+
+    #[inline]
+    fn prepare_append(
+        &mut self,
+        length: Option<usize>,
+        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
+    ) -> Result<RuntimeRange, EvalError> {
+        let length = length
+            .filter(|&length| length <= MAX_CONCAT_UNITS)
+            .ok_or(EvalError::StringConcatenationLengthLimitExceeded)?;
+        let start = self.used;
+        let end = start
+            .checked_add(length)
+            .filter(|&end| end <= MAX_APPENDED_UNITS)
+            .ok_or(EvalError::StringConcatenationBudgetExceeded)?;
+        if end > self.chunks.len() * CHUNK_UNITS {
+            self.grow(end, reserve)?;
+        }
+        // Both bounds fit by the inclusive aggregate check above.
+        Ok(RuntimeRange {
+            start: start as u16,
+            end: end as u16,
+        })
     }
 
     #[inline(never)]
@@ -313,6 +402,111 @@ impl<'a> AppendSource<'a> {
 mod tests {
     use super::*;
     use crate::{PrimitiveValue, Value, parse_script, parser::Instruction};
+
+    #[test]
+    fn template_appends_check_all_ranges_and_publish_only_after_success() {
+        let script = parse_script("'abc'; ''").unwrap();
+        let [
+            Instruction::String(abc),
+            Instruction::Discard,
+            Instruction::String(empty),
+        ] = script.instructions()
+        else {
+            panic!("expected literal ranges");
+        };
+        let literals = script.string_units();
+        let mut scratch = EvalScratch::new();
+        let stale = StringOperand::Runtime(RuntimeRange { start: 1, end: 1 });
+        let literal = StringOperand::Literal(*abc);
+        let empty_literal = StringOperand::Literal(*empty);
+        for (prefix, sub, following, pool) in [
+            (stale, Operand::Scalar(Value::Null), *empty, literals),
+            (literal, Operand::String(stale), *empty, literals),
+            (
+                literal,
+                Operand::Scalar(Value::Number(1e21)),
+                *empty,
+                &literals[..2],
+            ),
+            (
+                StringOperand::TypeName(TypeName::String),
+                Operand::String(StringOperand::TypeName(TypeName::String)),
+                *empty,
+                &literals[..2],
+            ),
+        ] {
+            assert_eq!(
+                scratch.append_template(pool, prefix, sub, following).err(),
+                Some(EvalError::InvalidScript)
+            );
+            assert_eq!(scratch.used, 0);
+            assert_eq!(scratch.chunks.capacity(), 0);
+        }
+        let output = scratch
+            .append_template(
+                literals,
+                empty_literal,
+                Operand::String(empty_literal),
+                *empty,
+            )
+            .unwrap();
+        assert!(matches!(output, StringOperand::Runtime(_)));
+        assert_eq!(scratch.chunks.capacity(), 0);
+
+        let text = [97; 200];
+        let old = scratch
+            .append_pair(AppendSource::Borrowed(&text), AppendSource::Borrowed(&[]))
+            .unwrap();
+        let old_capacity = scratch.chunks.capacity();
+        let lhs = AppendSource::checked(old, literals, scratch.used).unwrap();
+        let rhs = AppendSource::checked(old, literals, scratch.used).unwrap();
+        assert_eq!(
+            scratch
+                .append_three(lhs, rhs, literals, |chunks, _| chunks
+                    .try_reserve_exact(usize::MAX))
+                .err(),
+            Some(EvalError::AllocationFailed)
+        );
+        assert_eq!(scratch.chunks.capacity(), old_capacity);
+        assert_eq!(scratch.chunks.len(), 1);
+        assert_eq!(scratch.runtime_units(), text);
+        let out = scratch
+            .append_template(literals, old, Operand::String(old), *abc)
+            .unwrap();
+        assert_eq!(old.get(scratch.pools(literals)), Some(&text[..]));
+        let result = out.get(scratch.pools(literals)).unwrap();
+        assert_eq!(&result[..400], &[97; 400]);
+        assert_eq!(&result[400..], literals);
+        assert_eq!(scratch.used, 603);
+
+        // An invalid empty range wins over both length and budget failures.
+        scratch
+            .grow(MAX_APPENDED_UNITS, Vec::try_reserve_exact)
+            .unwrap();
+        scratch.used = MAX_APPENDED_UNITS;
+        let long = StringOperand::Runtime(RuntimeRange {
+            start: 0,
+            end: MAX_CONCAT_UNITS as u16,
+        });
+        let scalar = Operand::Scalar(Value::Number(1.0));
+        assert_eq!(
+            scratch.append_template(&[], long, scalar, *empty).err(),
+            Some(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            scratch
+                .append_template(literals, long, scalar, *empty)
+                .err(),
+            Some(EvalError::StringConcatenationLengthLimitExceeded)
+        );
+        assert_eq!(
+            scratch
+                .append_template(literals, empty_literal, scalar, *empty)
+                .err(),
+            Some(EvalError::StringConcatenationBudgetExceeded)
+        );
+        assert_eq!(scratch.used, MAX_APPENDED_UNITS);
+    }
 
     #[test]
     fn typeof_spellings_do_not_use_the_script_pool_or_append_arena() {

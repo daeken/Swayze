@@ -210,7 +210,7 @@ fn validates_all_bodies_even_when_untaken() {
         ("x=1", Unsupported),
         ("x=;", Malformed),
         ("x=1+;", Malformed),
-        ("x=(x=1);", Unsupported),
+        ("x=(c=1);", Unsupported),
         ("x||=later;", Unsupported),
         ("function f() {}", Unsupported),
     ] {

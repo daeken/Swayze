@@ -1430,6 +1430,30 @@ fn lets_and_assignments_compile_to_ordered_slot_operations() {
 }
 
 #[test]
+fn grouped_assignments_keep_the_rhs_in_stack_order_after_expression_joins() {
+    use Instruction::{Boolean, Jump, JumpIfFalse, StoreBindingKeep, Undefined};
+    assert_postfix(
+        "let x;let y;1+(x=(y=true?2:3))",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Number(1.0),
+            Boolean(true),
+            JumpIfFalse(9),
+            Number(2.0),
+            Jump(10),
+            Number(3.0),
+            StoreBindingKeep(1),
+            StoreBindingKeep(0),
+            Add,
+        ],
+        2,
+    );
+}
+
+#[test]
 fn initializerless_let_pushes_undefined_and_initializes_its_own_slot() {
     assert_postfix(
         "let first; let second=first; let third; second",
@@ -1498,7 +1522,7 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
 }
 
 #[test]
-fn assignments_require_explicit_semicolons_and_are_not_expressions() {
+fn assignment_statements_require_explicit_semicolons() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [
         ("let x=1; x=2", Unsupported, 12, 12),
@@ -1509,9 +1533,8 @@ fn assignments_require_explicit_semicolons_and_are_not_expressions() {
         ("let x=1; x=2/*\u{2028}*/x", Unsupported, 19, 20),
         ("let x=1\nx=2; x", Unsupported, 8, 9),
         ("let x=1; (x)=2; x", Unsupported, 12, 13),
-        ("let x=1; (x=2)", Unsupported, 11, 12),
-        ("let x=1; x + (x=2)", Unsupported, 15, 16),
-        ("let x=1; let y=(x=2); y", Unsupported, 17, 18),
+        ("let x=1; (x + x=2)", Unsupported, 15, 16),
+        ("let x=1; let y=x=2; y", Unsupported, 16, 17),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
         ("let x=1; (x**=2)", Unsupported, 11, 14),
         ("let x=1; x=>2; x", Unsupported, 10, 12),

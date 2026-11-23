@@ -91,7 +91,7 @@ fn skipped_rhs_is_still_validated() {
         ("true || missing", ErrorKind::Unsupported),
         ("false && missing", ErrorKind::Unsupported),
         ("const x = true || x; x", ErrorKind::Unsupported),
-        ("let x = 1; false && (x = 2)", ErrorKind::Unsupported),
+        ("const x = 1; false && (x = 2)", ErrorKind::Unsupported),
         ("true || (1 ? 2 : missing)", ErrorKind::Unsupported),
         ("false && (1 +)", ErrorKind::Malformed),
         ("true ||", ErrorKind::Malformed),

@@ -597,6 +597,17 @@ fn fixtures() -> Vec<String> {
             "let n=0; typeof n++ === 'number' && n===1",
             "(typeof x).length",
             "(typeof 2) + ':' + typeof (void 3)",
+            "``",
+            "`a\rb\r\nc\nd\u{2028}e\u{2029}f`",
+            "`a\\\r\nb\\\u{2028}c`",
+            r#"`\x41\uD800\u{1F600}\0`"#,
+            r#"`a\`b\${c}`"#,
+            "`᠎`.length",
+            "typeof `a` + `!`",
+            "let s=`a`; s += `😀`; s.length",
+            "true ? `ok` : null.length",
+            "`use strict`; `still a String`",
+            "`non-directive`; 'use strict'; 2",
         ]
         .map(str::to_owned),
     );

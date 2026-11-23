@@ -210,7 +210,15 @@ inside a literal. Legacy decimal and octal escapes and root `use strict`
 directives are outside the subset. Source ingress and diagnostic offsets
 remain UTF-8; a Script does not retain source text.
 
-Each quoted token may occupy up to 4,096 UTF-8 bytes, including the quotes.
+An untagged backtick literal without substitutions produces a cooked UTF-16
+String. Raw CR and CRLF normalize to LF; raw LF, LS and PS are retained, and
+backslash line continuations emit no units. An escaped dollar can produce
+literal `${` text. Unescaped `${`, tagged templates and raw template access
+are outside the subset; decimal and octal escapes are malformed in these
+literals. A backtick literal is never a directive.
+
+Each quoted or backtick token may occupy up to 4,096 UTF-8 bytes, including
+both delimiters.
 All literals in a script together may decode to at most 16,384 UTF-16 code
 units, including literals in skipped code. Exhaustive `Limit`/`JsLimit`
 matches must handle `StringLiteralBytes` and `StringLiteralUnits`; the

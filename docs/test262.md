@@ -50,9 +50,10 @@ cases are credited.
 
 The required adapted sloppy-mode cases cover numeric separators in integer,
 fraction and exponent positions; U+2028, U+2029 and U+180E in Strings; unary
-positive and negative zero; and `typeof x` for an unbound name. The two
-no-substitution template literal cases are frontier cases: they are run, but
-the lexer currently reports them as unsupported. A required variant becoming
+positive and negative zero; `typeof x` for an unbound name; and two cooked
+no-substitution template literals, including U+180E. The template cases were
+first reproduced as unsupported and then promoted to required after the fix.
+A required variant becoming
 unsupported, a wrong result, or no required passes exits 1; infrastructure
 errors exit 2. An unsupported frontier case alone does not fail the run.
 Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)

@@ -1,8 +1,8 @@
 use super::{Error, Lexer, Limit, Span, is_line_terminator};
 
 const MAX_STRING_LITERAL_BYTES: usize = 4096;
-// Two quotes emit nothing; every other scalar or escape emits at most as
-// many UTF-16 units as the number of UTF-8 source bytes it consumes.
+// Two delimiters emit nothing; a scalar, escape or normalized line ending
+// emits at most as many UTF-16 units as the number of source bytes it consumes.
 pub(crate) const MAX_STRING_LITERAL_CODE_UNITS: usize = MAX_STRING_LITERAL_BYTES - 2;
 const MAX_STRING_LITERAL_UNITS: usize = 16_384;
 const MAX_CODE_POINT: u32 = 0x10_FFFF;
@@ -27,16 +27,17 @@ impl StringRange {
 }
 
 impl Lexer<'_> {
-    // The opening quote has already been consumed and charged.
+    // The opening quote or backtick has already been consumed and charged.
     pub(super) fn string_literal(
         &mut self,
-        quote: char,
+        delimiter: char,
         start: usize,
     ) -> Result<StringRange, Error> {
+        let template = delimiter == '`';
         let unit_start = self.string_units.len();
         while let Some(c) = self.peek() {
             let span = self.consume_string(c, start)?;
-            if c == quote {
+            if c == delimiter {
                 return Ok(StringRange {
                     // The append ceiling bounds both fields, including the start of
                     // an empty literal immediately after a full pool.
@@ -44,52 +45,91 @@ impl Lexer<'_> {
                     len: (self.string_units.len() - unit_start) as u16,
                 });
             }
-            match c {
-                '\n' | '\r' => {
+            let value = match c {
+                '\n' | '\r' if !template => {
                     return Err(Error::malformed(
                         span,
                         "unescaped CR or LF in string literal",
                     ));
                 }
-                '\\' => {
-                    if let Some(value) = self.string_escape(start, span.start)? {
-                        self.append_string_point(
-                            value,
-                            Span {
-                                start: span.start,
-                                end: self.offset,
-                            },
-                        )?;
-                    }
+                '\r' => {
+                    self.finish_string_crlf(c, start)?;
+                    u32::from('\n')
                 }
-                // This includes raw NUL, LS and PS.
-                _ => self.append_string_point(u32::from(c), span)?,
-            }
+                '$' if template && self.peek() == Some('{') => {
+                    self.consume_string('{', start)?;
+                    return Err(Error::unsupported(
+                        Span {
+                            start: span.start,
+                            end: self.offset,
+                        },
+                        "template interpolation is outside the subset",
+                    ));
+                }
+                '\\' => match self.string_escape(start, span.start, template)? {
+                    Some(value) => value,
+                    None => continue,
+                },
+                // This includes raw NUL, LS and PS, and a template's LF.
+                _ => u32::from(c),
+            };
+            self.append_string_point(
+                value,
+                Span {
+                    start: span.start,
+                    end: self.offset,
+                },
+            )?;
         }
         Err(Error::malformed(
             Span {
                 start,
                 end: self.offset,
             },
-            "unterminated string literal",
+            if template {
+                "unterminated template literal"
+            } else {
+                "unterminated string literal"
+            },
         ))
     }
 
     fn consume_string(&mut self, c: char, start: usize) -> Result<Span, Error> {
         let end = self.offset + c.len_utf8();
         if end - start > MAX_STRING_LITERAL_BYTES {
-            return Err(Error::limit(
+            let err = Error::limit(
                 Span {
                     start: self.offset,
                     end,
                 },
                 Limit::StringLiteralBytes,
-            ));
+            );
+            return Err(if self.source.as_bytes()[start] == b'`' {
+                Error {
+                    message: "template literal byte ceiling exceeded (including backticks)",
+                    ..err
+                }
+            } else {
+                err
+            });
         }
         self.consume(c)
     }
 
-    fn string_escape(&mut self, start: usize, slash: usize) -> Result<Option<u32>, Error> {
+    // CRLF is one line ending, but both bytes must pass the token and work caps.
+    fn finish_string_crlf(&mut self, c: char, start: usize) -> Result<(), Error> {
+        if c == '\r' && self.peek() == Some('\n') {
+            self.consume_string('\n', start)?;
+        }
+        Ok(())
+    }
+
+    fn string_escape(
+        &mut self,
+        start: usize,
+        slash: usize,
+        template: bool,
+    ) -> Result<Option<u32>, Error> {
         let c = self.peek().ok_or_else(|| {
             Error::malformed(
                 Span {
@@ -101,11 +141,8 @@ impl Lexer<'_> {
         })?;
         self.consume_string(c, start)?;
         if is_line_terminator(c) {
-            // CRLF is one continuation. Raw LS and PS are allowed, but escaped
-            // LS and PS are continuations and contribute no code units.
-            if c == '\r' && self.peek() == Some('\n') {
-                self.consume_string('\n', start)?;
-            }
+            // Escaped line terminators are continuations and emit no units.
+            self.finish_string_crlf(c, start)?;
             return Ok(None);
         }
 
@@ -126,15 +163,22 @@ impl Lexer<'_> {
                 {
                     self.consume_string(digit, start)?;
                 }
-                return Err(Error::unsupported(
-                    Span {
-                        start: slash,
-                        end: self.offset,
-                    },
-                    "Annex B decimal and octal string escapes are outside the subset",
-                ));
+                let span = Span {
+                    start: slash,
+                    end: self.offset,
+                };
+                return Err(if template {
+                    // Annex B extends quoted Strings only. Untagged templates
+                    // reject these escapes rather than producing a cooked value.
+                    Error::malformed(span, "invalid decimal or octal template escape")
+                } else {
+                    Error::unsupported(
+                        span,
+                        "Annex B decimal and octal string escapes are outside the subset",
+                    )
+                });
             }
-            // Escaped quotes and backslashes, and NonEscapeCharacter identity escapes.
+            // This includes escaped backticks, dollars and identity escapes.
             _ => u32::from(c),
         };
         Ok(Some(value))

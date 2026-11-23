@@ -1,7 +1,7 @@
 //! Opt-in differential Wasm i32 smoke check: run tools/check-wasm-reference.sh.
 
 use std::{error::Error, process::Command};
-use swayze_engine::{WasmInvokeError, WasmTrap, validate_module};
+use swayze_engine::{WasmInstantiationError, WasmInvokeError, WasmTrap, validate_module};
 
 const EXPORT: &str = "answer";
 const REFERENCE: &str = r#"
@@ -14,7 +14,15 @@ for (const fixture of fixtures) {
     const [hex, nameBytes, ...args] = fixture.split(':');
     const name = Buffer.from(nameBytes, 'hex').toString('utf8');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
-    const invoke = new WebAssembly.Instance(module).exports[name];
+    let instance;
+    try {
+        instance = new WebAssembly.Instance(module);
+    } catch (error) {
+        if (!(error instanceof WebAssembly.RuntimeError)) throw error;
+        console.log('instantiation-error');
+        continue;
+    }
+    const invoke = instance.exports[name];
     try {
         const value = invoke(...args.map(Number));
         if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
@@ -69,8 +77,14 @@ fn singleton_module(
     module
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Invocation(Result<i32, WasmTrap>),
+    DataSegmentOutOfBounds(usize),
+}
+
 struct Fixture {
-    expected: Result<i32, WasmTrap>,
+    expected: Outcome,
     bytes: Vec<u8>,
     export: &'static str,
     args: Vec<i32>,
@@ -92,7 +106,7 @@ impl Fixture {
         expression: &[u8],
     ) -> Self {
         Self {
-            expected,
+            expected: Outcome::Invocation(expected),
             bytes: singleton_module(u8::try_from(args.len()).unwrap(), locals, expression, None),
             export: EXPORT,
             args: args.to_vec(),
@@ -233,7 +247,7 @@ fn fixtures() -> Vec<Fixture> {
                   \x0a\x0e\x02\x04\0\x20\0\x0b\x07\0\x20\0\x41\x01\x6a\x0b";
     for (export, arg, expected) in [("x", 41, 42), ("y", 41, 41), ("π", i32::MAX, i32::MIN)] {
         cases.push(Fixture {
-            expected: Ok(expected),
+            expected: Outcome::Invocation(Ok(expected)),
             bytes: multi.to_vec(),
             export,
             args: vec![arg],
@@ -244,7 +258,7 @@ fn fixtures() -> Vec<Fixture> {
                     \x03\x03\x02\0\0\x07\x0a\x01\x06answer\0\0\
                     \x0a\x10\x02\x06\0\x20\0\x10\x01\x0b\x07\0\x20\0\x41\x02\x6c\x0b";
     cases.push(Fixture {
-        expected: Ok(42),
+        expected: Outcome::Invocation(Ok(42)),
         bytes: forward.to_vec(),
         export: EXPORT,
         args: vec![21],
@@ -264,7 +278,7 @@ fn fixtures() -> Vec<Fixture> {
                   \x07\0\x20\0\x20\x01\x6b\x0b";
     for (export, args, expected) in [("x", vec![], 42), ("y", vec![45, 3], 42)] {
         cases.push(Fixture {
-            expected: Ok(expected),
+            expected: Outcome::Invocation(Ok(expected)),
             bytes: mixed.to_vec(),
             export,
             args,
@@ -308,13 +322,52 @@ fn fixtures() -> Vec<Fixture> {
         ),
     ] {
         cases.push(Fixture {
-            expected,
+            expected: Outcome::Invocation(expected),
             bytes: singleton_module(args.len() as u8, &[0], expression, Some(pages)),
             export: EXPORT,
             args: args.to_vec(),
         });
     }
+    cases.extend([
+        with_data(
+            &[(0, &[1, 2, 3, 4]), (1, &[9])],
+            0,
+            Outcome::Invocation(Ok(0x0403_0901)),
+        ),
+        with_data(
+            &[(65535, &[42]), (65536, &[])],
+            65532,
+            Outcome::Invocation(Ok(0x2a00_0000)),
+        ),
+        with_data(
+            &[(0, &[1]), (65537, &[])],
+            0,
+            Outcome::DataSegmentOutOfBounds(1),
+        ),
+        with_data(&[(-1, &[1])], 0, Outcome::DataSegmentOutOfBounds(0)),
+    ]);
     cases
+}
+
+fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {
+    let mut bytes = singleton_module(1, &[0], &[0x20, 0, 0x28, 2, 0], Some(1));
+    let mut payload = vec![u8::try_from(segments.len()).unwrap()];
+    for &(offset, data) in segments {
+        payload.extend([0, 0x41]); // Memory index zero, i32.const.
+        payload.extend(sleb32(offset, 1));
+        assert!(data.len() < 128);
+        payload.extend([0x0b, data.len() as u8]);
+        payload.extend_from_slice(data);
+    }
+    assert!(payload.len() < 128);
+    bytes.extend([11, payload.len() as u8]);
+    bytes.extend(payload);
+    Fixture {
+        expected,
+        bytes,
+        export: EXPORT,
+        args: vec![address],
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -326,13 +379,18 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn evaluate(fixture: &Fixture) -> Result<Result<i32, WasmTrap>, Box<dyn Error>> {
-    match validate_module(&fixture.bytes)?
-        .instantiate()?
-        .invoke_i32_with_args(fixture.export, &fixture.args)
-    {
-        Ok(value) => Ok(Ok(value)),
-        Err(WasmInvokeError::Trap(trap)) => Ok(Err(trap)),
+fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
+    let module = validate_module(&fixture.bytes)?;
+    let instance = match module.instantiate() {
+        Ok(instance) => instance,
+        Err(WasmInstantiationError::DataSegmentOutOfBounds { segment_index }) => {
+            return Ok(Outcome::DataSegmentOutOfBounds(segment_index));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match instance.invoke_i32_with_args(fixture.export, &fixture.args) {
+        Ok(value) => Ok(Outcome::Invocation(Ok(value))),
+        Err(WasmInvokeError::Trap(trap)) => Ok(Outcome::Invocation(Err(trap))),
         Err(host_error) => Err(host_error.into()),
     }
 }
@@ -365,8 +423,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let expected = fixture.expected;
         let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
         let agrees = match actual {
-            Ok(value) => reference.parse::<i32>().ok() == Some(value),
-            Err(_) => reference == "trap",
+            Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
+            Outcome::Invocation(Err(_)) => reference == "trap",
+            Outcome::DataSegmentOutOfBounds(_) => reference == "instantiation-error",
         };
         if !agrees || actual != expected {
             return Err(format!(
@@ -375,6 +434,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    println!("Matched all {count} fixtures against Node {version} (i32 results or runtime traps)");
+    println!(
+        "Matched all {count} fixtures against Node {version} (i32 results, invocation traps, or instantiation errors)"
+    );
     Ok(())
 }

@@ -80,7 +80,7 @@ fn distinguishes_bad_or_incomplete_magic_from_unsupported_version() {
 
 #[test]
 fn rejects_even_empty_vectors_in_unsupported_sections() {
-    for id in [2, 4, 6, 8, 9, 11, 12, 13] {
+    for id in [2, 4, 6, 8, 9, 12, 13] {
         let bytes = module_with_suffix(&[0, 1, 0, id, 1, 0]);
         expect_error(&bytes, 11, ErrorKind::UnsupportedSection { id });
     }
@@ -174,7 +174,7 @@ fn differentiates_maximum_u32_from_leb_overflow() {
 
 #[test]
 fn checks_size_and_availability_before_reporting_recognized_unsupported_sections() {
-    for id in [0, 1, 12, 13] {
+    for id in [0, 1, 11, 12, 13] {
         let bytes = module_with_suffix(&[id, 2, 0]);
         expect_error(
             &bytes,

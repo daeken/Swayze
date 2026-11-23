@@ -1,4 +1,4 @@
-use crate::{ExecutionLimit, Export, Instance, InvokeError, Module, Trap};
+use crate::{ExecutionLimit, Export, Instance, InvokeError, Module, Trap, memory::DataSegment};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -36,6 +36,7 @@ pub enum ErrorKind {
     TruncatedSection { declared: usize, available: usize },
     TruncatedBody { declared: usize, available: usize },
     TruncatedName { declared: usize, available: usize },
+    TruncatedData { declared: usize, available: usize },
     InvalidUtf8Name,
     DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
@@ -66,6 +67,7 @@ pub enum LengthField {
     CustomNameSize,
     ExportNameSize,
     CodeBodySize,
+    DataSize,
 }
 
 /// A count, index, or immediate encoded as a LEB32 integer.
@@ -78,6 +80,8 @@ pub enum IntegerField {
     FunctionCount,
     ExportCount,
     MemoryCount,
+    DataCount,
+    MemoryIndex,
     MemoryMinimum,
     MemoryMaximum,
     MemoryAlignment,
@@ -115,6 +119,8 @@ pub enum Limit {
     CustomNameBytes,
     /// Name bytes in one export, excluding its length field.
     ExportNameBytes,
+    /// Total retained payload bytes across all data segments, including overlaps.
+    DataBytes,
 }
 
 impl Limit {
@@ -129,6 +135,7 @@ impl Limit {
             Self::OperandStackDepth => 32,
             Self::ControlDepth => 16,
             Self::CustomNameBytes | Self::ExportNameBytes => 4 * 1024,
+            Self::DataBytes => MEMORY_PAGE_BYTES,
         }
     }
 }
@@ -170,6 +177,13 @@ impl fmt::Display for Error {
                 f,
                 "name declares {declared} bytes but only {available} remain in its section"
             ),
+            TruncatedData {
+                declared,
+                available,
+            } => write!(
+                f,
+                "data segment declares {declared} bytes but only {available} remain in its section"
+            ),
             InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
             DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
@@ -181,7 +195,9 @@ impl fmt::Display for Error {
             InvalidMemoryLimits { minimum, maximum } => {
                 write!(f, "memory minimum {minimum} exceeds maximum {maximum}")
             }
-            MissingMemory => f.write_str("memory instruction requires a defined memory"),
+            MissingMemory => {
+                f.write_str("memory instruction or data segment requires a defined memory")
+            }
             InvalidMemoryAlignment { exponent } => {
                 write!(f, "i32 memory alignment exponent {exponent} exceeds 2")
             }
@@ -222,7 +238,9 @@ impl std::error::Error for Error {}
 /// executing it. Work is at most linear in the input length under the fixed
 /// section and vector caps. Allocations retain up to eight bodies bounded by
 /// [`Limit::BodyInstructions`] and eight export entries with names bounded by
-/// [`Limit::ExportNameBytes`]. Linear memory is not allocated during validation.
+/// [`Limit::ExportNameBytes`], plus up to eight active data segments bounded in
+/// total by [`Limit::DataBytes`]. Validation neither allocates linear memory
+/// nor checks that the data ranges fit; both belong to instantiation.
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -241,7 +259,9 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
 /// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent;
-/// [`ErrorKind::MissingMemory`] points to the instruction opcode.
+/// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
+/// segment's memory index. A data length above the remaining aggregate budget
+/// is reported as [`ErrorKind::LimitExceeded`] at the start of the length field.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -264,6 +284,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut functions = Vec::new();
     let mut exports = Vec::new();
     let mut memory_bytes = None;
+    let mut data_segments = Vec::new();
     let mut has_function_sections = false;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
@@ -290,7 +311,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3 | 5 | 7 | 10) {
+        if id <= last_standard && matches!(id, 1 | 3 | 5 | 7 | 10 | 11) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -321,6 +342,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     memory_bytes.is_some(),
                 )?;
             }
+            11 => data_segments = validate_data(&mut section, memory_bytes.is_some())?,
             _ => {
                 return Err(Error {
                     offset: id_offset,
@@ -330,7 +352,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         section.finish(ErrorKind::TrailingSectionBytes { id })?;
         last_standard = id;
-        has_function_sections |= id != 5;
+        has_function_sections |= matches!(id, 1 | 3 | 7 | 10);
     }
     if !module.remaining.is_empty() {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
@@ -352,6 +374,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         functions,
         exports,
         memory_bytes,
+        data_segments,
     })
 }
 
@@ -389,6 +412,7 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
 const MAX_TYPES: u32 = 8;
 const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
+const MAX_DATA_SEGMENTS: u32 = 8;
 const MAX_MEMORY_PAGES: u32 = 1;
 const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PARAMETERS: u32 = 4;
@@ -486,6 +510,57 @@ fn validate_exports(
     Ok(exports)
 }
 
+fn validate_data(section: &mut Reader<'_>, has_memory: bool) -> Result<Vec<DataSegment>, Error> {
+    let allocation_error = section.error(ErrorKind::AllocationFailed);
+    let count = section.count(IntegerField::DataCount, 0..=MAX_DATA_SEGMENTS)?;
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(count as usize)
+        .map_err(|_| allocation_error)?;
+    let limit = Limit::DataBytes;
+    let mut budget = limit.maximum();
+    for _ in 0..count {
+        // Core 1.0 encodes a memory index, not a bulk-memory flags byte.
+        let index_offset = section.position();
+        section.index(IntegerField::MemoryIndex, 1)?;
+        if !has_memory {
+            return Err(Error {
+                offset: index_offset,
+                kind: ErrorKind::MissingMemory,
+            });
+        }
+        section.expect_byte(I32_CONST)?;
+        let offset = section.integer(IntegerField::I32Const)?;
+        section.expect_byte(END)?;
+
+        let length_offset = section.position();
+        let declared = section.length(LengthField::DataSize)?;
+        if declared > budget {
+            return Err(Error {
+                offset: length_offset,
+                kind: ErrorKind::LimitExceeded { limit },
+            });
+        }
+        budget -= declared;
+        let available = section.remaining.len();
+        let payload = section.take(declared).ok_or(Error {
+            offset: section.end,
+            kind: ErrorKind::TruncatedData {
+                declared,
+                available,
+            },
+        })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(declared).map_err(|_| Error {
+            offset: length_offset,
+            kind: ErrorKind::AllocationFailed,
+        })?;
+        bytes.extend_from_slice(payload);
+        segments.push(DataSegment { offset, bytes });
+    }
+    Ok(segments)
+}
+
 const BLOCK: u8 = 0x02;
 const LOOP: u8 = 0x03;
 const EMPTY_BLOCK_TYPE: u8 = 0x40;
@@ -495,6 +570,7 @@ const END: u8 = 0x0b;
 const BR_IF: u8 = 0x0d;
 const I32_LOAD: u8 = 0x28;
 const I32_STORE: u8 = 0x36;
+const I32_CONST: u8 = 0x41;
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
@@ -819,7 +895,7 @@ fn decode_plain(
                 }
             }
         }
-        0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
+        I32_CONST => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
         0x45 => Instruction::Eqz,
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
@@ -1183,6 +1259,7 @@ impl<'a> Reader<'a> {
             LengthField::CodeBodySize => Limit::CodeBodyBytes,
             LengthField::CustomNameSize => Limit::CustomNameBytes,
             LengthField::ExportNameSize => Limit::ExportNameBytes,
+            LengthField::DataSize => Limit::DataBytes,
         };
         match usize::try_from(value) {
             Ok(length) if length <= limit.maximum() => Ok(length),

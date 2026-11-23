@@ -73,31 +73,44 @@ fn unconditional_continue_needs_no_payload() {
 }
 
 #[test]
-fn table_can_share_void_block_label_but_not_an_equally_typed_result_label() {
+fn table_continues_loops_with_different_end_results_and_common_void_labels() {
     let body = [
-        1, 1, 0x7f, // Local 1 counts trips.
-        0x41, 40, 0x02, 0x40, 0x03, 0x7f, // Void block and i32-result loop.
-        0x20, 1, 0x41, 1, 0x6a, 0x21, 1, // Increment the trip count.
-        0x20, 0, 0x41, 1, 0x21, 0, // Select with the old param; default next time.
-        0x0e, 1, 0, 1, // Case 0 continues; default exits the block. Both labels are void.
-        0x0b, 0x1a, 0x0b, // Loop end pushes a concrete i32 even in the dead tail.
-        0x20, 1, 0x6a, 0x0b,
+        1, 2, 0x7f, // Locals 1 and 2 count outer and inner trips, respectively.
+        0x41, 40, 0x03, 0x7f, // The i32-result loop preserves 40.
+        0x20, 1, 0x41, 1, 0x6a, 0x21, 1, // Increment the outer count.
+        0x41, 5, 0x03, 0x7e, // The i64-result loop also preserves 5.
+        0x20, 2, 0x41, 1, 0x6a, 0x22, 2, // Increment the inner count.
+        0x41, 1, 0x46, 0x04, 0x40, // Enter the if only on the first inner trip.
+        0x42, 17, 0x20, 0, // Leave an i64 temporary at the active floor under the selector.
+        0x0e, 1, 1, 2, // Case 0 continues the inner loop; default continues the outer loop.
+        0x0b, 0x42, 21, 0x0b, // Either continue leads to an i64 fallthrough of 21.
+        0xa7, 0x6a, 0x20, 1, 0x6a, 0x0b, // Outer loop yields i32 (21 + 5 + outer count).
+        0x6a, 0x0b, // Add the original 40.
     ];
     let module = exported_function(&i32_type(1), &code_body(&body));
     let instance = module.instantiate().unwrap();
-    for (selector, expected) in [(0, 42), (1, 41), (-1, 41)] {
+    // Both continues drop 17; only the inner one preserves its current 5.
+    for (selector, expected) in [(0, 67), (1, 68), (-1, 68)] {
         assert_eq!(
             instance.invoke_i32_with_args("answer", &[selector]),
             Ok(expected)
         );
     }
+}
 
+#[test]
+fn table_rejects_different_label_payloads_even_with_the_same_end_result() {
     // Both constructs have i32 end results, but only the block's label does.
     let prefix = &[0, 0x02, 0x7f, 0x03, 0x7f, 0x00, 0x0e][..];
-    for (labels, expected, actual) in [([0, 1], 0, 1), ([1, 0], 1, 0)] {
+    for (immediates, at, expected, actual) in [
+        ([2, 0, 1, 0], 2, 0, 1), // Mismatch in the second explicit entry.
+        ([2, 1, 0, 1], 2, 1, 0),
+        ([2, 0, 0, 1], 3, 0, 1), // Mismatch in the default entry.
+        ([2, 1, 1, 0], 3, 1, 0),
+    ] {
         bad_body(
-            &[prefix, &[1, labels[0], labels[1], 0x0b, 0x0b, 0x0b]].concat(),
-            prefix.len() + 2, // The mismatching default label byte, even in dead code.
+            &[prefix, &immediates, &[0x0b, 0x0b, 0x0b]].concat(),
+            prefix.len() + at, // The mismatching label byte, even in dead code.
             ErrorKind::BranchTableArityMismatch { expected, actual },
         );
     }

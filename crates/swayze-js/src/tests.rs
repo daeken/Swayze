@@ -289,6 +289,36 @@ fn expression_updates_each_emit_one_checked_instruction_in_operand_order() {
 }
 
 #[test]
+fn leading_expression_updates_emit_one_operand_and_discard_only_statement_results() {
+    use crate::parser::{Update, UpdateResult};
+    use Instruction::{Discard, Exponentiate, UpdateBinding};
+
+    assert_postfix(
+        "let x=2; x++ + 1; ++x ** 2;",
+        &[
+            Number(2.0),
+            init_let(0),
+            UpdateBinding {
+                slot: 0,
+                op: Update::Increment,
+                result: UpdateResult::Old,
+            },
+            Number(1.0),
+            Add,
+            Discard,
+            UpdateBinding {
+                slot: 0,
+                op: Update::Increment,
+                result: UpdateResult::New,
+            },
+            Number(2.0),
+            Exponentiate,
+        ],
+        2,
+    );
+}
+
+#[test]
 fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
     use Instruction::{Boolean, JumpIfFalseStatement, LoopBack, StoreBinding};
 

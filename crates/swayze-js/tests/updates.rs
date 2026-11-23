@@ -143,13 +143,14 @@ fn statement_update_sequences_check_all_targets_statically() {
 }
 
 #[test]
-fn only_a_comma_can_continue_a_statement_leading_bare_name_update() {
+fn statement_leading_updates_keep_their_unsupported_boundary_spans() {
     use ErrorKind::Unsupported;
     for (source, message) in [
-        ("let x=0; x@++@ + 1; x", "outside the subset"),
-        ("let x=0; { @++@x ** 2; } x", "outside the subset"),
-        ("let x=0; @++@x ** 2, x; x", "outside the subset"),
-        ("let x=0; { x@++@ + 1, x; } x", "outside the subset"),
+        ("let x=0; x@++@(); x", "outside the subset"),
+        ("let x=0; { @++@x !1; } x", "outside the subset"),
+        ("let x=0; @++@x ~1; x", "outside the subset"),
+        ("let x=0; { x@++@ void 1; } x", "outside the subset"),
+        ("let x=0; x++/*💡\n*/@(@); x", "explicit semicolons"),
         ("let x=0; @--@(x), x; x", "identifier"),
         ("let x=0; { (x)@--@, x; } x", "identifier"),
         ("let x=0; ++x@.@p, x; x", "token"),
@@ -159,7 +160,7 @@ fn only_a_comma_can_continue_a_statement_leading_bare_name_update() {
         assert_error(source, Unsupported, message);
     }
     // Grouping the leading update with the operator or putting it after
-    // the first comma uses ordinary value-producing expression rules.
+    // the first comma still uses ordinary value-producing expression rules.
     for source in [
         "let x=0; (x++ + 1)",
         "let x=0,y; 0,y=x++ + 1; y",
@@ -454,13 +455,11 @@ fn standalone_dispatch_still_requires_a_complete_update() {
     use ErrorKind::Unsupported;
     for (source, message) in [
         ("let x=0;for(++x;false;x@++@ + 1){}x", "expressions"),
-        ("let x=0;x@++@+1;x", "expressions"),
-        ("let x=0;x@--@-1;x", "expressions"),
+        ("let x=0;for(;false;@++@x\n**2){}x", "expressions"),
+        ("let x=0;for(x@++@\n+1;false;){}x", "expressions"),
+        ("let x=0;for(@++@x ? 1 : 2;false;){}x", "expressions"),
         ("let x=0;x@++@=1;x", "expressions"),
         ("let x=0;x@--@=1;x", "expressions"),
-        ("let x=0;x @++@+x", "expressions"),
-        ("let x=0;x @--@-x", "expressions"),
-        ("let x=0;@++@x+1;x", "expressions"),
         ("let x=0;@++@+x;x", "identifier"),
         ("let x=0;@--@(x);x", "identifier"),
         ("@++@true;0", "identifier"),
@@ -908,7 +907,7 @@ fn only_postfix_forbids_a_line_terminator_before_its_operator() {
 }
 
 #[test]
-fn postfix_line_terminator_diagnostic_is_distinct_from_standalone_dispatch() {
+fn a_line_break_after_the_update_does_not_prevent_a_continuation() {
     use ErrorKind::Unsupported;
     for source in [
         "let x = 2; (x/*\n*/@++@ ** 2) + x",
@@ -920,11 +919,239 @@ fn postfix_line_terminator_diagnostic_is_distinct_from_standalone_dispatch() {
             "a line terminator cannot precede a postfix update",
         );
     }
-    assert_error(
-        "let x = 2; x@++@ + 1; x",
-        Unsupported,
-        "increment and decrement expressions are outside the subset at the start of a statement or for clause",
-    );
+    for (source, expected) in [
+        ("let x=2; x++\n+1", 3.0),
+        ("let x=2; ++x\n**2", 9.0),
+        ("let x = 2; x++/*\n*/ + 1; x", 3.0),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+    for newline in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+        for trivia in [format!("/*💡{newline}*/"), format!("//💡{newline}")] {
+            let source = format!("let x=2; --{trivia}x{trivia}? x : 0");
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Ok(1.0),
+                "{source}"
+            );
+            let source = format!("let x=2; x{trivia}--{trivia}**2");
+            assert_error(
+                &source.replacen("--", "@--@", 1),
+                Unsupported,
+                "line terminator",
+            );
+            let source = format!("let x=2; x--{trivia}**2");
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Ok(4.0),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn leading_update_expressions_obey_precedence_and_keep_primitive_results() {
+    for (source, expected) in [
+        ("let x=2; x+++1", Value::Number(3.0)),
+        ("let x=2; x---1;", Value::Number(1.0)),
+        ("let x=2; --x + 2 * x", Value::Number(3.0)),
+        ("let x=2; x++ ** 2", Value::Number(4.0)),
+        ("let x=1; ++x ** 2 ** 3", Value::Number(256.0)),
+        ("let x=2; x-- ** -1 + x", Value::Number(1.5)),
+        ("let x=true; x++ === 1 && x === 2", Value::Boolean(true)),
+        ("let x=0; x++ ? void --x : null", Value::Null),
+        ("let x=0; ++x ? void x : null", Value::Undefined),
+        ("let x=2; x++ + 1, x += 3", Value::Number(6.0)),
+        ("let x=2; x++ + 1, null;", Value::Null),
+        ("let x=0; x++ && --x, x", Value::Number(1.0)),
+        ("let x=3; x-- ?? ++x, x", Value::Number(2.0)),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate_value(), Ok(expected), "{source}");
+        assert_eq!(script.evaluate_value(), Ok(expected), "{source}");
+    }
+    for (source, expected) in [
+        ("let x=-0; x++ && 1", -0.0_f64),
+        ("let x=-0; x-- / 2", -0.0),
+        ("let x=1; --x / 2", 0.0),
+    ] {
+        let actual = parse_script(source).unwrap().evaluate().unwrap();
+        assert_eq!(actual.to_bits(), expected.to_bits(), "{source}");
+    }
+}
+
+#[test]
+fn leading_update_expressions_have_ordinary_completion_and_error_rules() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, expected) in [
+        ("let x=2; x++ + 100; x", 3.0),
+        ("let x=2; { ++x ** 2, x+=4; } x", 7.0),
+        ("let x=2; if(false){x++ + 1;} x", 2.0),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+    for (source, kind, message) in [
+        ("let x=0; x++ + /*💡*/@@", Malformed, "expected an operand"),
+        (
+            "let x=0; ++x ? null @,@ 0",
+            Malformed,
+            "expected ':' before ','",
+        ),
+        ("let x=0; ++x ?? 1 @||@ 2", Malformed, "cannot be mixed"),
+        (
+            "let x=0; {x++ + 1/*💡*/@}@ x",
+            Unsupported,
+            "expression statements require explicit semicolons",
+        ),
+        (
+            "let x=0; {x++ + 1;}/*💡*/@@",
+            Unsupported,
+            "a final expression is required",
+        ),
+        (
+            "let x=0; ++x;/*💡*/@@",
+            Unsupported,
+            "a final expression is required",
+        ),
+        (
+            "let x=0; x++ + 1; let y=0;/*💡*/@@",
+            Unsupported,
+            "a final expression is required",
+        ),
+        (
+            "let x=0; {++x ** 2\n@let@ y=0;} x",
+            Unsupported,
+            "expression statements require explicit semicolons",
+        ),
+        (
+            "let x=0; x++ + 1\n@x@",
+            Unsupported,
+            "expression statements require explicit semicolons",
+        ),
+        (
+            "let x=0; x++ + x@=@2",
+            Unsupported,
+            "assignment expressions",
+        ),
+        ("@missing@++ + 1", Unsupported, "unbound name"),
+        (
+            "if(false){const x=0; @++@x ** 2;} 0",
+            Unsupported,
+            "assignment to const",
+        ),
+        (
+            "let x=0; { @x@-- + 1; let x; } x",
+            Unsupported,
+            "initialization",
+        ),
+        ("missing++ + @;@ 0", Malformed, "expected an operand"),
+    ] {
+        assert_error(source, kind, message);
+    }
+}
+
+#[test]
+fn leading_update_continuation_is_read_and_charged_once() {
+    for (form, expected) in [("x++", 1.0), ("--x", 0.0)] {
+        let source = format!("let x=false;{form}/*💡*/+true");
+        let name = source.rfind('x').unwrap();
+        let plus = source.rfind('+').unwrap();
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 9,
+            max_nesting_depth: 0,
+            // Source bytes, five emissions, one pending push, and one name lookup.
+            max_work: source.len() + 8,
+        };
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 5, "{source}");
+        assert_eq!(script.max_stack_depth(), 2, "{source}");
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+        for (limits, limit, start) in [
+            (
+                Limits {
+                    max_tokens: 7,
+                    ..limits
+                },
+                Limit::Tokens,
+                plus,
+            ),
+            // The delimiter lookahead is read after the two declaration
+            // emissions but before charging the expression update at its name.
+            (
+                Limits {
+                    max_work: plus + 1 + 2,
+                    ..limits
+                },
+                Limit::Work,
+                name,
+            ),
+            (
+                Limits {
+                    max_work: plus + 1 + 3,
+                    ..limits
+                },
+                Limit::Work,
+                plus,
+            ),
+            (
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+                Limit::Work,
+                name,
+            ),
+        ] {
+            let error = parse_script_with_limits(&source, limits).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit), "{source}");
+            assert_eq!(
+                error.span(),
+                Span {
+                    start,
+                    end: start + 1
+                },
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn leading_update_expressions_share_the_prepared_and_dispatch_caps() {
+    let limits = Limits {
+        max_tokens: 5200,
+        ..Limits::default()
+    };
+    for (prefixes, expected) in [(3, Ok(0.0)), (4, Err(EvalError::LimitExceeded))] {
+        // Each skipped block item emits update, operand, add, and discard.
+        let source = format!(
+            "let x=0;if(false){{{}}}{}x",
+            "++x+0;".repeat(1022),
+            "+ ".repeat(prefixes)
+        );
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 4093 + prefixes);
+        assert_eq!(script.evaluate(), expected);
+    }
+    // Two setup dispatches, eight per iteration (one extra for the RHS on
+    // the first), four for the final test, and the final load: 16,384.
+    for (prefix, expected) in [
+        ("", Ok(2047.0)),
+        ("+", Err(EvalError::DispatchLimitExceeded)),
+    ] {
+        let source = format!("let i=0;while(i<2047){{i++ || 1;}}{prefix}i");
+        assert_eq!(parse_script(&source).unwrap().evaluate(), expected);
+    }
 }
 
 #[test]

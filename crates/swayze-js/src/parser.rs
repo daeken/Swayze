@@ -342,6 +342,13 @@ enum Operator {
 }
 
 impl Operator {
+    fn is_binary(self) -> bool {
+        !matches!(
+            self,
+            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void
+        )
+    }
+
     fn precedence(self) -> u8 {
         match self {
             // Mixing `??` with either logical operator at this level is forbidden.
@@ -1084,6 +1091,24 @@ struct WriteAccess {
     load: Option<usize>,
 }
 
+enum ExpressionStart {
+    Token(Token),
+    // Statement dispatch checked the update and already read its continuation.
+    Update {
+        name: Span,
+        operator: Span,
+        op: Update,
+        result: UpdateResult,
+        following: Token,
+    },
+}
+
+impl From<Token> for ExpressionStart {
+    fn from(token: Token) -> Self {
+        Self::Token(token)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExpressionEnd {
     Script,
@@ -1227,10 +1252,10 @@ impl Parser<'_> {
             // Reaching this loop's EOF check again means a statement was parsed,
             // even if it emitted nothing. The final expression exits the loop.
             saw_statement = true;
-            let Some(first) = self.parse_non_expression_statement(first)? else {
+            let Some(start) = self.parse_non_expression_statement(first)? else {
                 continue;
             };
-            let (end, delimiter) = self.parse_expression(first, ExpressionEnd::Script)?;
+            let (end, delimiter) = self.parse_expression(start, ExpressionEnd::Script)?;
             if delimiter.is_none() {
                 break;
             }
@@ -1582,7 +1607,8 @@ impl Parser<'_> {
             self.emit(Instruction::Boolean(true), first.span)?;
             first.span
         } else {
-            self.parse_expression(first, ExpressionEnd::ForTest)?.0
+            self.parse_expression(first.into(), ExpressionEnd::ForTest)?
+                .0
         };
         let exit = self.emit_statement_test(end)?;
 
@@ -1632,11 +1658,11 @@ impl Parser<'_> {
             }
             _ => {}
         }
-        self.parse_discarded_expression(first, ExpressionEnd::ForClause(end))
+        self.parse_discarded_expression(first.into(), ExpressionEnd::ForClause(end))
     }
 
-    // Both statements and for clauses have already read one token after the name.
-    // If it doesn't commit to a store, leave it cached for the expression parser.
+    // The for clause has already read one token after the name. If it doesn't
+    // commit to a store, leave it cached for the expression parser.
     fn parse_name_store(
         &mut self,
         name: Span,
@@ -1666,10 +1692,10 @@ impl Parser<'_> {
 
     fn parse_discarded_expression(
         &mut self,
-        first: Token,
+        start: ExpressionStart,
         end: ExpressionEnd,
     ) -> Result<Span, Error> {
-        let (span, _) = self.parse_expression(first, end)?;
+        let (span, _) = self.parse_expression(start, end)?;
         self.emit(Instruction::Discard, span)?;
         Ok(span)
     }
@@ -1679,7 +1705,7 @@ impl Parser<'_> {
         if !matches!(open.kind, TokenKind::Open) {
             return Err(Error::malformed(open.span, missing_open));
         }
-        let (end, _) = self.parse_expression(open, ExpressionEnd::StatementTest)?;
+        let (end, _) = self.parse_expression(open.into(), ExpressionEnd::StatementTest)?;
         self.emit_statement_test(end)
     }
 
@@ -1711,15 +1737,18 @@ impl Parser<'_> {
         if matches!(first.kind, TokenKind::CloseBrace) {
             return self.close_block(first.span);
         }
-        if let Some(first) = self.parse_non_expression_statement(first)? {
-            self.parse_discarded_expression(first, ExpressionEnd::ExpressionStatement)?;
+        if let Some(start) = self.parse_non_expression_statement(first)? {
+            self.parse_discarded_expression(start, ExpressionEnd::ExpressionStatement)?;
         }
         Ok(())
     }
 
-    // If the token does not start a dedicated statement, return it as the
-    // start of an expression. Bare braces, labels and stores take priority.
-    fn parse_non_expression_statement(&mut self, first: Token) -> Result<Option<Token>, Error> {
+    // If this is not a dedicated statement, return the start of an expression.
+    // Bare braces, labels and assignments take priority; updates use lookahead.
+    fn parse_non_expression_statement(
+        &mut self,
+        first: Token,
+    ) -> Result<Option<ExpressionStart>, Error> {
         match first.kind {
             TokenKind::Semicolon => {}
             TokenKind::Declaration(kind) => self.parse_declaration(kind)?,
@@ -1730,23 +1759,37 @@ impl Parser<'_> {
             | TokenKind::Do => self.open_statement(first, self.labels.len())?,
             TokenKind::Break | TokenKind::Continue => self.parse_statement_jump(&first)?,
             TokenKind::Update(op) => {
-                self.parse_prefix_update(op, first.span, ExpressionEnd::StatementStore)?;
+                let name = self.parse_update_target(first.span)?;
+                return self.parse_statement_update(name, op, first.span, UpdateResult::New);
             }
-            TokenKind::Identifier => {
-                let next = self.next_token()?;
-                if matches!(
-                    next.as_ref().map(|token| token.kind),
-                    Some(TokenKind::Colon)
-                ) {
+            TokenKind::Identifier => match self.next_token()? {
+                Some(Token {
+                    kind: TokenKind::Colon,
+                    ..
+                }) => {
                     self.open_labeled_statement(first.span)?;
-                } else if self
-                    .parse_name_store(first.span, next, ExpressionEnd::StatementStore)?
-                    .is_none()
-                {
-                    return Ok(Some(first));
                 }
-            }
-            _ => return Ok(Some(first)),
+                Some(Token {
+                    kind: TokenKind::Assignment(op),
+                    span,
+                    ..
+                }) => {
+                    self.parse_assignment(first.span, op, span, ExpressionEnd::StatementStore)?;
+                }
+                Some(Token {
+                    kind: TokenKind::Update(op),
+                    span,
+                    after_line_break,
+                }) => {
+                    check_postfix_line_break(span, after_line_break)?;
+                    return self.parse_statement_update(first.span, op, span, UpdateResult::Old);
+                }
+                next => {
+                    self.lookahead = Some(next);
+                    return Ok(Some(first.into()));
+                }
+            },
+            _ => return Ok(Some(first.into())),
         }
         Ok(None)
     }
@@ -2036,7 +2079,7 @@ impl Parser<'_> {
             }
             TokenKind::Assignment(None) => {
                 let first = self.require_token("expected a binding initializer")?;
-                self.parse_expression(first, ExpressionEnd::Declarator(mode))?
+                self.parse_expression(first.into(), ExpressionEnd::Declarator(mode))?
             }
             TokenKind::Assignment(Some(_)) => {
                 return Err(Error::unsupported(
@@ -2059,6 +2102,41 @@ impl Parser<'_> {
         try_push(&mut self.bindings, binding, name.span)?;
         self.scopes[scope].last_binding = Some(slot);
         Ok(matches!(separator, Some(TokenKind::Comma)))
+    }
+
+    fn parse_statement_update(
+        &mut self,
+        name: Span,
+        op: Update,
+        operator: Span,
+        result: UpdateResult,
+    ) -> Result<Option<ExpressionStart>, Error> {
+        // Only binary operators and '?' opt into the expression path. In
+        // particular, an immediate comma still begins a consuming store suffix.
+        match self.next_token()? {
+            Some(following)
+                if matches!(following.kind, TokenKind::Question)
+                    || matches!(following.kind, TokenKind::Operator(op) if op.is_binary()) =>
+            {
+                Ok(Some(ExpressionStart::Update {
+                    name,
+                    operator,
+                    op,
+                    result,
+                    following,
+                }))
+            }
+            next => {
+                self.parse_consuming_update(
+                    name,
+                    op,
+                    operator,
+                    ExpressionEnd::StatementStore,
+                    next,
+                )?;
+                Ok(None)
+            }
+        }
     }
 
     fn parse_prefix_update(
@@ -2086,6 +2164,17 @@ impl Parser<'_> {
         end: ExpressionEnd,
     ) -> Result<Span, Error> {
         let next = self.next_token()?;
+        self.parse_consuming_update(name, op, operator, end, next)
+    }
+
+    fn parse_consuming_update(
+        &mut self,
+        name: Span,
+        op: Update,
+        operator: Span,
+        end: ExpressionEnd,
+        next: Option<Token>,
+    ) -> Result<Span, Error> {
         let span = next
             .as_ref()
             .map_or(Span::at(self.lexer.offset), |t| t.span);
@@ -2184,7 +2273,7 @@ impl Parser<'_> {
             binary => (None, binary),
         };
         let first = self.require_token("expected an assignment value")?;
-        let (rhs_end, delimiter) = self.parse_expression(first, end)?;
+        let (rhs_end, delimiter) = self.parse_expression(first.into(), end)?;
         if let Some(binary) = binary {
             self.emit(binary, operator_span)?;
         }
@@ -2214,7 +2303,7 @@ impl Parser<'_> {
         // The comma was already consumed, and the store (or its skip edge)
         // leaves no value to discard. Parse just the remaining operands.
         let first = self.require_token("expected an operand before end of source")?;
-        self.parse_discarded_expression(first, suffix_end)
+        self.parse_discarded_expression(first.into(), suffix_end)
     }
 
     fn begin_write(&mut self, name: Span, operator_span: Span, load: bool) -> Result<usize, Error> {
@@ -2460,7 +2549,7 @@ impl Parser<'_> {
 
     fn parse_expression(
         &mut self,
-        first: Token,
+        start: ExpressionStart,
         end_kind: ExpressionEnd,
     ) -> Result<(Span, Option<TokenKind>), Error> {
         // Compound assignment keeps its loaded LHS below the RHS operands.
@@ -2486,15 +2575,26 @@ impl Parser<'_> {
             | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
             _ => None,
         };
-        let mut needs_operand = true;
-        // Statement tests receive their already checked opening parenthesis.
-        // Meter it like a group, but let it own the test's close and comma
-        // sequence without reusing the test marker for an assignment.
-        let (mut next, mut after_open) = if statement_test {
-            self.open_pending(Pending::StatementTest, first.span)?;
-            (self.next_token()?, true)
-        } else {
-            (Some(first), false)
+        let (mut next, mut needs_operand, mut after_open) = match start {
+            // Statement tests receive their already checked opening parenthesis.
+            // Meter it like a group, but let it own the test's close and comma
+            // sequence without reusing the test marker for an assignment.
+            ExpressionStart::Token(first) if statement_test => {
+                self.open_pending(Pending::StatementTest, first.span)?;
+                (self.next_token()?, true, true)
+            }
+            ExpressionStart::Token(first) => (Some(first), true, false),
+            ExpressionStart::Update {
+                name,
+                operator,
+                op,
+                result,
+                following,
+            } => {
+                self.lexer.charge(1, name)?;
+                self.emit_expression_update(name, operator, op, result)?;
+                (Some(following), false, false)
+            }
         };
         // Bare assignment prefixes can start a test, RHS, ternary arm, or
         // noninitial sequence operand, but not an operator operand. Store

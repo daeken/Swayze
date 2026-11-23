@@ -204,6 +204,20 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
                 Ok(())
             );
         }
+        // EOF after a swallowed suffix would be accepted by the completion API.
+        let prefix = format!("#!🌹{terminator}");
+        let source = format!("{prefix}/* unterminated");
+        let error = parse_script_for_completion(&source).unwrap_err();
+        assert_eq!(parse_script(&source).unwrap_err(), error);
+        assert_eq!(error.kind(), ErrorKind::Malformed);
+        assert_eq!(error.message(), "unterminated block comment");
+        assert_eq!(
+            error.span(),
+            Span {
+                start: prefix.len(),
+                end: source.len()
+            }
+        );
     }
     for source in [
         "#!",
@@ -232,6 +246,7 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
     }
     for (source, start) in [
         ("# a lone hash", 0),
+        ("#name", 0),
         ("# ! not a hashbang", 0),
         (" \t#! wrong", 2),
         ("\u{FEFF}#! wrong", 3),
@@ -241,6 +256,7 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
         ("#! first\r\n#! second", 10),
         ("1; #! wrong", 3),
         ("(1 + #! wrong", 5),
+        ("if (false) { #! wrong\n }", 13),
     ] {
         let error = parse_script(source).unwrap_err();
         assert_eq!(parse_script_for_completion(source).unwrap_err(), error);
@@ -265,6 +281,25 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
         "Use Strict Directives are outside the subset"
     );
     assert_eq!(error.span(), Span { start: 3, end: 15 });
+}
+
+#[test]
+fn hashbang_like_text_inside_existing_tokens_and_trivia_is_unchanged() {
+    for source in [
+        "'#!'.length",
+        "`#!`.length",
+        "/* #! */ 2",
+        "// #!\n2",
+        "#! prologue\nif (false) { '#!'; false.length; } /* #! */ 2",
+    ] {
+        assert_eq!(evaluate(source), 2.0);
+        assert_eq!(
+            parse_script_for_completion(source)
+                .unwrap()
+                .execute_with_scratch(&mut EvalScratch::new()),
+            Ok(())
+        );
+    }
 }
 
 #[test]

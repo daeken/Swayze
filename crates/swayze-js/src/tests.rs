@@ -424,6 +424,82 @@ fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
 }
 
 #[test]
+fn for_no_comma_logical_store_and_leading_update_keep_their_instructions() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{
+        Boolean, JumpIfFalseStatement, JumpStatement, LoopBack, ShortCircuitStatement, StoreBinding,
+    };
+
+    assert_postfix(
+        "let x=false;for(x||=true;false;x++){continue;}x",
+        &[
+            Boolean(false),
+            init_let(0),
+            LoadBinding(0),
+            ShortCircuitStatement {
+                target: 6,
+                condition: ShortCircuitCondition::Truthy,
+            },
+            Boolean(true),
+            StoreBinding(0),
+            Boolean(false), // 6: test
+            JumpIfFalseStatement(16),
+            JumpStatement(14),
+            LoadBinding(0), // 9: update
+            Number(1.0),
+            Add,
+            StoreBinding(0),
+            LoopBack(6),
+            LoopBack(9),    // 14: continue
+            LoopBack(9),    // body fallthrough
+            LoadBinding(0), // 16: exit
+        ],
+        2,
+    );
+}
+
+#[test]
+fn for_assignment_sequences_store_first_and_join_with_an_empty_stack() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{
+        Boolean, Discard, JumpIfFalseStatement, JumpStatement, LoopBack, Null,
+        ShortCircuitStatement, StoreBinding, StoreBindingKeep, Undefined,
+    };
+
+    assert_postfix(
+        "let x;for(x+=true,x=false;false;x||=null,false){continue;}x",
+        &[
+            Undefined,
+            init_let(0),
+            LoadBinding(0),
+            Boolean(true),
+            Add,
+            StoreBinding(0), // consuming store before the next operand
+            Boolean(false),
+            StoreBindingKeep(0),
+            Discard,        // final initializer result
+            Boolean(false), // 9: test
+            JumpIfFalseStatement(21),
+            JumpStatement(19),
+            LoadBinding(0), // 12: update
+            ShortCircuitStatement {
+                target: 16,
+                condition: ShortCircuitCondition::Truthy,
+            },
+            Null,
+            StoreBinding(0),
+            Boolean(false), // 16: update suffix, reached on both paths
+            Discard,
+            LoopBack(9),
+            LoopBack(12),   // 19: continue
+            LoopBack(12),   // body fallthrough
+            LoadBinding(0), // 21: exit
+        ],
+        2,
+    );
+}
+
+#[test]
 fn for_expression_clauses_join_at_discards_before_statement_edges() {
     use crate::parser::ShortCircuitCondition;
     use Instruction::{

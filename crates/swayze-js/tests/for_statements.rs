@@ -63,6 +63,66 @@ fn non_store_clauses_work_at_root_and_in_nested_loops() {
 }
 
 #[test]
+fn assignment_sequences_run_left_to_right_on_entry_fallthrough_and_continue() {
+    let script = parse_script(
+        "let x=99,y=99,trace=0;
+         for (x=0, y=2; x<4; x+=1, y*=2, y+=x) {
+             if (x===1) {continue;}
+             if (x===3) {break;}
+             trace=trace*100+y;
+         }
+         trace===212 && x===3 && y===27",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(true)));
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(true)));
+}
+
+#[test]
+fn eager_assignment_keeps_its_old_lhs_across_chains_and_ternary_arms() {
+    for (test, expected) in [("true", 4206.0), ("false", 2446.0)] {
+        let leading = format!("x /= y = {test} ? x = 2 : z = x = 4, seen = x + y");
+        for header in [format!("{leading}; false;"), format!("; !seen; {leading}")] {
+            let source =
+                format!("let x=8,y=0,z=0,seen=0;for({header}){{continue;}}x*1000+y*100+z*10+seen");
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Ok(expected),
+                "{source}"
+            );
+        }
+    }
+    let source = "let x=8,y;for(x/=(x=2,4), y=x;false;){}y";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(2.0));
+}
+
+#[test]
+fn logical_assignment_skip_and_take_both_reach_the_remaining_operands() {
+    for (initial, op, expected) in [
+        ("true", "&&=", "null"),
+        ("false", "&&=", "false"),
+        ("false", "||=", "null"),
+        ("true", "||=", "true"),
+        ("undefined", "??=", "null"),
+        ("false", "??=", "false"),
+    ] {
+        let leading = format!("x{op}(hits++,null), seen=x, tails++");
+        let hits = usize::from(expected == "null");
+        for header in [format!("{leading}; false;"), format!("; !tails; {leading}")] {
+            let source = format!(
+                "let x={initial},hits=0,seen,tails=0;for({header}){{continue;}}
+                 x==={expected} && seen===x && hits==={hits} && tails===1"
+            );
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate_value(),
+                Ok(Value::Boolean(true)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn each_clause_can_be_omitted() {
     for statement in [
         "for (;i<3;i=i+1) {}",
@@ -320,11 +380,9 @@ fn requires_braces_and_explicit_delimiters() {
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "for(|i"),
-        ("for(i=0,j=1;false;){}42", Unsupported, ","),
         ("for(;-i+=1;){}42", Unsupported, "+="),
         ("for(;false;i++){}42", Unsupported, "false;|i"),
         ("for(;false;i+1){}42", Unsupported, "false;|i"),
-        ("for(;false;i=0,i=1){}42", Unsupported, ","),
         ("for(i=;false;){}42", Malformed, "i=|;"),
         ("for(i=0\ntrue;){}42", Malformed, "true"),
         ("for(i=0){}42", Malformed, ")"),
@@ -444,18 +502,15 @@ fn skipped_non_store_clauses_still_resolve_all_names_in_their_own_scope() {
 }
 
 #[test]
-fn stores_remain_standalone_in_both_clauses() {
+fn no_comma_stores_and_leading_update_restrictions_remain_unchanged() {
     let source = "let i;for(i??=(null,0);i<3;i+=(true?1:2,1)){}i";
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(3.0));
     let source = "let i=2;for(--i;i<3;i/**/++){if(i===2){break;}continue;}i";
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(2.0));
 
-    let requires_group = "a sequence in an assignment RHS requires parentheses";
     let assignment_expr = "assignment expressions require a simple name followed by an assignment operator at the start of an expression group";
     let standalone_update = "increment and decrement expressions are outside the subset at the start of a statement or for clause";
     for (source, marked, message) in [
-        ("let i;for(i??=null,0;false;){}0", ",", requires_group),
-        ("let i;for(;false;i+=true?1:2,1){}0", ",", requires_group),
         ("let i;for(i, -i+=1;false;){}0", "+=", assignment_expr),
         ("let i;for(;false;((i)=1)){}0", "=", assignment_expr),
         (
@@ -479,6 +534,84 @@ fn stores_remain_standalone_in_both_clauses() {
             message,
             "{source}"
         );
+    }
+}
+
+#[test]
+fn assignment_sequence_diagnostics_respect_comma_ownership_and_scope() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, marked, message) in [
+        (
+            "let x;for(x=1,;false;){}x",
+            Malformed,
+            ",|;",
+            "expected an operand",
+        ),
+        (
+            "let x;for(;false;x=1,){}x",
+            Malformed,
+            ",|)",
+            "expected an operand",
+        ),
+        (
+            "let x;for(x=1,",
+            Malformed,
+            "",
+            "expected an operand before end of source",
+        ),
+        (
+            "let x;for(x=1,null){}x",
+            Malformed,
+            ")",
+            "expected ';' between for clauses",
+        ),
+        (
+            "let x;for(;false;x=1,null",
+            Malformed,
+            "",
+            "expected ')' after the for update",
+        ),
+        (
+            "let x;for(x=true?1,2:3;false;){}x",
+            Malformed,
+            ",",
+            "expected ':' before ','",
+        ),
+        (
+            "for(let x=1,null;false;){}0",
+            Unsupported,
+            "null",
+            "null cannot be used as a binding name",
+        ),
+        ("let x;for(x=1,null in x){}x", Unsupported, "in", "outside"),
+        ("let x;for(x=1,null of x){}x", Unsupported, "of", "outside"),
+        (
+            "const x=0;for(;false;x&&=missing,0){}0",
+            Unsupported,
+            "&&=",
+            "assignment to const",
+        ),
+        (
+            "let x=0;for(x&&=missing,0;false;){}x",
+            Unsupported,
+            "missing",
+            "unbound name",
+        ),
+        (
+            "let x;for(;false;x=1,missing=2){let missing;}x",
+            Unsupported,
+            ",|missing",
+            "unbound name",
+        ),
+        (
+            "let x=0;if(false){for(x=1,null;false;){}let x;}x",
+            Unsupported,
+            "for(|x",
+            "before lexical binding initialization",
+        ),
+    ] {
+        let error = assert_error_at(source, kind, marked);
+        assert!(error.message().contains(message), "{source}: {error}");
     }
 }
 
@@ -900,6 +1033,140 @@ fn non_store_clauses_share_exact_token_work_and_nesting_caps() {
                 end: start + len
             }
         );
+    }
+}
+
+#[test]
+fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
+    for (source, tokens, instructions, depth, value) in [
+        (
+            "let x;for(x=true,null;false;x||=null,false){}x",
+            22,
+            18,
+            1,
+            Value::Boolean(true),
+        ),
+        (
+            "let x=false;for(++x;false;x||=null){}x",
+            19,
+            16,
+            2,
+            Value::Number(1.0),
+        ),
+        (
+            "let x=true;for(x+=true;false;x++){}x",
+            19,
+            16,
+            2,
+            Value::Number(2.0),
+        ),
+    ] {
+        // Besides scanned bytes and emissions: one header and one frame,
+        // and three two-unit lookups (one each for the init, update and exit).
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: tokens,
+            max_nesting_depth: 1,
+            max_work: source.len() + instructions + 8,
+        };
+        let script = parse_script_with_limits(source, limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.max_stack_depth(), depth);
+        assert_eq!(script.evaluate_value(), Ok(value), "{source}");
+        for (limits, limit) in [
+            (
+                Limits {
+                    max_source_bytes: source.len() - 1,
+                    ..limits
+                },
+                Limit::SourceBytes,
+            ),
+            (
+                Limits {
+                    max_tokens: tokens - 1,
+                    ..limits
+                },
+                Limit::Tokens,
+            ),
+            (
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+                Limit::Work,
+            ),
+        ] {
+            let error = parse_script_with_limits(source, limits).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+            assert_eq!(
+                error.span(),
+                Span {
+                    start: source.len() - 1,
+                    end: source.len()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn the_first_comma_meters_the_store_before_scanning_the_next_operand() {
+    let source = "let x;for(x=true,null;false;){}x";
+    let comma = source.find(',').unwrap();
+    let limits = Limits {
+        // Bytes through the comma, two declaration instructions, one
+        // header and one RHS literal instruction. The next charge is the store.
+        max_work: comma + 1 + 4,
+        ..Limits::default()
+    };
+    let error = parse_script_with_limits(source, limits).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+    assert_eq!(
+        error.span(),
+        Span {
+            start: comma,
+            end: comma + 1
+        }
+    );
+}
+
+#[test]
+fn assignment_sequence_suffix_counts_even_in_an_unreached_update() {
+    let tail = ",null".repeat(2042);
+    let limits = Limits {
+        max_tokens: 8192,
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for (final_expr, instructions, expected) in [
+        ("!!x", 4096, Ok(Value::Boolean(false))),
+        ("!!!x", 4097, Err(EvalError::LimitExceeded)),
+    ] {
+        let source = format!("let x;for(;false;x=null{tail}){{}}{final_expr}");
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(script.evaluate_value(), expected);
+    }
+}
+
+#[test]
+fn leading_logical_skip_and_take_have_exact_update_dispatch_costs() {
+    // Four setup dispatches, four for the last test and one for the final
+    // read. Each continuing iteration takes 14 on skip and 16 on take.
+    for (initial, iterations, padding) in [("true", 1169, 9), ("false", 1023, 7)] {
+        for extra in [0, 1] {
+            let source = format!(
+                "let i=0,x={initial};for(;i<{iterations};x||=false,i+=1){{continue;}}{}i",
+                "+ ".repeat(padding + extra),
+            );
+            let expected = if extra == 0 {
+                Ok(f64::from(iterations))
+            } else {
+                Err(EvalError::DispatchLimitExceeded)
+            };
+            assert_eq!(parse_script(&source).unwrap().evaluate(), expected);
+        }
     }
 }
 

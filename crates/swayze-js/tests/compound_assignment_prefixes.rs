@@ -187,8 +187,8 @@ fn delimiters_and_leading_standalone_dispatch_keep_their_existing_roles() {
     for source in [
         "let x=0,y=2; x=y+=1@,@x; x",
         "let x=0; x ||= 1@,@2; x",
-        "let x=0; for(x+=1@,@true;false;){} x",
-        "let x=0; for(;false;x+=1@,@true){} x",
+        "let x=0; {x+=1@,@true;} x",
+        "let x=0; x=1@,@x",
     ] {
         assert_marked_error(
             source,
@@ -198,6 +198,11 @@ fn delimiters_and_leading_standalone_dispatch_keep_their_existing_roles() {
     }
     assert_marked_error(
         "let x=0; x+=1@@",
+        ErrorKind::Unsupported,
+        "assignments require explicit semicolons",
+    );
+    assert_marked_error(
+        "let x=0; {x+=1@}@ x",
         ErrorKind::Unsupported,
         "assignments require explicit semicolons",
     );

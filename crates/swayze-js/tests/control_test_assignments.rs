@@ -138,16 +138,6 @@ fn test_assignment_prefixes_require_a_bare_name() {
     ] {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");
     }
-    for source in [
-        "let x; for (x=1@,@ true; false;) {} x",
-        "let x; for (; false; x=1@,@ true) {} x",
-    ] {
-        assert_marked_error(
-            source,
-            ErrorKind::Unsupported,
-            "sequence in an assignment RHS",
-        );
-    }
     assert_marked_error(
         "let x; if (x=true) {}@@",
         ErrorKind::Unsupported,

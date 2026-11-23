@@ -300,6 +300,10 @@ fn fixtures() -> Vec<String> {
             "let x; x ??= 42; x",
             "let x = 42; let out; { let undefined = 7; let x; out = x; } out ?? x",
             "let n = 0; let out = 0; while (n < 3) { let x; out += x ?? 14; x = 100; n++; } out",
+            "let a, b = a ?? 40, c = b + 2; c",
+            "const a = 20, b = a + 2; a + b",
+            "let a = true ? (20 + 1) : 0, b = a === 21 ? a : 0; a + b",
+            "let a = 1, out; { let a = 20, b = a + 21; out = b; } out + a",
         ]
         .map(str::to_owned),
     );

@@ -1031,6 +1031,29 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
 }
 
 #[test]
+fn declaration_lists_compile_each_item_before_the_next() {
+    assert_postfix(
+        "let x,y=x,z; const a=20,b=a+22; b",
+        &[
+            Instruction::Undefined,
+            init_let(0),
+            LoadBinding(0),
+            init_let(1),
+            Instruction::Undefined,
+            init_let(2),
+            Number(20.),
+            init_const(3),
+            LoadBinding(3),
+            Number(22.),
+            Add,
+            init_const(4),
+            LoadBinding(4),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn consts_decline_reserved_and_non_subset_names_without_splitting() {
     use ErrorKind::Unsupported;
     for name in [
@@ -1083,7 +1106,6 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const x=1;", Unsupported, 10, 10),
         ("const x=1\nx", Unsupported, 10, 11),
         ("const x=1\nconst y=2; x", Unsupported, 10, 15),
-        ("const x=1,y=2; x", Unsupported, 9, 10),
         ("const [x]=1; x", Unsupported, 6, 7),
         ("const {x}=1; x", Unsupported, 6, 7),
         ("const x=(1;); x", Malformed, 10, 11),

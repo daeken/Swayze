@@ -20,9 +20,11 @@ with a metered, fallible pass; explicit-radix conversion skips them while
 scanning. Legacy octal and BigInt remain outside the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
 `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and `let`
-declarations initialize slots in source order, preserving the value type.
-`const` requires an initializer. `let name;` initializes to `undefined` each
-time the declaration executes, without reading any binding named `undefined`.
+declarations initialize slots in source order, including left to right within
+comma-separated lists. Each `const` item requires an initializer. A `let`
+item without an initializer initializes to `undefined` each time it executes,
+without reading any binding named `undefined`. Comma expressions and trailing
+commas in declaration lists are unsupported.
 Simple and compound assignments update earlier `let` slots. Arithmetic and
 bitwise compound assignments read the target once, evaluate the right operand,
 apply the corresponding operator, and store the result. Logical assignments

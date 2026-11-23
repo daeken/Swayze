@@ -236,14 +236,13 @@ fn shadow_access_resolution_has_an_exact_work_budget() {
 }
 
 #[test]
-fn local_declarations_require_single_names_and_explicit_semicolons() {
+fn local_declarations_require_initializers_for_const_and_explicit_semicolons() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind) in [
         ("if(false){const x|;}0", Malformed),
         ("if(false){let x|}0", Malformed),
         ("if(false){const x=|;}0", Malformed),
         ("while(false){let x=1|}0", Unsupported),
-        ("if(false){let x=1|,y=2;}0", Unsupported),
         ("if(false){const x=1;let |x=2;}0", Malformed),
         (
             "let x=0;if(false){let x=1;while(false){let x=2;}const |x=3;}x",

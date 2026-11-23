@@ -51,13 +51,6 @@ enum Operand {
 }
 
 impl Operand {
-    fn require_scalar(self) -> Result<Value, EvalError> {
-        match self {
-            Self::Scalar(value) => Ok(value),
-            Self::String(_) => Err(EvalError::UnsupportedStringOperation),
-        }
-    }
-
     fn to_number(
         self,
         strings: StringPools<'_>,
@@ -250,8 +243,8 @@ impl Script {
     /// code units, with a proper prefix sorting before the longer String.
     /// Otherwise, both operands are converted to Numbers, and the relation is
     /// always `false` if either converted Number is NaN.
-    /// Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`,
-    /// `<<`, `>>`, and `>>>` (including their eager compound forms), mixed
+    /// Unary `+`, `-`, and `~` and binary `-`, `*`, `/`, `%`, `**`, `&`, `^`,
+    /// `|`, `<<`, `>>`, and `>>>` (including their eager compound forms), mixed
     /// relational comparisons, and loose equality between a String and a Number
     /// or Boolean convert Strings to Numbers using ECMAScript's whitespace,
     /// signed decimal and `Infinity` forms, and unsigned `0x`, `0o`, and `0b`
@@ -280,7 +273,7 @@ impl Script {
     /// equality are false without conversion. `!==` and `!=` negate their
     /// corresponding equality results. Binary `+` and `+=` concatenate two
     /// Strings in left-to-right UTF-16 order, without normalization. Mixed
-    /// String/scalar addition and binary `-` and `-=` on Strings are unsupported.
+    /// String/scalar `+` and `+=` are unsupported.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -335,7 +328,7 @@ impl Script {
     /// before comparison, even for aliases or an early mismatch. Mixed and
     /// skipped comparisons cost no pairs.
     /// String-to-Number conversion has a separate 262,144-credit budget per
-    /// call, shared by unary `+`, `-`, and `~`, binary `*`, `/`, `%`, `**`,
+    /// call, shared by unary `+`, `-`, and `~`, binary `-`, `*`, `/`, `%`, `**`,
     /// `&`, `^`, `|`, `<<`, `>>`, and `>>>` (including their eager compound
     /// forms), name `++` and `--` updates, and comparisons that coerce Strings.
     /// After dispatch, operand arity checks, and validation of the operand's
@@ -574,11 +567,12 @@ fn evaluate(
             Instruction::Add => {
                 apply_binary_operand(&mut stack, |lhs, rhs| add(lhs, rhs, string_units, scratch))?
             }
-            Instruction::Subtract => apply_binary(&mut stack, |lhs, rhs| {
-                Ok(Value::Number(
-                    lhs.require_scalar()?.to_number() - rhs.require_scalar()?.to_number(),
-                ))
-            })?,
+            Instruction::Subtract => apply_numeric_binary(
+                &mut stack,
+                scratch.pools(string_units),
+                &mut string_conversion_credits_left,
+                |lhs, rhs| lhs - rhs,
+            )?,
             Instruction::Multiply => apply_numeric_binary(
                 &mut stack,
                 scratch.pools(string_units),
@@ -1095,14 +1089,14 @@ mod tests {
 
     #[test]
     fn numeric_binary_checks_arity_before_left_to_right_conversion() {
-        let script = crate::parse_script("'1' * '2'").unwrap();
+        let script = crate::parse_script("'1' - '2'").unwrap();
         let [
             Instruction::String(lhs),
             Instruction::String(rhs),
-            Instruction::Multiply,
+            Instruction::Subtract,
         ] = script.instructions()
         else {
-            panic!("expected two String instructions and a multiply");
+            panic!("expected two String instructions and a subtract");
         };
         // A malformed operand cannot pass literal dispatch. Inject it here to
         // distinguish which conversion ran first when both would fail.
@@ -1132,6 +1126,54 @@ mod tests {
                 Err(expected)
             );
             assert_eq!(credits, remaining);
+        }
+    }
+
+    #[test]
+    fn subtract_checks_arity_before_converting_the_available_operand() {
+        let source = format!(
+            "const ws = '{}'; let i = 0; while (i++ < 64) {{ +ws; }} +'{}'; ''",
+            " ".repeat(4094),
+            " ".repeat(63),
+        );
+        let script = crate::parse_script(&source).unwrap();
+        let mut ops = script.instructions().to_vec();
+        ops.push(Instruction::Subtract);
+        // There is only one String on the stack and no conversion credit left.
+        assert_eq!(
+            evaluate_for_error(&script, &ops),
+            Err(EvalError::InvalidScript)
+        );
+    }
+
+    #[test]
+    fn compound_subtraction_failure_stops_before_either_store_form() {
+        for (padding, expected) in [
+            (61, EvalError::InvalidScript),
+            (62, EvalError::StringNumericConversionLimitExceeded),
+        ] {
+            for tail in ["x -= ''; x", "(x -= '')"] {
+                let source = format!(
+                    "const ws = '{}'; let i = 0; while (i++ < 64) {{ +ws; }} +'{}'; \
+                     let x = '' + ''; {tail}",
+                    " ".repeat(4094),
+                    " ".repeat(padding),
+                );
+                let script = crate::parse_script(&source).unwrap();
+                let mut ops = script.instructions().to_vec();
+                let subtract = ops
+                    .iter()
+                    .position(|op| *op == Instruction::Subtract)
+                    .unwrap();
+                let store = &mut ops[subtract + 1];
+                *store = match *store {
+                    Instruction::StoreBinding(_) => Instruction::StoreBinding(usize::MAX),
+                    Instruction::StoreBindingKeep(_) => Instruction::StoreBindingKeep(usize::MAX),
+                    _ => panic!("compound store must follow Subtract"),
+                };
+                // Only a successful subtraction dispatches the invalid store.
+                assert_eq!(evaluate_for_error(&script, &ops), Err(expected), "{tail}");
+            }
         }
     }
 

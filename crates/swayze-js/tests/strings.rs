@@ -471,8 +471,8 @@ fn skipped_mixed_comparisons_still_validate_literals_and_bindings() {
 }
 
 #[test]
-fn unsupported_operations_fail_only_when_dispatched() {
-    for expr in ["'2' + 1", "1 + '2'", "'2' - 1", "1 - '2'", "'a' - 'b'"] {
+fn mixed_string_addition_fails_only_when_dispatched() {
+    for expr in ["'2' + 1", "1 + '2'", "('' + '2') + 1", "1 + ('' + '2')"] {
         let script = parse_script(expr).unwrap();
         assert_eq!(
             script.evaluate_primitive(),
@@ -481,23 +481,24 @@ fn unsupported_operations_fail_only_when_dispatched() {
         );
         assert_scalar(&format!("false && ({expr})"), Value::Boolean(false));
     }
-    for op in ["+=", "-="] {
-        for source in [
-            format!("let x = '2'; x {op} 1; 0"),
-            format!("let x = 1; (x {op} '2')"),
-        ] {
-            assert_eq!(
-                parse_script(&source).unwrap().evaluate(),
-                Err(EvalError::UnsupportedStringOperation)
-            );
-        }
+    for source in [
+        "let x = '2'; x += 1; 0",
+        "let x = 1; (x += '2')",
+        "let x = '' + '2'; x += 1; 0",
+        "let x = 1; (x += '' + '2')",
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Err(EvalError::UnsupportedStringOperation),
+            "{source}"
+        );
     }
     assert_scalar(
         "let x = ''; if ('') { x++; x += 1; } 42",
         Value::Number(42.0),
     );
     assert_scalar(
-        "let x = ''; for (; ''; ++x) { x -= 2; } 42",
+        "let x = ''; for (; ''; ++x) { x += 2; } 42",
         Value::Number(42.0),
     );
     assert!(parse_script(r"true || '\x00' + '\u{}'").is_err());

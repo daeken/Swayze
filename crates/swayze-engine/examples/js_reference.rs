@@ -555,6 +555,13 @@ fn fixtures() -> Vec<String> {
             "+('-' + '0')",
             "let s='4' + '2'; s--; s",
             "false && ('bad' + 'branch') || ('x' + 'y')",
+            "('1' + '2') - '0b11'",
+            "true - ('2' + '0')",
+            "'-0' - '0'",
+            "'Infinity' - 'Infinity'",
+            "let x='20'; x -= (x = '3' + '2'); x",
+            "let x='5' + '0'; (x -= '0x10')",
+            "let x='9'; false && (x -= '3'); x",
         ]
         .map(str::to_owned),
     );

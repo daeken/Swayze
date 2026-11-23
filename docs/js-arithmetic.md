@@ -230,11 +230,10 @@ produce `StringConcatenationLengthLimitExceeded` and
 dispatch, comparison, and conversion budgets. Reached, nonempty concatenations
 may grow the scratch allocation fallibly. Empty or skipped concatenations do
 not allocate String storage. This scratch is not a GC heap. Mixed String/scalar
-`+` and `+=`, and binary `-` and `-=` on Strings, remain unsupported only when
-executed.
+`+` and `+=` remain unsupported only when executed.
 
-Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`, `<<`,
-`>>`, and `>>>` (including their compound assignments) convert Strings to
+Unary `+`, `-`, and `~` and binary `-`, `*`, `/`, `%`, `**`, `&`, `^`, `|`,
+`<<`, `>>`, and `>>>` (including their compound assignments) convert Strings to
 Numbers, as do the mixed numeric comparisons above and name updates with
 `++` and `--`. Conversion trims
 ECMAScript whitespace and line terminators, then accepts signed decimal and

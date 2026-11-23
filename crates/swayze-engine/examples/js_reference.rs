@@ -351,7 +351,9 @@ fn fixtures() -> Vec<String> {
             "let outer = 40; outer: do { for (;;) { outer++; continue outer; } } while (outer < 42); outer: while (false) {} outer",
             "let n = 40; done: { while (true) { n += 2; break done; } n = 0; } n",
             "let n = 0; for (let i = 0; i < 3; i++) { done: { while (true) { break done; } } n += 14; continue; } n",
-            "let n = 40; done: { doneInner: { break doneInner; n = 0; } n += 1; } done: { n += 1; break done; } n"
+            "let n = 40; done: { doneInner: { break doneInner; n = 0; } n += 1; } done: { n += 1; break done; } n",
+            "let n = 0; outer: again: for (let i = 0; i < 3; i++) { while (true) { n += 14; continue again; } } n",
+            "let n = 40; outer: done: { while (true) { n++; break outer; } n = 0; } done: outer: { n++; break done; } n"
         ]
         .map(str::to_owned),
     );

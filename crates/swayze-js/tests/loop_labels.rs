@@ -173,7 +173,6 @@ fn invalid_labels_and_static_targets_pin_error_spans() {
         ("while(true){a:}42", Malformed, "}"),
         ("a: /**/", Malformed, ""),
         ("a:if(true){}42", Unsupported, "if"),
-        ("a:b:while(false){}42", Unsupported, "b"),
         ("aé:while(false){}42", Unsupported, "é"),
         ("a\\u0030:while(false){}42", Unsupported, "\\"),
         ("eval:while(false){}42", Unsupported, "eval"),

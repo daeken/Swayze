@@ -287,6 +287,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         statement_frames: Vec::new(),
         innermost_loop: None,
         innermost_target: None,
+        labels: Vec::new(),
         for_header_scope: None,
         instructions: Vec::new(),
         scopes: Vec::new(),
@@ -1085,7 +1086,7 @@ enum StatementFrame {
     },
     Target {
         kind: TargetKind,
-        label: Option<Span>,
+        label_start: usize,
         enclosing_target: Option<usize>,
         // Head of a list threaded through unpatched break instructions.
         break_head: usize,
@@ -1136,6 +1137,9 @@ struct Parser<'s> {
     innermost_loop: Option<usize>,
     // Includes all loops and labeled standalone blocks, in nesting order.
     innermost_target: Option<usize>,
+    // Contiguous spans per target, plus any prefix currently being parsed.
+    // A target's closing brace truncates this Copy-only stack back to its start.
+    labels: Vec<Span>,
     // Only active while parsing a `for` declaration header and opening its body.
     // Once the body frame is pushed, its own scope links to this one.
     for_header_scope: Option<usize>,
@@ -1236,23 +1240,23 @@ impl Parser<'_> {
         Ok(id)
     }
 
-    fn open_statement(&mut self, first: Token, label: Option<Span>) -> Result<(), Error> {
+    fn open_statement(&mut self, first: Token, label_start: usize) -> Result<(), Error> {
         if self.statement_frames.len() == MAX_STATEMENT_FRAMES {
             return Err(Error {
                 message: "statement nesting ceiling exceeded",
-                ..Error::limit(label.unwrap_or(first.span), Limit::NestingDepth)
+                ..Error::limit(
+                    self.labels.get(label_start).copied().unwrap_or(first.span),
+                    Limit::NestingDepth,
+                )
             });
         }
-        if let Some(label) = label
-            && self.find_active_label(label)?.is_some()
-        {
-            return Err(Error::malformed(label, "duplicate active label"));
-        }
+        self.check_label_prefix(label_start)?;
         let (frame, missing_brace) = match first.kind {
             TokenKind::OpenBrace => {
-                let frame = match label {
-                    Some(label) => self.target_frame(TargetKind::Block, Some(label)),
-                    None => StatementFrame::Bare,
+                let frame = if label_start == self.labels.len() {
+                    StatementFrame::Bare
+                } else {
+                    self.target_frame(TargetKind::Block, label_start)
                 };
                 return self.open_block(frame, first.span);
             }
@@ -1272,19 +1276,19 @@ impl Parser<'_> {
                             continue_target: test,
                             exit,
                         },
-                        label,
+                        label_start,
                     ),
                     "expected '{' to open the while body",
                 )
             }
-            TokenKind::For => return self.open_for(label),
+            TokenKind::For => return self.open_for(label_start),
             TokenKind::Do => (
                 self.loop_frame(
                     LoopLayout::PostTest {
                         body_start: self.instructions.len(),
                         continue_head: UNPATCHED,
                     },
-                    label,
+                    label_start,
                 ),
                 "expected '{' to open the do body",
             ),
@@ -1348,7 +1352,7 @@ impl Parser<'_> {
                             statement: StatementFrame::IfAwaitJoin { join },
                             scope: parent,
                         };
-                        return self.open_statement(arm, None);
+                        return self.open_statement(arm, self.labels.len());
                     }
                     let brace = Self::block_open(arm, missing)?;
                     // Same control frame, disjoint lexical scope.
@@ -1372,14 +1376,15 @@ impl Parser<'_> {
             }
             StatementFrame::Target {
                 kind,
+                label_start,
                 enclosing_target,
                 break_head,
-                ..
             } => {
                 // A trailing test resolves names in the surrounding scope, not
                 // the just-closed body, even when entered by a continue.
                 self.statement_frames.pop();
                 self.innermost_target = enclosing_target;
+                self.labels.truncate(label_start);
                 if let TargetKind::Loop {
                     layout,
                     enclosing_loop,
@@ -1431,20 +1436,20 @@ impl Parser<'_> {
         self.patch_jump(at, span)
     }
 
-    fn loop_frame(&self, layout: LoopLayout, label: Option<Span>) -> StatementFrame {
+    fn loop_frame(&self, layout: LoopLayout, label_start: usize) -> StatementFrame {
         self.target_frame(
             TargetKind::Loop {
                 layout,
                 enclosing_loop: self.innermost_loop,
             },
-            label,
+            label_start,
         )
     }
 
-    fn target_frame(&self, kind: TargetKind, label: Option<Span>) -> StatementFrame {
+    fn target_frame(&self, kind: TargetKind, label_start: usize) -> StatementFrame {
         StatementFrame::Target {
             kind,
-            label,
+            label_start,
             enclosing_target: self.innermost_target,
             break_head: UNPATCHED,
         }
@@ -1472,8 +1477,8 @@ impl Parser<'_> {
         }
     }
 
-    fn open_for(&mut self, label: Option<Span>) -> Result<(), Error> {
-        let result = self.parse_for_header(label).and_then(|frame| {
+    fn open_for(&mut self, label_start: usize) -> Result<(), Error> {
+        let result = self.parse_for_header(label_start).and_then(|frame| {
             let brace = self.require_block_open("expected '{' to open the for body")?;
             self.open_block(frame, brace)
         });
@@ -1481,7 +1486,7 @@ impl Parser<'_> {
         result
     }
 
-    fn parse_for_header(&mut self, label: Option<Span>) -> Result<StatementFrame, Error> {
+    fn parse_for_header(&mut self, label_start: usize) -> Result<StatementFrame, Error> {
         let missing_open = "expected '(' after 'for'";
         let open = self.require_token(missing_open)?;
         if !matches!(open.kind, TokenKind::Open) {
@@ -1547,7 +1552,7 @@ impl Parser<'_> {
                 continue_target,
                 exit,
             },
-            label,
+            label_start,
         ))
     }
 
@@ -1665,7 +1670,7 @@ impl Parser<'_> {
             | TokenKind::If
             | TokenKind::While
             | TokenKind::For
-            | TokenKind::Do => self.open_statement(first, None)?,
+            | TokenKind::Do => self.open_statement(first, self.labels.len())?,
             TokenKind::Break | TokenKind::Continue => self.parse_statement_jump(&first)?,
             TokenKind::Update(op) => {
                 self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
@@ -1689,39 +1694,87 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    fn open_labeled_statement(&mut self, label: Span) -> Result<(), Error> {
+    fn open_labeled_statement(&mut self, mut label: Span) -> Result<(), Error> {
+        let label_start = self.labels.len();
         let missing = "expected a block or loop after the label";
-        let first = self.require_token(missing)?;
-        match first.kind {
-            TokenKind::OpenBrace | TokenKind::While | TokenKind::For | TokenKind::Do => {
-                self.open_statement(first, Some(label))
+        loop {
+            // Each stored span follows an already metered name and colon.
+            try_push(&mut self.labels, label, label)?;
+            let first = self.require_token(missing)?;
+            match first.kind {
+                TokenKind::OpenBrace | TokenKind::While | TokenKind::For | TokenKind::Do => {
+                    return self.open_statement(first, label_start);
+                }
+                TokenKind::CloseBrace => return Err(Error::malformed(first.span, missing)),
+                TokenKind::Identifier => {
+                    if let Some(Token {
+                        kind: TokenKind::Colon,
+                        ..
+                    }) = self.next_token()?
+                    {
+                        label = first.span;
+                        continue;
+                    }
+                }
+                _ => {}
             }
-            TokenKind::CloseBrace => Err(Error::malformed(first.span, missing)),
-            _ => Err(Error::unsupported(
+            return Err(Error::unsupported(
                 first.span,
                 "a label must directly precede a braced block or loop",
-            )),
+            ));
         }
     }
 
-    fn find_active_label(&mut self, name: Span) -> Result<Option<usize>, Error> {
-        // Include unlabeled loops as before, but skip frames that cannot be targets.
+    fn check_label_prefix(&mut self, start: usize) -> Result<(), Error> {
+        for index in start..self.labels.len() {
+            let name = self.labels[index];
+            // Preserve the first label's old cost. Charge each additional
+            // prefix entry's validation as well as the candidates it visits.
+            if index != start {
+                self.lexer.charge(1, name)?;
+            }
+            if self.has_label(name, start, index)? || self.find_active_label(name, start)?.is_some()
+            {
+                return Err(Error::malformed(name, "duplicate active label"));
+            }
+        }
+        Ok(())
+    }
+
+    fn has_label(&mut self, name: Span, start: usize, end: usize) -> Result<bool, Error> {
+        for index in (start..end).rev() {
+            self.lexer.charge(1, name)?;
+            if self.names_equal(name, self.labels[index])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn find_active_label(
+        &mut self,
+        name: Span,
+        mut label_end: usize,
+    ) -> Result<Option<usize>, Error> {
+        // Only active spans precede label_end: any pending prefix follows it.
+        // The first alias visit pays for its frame; unlabeled loops still
+        // charge one frame visit.
         let mut next = self.innermost_target;
         while let Some(index) = next {
-            self.lexer.charge(1, name)?;
             let StatementFrame::Target {
-                label,
+                label_start,
                 enclosing_target,
                 ..
             } = self.statement_frames[index].statement
             else {
                 unreachable!("active target chain must refer only to target frames");
             };
-            if let Some(label) = label
-                && self.names_equal(name, label)?
-            {
+            if label_start == label_end {
+                self.lexer.charge(1, name)?;
+            } else if self.has_label(name, label_start, label_end)? {
                 return Ok(Some(index));
             }
+            label_end = label_start;
             next = enclosing_target;
         }
         Ok(None)
@@ -1742,7 +1795,7 @@ impl Parser<'_> {
                     ));
                 }
                 let index = self
-                    .find_active_label(span)?
+                    .find_active_label(span, self.labels.len())?
                     .ok_or_else(|| Error::malformed(span, "jump target is not an active label"))?;
                 if is_continue
                     && matches!(

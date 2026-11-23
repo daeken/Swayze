@@ -24,7 +24,8 @@ pub struct Error {
 /// the depth differs from the frame's result arity (zero for void, one for i32),
 /// unless a missing result is supplied by an unreachable frame's implicit i32.
 /// `BranchTableArityMismatch` compares a `br_table` target's result arity to
-/// that of the first target.
+/// that of the first target. `InvalidStartSignature` reports the parameter
+/// count and result kind of a start target that is not `() -> ()`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -47,6 +48,7 @@ pub enum ErrorKind {
     DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
+    InvalidStartSignature { parameters: u32, result: ResultKind },
     TruncatedTableLimitsFlags,
     UnsupportedTableLimitsFlags { flags: u8 },
     InvalidTableLimits { minimum: u32, maximum: u32 },
@@ -216,6 +218,10 @@ impl fmt::Display for Error {
             DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
+            InvalidStartSignature { parameters, result } => write!(
+                f,
+                "start function must take no parameters and return void, found {parameters} parameters and {result} result"
+            ),
             TruncatedTableLimitsFlags => f.write_str("missing table limits flags"),
             UnsupportedTableLimitsFlags { flags } => {
                 write!(f, "unsupported table limits flags {flags:#04x}")
@@ -306,6 +312,9 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
+/// The start section checks its index and exact frame before requiring a
+/// `() -> ()` target. [`ErrorKind::InvalidStartSignature`] points to the start
+/// of the index and is reported only after other module checks pass.
 /// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
 /// (including the implicit function label) is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
@@ -355,6 +364,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
+    let mut start = None;
     let mut table_entries = None;
     let mut element_segments = Vec::new();
     let mut memory_bytes = None;
@@ -387,7 +397,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3..=7 | 9..=11) {
+        if id <= last_standard && matches!(id, 1 | 3..=11) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -411,6 +421,12 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             5 => memory_bytes = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
             7 => exports = validate_exports(&mut section, function_count)?,
+            8 => {
+                let offset = section.position();
+                let index =
+                    section.index(IntegerField::FunctionIndex, function_count.unwrap_or(0))?;
+                start = Some((index as usize, offset));
+            }
             9 => {
                 element_segments = validate_elements(
                     &mut section,
@@ -445,7 +461,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     }
     if has_function_sections {
         // The presence of all three sections makes the count and index checks
-        // above sufficient to associate each export and call with a validated body.
+        // above sufficient to associate exports, calls, and start with validated bodies.
         for (id, present) in [
             (1, type_count.is_some()),
             (3, function_count.is_some()),
@@ -456,9 +472,23 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
         }
     }
+    // Do not report a signature error for a placeholder type or mask malformed code.
+    let start_function = if let Some((index, offset)) = start {
+        let FunctionType { parameters, result } = function_types[index];
+        if parameters != 0 || result != ResultKind::Void {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::InvalidStartSignature { parameters, result },
+            });
+        }
+        Some(index)
+    } else {
+        None
+    };
     Ok(Module {
         functions,
         exports,
+        start_function,
         memory_bytes,
         table_entries,
         element_segments,
@@ -1031,14 +1061,13 @@ impl CallFrame {
     }
 }
 
-pub(super) fn execute(
+pub(super) fn invoke_index(
     instance: &Instance<'_>,
     function_index: usize,
     args: &[i32],
     expected: ResultKind,
 ) -> Result<Option<i32>, InvokeError> {
-    let module = instance.module;
-    let signature = module.functions[function_index].signature;
+    let signature = instance.module.functions[function_index].signature;
     let parameter_count = signature.parameters as usize;
     if args.len() != parameter_count {
         return Err(InvokeError::ArityMismatch {
@@ -1050,13 +1079,32 @@ pub(super) fn execute(
     if actual != expected {
         return Err(InvokeError::ResultMismatch { expected, actual });
     }
+    execute(instance, function_index, args).map_err(|error| match error {
+        ExecutionError::Trap(trap) => InvokeError::Trap(trap),
+        ExecutionError::LimitExceeded { limit } => InvokeError::LimitExceeded { limit },
+    })
+}
+
+pub(super) enum ExecutionError {
+    Trap(Trap),
+    LimitExceeded { limit: ExecutionLimit },
+}
+
+// The caller has already checked the entry function's signature, either when
+// validating the start section or when invoking a typed export.
+pub(super) fn execute(
+    instance: &Instance<'_>,
+    function_index: usize,
+    args: &[i32],
+) -> Result<Option<i32>, ExecutionError> {
+    let module = instance.module;
     let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
     frames[0] = CallFrame::new(function_index, args);
     let mut active = 0;
     let mut remaining_dispatches = ExecutionLimit::InstructionDispatches.maximum();
     loop {
         let frame = &mut frames[active];
-        // Export and call indices are bounded by the exact decoded body count.
+        // Start, export and call indices are bounded by the exact decoded body count.
         let code = &module.functions[frame.function_index];
         let Some(&instruction) = code.instructions.get(frame.pc) else {
             // Fallthrough and function exits leave exactly the declared results
@@ -1077,14 +1125,14 @@ pub(super) fn execute(
             continue;
         };
         if remaining_dispatches == 0 {
-            return Err(InvokeError::LimitExceeded {
+            return Err(ExecutionError::LimitExceeded {
                 limit: ExecutionLimit::InstructionDispatches,
             });
         }
         remaining_dispatches -= 1;
         frame.pc += 1;
         match instruction {
-            Instruction::Unreachable => return Err(InvokeError::Trap(Trap::Unreachable)),
+            Instruction::Unreachable => return Err(ExecutionError::Trap(Trap::Unreachable)),
             Instruction::Nop => {}
             Instruction::Drop => {
                 frame.pop();
@@ -1112,15 +1160,15 @@ pub(super) fn execute(
                         let table = instance.table.as_ref().expect("validated table presence");
                         let index = table
                             .resolve(frame.pop() as u32)
-                            .map_err(InvokeError::Trap)?;
+                            .map_err(ExecutionError::Trap)?;
                         if module.functions[index].signature != expected {
-                            return Err(InvokeError::Trap(Trap::IndirectCallTypeMismatch));
+                            return Err(ExecutionError::Trap(Trap::IndirectCallTypeMismatch));
                         }
                         index
                     }
                 };
                 if active + 1 == ExecutionLimit::CallDepth.maximum() {
-                    return Err(InvokeError::LimitExceeded {
+                    return Err(ExecutionError::LimitExceeded {
                         limit: ExecutionLimit::CallDepth,
                     });
                 }
@@ -1139,14 +1187,14 @@ pub(super) fn execute(
             Instruction::Binary(op) => {
                 let rhs = frame.pop();
                 let lhs = &mut frame.operands[frame.depth - 1];
-                *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
+                *lhs = op.apply(*lhs, rhs).map_err(ExecutionError::Trap)?;
             }
             Instruction::LoadI32 { kind, offset } => {
                 let address_and_result = &mut frame.operands[frame.depth - 1];
                 *address_and_result = instance
                     .memory
                     .load_i32(*address_and_result, offset, kind)
-                    .map_err(InvokeError::Trap)?;
+                    .map_err(ExecutionError::Trap)?;
             }
             Instruction::StoreI32 { width, offset } => {
                 let value = frame.pop();
@@ -1154,7 +1202,7 @@ pub(super) fn execute(
                 instance
                     .memory
                     .store_i32(address, offset, width, value)
-                    .map_err(InvokeError::Trap)?;
+                    .map_err(ExecutionError::Trap)?;
             }
             Instruction::MemorySize => frame.push(instance.memory.size_in_pages()),
             Instruction::JumpIfZero { target } => {

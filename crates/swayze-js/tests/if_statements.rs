@@ -17,6 +17,40 @@ fn runs_only_the_selected_assignments_in_source_order() {
 }
 
 #[test]
+fn else_if_selects_the_first_truthy_test_or_the_optional_else() {
+    for (first, second, third, fallback, expected) in [
+        ("true", "true", "true", true, 1.0),
+        ("null", "42", "true", true, 2.0),
+        ("null", "undefined", "!0", false, 3.0),
+        ("null", "0", "false", true, 4.0),
+        ("null", "0", "false", false, 0.0),
+    ] {
+        let fallback = if fallback { "else { x=4; }" } else { "" };
+        let source = format!(
+            "let x=0; if ({first}) {{ x=1; }} else /*\n*/ if ({second}) {{ x=2; }}
+             else // comment\u{2028} if ({third}) {{ x=3; }} {fallback} x"
+        );
+        assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(expected));
+    }
+}
+
+#[test]
+fn else_if_tests_see_the_enclosing_scope_and_arms_have_disjoint_shadows() {
+    for (gate, expected) in [(1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)] {
+        let source = format!(
+            "const key=0; let result=0;
+             {{ let key={gate};
+                if (key===1) {{ const key=10; result=key; }}
+                else if (key===2) {{ let key=20; result=key; }}
+                else if (key===3) {{ const key=30; result=key; }}
+                else {{ let key=40; result=key; }}
+             }} result + key"
+        );
+        assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(expected));
+    }
+}
+
+#[test]
 fn missing_else_and_empty_branches_do_not_write() {
     for (source, expected) in [
         ("let x=1; if (true) {x=5;} x", 5.0),
@@ -124,12 +158,19 @@ fn delimiters_and_the_required_final_expression() {
         ("let x=0; if (true) x=1; x", Malformed),
         ("let x=0; if (true) {} else x=1; x", Malformed),
         ("if (true) {} else", Malformed),
+        ("if (true) {} else if false {} 1", Malformed),
+        ("if (true) {} else if (false) ; 1", Malformed),
+        ("let x=0; if (true) {} else if (false) x=1; x", Malformed),
+        ("if (true) {} else if (false)", Malformed),
+        ("if (true) {} else if (false) {} else 1", Malformed),
         ("if (true) {", Malformed),
         ("if (true) {}", Unsupported),
         ("let x=0; if (true) {x=2;}", Unsupported),
         ("if (true) {}; else {} 1", Unsupported),
         ("else {} 1", Unsupported),
         ("if (true) {} else {} else {} 1", Unsupported),
+        ("if (true) {} else if (false) {}; else {} 1", Unsupported),
+        ("if (true) {} else if (false) {} else", Malformed),
         ("1; if (true) {}", Unsupported),
         ("if (true) {} 1; 2", Unsupported),
         ("let x=0; if (true) {} x; x=2;", Unsupported),
@@ -139,7 +180,8 @@ fn delimiters_and_the_required_final_expression() {
     ] {
         assert_eq!(parse_script(source).unwrap_err().kind(), kind, "{source}");
     }
-    let source = "if (false) {} else if (true) {} 1";
+    // An unbraced nested `if` is still disallowed unless it follows `else`.
+    let source = "if (false) {} else if (true) if (false) {} 1";
     let error = parse_script(source).unwrap_err();
     let start = source.rfind("if").unwrap();
     assert_eq!(error.kind(), Unsupported);
@@ -150,11 +192,11 @@ fn delimiters_and_the_required_final_expression() {
             end: start + 2
         }
     );
-    assert!(error.message().contains("else if"));
+    assert!(error.message().contains("require braces"));
 }
 
 #[test]
-fn validates_both_bodies_even_when_untaken() {
+fn validates_all_bodies_even_when_untaken() {
     use ErrorKind::{Malformed, Unsupported};
     for (body, kind) in [
         ("missing=1;", Unsupported),
@@ -175,10 +217,45 @@ fn validates_both_bodies_even_when_untaken() {
         for statement in [
             format!("if (false) {{{body}}}"),
             format!("if (true) {{}} else {{{body}}}"),
+            format!("if (true) {{}} else if (true) {{{body}}} else {{}}"),
+            format!("if (true) {{}} else if (false) {{}} else {{{body}}}"),
         ] {
             let source = format!("let x=0; const c=2; {statement} let later=1; x");
             assert_eq!(parse_script(&source).unwrap_err().kind(), kind, "{source}");
         }
+    }
+}
+
+#[test]
+fn validates_untaken_else_if_tests_and_rejects_arm_local_accesses() {
+    for name in ["missing", "prior", "own", "later"] {
+        let prefix = "if (true) { let prior=1; } else if (";
+        let source = format!("{prefix}{name}) {{ let own=1; }} let later=1; 42");
+        let error = parse_script(&source).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{source}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start: prefix.len(),
+                end: prefix.len() + name.len(),
+            },
+            "{source}"
+        );
+    }
+    for (source, name) in [
+        (
+            "if (true) {} else if (false) { let hidden=1; } hidden",
+            "hidden",
+        ),
+        (
+            "let x=1; if (true) {} else if (false) { x=2; let x=3; } x",
+            "x=2",
+        ),
+    ] {
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{source}");
+        let start = source.rfind(name).unwrap();
+        assert_eq!(error.span().start, start, "{source}");
     }
 }
 
@@ -192,6 +269,7 @@ fn condition_parentheses_and_untaken_expressions_share_the_nesting_limit() {
     for source in [
         "if ((true)) {} 1",
         "if (true ? false : true) {} 1",
+        "if (true) {} else if ((false)) {} 1",
         "let x=1; if (false) {x=((0));} x",
     ] {
         assert_eq!(
@@ -220,6 +298,139 @@ fn instructions_in_both_branches_count_toward_the_evaluation_ceiling() {
             let script = parse_script_with_limits(&source, limits).unwrap();
             assert_eq!(script.instruction_count(), 4096 + extra);
             assert_eq!(script.evaluate(), expected);
+        }
+    }
+}
+
+#[test]
+fn skipped_else_if_tests_also_count_toward_the_prepared_instruction_ceiling() {
+    let limits = Limits {
+        max_tokens: 4200,
+        ..Limits::default()
+    };
+    for (extra, expected) in [(0, Ok(42.0)), (1, Err(EvalError::LimitExceeded))] {
+        let source = format!(
+            "let x=42;if(true){{}}else if({}false){{}}else if(false){{}}x",
+            "!".repeat(4085 + extra)
+        );
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 4096 + extra);
+        assert_eq!(script.evaluate(), expected);
+    }
+}
+
+#[test]
+fn else_if_dispatches_only_reached_tests_and_one_join_per_selected_arm() {
+    // Each iteration costs 12: outer test (2), first and second if tests
+    // (2 each), decrement (4), jump to the join (1), and back edge (1).
+    // Initialization, the final loop test, and the result load cost 5 more.
+    for (prefixes, expected) in [(11, Ok(0.0)), (12, Err(EvalError::DispatchLimitExceeded))] {
+        let source = format!(
+            "let n=1364;while(n){{if(false){{}}else if(true){{n--;}}else if(true){{}}else{{}}}}{}n",
+            "+ ".repeat(prefixes)
+        );
+        assert_eq!(parse_script(&source).unwrap().evaluate(), expected);
+    }
+}
+
+#[test]
+fn else_if_counts_each_tested_arm_against_the_shared_frame_cap() {
+    let chain = format!("if(false){{}}{}", "else if(false){}".repeat(127));
+    let limits = Limits {
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for fallback in ["", "else{}"] {
+        // The optional final else reuses the last if frame, and subsequent
+        // statements can reuse all the frames after the chain joins.
+        let source = format!("{chain}{fallback}{chain}{fallback}42");
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.evaluate(), Ok(42.0));
+    }
+    let prefix = format!("{chain}else ");
+    // An enclosing loop and bare block leave room for only 126 tested arms.
+    let nested = format!(
+        "while(false){{{{if(false){{}}{}",
+        "else if(false){}".repeat(125)
+    );
+    assert!(parse_script_with_limits(&format!("{nested}}}}}42"), limits).is_ok());
+    for (source, start, len) in [
+        (format!("{prefix}if(true){{}}42"), prefix.len(), 2),
+        (
+            format!("{chain}else{{{{}}}}42"),
+            chain.len() + "else{".len(),
+            1,
+        ),
+        (
+            format!("{nested}else if(true){{}}}}}}42"),
+            nested.len() + "else ".len(),
+            2,
+        ),
+    ] {
+        let error = parse_script_with_limits(&source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + len
+            }
+        );
+        assert!(error.message().contains("statement nesting"));
+    }
+}
+
+#[test]
+fn else_if_meters_all_frames_tests_and_fixups_once() {
+    for arms in [2, 128] {
+        let source = format!(
+            "if(true){{}}{}else{{}}true",
+            "else if(false){}".repeat(arms - 1)
+        );
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 6 + (arms - 1) * 7 + 3 + 1,
+            max_nesting_depth: 1,
+            // Per tested arm: a paren marker, a frame, three emissions,
+            // and two jump patches. Finally, one result emission.
+            max_work: source.len() + 7 * arms + 1,
+        };
+        assert_eq!(
+            parse_script_with_limits(&source, limits)
+                .unwrap()
+                .evaluate_value(),
+            Ok(Value::Boolean(true))
+        );
+        // Exhaust the work meter at the last join patch, not while emitting
+        // an instruction or scanning the following expression.
+        let close = source.rfind('}').unwrap();
+        for (kind, span, limits) in [
+            (
+                Limit::Work,
+                Span {
+                    start: close,
+                    end: close + 1,
+                },
+                Limits {
+                    max_work: close + 7 * arms,
+                    ..limits
+                },
+            ),
+            (
+                Limit::Tokens,
+                Span {
+                    start: close + 1,
+                    end: close + 2,
+                },
+                Limits {
+                    max_tokens: limits.max_tokens - 1,
+                    ..limits
+                },
+            ),
+        ] {
+            let error = parse_script_with_limits(&source, limits).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(kind));
+            assert_eq!(error.span(), span);
         }
     }
 }

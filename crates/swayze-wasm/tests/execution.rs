@@ -43,6 +43,8 @@ mod i64_operands;
 mod i64_signatures;
 #[path = "execution/if_branch.rs"]
 mod if_branch;
+#[path = "execution/int_to_float.rs"]
+mod int_to_float;
 #[path = "execution/memory.rs"]
 mod memory;
 #[path = "execution/stack.rs"]
@@ -2268,14 +2270,14 @@ fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1a,
-            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0xac, 0xad, 0xb6,
+            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0xac, 0xad,
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)
             && !(0x41..=0x91).contains(&opcode)
             && !(0x96..=0x9f).contains(&opcode)
             && !(0xa4..=0xa7).contains(&opcode)
-            && !(0xbb..=0xbf).contains(&opcode)
+            && !(0xb2..=0xbf).contains(&opcode)
         {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],

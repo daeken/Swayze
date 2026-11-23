@@ -1120,10 +1120,39 @@ impl Operand {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum IntegerSource {
+    I32S,
+    I32U,
+    I64S,
+    I64U,
+}
+
+impl IntegerSource {
+    fn operand_type(self) -> ValType {
+        match self {
+            Self::I32S | Self::I32U => ValType::I32,
+            Self::I64S | Self::I64U => ValType::I64,
+        }
+    }
+
+    fn magnitude_and_sign(self, value: Operand) -> (u64, bool) {
+        let signed = match self {
+            Self::I32S => i64::from(value.as_i32()),
+            Self::I32U => return (u64::from(value.as_i32() as u32), false),
+            Self::I64S => value.as_i64(),
+            Self::I64U => return (value.as_i64() as u64, false),
+        };
+        // unsigned_abs also gives the exact magnitude of i64::MIN.
+        (signed.unsigned_abs(), signed < 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum Conversion {
     WrapI64,
     ExtendI32S,
     ExtendI32U,
+    IntToFloat(IntegerSource, FloatWidth),
     DemoteF64,
     PromoteF32,
     I32ReinterpretF32,
@@ -1138,6 +1167,7 @@ impl Conversion {
         match self {
             Self::WrapI64 => (I64, I32),
             Self::ExtendI32S | Self::ExtendI32U => (I32, I64),
+            Self::IntToFloat(source, width) => (source.operand_type(), width.operand_type()),
             Self::DemoteF64 => (F64, F32),
             Self::PromoteF32 => (F32, F64),
             Self::I32ReinterpretF32 => (F32, I32),
@@ -1152,6 +1182,14 @@ impl Conversion {
             Self::WrapI64 => Operand::I32(value.as_i64() as i32),
             Self::ExtendI32S => Operand::I64(i64::from(value.as_i32())),
             Self::ExtendI32U => Operand::I64(i64::from(value.as_i32() as u32)),
+            Self::IntToFloat(source, width) => {
+                let (magnitude, negative) = source.magnitude_and_sign(value);
+                let bits = integer_to_float_bits(magnitude, negative, width);
+                match width {
+                    FloatWidth::F32 => Operand::F32(bits as u32),
+                    FloatWidth::F64 => Operand::F64(bits),
+                }
+            }
             Self::DemoteF64 => Operand::F32(demote_f64_bits(value.f64_bits())),
             Self::PromoteF32 => Operand::F64(promote_f32_bits(value.f32_bits())),
             Self::I32ReinterpretF32 => Operand::I32(value.f32_bits() as i32),
@@ -1168,6 +1206,38 @@ const F32_INFINITY: u32 = 0x7f80_0000;
 const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
 const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
 const F64_CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+fn integer_to_float_bits(magnitude: u64, negative: bool, width: FloatWidth) -> u64 {
+    if magnitude == 0 {
+        return 0; // Integer zero always produces +0.
+    }
+    let (fraction_bits, bias, sign) = match width {
+        FloatWidth::F32 => (23, 127, u64::from(F32_SIGN)),
+        FloatWidth::F64 => (52, 1023, F64_SIGN),
+    };
+    let exponent = magnitude.ilog2(); // 0..=63: all nonzero results are normal.
+    let significand = if exponent <= fraction_bits {
+        // Exact: shift left at most 52 places, to put the leading one at fraction_bits.
+        magnitude << (fraction_bits - exponent)
+    } else {
+        // Round once, dropping 1..=40 bits for f32 or 1..=11 for f64.
+        round_shift_ties_even(magnitude, exponent - fraction_bits)
+    };
+    // Remove the leading one. Addition propagates a rounding carry into the
+    // exponent field. The resulting exponent is at most 64, so never infinity.
+    let magnitude =
+        (u64::from(exponent + bias) << fraction_bits) + (significand - (1 << fraction_bits));
+    magnitude | if negative { sign } else { 0 }
+}
+
+// Round value / 2^shift to nearest, ties to even. Callers require 0 < shift < 64.
+fn round_shift_ties_even(value: u64, shift: u32) -> u64 {
+    let truncated = value >> shift;
+    let discarded = value & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    let round_up = discarded > half || (discarded == half && truncated & 1 != 0);
+    truncated + u64::from(round_up)
+}
 
 fn promote_f32_bits(bits: u32) -> u64 {
     let sign = u64::from(bits & F32_SIGN) << 32;
@@ -1220,12 +1290,8 @@ fn demote_f64_bits(bits: u64) -> u32 {
     // -150..=-127 round in units of 2^-149 instead (shift 30..=53).
     // All shifts (including midpoint and mask) are below the u64 width.
     let significand = (1 << 52) | (magnitude & ((1 << 52) - 1));
-    let shift = 29 + (-126 - exponent).max(0);
-    let truncated = significand >> shift;
-    let discarded = significand & ((1 << shift) - 1);
-    let half = 1 << (shift - 1);
-    let round_up = discarded > half || (discarded == half && truncated & 1 != 0);
-    let rounded = truncated as u32 + u32::from(round_up);
+    let shift = 29 + (-126 - exponent).max(0) as u32;
+    let rounded = round_shift_ties_even(significand, shift) as u32;
     let magnitude = if exponent < -126 {
         // At most 2^23: a carry out of the fraction encodes the least normal.
         rounded
@@ -2686,7 +2752,15 @@ fn decode_plain(
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),
+        0xb2 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32S, FloatWidth::F32)),
+        0xb3 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32U, FloatWidth::F32)),
+        0xb4 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64S, FloatWidth::F32)),
+        0xb5 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64U, FloatWidth::F32)),
         0xb6 => Instruction::Convert(Conversion::DemoteF64),
+        0xb7 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32S, FloatWidth::F64)),
+        0xb8 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32U, FloatWidth::F64)),
+        0xb9 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64S, FloatWidth::F64)),
+        0xba => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64U, FloatWidth::F64)),
         0xbb => Instruction::Convert(Conversion::PromoteF32),
         0xbc => Instruction::Convert(Conversion::I32ReinterpretF32),
         0xbd => Instruction::Convert(Conversion::I64ReinterpretF64),

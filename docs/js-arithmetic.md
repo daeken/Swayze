@@ -214,13 +214,15 @@ with Numbers or Booleans, mixed String/scalar ordering, concatenation and
 updates on Strings are unsupported. An unsupported String operation is an
 evaluation error only when it executes.
 
-Unary `+` converts a String to a Number. It trims ECMAScript whitespace and
-line terminators, then accepts signed decimal and `Infinity` forms and
-unsigned `0x`, `0o`, and `0b` integers. Empty text becomes `+0`, negative
-zero is preserved, and invalid numeric text produces NaN rather than a
-parse error. Decimal parsing rounds the full magnitude to binary64 through
-the pinned Rust parser; radix conversion rounds directly from integer digits.
-No other operator performs this conversion yet.
+Unary `+`, `-`, and `~` convert a String to a Number. Conversion trims
+ECMAScript whitespace and line terminators, then accepts signed decimal and
+`Infinity` forms and unsigned `0x`, `0o`, and `0b` integers. Empty text becomes
+`+0`, negative zero is preserved, and invalid numeric text produces NaN rather
+than a parse error. Decimal parsing rounds the full magnitude to binary64
+through the pinned Rust parser; radix conversion rounds directly from integer
+digits. Unary `-` then negates the Number, and `~` applies bitwise NOT after
+converting the rounded Number to a signed 32-bit integer. Binary operators
+and updates do not perform this String-to-Number conversion yet.
 
 Each evaluation has 262,144 conversion credits, separate from comparison
 and dispatch limits. A reached String conversion charges `1 + original

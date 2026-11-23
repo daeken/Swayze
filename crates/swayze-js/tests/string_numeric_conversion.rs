@@ -2,11 +2,15 @@ use swayze_js::{
     ErrorKind, EvalError, Limit, Limits, Value, parse_script, parse_script_with_limits,
 };
 
-fn positive(text: &str) -> f64 {
-    parse_script(&format!("+'{text}'"))
-        .unwrap_or_else(|err| panic!("{text:?}: {err}"))
+fn unary(op: &str, text: &str) -> f64 {
+    parse_script(&format!("{op}'{text}'"))
+        .unwrap_or_else(|err| panic!("{op}{text:?}: {err}"))
         .evaluate()
         .unwrap()
+}
+
+fn positive(text: &str) -> f64 {
+    unary("+", text)
 }
 
 fn assert_bits(text: &str, expected: f64) {
@@ -67,6 +71,62 @@ fn converts_only_the_numeric_text_produced_by_the_operand() {
     assert_eq!(script.evaluate(), Ok(43.0));
     let script = parse_script("const x = '42'; +x, x").unwrap();
     assert_eq!(script.evaluate(), Err(EvalError::NonNumericResult));
+}
+
+#[test]
+fn unary_minus_negates_the_rounded_number_including_signed_zeros() {
+    for (text, number) in [
+        ("", 0.0),
+        ("+0", 0.0),
+        ("-0", -0.0),
+        ("+1e-9999", 0.0),
+        ("-1e-9999", -0.0),
+        ("-2.4703282292062328e-324", -f64::from_bits(1)),
+        ("+Infinity", f64::INFINITY),
+        ("-Infinity", f64::NEG_INFINITY),
+        ("0x20000000000003", 9_007_199_254_740_996.0),
+    ] {
+        assert_bits(text, number);
+        assert_eq!(unary("-", text).to_bits(), (-number).to_bits(), "{text:?}");
+    }
+    for text in ["NaN", "+NaN", "-NaN", "-0x1", "1e+", r"\uD800"] {
+        assert!(positive(text).is_nan(), "{text:?}");
+        assert!(unary("-", text).is_nan(), "{text:?}");
+        assert_eq!(unary("~", text), -1.0, "{text:?}");
+    }
+}
+
+#[test]
+fn bitwise_not_uses_to_int32_of_the_rounded_number() {
+    for (text, expected) in [
+        ("-0", -1.0),
+        ("+Infinity", -1.0),
+        ("-Infinity", -1.0),
+        ("2147483647", -2_147_483_648.0),
+        ("2147483648", 2_147_483_647.0),
+        ("4294967296", -1.0),
+        ("4294967297.9", -2.0),
+        ("-4294967297.9", 0.0),
+        ("9007199254740993", -1.0), // Rounds down to 2^53 before wrapping.
+        ("9007199254740995", -5.0), // Rounds up to 2^53 + 4.
+        ("0x20000000000003", -5.0),
+    ] {
+        assert_eq!(
+            unary("~", text).to_bits(),
+            f64::to_bits(expected),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn unary_conversions_evaluate_operands_once_in_source_order() {
+    let script = parse_script(
+        "let x = '2', n = 0; const result = -(n++, x) + ~(n++, x = '4'); \
+         n === 2 && x === '4' ? result : 0",
+    )
+    .unwrap();
+    assert_eq!(script.evaluate(), Ok(-7.0));
 }
 
 #[test]
@@ -140,10 +200,14 @@ fn rejects_non_numeric_text_without_widening_source_syntax() {
     ] {
         assert!(parse_script(source).is_err(), "{source:?}");
     }
-    assert_eq!(
-        parse_script(r"false && +'\u{}'").unwrap_err().kind(),
-        ErrorKind::Malformed
-    );
+    for op in ["+", "-", "~"] {
+        assert_eq!(
+            parse_script(&format!(r"false && {op}'\u{{}}'"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Malformed
+        );
+    }
 }
 
 #[test]
@@ -245,24 +309,24 @@ fn exact_literal_bound_and_unchanged_scalar_costs() {
         max_work: 6,
         ..Limits::default()
     };
-    assert_eq!(
-        parse_script_with_limits("+1", scalar_limits)
-            .unwrap()
-            .evaluate(),
-        Ok(1.0)
-    );
     let one_short = Limits {
         max_work: 5,
         ..scalar_limits
     };
-    assert_eq!(
-        parse_script_with_limits("+1", one_short)
-            .unwrap_err()
-            .kind(),
-        ErrorKind::LimitExceeded(Limit::Work),
-    );
-    let exact = format!("let n = 0; while (n++ < 3274) {{}} {}0", "+ ".repeat(7));
-    assert_eq!(parse_script(&exact).unwrap().evaluate(), Ok(0.0));
+    for (source, expected) in [("+1", 1.0), ("-1", -1.0), ("~1", -2.0)] {
+        let script = parse_script_with_limits(source, scalar_limits).unwrap();
+        assert_eq!(script.instruction_count(), 2);
+        assert_eq!(script.evaluate(), Ok(expected));
+        assert_eq!(
+            parse_script_with_limits(source, one_short)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::LimitExceeded(Limit::Work),
+        );
+    }
+    // The final literal and seven unary instructions use exactly the dispatches left.
+    let exact = "let n = 0; while (n++ < 3274) {} + - ~ + - ~ +0";
+    assert_eq!(parse_script(exact).unwrap().evaluate(), Ok(2.0));
     assert_eq!(
         parse_script(&format!("{exact}, 0")).unwrap().evaluate(),
         Err(EvalError::DispatchLimitExceeded)
@@ -279,11 +343,14 @@ fn exact_conversion_budget_is_shared_inclusive_and_fresh() {
     // 195 + 256 + 3*191 = 1,024; whitespace 4.
     let prefix = format!(
         "const r = '{radix}', d = '{decimal}', x = '{nonnumeric}'; let i = 0; \
-         while (i++ < 64) {{ +r; +d; +x; +'   '; }} "
+         while (i++ < 64) {{ +r; -d; ~x; ~'   '; }} "
     );
     // At exactly 262,144 credits, all three calls get their own budget;
-    // comparison, plain String operands and scalar plus don't charge it.
-    let exact = parse_script(&format!("{prefix}x === x && x > '' ? (void x, +42) : 0")).unwrap();
+    // comparison, plain String operands and scalar unary operations don't charge it.
+    let exact = parse_script(&format!(
+        "{prefix}x === x && x > '' ? (void x, + - ~41) : 0"
+    ))
+    .unwrap();
     for _ in 0..2 {
         assert_eq!(exact.evaluate(), Ok(42.0));
         assert_eq!(exact.evaluate_value(), Ok(Value::Number(42.0)));
@@ -293,17 +360,19 @@ fn exact_conversion_budget_is_shared_inclusive_and_fresh() {
         );
     }
     let skipped = parse_script(&format!(
-        "{prefix}let s = 0; if (false) {{ +'0'; }} while (false) {{ +'0'; }} \
-         for (; false; +'0') {{}} false && +'0'; true || +''; '' ?? +''; \
-         s &&= +''; s ??= +''; true ? 42 : +''"
+        "{prefix}let s = 0; if (false) {{ -'0'; }} while (false) {{ +'0'; }} \
+         for (; false; ~'0') {{}} false && -'0'; true || ~''; '' ?? +''; \
+         s &&= -''; s ??= ~''; true ? 42 : +''"
     ))
     .unwrap();
     assert_eq!(skipped.evaluate(), Ok(42.0));
-    let over = parse_script(&format!("{prefix}+''")).unwrap();
     let error = EvalError::StringNumericConversionLimitExceeded;
-    assert_eq!(over.evaluate(), Err(error));
-    assert_eq!(over.evaluate_value(), Err(error));
-    assert_eq!(over.evaluate_primitive(), Err(error));
+    for op in ["+", "-", "~"] {
+        let over = parse_script(&format!("{prefix}{op}''")).unwrap();
+        assert_eq!(over.evaluate(), Err(error));
+        assert_eq!(over.evaluate_value(), Err(error));
+        assert_eq!(over.evaluate_primitive(), Err(error));
+    }
 }
 
 #[test]
@@ -327,20 +396,28 @@ fn sign_only_candidate_must_pay_the_surcharge_before_returning_nan() {
 
 #[test]
 fn dispatch_precedes_conversion_and_comparisons_have_an_independent_budget() {
-    // 64 * (4094 + 1) + 64 conversion credits, then launch a dispatch-only loop.
-    let prefix = format!(
-        "const x = '{}'; let i = 0; while (i++ < 64) {{ +x; }} +'{}'; \
-         let k = 0; while (k++ < 3170) {{}} ",
-        " ".repeat(4094),
-        " ".repeat(63)
-    );
-    for (pad, expected) in [
-        ("+0", EvalError::StringNumericConversionLimitExceeded),
-        ("+ +0", EvalError::DispatchLimitExceeded),
-    ] {
-        // Only the extra scalar `+` pushes the final unary `+` past dispatch 16,384.
-        let script = parse_script(&format!("{prefix}{pad}; +''")).unwrap();
-        assert_eq!(script.evaluate(), Err(expected));
+    for padding in [62, 63] {
+        // 64 * (4094 + 1) + (padding + 1) credits, leaving either one or zero.
+        let prefix = format!(
+            "const x = '{}'; let i = 0; while (i++ < 64) {{ +x; }} +'{}'; \
+             let k = 0; while (k++ < 3170) {{}} ",
+            " ".repeat(4094),
+            " ".repeat(padding)
+        );
+        for (op, expected) in [("+", 0.0), ("-", -0.0), ("~", -1.0)] {
+            let exact = parse_script(&format!("{prefix}+0; {op}''")).unwrap();
+            if padding == 62 {
+                assert_eq!(exact.evaluate().unwrap().to_bits(), f64::to_bits(expected));
+            } else {
+                assert_eq!(
+                    exact.evaluate(),
+                    Err(EvalError::StringNumericConversionLimitExceeded)
+                );
+            }
+            // Only the extra scalar `+` pushes the final conversion past dispatch 16,384.
+            let over = parse_script(&format!("{prefix}+ +0; {op}''")).unwrap();
+            assert_eq!(over.evaluate(), Err(EvalError::DispatchLimitExceeded));
+        }
     }
     let prefix = format!(
         "const x = '{}'; let i = 0; while (i++ < 64) {{ x === x; }} ",

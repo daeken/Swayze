@@ -397,16 +397,14 @@ fn mixed_string_relations_are_unsupported_only_when_reached() {
 #[test]
 fn unsupported_operations_fail_only_when_dispatched() {
     for expr in [
-        "-''",
-        "~''",
         "'a' + 'b'",
-        "1 + ''",
-        "'' - 1",
+        "1 + '2'",
+        "'2' - 1",
         "1 * ''",
         "'' / 1",
         "'' % 1",
         "1 ** ''",
-        "'' & 1",
+        "'2' & 1",
         "1 ^ ''",
         "'' | 1",
         "'' << 1",
@@ -428,8 +426,8 @@ fn unsupported_operations_fail_only_when_dispatched() {
     }
     for update in ["x++", "++x", "x--", "--x"] {
         for source in [
-            format!("let x = ''; {update}; 0"),
-            format!("let x = ''; ({update})"),
+            format!("let x = '2'; {update}; 0"),
+            format!("let x = '2'; ({update})"),
         ] {
             assert_eq!(
                 parse_script(&source).unwrap().evaluate(),
@@ -441,8 +439,8 @@ fn unsupported_operations_fail_only_when_dispatched() {
         "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
     ] {
         for source in [
-            format!("let x = ''; x {op} 1; 0"),
-            format!("let x = 1; (x {op} '')"),
+            format!("let x = '2'; x {op} 1; 0"),
+            format!("let x = 1; (x {op} '2')"),
         ] {
             assert_eq!(
                 parse_script(&source).unwrap().evaluate(),

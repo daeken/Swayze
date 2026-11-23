@@ -54,6 +54,16 @@ impl Operand {
         }
     }
 
+    fn to_number(self, string_units: &[u16], credits_left: &mut usize) -> Result<f64, EvalError> {
+        match self {
+            Self::Scalar(value) => Ok(value.to_number()),
+            Self::String(range) => {
+                let units = range.get(string_units).ok_or(EvalError::InvalidScript)?;
+                string_number::convert(units, credits_left)
+            }
+        }
+    }
+
     fn to_boolean(self) -> bool {
         match self {
             Self::Scalar(value) => value.to_boolean(),
@@ -73,24 +83,11 @@ impl Value {
     }
 
     fn to_uint32(self) -> u32 {
-        const MODULUS: f64 = 4_294_967_296.0; // 2^32
-        let number = self.to_number();
-        if !number.is_finite() {
-            return 0;
-        }
-        // Reduce the represented Number, not its source literal. The truncated
-        // integer's remainder is exact: the modulus is a power of two, and
-        // both the remainder and its nonnegative residue fit exactly in f64.
-        let remainder = number.trunc() % MODULUS;
-        (if remainder < 0.0 {
-            remainder + MODULUS
-        } else {
-            remainder
-        }) as u32
+        number_to_uint32(self.to_number())
     }
 
     fn to_int32(self) -> i32 {
-        self.to_uint32() as i32 // Interpret the same bits as a signed integer.
+        number_to_int32(self.to_number())
     }
 
     fn to_boolean(self) -> bool {
@@ -123,6 +120,26 @@ impl Value {
     }
 }
 
+fn number_to_uint32(number: f64) -> u32 {
+    const MODULUS: f64 = 4_294_967_296.0; // 2^32
+    if !number.is_finite() {
+        return 0;
+    }
+    // Reduce the represented Number, not its source text. The truncated
+    // integer's remainder is exact: the modulus is a power of two, and
+    // both the remainder and its nonnegative residue fit exactly in f64.
+    let remainder = number.trunc() % MODULUS;
+    (if remainder < 0.0 {
+        remainder + MODULUS
+    } else {
+        remainder
+    }) as u32
+}
+
+fn number_to_int32(number: f64) -> i32 {
+    number_to_uint32(number) as i32 // Interpret the same bits as a signed integer.
+}
+
 impl ShortCircuitCondition {
     fn skips_rhs(self, lhs: Operand) -> bool {
         match self {
@@ -153,7 +170,7 @@ pub enum EvalError {
     UnsupportedStringOperation,
     /// A String comparison would exceed the evaluation's 65,536-pair budget.
     StringComparisonLimitExceeded,
-    /// A unary `+` String conversion would exceed the evaluation's 262,144-credit budget.
+    /// A String conversion by `+`, `-`, or `~` would exceed the 262,144-credit evaluation budget.
     StringNumericConversionLimitExceeded,
 }
 
@@ -216,14 +233,17 @@ impl Script {
     /// return a Boolean, always `false` if either operand is NaN. Two Strings
     /// are ordered lexicographically by UTF-16 code units, with a proper prefix
     /// sorting before the longer String.
-    /// Unary `+` additionally converts a String using ECMAScript's whitespace,
-    /// signed decimal and `Infinity` forms, and unsigned `0x`, `0o`, and `0b`
-    /// integer forms. Empty or whitespace-only Strings become `+0`; invalid
-    /// numeric text becomes NaN. Other numeric operators do not coerce Strings.
+    /// The numeric unary operators (`+`, `-`, `~`) also convert Strings to
+    /// Numbers using ECMAScript's whitespace, signed decimal and `Infinity`
+    /// forms, and unsigned `0x`, `0o`, and `0b` integer forms. Empty or
+    /// whitespace-only Strings become `+0`; invalid numeric text becomes NaN.
+    /// Unary `+` returns the Number and unary `-` negates it, including signed
+    /// zero. Unary `~` applies bitwise NOT after converting the rounded Number
+    /// to a signed 32-bit integer. Other numeric operators do not coerce Strings.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
-    /// Bitwise operators also use this conversion, then truncate and wrap to 32
-    /// bits (nonfinite values and signed zeros become zero). Shifts use the
+    /// Bitwise operators truncate and wrap the coerced Number to 32 bits
+    /// (nonfinite values and signed zeros become zero). Shifts use the
     /// low five bits of the converted count. Bitwise results are Numbers
     /// representing signed 32-bit integers, except for zero-fill right shift
     /// (`>>>`), which returns an unsigned 32-bit result.
@@ -236,9 +256,9 @@ impl Script {
     /// other Strings; mixed strict equality and String/nullish loose equality
     /// are false. `!==` and `!=` negate their corresponding equality results.
     /// String/Number and String/Boolean loose equality, mixed String/scalar
-    /// relational comparison, other String arithmetic (including concatenation),
-    /// bitwise operations, and Number coercions in updates and eager compounds
-    /// are unsupported.
+    /// relational comparison, and binary arithmetic (including concatenation)
+    /// and bitwise operations on Strings are unsupported, as is Number coercion
+    /// of Strings in updates and eager compound assignments.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -293,12 +313,13 @@ impl Script {
     /// before comparison, even for aliases or an early mismatch; skipped
     /// comparisons cost nothing.
     /// String-to-Number conversion has a separate 262,144-credit budget per
-    /// call. After dispatch and range validation, unary `+` charges `1 +`
-    /// the original UTF-16 length. Trimmed-empty text, exact optionally signed
-    /// `Infinity`, and recognized unsigned radix prefixes only pay this base
-    /// charge. All other candidates additionally pay `256 + 3 *` the trimmed
-    /// magnitude length (excluding a leading sign), before validating decimal
-    /// syntax. Skipped instructions and scalar unary `+` cost no conversion credits.
+    /// call, shared by `+`, `-`, and `~`. After dispatch and range validation,
+    /// a conversion charges `1 +` the original UTF-16 length. Trimmed-empty
+    /// text, exact optionally signed `Infinity`, and recognized unsigned radix
+    /// prefixes only pay this base charge. All other candidates additionally pay
+    /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
+    /// before validating decimal syntax. Skipped instructions and scalar operands
+    /// cost no conversion credits.
     /// String operands only copy ranges; evaluation allocates no String storage.
     ///
     /// # Errors
@@ -310,8 +331,8 @@ impl Script {
     /// Returns [`EvalError::UnsupportedStringOperation`] if execution reaches an
     /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
     /// if a comparison would exceed its pair budget. Returns
-    /// [`EvalError::StringNumericConversionLimitExceeded`] if a String
-    /// conversion would exceed its credit budget.
+    /// [`EvalError::StringNumericConversionLimitExceeded`] if a numeric unary
+    /// operator's String conversion would exceed its credit budget.
     pub fn evaluate_primitive(&self) -> Result<PrimitiveValue<'_>, EvalError> {
         evaluate(
             self.instructions(),
@@ -510,19 +531,16 @@ fn evaluate<'script>(
             }
             Instruction::Positive => {
                 apply_unary(&mut stack, |value| {
-                    let number = match value {
-                        Operand::Scalar(value) => value.to_number(),
-                        Operand::String(range) => {
-                            let units = range.get(string_units).ok_or(EvalError::InvalidScript)?;
-                            string_number::convert(units, &mut string_conversion_credits_left)?
-                        }
-                    };
+                    let number =
+                        value.to_number(string_units, &mut string_conversion_credits_left)?;
                     Ok(Value::Number(number))
                 })?;
             }
             Instruction::Negate => {
                 apply_unary(&mut stack, |value| {
-                    Ok(Value::Number(-value.require_scalar()?.to_number()))
+                    let number =
+                        value.to_number(string_units, &mut string_conversion_credits_left)?;
+                    Ok(Value::Number(-number))
                 })?;
             }
             Instruction::Not => {
@@ -530,9 +548,9 @@ fn evaluate<'script>(
             }
             Instruction::BitwiseNot => {
                 apply_unary(&mut stack, |value| {
-                    Ok(Value::Number(f64::from(
-                        !value.require_scalar()?.to_int32(),
-                    )))
+                    let number =
+                        value.to_number(string_units, &mut string_conversion_credits_left)?;
+                    Ok(Value::Number(f64::from(!number_to_int32(number))))
                 })?;
             }
             Instruction::Void => apply_unary(&mut stack, |_| Ok(Value::Undefined))?,
@@ -818,23 +836,36 @@ mod tests {
     }
 
     #[test]
-    fn unary_plus_on_strings_requires_a_checked_operand_when_reached() {
-        use Instruction::{Discard, JumpStatement, Number, Positive};
-        let script = crate::parse_script("+'1'").unwrap();
-        let [literal @ Instruction::String(_), Positive] = script.instructions() else {
-            panic!("expected a String operand and the existing unary plus instruction");
-        };
-        let ops = [*literal, Positive];
-        assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
-        assert_eq!(script.evaluate_value(), Ok(Value::Number(1.0)));
-        assert_eq!(
-            evaluate(
-                &[JumpStatement(4), *literal, Positive, Discard, Number(42.0)],
-                1,
-                0
-            ),
-            Ok(Value::Number(42.0)),
-        );
+    fn numeric_unary_instructions_require_a_checked_operand_when_reached() {
+        use Instruction::{BitwiseNot, Discard, JumpStatement, Negate, Number, Positive};
+        for (source, op, expected) in [
+            ("+'1'", Positive, 1.0),
+            ("-'1'", Negate, -1.0),
+            ("~'1'", BitwiseNot, -2.0),
+        ] {
+            let script = crate::parse_script(source).unwrap();
+            let [literal @ Instruction::String(range), actual] = script.instructions() else {
+                panic!("expected a String and one unary instruction");
+            };
+            assert_eq!(*actual, op);
+            assert_eq!(
+                Operand::String(*range).to_number(&[], &mut 0),
+                Err(EvalError::InvalidScript),
+            );
+            assert_eq!(
+                evaluate(&[*literal, op], 1, 0),
+                Err(EvalError::InvalidScript)
+            );
+            assert_eq!(script.evaluate_value(), Ok(Value::Number(expected)));
+            assert_eq!(
+                evaluate(
+                    &[JumpStatement(4), *literal, op, Discard, Number(42.0)],
+                    1,
+                    0
+                ),
+                Ok(Value::Number(42.0)),
+            );
+        }
     }
 
     #[test]

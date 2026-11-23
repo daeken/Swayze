@@ -955,6 +955,28 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![arg],
         });
     }
+    // Check bit-preserving float joins without crossing a floating-point host boundary.
+    for (condition, expected) in [(1, 0x7f80_0042), (0, i32::MIN)] {
+        cases.push(Fixture::new(
+            expected,
+            &[condition],
+            &[
+                0x20, 0, 0x04, 0x7d, 0x43, 0x42, 0, 0x80, 0x7f, 0x05, 0x43, 0, 0, 0, 0x80, 0x0b,
+                0xbc,
+            ],
+        ));
+    }
+    for condition in [0, 1] {
+        // br_if leaves the same f64 signaling NaN on the stack on both paths.
+        cases.push(Fixture::new(
+            1,
+            &[condition],
+            &[
+                0x02, 0x7c, 0x44, 0x42, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0x20, 0, 0x0d, 0, 0x0b, 0xbd,
+                0x44, 0x42, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0xbd, 0x51,
+            ],
+        ));
+    }
     cases
 }
 

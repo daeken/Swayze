@@ -321,7 +321,7 @@ fn requires_braces_and_explicit_delimiters() {
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "for(|i"),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
-        ("for(;i+=1;){}42", Unsupported, "+="),
+        ("for(;-i+=1;){}42", Unsupported, "+="),
         ("for(;false;i++){}42", Unsupported, "false;|i"),
         ("for(;false;i+1){}42", Unsupported, "false;|i"),
         ("for(;false;i=0,i=1){}42", Unsupported, ","),
@@ -456,7 +456,7 @@ fn stores_remain_standalone_in_both_clauses() {
     for (source, marked, message) in [
         ("let i;for(i??=null,0;false;){}0", ",", requires_group),
         ("let i;for(;false;i+=true?1:2,1){}0", ",", requires_group),
-        ("let i;for(i, i+=1;false;){}0", "+=", assignment_expr),
+        ("let i;for(i, -i+=1;false;){}0", "+=", assignment_expr),
         ("let i;for(;false;((i)=1)){}0", "=", assignment_expr),
         (
             "let i=0,j=0;for(i++,j++;false;){}0",

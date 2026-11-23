@@ -222,12 +222,12 @@ fn only_direct_names_at_admitted_rhs_starts_can_begin_a_chain() {
         "let a=0,b=0,c=0; let x = a + b @=@ c; x",
         "let a; let x = -a @=@ 1; x",
         "let a; let x = true && a @=@ 1; x",
-        "let a; let x = true ? a @+=@ 1 : 0; x",
-        "let a; let x = false ? 0 : a @||=@ 1; x",
+        "let a; let x = true ? +a @+=@ 1 : 0; x",
+        "let a; let x = false ? 0 : (a) @||=@ 1; x",
         "let a; true ? 0 : +a @=@ 1",
         "let a; if (+a @=@ 1) {} a",
         "let a; let x = (a) @=@ 1; x",
-        "let a; let x = a @||=@ 1; x",
+        "let a; let x = true && a @||=@ 1; x",
         "let a; let x = a = a++ @=@ 1; x",
     ] {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");

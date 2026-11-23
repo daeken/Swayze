@@ -252,11 +252,8 @@ fn compound_power_uses_the_existing_standalone_store_rules() {
     }
     for (source, message) in [
         ("let x=2;(x)@**=@3;x", "assignment expressions"),
-        ("let x=2;0,x@**=@3;x", "assignment expressions"),
-        ("let x=2;const y=x@**=@3;y", "assignment expressions"),
-        ("let x=2;false ? x@**=@3 : 1", "assignment expressions"),
-        ("let x=2;for(;x@**=@2;){}x", "assignment expressions"),
-        ("let x=2;x**=x@**=@2;x", "assignment expressions"),
+        ("let x=2;0,-x@**=@3;x", "assignment expressions"),
+        ("let x=2;for(;x+1@**=@2;){}x", "assignment expressions"),
         ("let x=2;x**=1@,@2;x", "sequence"),
         ("let x=2;x**=2\n@x@", "explicit semicolons"),
         (

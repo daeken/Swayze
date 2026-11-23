@@ -125,11 +125,11 @@ fn assert_marked_error(source: &str, kind: ErrorKind, message: &str) {
 }
 
 #[test]
-fn only_simple_prefixes_at_the_test_start_are_newly_admitted() {
+fn test_assignment_prefixes_require_a_bare_name() {
     for source in [
-        "let x; if (false) {} else if (x @||=@ 1) {} x",
-        "let x,y; if (x=y @+=@ 1) {} x",
-        "let x; if (true, x @+=@ 1) {} x",
+        "let x; if (false) {} else if (!x @||=@ 1) {} x",
+        "let x,y; if (x=(y) @+=@ 1) {} x",
+        "let x; if (true, x+1 @+=@ 1) {} x",
         "let x; for (; x=0, !x @=@ 1;) {} x",
         "let x; if ((x) @=@ 1) {} x",
         "let x; while (true && x @=@ 1) {} x",

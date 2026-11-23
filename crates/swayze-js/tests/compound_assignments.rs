@@ -148,9 +148,13 @@ fn rejects_other_targets_operators_and_assignment_expressions() {
         ("let x=1;x@.@p+=2;x", Unsupported, "token"),
         ("let x=1;x@[@0]+=2;x", Unsupported, "token"),
         ("let x=1;(x)@+=@2;x", Unsupported, "assignment expressions"),
-        ("let x=1;x+=x@*=@2;x", Unsupported, "assignment expressions"),
         (
-            "let x=1;for(;x@+=@1;){}x",
+            "let x=1;x+=-x@*=@2;x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x=1;for(;x+1@+=@1;){}x",
             Unsupported,
             "assignment expressions",
         ),
@@ -305,10 +309,10 @@ fn logical_assignment_punctuators_respect_targets_and_delimiters() {
     for (op, split) in [("&&=", "&&"), ("||=", "||"), ("??=", "??")] {
         for (source, message) in [
             (format!("let x=1;(x)@{op}@2;x"), "assignment expressions"),
-            (format!("let x=1;(0,x@{op}@2)"), "assignment expressions"),
-            (format!("let x=1;x=x@{op}@2;x"), "assignment expressions"),
+            (format!("let x=1;(0,-x@{op}@2)"), "assignment expressions"),
+            (format!("let x=1;x=x+1@{op}@2;x"), "assignment expressions"),
             (
-                format!("let x=1;for(;x@{op}@2;){{}}x"),
+                format!("let x=1;for(;true&&x@{op}@2;){{}}x"),
                 "assignment expressions",
             ),
             (format!("let x@{op}@1;x"), "declarations"),

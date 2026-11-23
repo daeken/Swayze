@@ -58,17 +58,15 @@ and returns the right-hand value without coercion. In `(x = a, b)`, the
 assignment stores `a` and the sequence yields `b`. In `(x = (a, b))`, the
 sequence is the right-hand side, so the assignment stores and returns `b`.
 A skipped logical assignment still proceeds to the next sequence operand.
-Use `if ((x += a))` for a compound
-assignment in a control test: the required test parentheses do not count as
-an explicit expression group.
 A lexical initializer, an existing assignment's right-hand side, either
-ternary arm, or a control test can start with a chain of simple name
-assignments. Examples are `let y = x = 3;`, `test ? x = a : x = b`, and
-`if (x = y = test)`. The final right-hand side is evaluated once; writes run
-from right to left, preserving its value. Only the selected ternary arm
-runs. A comma at test level follows the assignment, so `if (x = 0, true)`
-stores `0` and tests `true`. After a comma in a supported sequence, the next
-operand can start with a simple assignment chain, as in `0, x = y = 3, x + y`.
+ternary arm, or a control test can start with a right-associative chain of
+simple or compound name assignments, as in `let r = x += y = 3;` and
+`if (x ||= y)`. An eager compound reads the old target before evaluating its
+right-hand side; a logical compound can skip the entire nested chain. Only
+the selected ternary arm runs. A comma at test level follows the assignment,
+so `if (x = 0, true)` stores `0` and tests `true`. After a comma in a
+supported sequence, the next operand can start with an assignment chain,
+as in `0, x += y = 3, x + y`.
 Declaration separators and commas disallowed by the enclosing assignment or
 ternary syntax do not start sequence operands.
 Declarations, assignments, updates, and nonfinal expression statements require

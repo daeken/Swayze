@@ -93,6 +93,14 @@ impl LinearMemory {
         limits: Option<MemoryLimits>,
         segments: &[DataSegment],
     ) -> Result<Self, InstantiationError> {
+        Self::new_preflighted_with(limits, segments, Vec::try_reserve_exact)
+    }
+
+    fn new_preflighted_with(
+        limits: Option<MemoryLimits>,
+        segments: &[DataSegment],
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+    ) -> Result<Self, InstantiationError> {
         let (minimum_pages, cap_pages) = limits.map_or((0, 0), |limits| {
             (
                 limits.minimum_pages,
@@ -105,8 +113,7 @@ impl LinearMemory {
         let byte_len = minimum_pages as usize * MEMORY_PAGE_BYTES;
         let mut bytes = Vec::new();
         if byte_len != 0 {
-            bytes
-                .try_reserve_exact(byte_len)
+            reserve(&mut bytes, byte_len)
                 .map_err(|_| InstantiationError::MemoryAllocationFailed)?;
             Self::zero_tail(&mut bytes, byte_len);
         }
@@ -251,6 +258,27 @@ impl fmt::Debug for LinearMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_minimum_with_core_maximum_never_reserves_at_instantiation() {
+        // (module (memory 0 65536))
+        let module =
+            crate::validate_module(b"\0asm\x01\0\0\0\x05\x06\x01\x01\0\x80\x80\x04").unwrap();
+        let limits = module.memory_limits.unwrap();
+        assert_eq!(limits.minimum_pages, 0);
+        assert_eq!(limits.maximum_pages, Some(65_536));
+        let memory =
+            LinearMemory::new_preflighted_with(Some(limits), &module.data_segments, |_, _| {
+                panic!("zero-page initialization must not call reserve")
+            })
+            .unwrap();
+        let instance = module.instantiate().unwrap();
+        for memory in [&memory, &instance.memory] {
+            assert_eq!(memory.size_in_pages(), 0);
+            assert_eq!(memory.bytes.borrow().capacity(), 0);
+            assert_eq!(memory.cap_pages, 2);
+        }
+    }
 
     #[test]
     fn reserves_only_for_eligible_growth_and_can_retry_after_reserve_failure() {

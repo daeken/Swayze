@@ -95,12 +95,12 @@ fn statement_expressions_do_not_enable_other_syntax() {
     for (source, width, message) in [
         ("let x=1; {x, x@=2;} x", 1, "assignment expressions"),
         (
-            "let x=1; x + @++x; x",
+            "let x=1; x@++ + 1; x",
             2,
             "increment and decrement expressions",
         ),
         (
-            "let x=1; {(x@++ + 1);} x",
+            "let x=1; {x@-- - 1;} x",
             2,
             "increment and decrement expressions",
         ),

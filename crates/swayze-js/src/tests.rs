@@ -131,6 +131,42 @@ fn updates_load_and_store_the_same_slot_once_with_no_result() {
 }
 
 #[test]
+fn expression_updates_each_emit_one_checked_instruction_in_operand_order() {
+    use crate::parser::{Update, UpdateResult};
+    use Instruction::{Exponentiate, UpdateBinding};
+
+    assert_postfix(
+        "let x=2; let y=x++**--x; 1 + ++x + y",
+        &[
+            Number(2.0),
+            init_let(0),
+            UpdateBinding {
+                slot: 0,
+                op: Update::Increment,
+                result: UpdateResult::Old,
+            },
+            UpdateBinding {
+                slot: 0,
+                op: Update::Decrement,
+                result: UpdateResult::New,
+            },
+            Exponentiate,
+            init_let(1),
+            Number(1.0),
+            UpdateBinding {
+                slot: 0,
+                op: Update::Increment,
+                result: UpdateResult::New,
+            },
+            Add,
+            LoadBinding(1),
+            Add,
+        ],
+        2,
+    );
+}
+
+#[test]
 fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
     use Instruction::{Boolean, JumpIfFalseStatement, LoopBack, StoreBinding};
 

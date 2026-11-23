@@ -523,7 +523,28 @@ fn exact_segment_and_aggregate_index_caps_count_overlapping_entries() {
 }
 
 #[test]
-fn empty_at_end_is_valid_but_positive_lengths_and_unsigned_offsets_check_full_range() {
+fn empty_segment_fits_at_but_not_beyond_the_initial_length_including_zero() {
+    for len in [0, 15] {
+        // The declared maximum is greater than the initial length in both cases.
+        let table = [1, 0x70, 1, len, 16];
+        let offset = i32::from(len);
+        let module = element_module(&table, &element_payload(&[(offset, &[])]));
+        let instance = module.instantiate().unwrap();
+        assert_eq!(
+            live_entries(instance.table.as_ref().unwrap()),
+            &([None; 16][..usize::from(len)])
+        );
+
+        let module = element_module(&table, &element_payload(&[(offset + 1, &[])]));
+        assert_eq!(
+            module.instantiate().unwrap_err(),
+            InstantiationError::ElementSegmentOutOfBounds { segment_index: 0 }
+        );
+    }
+}
+
+#[test]
+fn checks_full_element_ranges_with_unsigned_offsets() {
     let module = element_module(
         &[1, 0x70, 0, 16],
         &element_payload(&[(15, &[7]), (16, &[])]),
@@ -545,7 +566,7 @@ fn empty_at_end_is_valid_but_positive_lengths_and_unsigned_offsets_check_full_ra
         assert_eq!(module.instantiate().unwrap_err(), error);
     }
     // The explicit maximum is not the initial length, even for a zero-entry table.
-    for (offset, indices) in [(0, &[0][..]), (1, &[]), (-1, &[])] {
+    for (offset, indices) in [(0, &[0][..]), (-1, &[])] {
         let module = element_module(&[1, 0x70, 1, 0, 16], &element_payload(&[(offset, indices)]));
         assert_eq!(
             module.instantiate().unwrap_err(),
@@ -597,23 +618,28 @@ fn elements_initialize_null_slots_in_source_order_alongside_data_on_fresh_instan
 
 #[test]
 fn instantiation_reports_elements_before_data_and_first_failure_within_each_kind() {
-    let good_elements = element_payload(&[(0, &[7])]);
-    let bad_elements = element_payload(&[(0, &[7]), (15, &[0, 1]), (17, &[])]);
-    let good_data = &[1, 0, 0x41, 0, 0x0b, 1, 0xff];
+    // The second element writes two slots; its bad offset puts the second
+    // write out of bounds. The first and third elements fit either way.
+    let elements = |offset| element_payload(&[(0, &[7]), (offset, &[0, 1]), (16, &[])]);
     let bad_data = &[
-        4, 0, 0x41, 0, 0x0b, 1, 1, 0, 0x41, 1, 0x0b, 1, 2, 0, 0x41, 0x7f, 0x0b, 1, 3, 0, 0x41,
-        0x7f, 0x0b, 0,
+        4, // two valid segments followed by two segments at unsigned offset u32::MAX
+        0, 0x41, 0, 0x0b, 1, 1, // one byte at 0
+        0, 0x41, 1, 0x0b, 1, 2, // one byte at 1
+        0, 0x41, 0x7f, 0x0b, 1, 3, // one byte at -1
+        0, 0x41, 0x7f, 0x0b, 0, // empty at -1
     ];
-    let element_error = InstantiationError::ElementSegmentOutOfBounds { segment_index: 1 };
-    let data_error = InstantiationError::DataSegmentOutOfBounds { segment_index: 2 };
-    for (elements, data, expected) in [
-        (bad_elements.as_slice(), good_data.as_slice(), element_error),
-        (bad_elements.as_slice(), bad_data.as_slice(), element_error),
-        (good_elements.as_slice(), bad_data.as_slice(), data_error),
-    ] {
-        assert_eq!(
-            with_data(elements, data).instantiate().unwrap_err(),
-            expected
-        );
-    }
+    assert_eq!(
+        with_data(&elements(15), bad_data)
+            .instantiate()
+            .unwrap_err(),
+        InstantiationError::ElementSegmentOutOfBounds { segment_index: 1 }
+    );
+    // Only repair the element's offset; the exact same data must now fail
+    // at its first out-of-bounds segment.
+    assert_eq!(
+        with_data(&elements(14), bad_data)
+            .instantiate()
+            .unwrap_err(),
+        InstantiationError::DataSegmentOutOfBounds { segment_index: 2 }
+    );
 }

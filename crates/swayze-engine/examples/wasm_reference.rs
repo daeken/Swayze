@@ -879,6 +879,33 @@ fn fixtures() -> Vec<Fixture> {
             &[0x20, 0, 0xbe, 0x20, 1, 0xbe, 0x98, 0xbc],
         ),
     ]);
+    // NaN is unordered, signed zeros compare equal, and negative subnormals
+    // remain ordered rather than flushing to zero.
+    for (op, lhs, rhs, expected) in [
+        (0x5b, 0, i32::MIN, 1),
+        (0x5c, 0x7f80_0042, 0x7f80_0042, 1),
+        (0x5d, i32::MIN | 1, i32::MIN, 1),
+        (0x5e, 0x7f80_0000, 0x7fc0_0042, 0),
+    ] {
+        cases.push(Fixture::new(
+            expected,
+            &[lhs, rhs],
+            &[0x20, 0, 0xbe, 0x20, 1, 0xbe, op],
+        ));
+    }
+    for (op, lhs, rhs, expected) in [
+        (0x61, 0_u64, 1_u64 << 63, 1),
+        (0x62, 0x7ff0_0000_0000_0042, 0, 1),
+        (0x65, (1 << 63) | 2, (1 << 63) | 1, 1),
+        (0x66, 0x7ff8_0000_0000_0042, 0x7ff0_0000_0000_0000, 0),
+    ] {
+        let mut expression = vec![0x44];
+        expression.extend(lhs.to_le_bytes());
+        expression.push(0x44);
+        expression.extend(rhs.to_le_bytes());
+        expression.push(op);
+        cases.push(Fixture::new(expected, &[], &expression));
+    }
     cases
 }
 

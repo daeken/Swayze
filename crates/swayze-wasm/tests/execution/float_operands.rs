@@ -14,6 +14,10 @@ const F32_COPYSIGN: u8 = 0x98;
 const F64_ABS: u8 = 0x99;
 const F64_NEG: u8 = 0x9a;
 const F64_COPYSIGN: u8 = 0xa6;
+const F32_COMPARISONS: [u8; 6] = [0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60];
+const F64_COMPARISONS: [u8; 6] = [0x61, 0x62, 0x63, 0x64, 0x65, 0x66];
+const F32_ZERO: &[u8] = b"\x43\0\0\0\0";
+const F64_ZERO: &[u8] = b"\x44\0\0\0\0\0\0\0\0";
 const I64_RESULT: &[u8] = &[1, 0x60, 0, 1, 0x7e];
 const F32_SNAN: u32 = 0x7f80_0b12; // Includes a literal `end` byte.
 const F64_SNAN: u64 = 0xfff0_000b_89ab_cdef;
@@ -124,6 +128,75 @@ fn sign_operations_preserve_every_non_sign_bit() {
                     (signaling.1, negative),
                 ] {
                     assert_bits(&binary_type, &body, &[input, rhs], result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn comparisons_return_i32_booleans_for_ordered_and_unordered_pairs() {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+
+    // Ranks specify the expected order independently of the bits. Both zero
+    // encodings share a rank; NaNs of either sign and kind are unordered.
+    let cases: [(Option<i8>, u32, u64); _] = [
+        (Some(-8), 0xff80_0000, 0xfff0_0000_0000_0000), // -infinity
+        (Some(-7), 0xff7f_ffff, 0xffef_ffff_ffff_ffff),
+        (Some(-6), 0xbf80_0001, 0xbff0_0000_0000_0001),
+        (Some(-5), 0xbf80_0000, 0xbff0_0000_0000_0000),
+        (Some(-4), 0x8080_0000, 0x8010_0000_0000_0000), // smallest-magnitude normal
+        (Some(-3), 0x807f_ffff, 0x800f_ffff_ffff_ffff), // largest-magnitude subnormal
+        (Some(-2), 0x8000_0002, 0x8000_0000_0000_0002),
+        (Some(-1), 0x8000_0001, 0x8000_0000_0000_0001),
+        (Some(0), 0x8000_0000, 0x8000_0000_0000_0000),
+        (Some(0), 0, 0),
+        (Some(1), 1, 1),
+        (Some(2), 2, 2),
+        (Some(3), 0x007f_ffff, 0x000f_ffff_ffff_ffff),
+        (Some(4), 0x0080_0000, 0x0010_0000_0000_0000),
+        (Some(5), 0x3f80_0000, 0x3ff0_0000_0000_0000),
+        (Some(6), 0x3f80_0001, 0x3ff0_0000_0000_0001),
+        (Some(7), 0x7f7f_ffff, 0x7fef_ffff_ffff_ffff),
+        (Some(8), 0x7f80_0000, 0x7ff0_0000_0000_0000), // +infinity
+        (None, 0x7f80_0001, 0x7ff0_0000_0000_0001),    // signaling, only low payload bit set
+        (None, 0xff80_0001, 0xfff0_0000_0000_0001),
+        (None, 0x7fc0_0000, 0x7ff8_0000_0000_0000), // quiet bit only
+        (None, 0xffc0_0000, 0xfff8_0000_0000_0000),
+    ];
+    for (int, to_float, ops, values) in [
+        (
+            0x7f,
+            F32_FROM_I32,
+            F32_COMPARISONS,
+            cases.map(|(rank, bits, _)| (rank, Value::I32(bits as i32))),
+        ),
+        (
+            0x7e,
+            F64_FROM_I64,
+            F64_COMPARISONS,
+            cases.map(|(rank, _, bits)| (rank, Value::I64(bits as i64))),
+        ),
+    ] {
+        let ty = types(&[(&[int; 2], Some(0x7f))]);
+        for (index, opcode) in ops.into_iter().enumerate() {
+            let body = [0, 0x20, 0, to_float, 0x20, 1, to_float, opcode, 0x0b];
+            let validated = exported_function(&ty, &code_body(&body));
+            let instance = validated.instantiate().unwrap();
+            for (lhs_rank, lhs) in values {
+                for (rhs_rank, rhs) in values {
+                    // Test every pair in both orders, including self-pairs.
+                    let expected = match lhs_rank.zip(rhs_rank).map(|(lhs, rhs)| lhs.cmp(&rhs)) {
+                        Some(Equal) => [1, 0, 0, 0, 1, 1],
+                        Some(Less) => [0, 1, 1, 0, 1, 0],
+                        Some(Greater) => [0, 1, 0, 1, 0, 1],
+                        None => [0, 1, 0, 0, 0, 0],
+                    };
+                    assert_eq!(
+                        instance.invoke_with_values("answer", &[lhs, rhs], ResultKind::I32),
+                        Ok(Some(Value::I32(expected[index]))),
+                        "opcode 0x{opcode:02x}, {lhs:x?} vs {rhs:x?}"
+                    );
                 }
             }
         }
@@ -336,6 +409,77 @@ fn sign_operations_preserve_underflow_and_dead_floor_diagnostics() {
 }
 
 #[test]
+fn comparisons_require_exact_types_in_both_positions_and_push_a_concrete_i32() {
+    let int32 = &b"\x41\0"[..];
+    let int64 = &b"\x42\0"[..];
+    for (ty, zero, other, wrong_width, ops) in [
+        (F32, F32_ZERO, F64, F64_ZERO, F32_COMPARISONS),
+        (F64, F64_ZERO, F32, F32_ZERO, F64_COMPARISONS),
+    ] {
+        for opcode in ops {
+            for prefix in [&[0][..], &[0, 0][..]] {
+                for (wrong, actual) in [(wrong_width, other), (int32, I32), (int64, I64)] {
+                    for (lhs, rhs) in [(zero, wrong), (wrong, zero)] {
+                        let inputs = [prefix, lhs, rhs].concat();
+                        let body = [&inputs, &[opcode, 0x0b][..]].concat();
+                        bad_body(&body, inputs.len(), mismatch(ty, actual));
+                    }
+                }
+                let inputs = [prefix, int64, wrong_width].concat();
+                let body = [&inputs, &[opcode, 0x0b][..]].concat();
+                bad_body(&body, inputs.len(), mismatch(ty, other)); // Topmost mismatch wins.
+            }
+            let body = [&[0][..], zero, zero, &[opcode, 0x0b]].concat();
+            bad_typed_body(I64_RESULT, &body, body.len() - 1, mismatch(I64, I32));
+            // Even with two synthesized inputs, the comparison produces a concrete i32.
+            bad_typed_body(I64_RESULT, &[0, 0, opcode, 0x0b], 3, mismatch(I64, I32));
+            for (abs, expected) in [(F32_ABS, F32), (F64_ABS, F64)] {
+                bad_body(&[0, 0, opcode, abs, 0x0b], 3, mismatch(expected, I32));
+            }
+        }
+    }
+}
+
+#[test]
+fn comparisons_preserve_underflow_and_polymorphic_floor_diagnostics() {
+    let floor = [0, 0x41, 42, 0x02, 0x40]; // i32 below the inner void block's floor.
+    let int = [0x41, 0];
+    for (ty, zero, ops) in [
+        (F32, F32_ZERO, F32_COMPARISONS),
+        (F64, F64_ZERO, F64_COMPARISONS),
+    ] {
+        for opcode in ops {
+            let tail = [opcode, 0x1a, 0x0b, 0x0b];
+            bad_body(
+                &[&floor[..], &tail].concat(),
+                floor.len(),
+                ErrorKind::StackUnderflow { depth: 0 },
+            );
+            bad_body(
+                &[&floor[..], &int, &tail].concat(),
+                floor.len() + int.len(),
+                ErrorKind::StackUnderflow { depth: 1 }, // Underflow before type mismatch.
+            );
+            let dead = [&floor[..], &[0]].concat();
+            bad_body(
+                &[&dead, &int[..], &tail[..]].concat(),
+                dead.len() + int.len(),
+                mismatch(ty, I32), // Missing lhs is implicit, present rhs is still checked.
+            );
+            for rhs in [&[][..], zero, &[0x1b]] {
+                // Both implicit, one explicit matching input, or an unknown from `select`.
+                let body = [&dead, rhs, &tail].concat();
+                let validated = exported_function(TYPE, &code_body(&body));
+                assert_eq!(
+                    validated.instantiate().unwrap().invoke_i32("answer"),
+                    Err(InvokeError::Trap(Trap::Unreachable))
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn dead_floors_synthesize_missing_operands_but_never_look_below_the_floor() {
     let mut body = vec![0];
     push_f64(&mut body, F64_SNAN);
@@ -429,7 +573,7 @@ fn floating_point_declarations_labels_memory_and_numeric_ops_stay_unsupported() 
     }
     bad_payload(6, &[1, 0x7f, 0, F32_CONST], 3, unexpected(0x41, F32_CONST));
     // Test with a defined memory, and in dead code so underflow is irrelevant.
-    for opcode in [0x2a, 0x2b, 0x38, 0x39, 0x5b, 0x92, 0xa0, 0xa8, 0xb2, 0x1c] {
+    for opcode in [0x2a, 0x2b, 0x38, 0x39, 0x92, 0xa0, 0xa8, 0xb2, 0x1c] {
         let mut bytes = module(&[(1, TYPE), (3, FUNCTION), (5, &[1, 0, 1])]);
         let start = push_section(&mut bytes, 10, &code_body(&[0, 0, opcode, 0, 0, 0x0b]));
         expect_error(&bytes, start + 4, ErrorKind::UnsupportedOpcode { opcode });
@@ -529,6 +673,82 @@ fn sign_operations_share_the_existing_stack_and_instruction_caps() {
                 limit: Limit::OperandStackDepth,
             },
         );
+    }
+}
+
+#[test]
+fn comparisons_share_the_existing_stack_and_instruction_caps() {
+    for (zero, [eq, ..]) in [(F32_ZERO, F32_COMPARISONS), (F64_ZERO, F64_COMPARISONS)] {
+        let mut body = vec![0];
+        for _ in 0..30 {
+            body.extend([0x41, 0]);
+        }
+        body.extend(zero);
+        body.extend(zero);
+        let mut at_floor = body.clone(); // All 32 stack slots occupied.
+        body.push(eq);
+        body.extend([0x6a; 30]); // Sum 30 zero i32s with the comparison result.
+        body.extend([0x01; 64]); // 32 pushes + 1 comparison + 30 adds + 64 nops = 127.
+        let end = body.len();
+        body.push(0x0b);
+        assert_body_result(&body, 1);
+        body.insert(end, 0x01);
+        bad_body(
+            &body,
+            end,
+            ErrorKind::LimitExceeded {
+                limit: Limit::BodyInstructions,
+            },
+        );
+
+        // Synthesized inputs use no slots, but the concrete result needs one.
+        let offset = at_floor.len() + 3;
+        at_floor.extend([0x02, 0x40, 0x00, eq, 0x1a, 0x0b, 0x0b]);
+        bad_body(
+            &at_floor,
+            offset,
+            ErrorKind::LimitExceeded {
+                limit: Limit::OperandStackDepth,
+            },
+        );
+    }
+}
+
+#[test]
+fn each_comparison_uses_one_shared_dispatch_at_the_fuel_boundary() {
+    let ty = i32_type(1);
+    for (zero, ops) in [(F32_ZERO, F32_COMPARISONS), (F64_ZERO, F64_COMPARISONS)] {
+        for (opcode, expected) in ops.into_iter().zip([1, 0, 0, 0, 1, 1]) {
+            let mut body = vec![0, 0x03, 0x40]; // Loop until --p0 == 0.
+            body.extend(zero);
+            body.extend(zero);
+            body.extend([opcode, 0x1a]);
+            body.extend([0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x0d, 0, 0x0b]); // 9 per loop.
+            body.extend([0x01; 4]);
+            body.extend(zero);
+            body.extend(zero);
+            let last = body.len();
+            body.extend([opcode, 0x0b]); // 9 * 113 + 7 = 1024, including this comparison.
+            assert_bits(
+                &ty,
+                &body,
+                &[Value::I32(113)],
+                ResultKind::I32,
+                Value::I32(expected),
+            );
+            body.insert(last, 0x01); // Now fuel is exhausted before the final comparison.
+            let validated = exported_function(&ty, &code_body(&body));
+            assert_eq!(
+                validated
+                    .instantiate()
+                    .unwrap()
+                    .invoke_i32_with_args("answer", &[113]),
+                Err(InvokeError::LimitExceeded {
+                    limit: ExecutionLimit::InstructionDispatches
+                }),
+                "opcode 0x{opcode:02x}"
+            );
+        }
     }
 }
 

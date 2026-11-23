@@ -375,37 +375,104 @@ fn relational_operands_run_once_in_source_order() {
 }
 
 #[test]
-fn mixed_string_relations_are_unsupported_only_when_reached() {
-    for scalar in ["0", "false", "null", "undefined"] {
-        for (lhs, rhs) in [("''", scalar), (scalar, "''")] {
-            for op in ["<", "<=", ">", ">="] {
-                let expr = format!("{lhs} {op} {rhs}");
-                let script = parse_script(&expr).unwrap();
-                assert_eq!(
-                    script.evaluate_primitive(),
-                    Err(EvalError::UnsupportedStringOperation),
-                    "{expr}"
-                );
-                assert_scalar(&format!("false && ({expr})"), Value::Boolean(false));
+fn mixed_string_relations_use_numeric_order_in_both_directions() {
+    let less = [true, true, false, false];
+    let equal = [false, true, false, true];
+    let greater = [false, false, true, true];
+    let unordered = [false; 4];
+    for (string, scalar, expected) in [
+        ("'2'", "10", less), // Unlike the String/String comparison.
+        ("' -0 '", "0", equal),
+        ("'0x10'", "15", greater),
+        ("'0.5'", "true", less),
+        ("'1'", "true", equal),
+        ("'0.5'", "false", greater),
+        ("''", "false", equal),
+        ("'-0'", "null", equal),
+        ("'1'", "null", greater),
+        ("''", "undefined", unordered),
+        ("'NaN'", "0", unordered),
+        ("'not a number'", "null", unordered),
+        ("'0'", "(0 / 0)", unordered),
+        ("'-Infinity'", "-1", less),
+    ] {
+        let [lt, le, gt, ge] = expected;
+        for (lhs, rhs, expected) in [
+            (string, scalar, expected),
+            (scalar, string, [gt, ge, lt, le]),
+        ] {
+            for (op, expected) in ["<", "<=", ">", ">="].into_iter().zip(expected) {
+                assert_scalar(&format!("{lhs} {op} {rhs}"), Value::Boolean(expected));
             }
         }
     }
-    assert!(parse_script(r"true || '' < '\u{}'").is_err());
-    assert!(parse_script("true || '' < missing").is_err());
+    assert_scalar("'2' > '10'", Value::Boolean(true));
+}
+
+#[test]
+fn mixed_loose_equality_converts_only_against_number_or_boolean() {
+    for (string, scalar, equal) in [
+        ("' 02 '", "2", true),
+        ("'0b10'", "2", true),
+        ("' -0 '", "0", true),
+        ("''", "-0", true),
+        ("'1.5'", "1", false),
+        ("'1'", "true", true),
+        ("'2'", "true", false),
+        ("'0'", "false", true), // A truthy String can coerce equal to false.
+        ("''", "true", false),
+        ("''", "null", false),
+        ("''", "undefined", false),
+        ("'NaN'", "(0 / 0)", false),
+        ("'invalid'", "false", false),
+        ("'Infinity'", "(1 / 0)", true),
+    ] {
+        for (lhs, rhs) in [(string, scalar), (scalar, string)] {
+            for (op, expected) in [("==", equal), ("!=", !equal), ("===", false), ("!==", true)] {
+                assert_scalar(&format!("{lhs} {op} {rhs}"), Value::Boolean(expected));
+            }
+        }
+    }
+    assert_scalar("'02' != '2'", Value::Boolean(true));
+}
+
+#[test]
+fn mixed_comparison_operands_run_once_in_source_order() {
+    for (op, expected) in [
+        ("<", true),
+        ("<=", true),
+        (">", false),
+        (">=", false),
+        ("==", false),
+        ("!=", true),
+    ] {
+        // The left operand must capture its old value before the RHS writes x.
+        // Reversing evaluation order changes the compared values in either case.
+        for (initial, assigned) in [("'2'", "3"), ("2", "'3'")] {
+            assert_scalar(
+                &format!(
+                    "let x = {initial}, n = 0; \
+                     const result = (n = n * 10 + 1, x) {op} (n = n * 10 + 2, x = {assigned}); \
+                     result === {expected} && n === 12 && x === {assigned}"
+                ),
+                Value::Boolean(true),
+            );
+        }
+    }
+}
+
+#[test]
+fn skipped_mixed_comparisons_still_validate_literals_and_bindings() {
+    for op in ["<", "<=", ">", ">=", "==", "!="] {
+        for rhs in [r"'\u{}'", "missing"] {
+            assert!(parse_script(&format!("true || 0 {op} {rhs}")).is_err());
+        }
+    }
 }
 
 #[test]
 fn unsupported_operations_fail_only_when_dispatched() {
-    for expr in [
-        "'a' + 'b'",
-        "1 + '2'",
-        "'2' - 1",
-        "'' == 0",
-        "0 != ''",
-        "'' != false",
-        "true == '1'",
-        "void ('' + '')",
-    ] {
+    for expr in ["'a' + 'b'", "1 + '2'", "'2' - 1", "void ('' + '')"] {
         let script = parse_script(expr).unwrap();
         assert_eq!(
             script.evaluate_primitive(),

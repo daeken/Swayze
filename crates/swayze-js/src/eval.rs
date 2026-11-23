@@ -221,22 +221,24 @@ impl Script {
     ///
     /// For scalar operands, arithmetic and relational operators leave Numbers
     /// unchanged and convert `true` to `1`, `false` and `null` to `+0`, and
-    /// `undefined` to NaN. Arithmetic returns a Number; relational operators
-    /// return a Boolean, always `false` if either operand is NaN. Two Strings
-    /// are ordered lexicographically by UTF-16 code units, with a proper prefix
-    /// sorting before the longer String.
+    /// `undefined` to NaN. Arithmetic returns a Number. Relational operators
+    /// return a Boolean: two Strings are ordered lexicographically by UTF-16
+    /// code units, with a proper prefix sorting before the longer String.
+    /// Otherwise, both operands are converted to Numbers, and the relation is
+    /// always `false` if either converted Number is NaN.
     /// Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`,
-    /// `<<`, `>>`, and `>>>` (including their eager compound forms) convert
-    /// Strings to Numbers using
-    /// ECMAScript's whitespace, signed decimal and `Infinity`
-    /// forms, and unsigned `0x`, `0o`, and `0b` integer forms. Empty or
-    /// whitespace-only Strings become `+0`; invalid numeric text becomes NaN.
+    /// `<<`, `>>`, and `>>>` (including their eager compound forms), mixed
+    /// relational comparisons, and loose equality between a String and a Number
+    /// or Boolean convert Strings to Numbers using ECMAScript's whitespace,
+    /// signed decimal and `Infinity` forms, and unsigned `0x`, `0o`, and `0b`
+    /// integer forms. Empty or whitespace-only Strings become `+0`; invalid
+    /// numeric text becomes NaN.
     /// Unary `+` returns the Number and unary `-` negates it, including signed
     /// zero. Unary `~` applies bitwise NOT after converting the rounded Number
-    /// to a signed 32-bit integer. These binary operators convert
-    /// the left operand and then the right, after evaluating both operand
-    /// expressions. Their compounds use the value loaded before the RHS runs
-    /// and store the Number only after the operation succeeds.
+    /// to a signed 32-bit integer. Binary operators that coerce Strings convert
+    /// the left operand and then the right, once each, after evaluating both
+    /// operand expressions. Eager compounds use the value loaded before the RHS
+    /// runs and store the Number only after the operation succeeds.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators truncate and wrap the coerced Number to 32 bits
@@ -248,14 +250,13 @@ impl Script {
     /// without coercing the operand's value.
     /// Equality and inequality return Booleans. Strict equality (`===`) never
     /// coerces. Loose equality (`==`) uses strict equality for matching tags,
-    /// equates `null` with `undefined`, and compares a Number and a Boolean
-    /// numerically after converting the Boolean. Strings compare code units with
-    /// other Strings; mixed strict equality and String/nullish loose equality
-    /// are false. `!==` and `!=` negate their corresponding equality results.
-    /// String/Number and String/Boolean loose equality, mixed String/scalar
-    /// relational comparison, binary `+` (including concatenation), and binary
-    /// `-` remain unsupported on Strings, as do the corresponding compounds and
-    /// all name updates on Strings.
+    /// equates `null` with `undefined`, and compares mixed pairs of Numbers,
+    /// Booleans, and Strings numerically after conversion. Strings compare code
+    /// units with other Strings; mixed strict equality and String/nullish loose
+    /// equality are false without conversion. `!==` and `!=` negate their
+    /// corresponding equality results. Binary `+` (including concatenation)
+    /// and binary `-` remain unsupported on Strings, as do the corresponding
+    /// compounds and all name updates on Strings.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -307,19 +308,20 @@ impl Script {
     /// String equality and ordering share a budget of 65,536 code-unit pairs
     /// per call. Equality charges the full length for equal-length Strings and
     /// nothing otherwise. Ordering charges the shorter length. Both charge
-    /// before comparison, even for aliases or an early mismatch; skipped
-    /// comparisons cost nothing.
+    /// before comparison, even for aliases or an early mismatch. Mixed and
+    /// skipped comparisons cost no pairs.
     /// String-to-Number conversion has a separate 262,144-credit budget per
-    /// call, shared by unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`,
+    /// call, shared by unary `+`, `-`, and `~`, binary `*`, `/`, `%`, `**`,
     /// `&`, `^`, `|`, `<<`, `>>`, and `>>>` (including their eager compound
-    /// forms). After dispatch, operand arity checks, and validation of the
-    /// operand's String range, each conversion charges `1 +` the original
-    /// UTF-16 length. Trimmed-empty text, exact optionally signed `Infinity`,
+    /// forms), and comparisons that coerce Strings. After dispatch, operand
+    /// arity checks, and validation of the operand's String range, each
+    /// conversion charges `1 +` the original UTF-16 length. Trimmed-empty
+    /// text, exact optionally signed `Infinity`,
     /// and recognized unsigned radix prefixes only pay this base charge.
     /// All other candidates additionally pay
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
-    /// before validating decimal syntax. Skipped instructions and scalar operands
-    /// cost no conversion credits.
+    /// before validating decimal syntax. Skipped instructions, scalar operands,
+    /// and noncoercing comparisons cost no conversion credits.
     /// String operands only copy ranges; evaluation allocates no String storage.
     ///
     /// # Errors
@@ -546,8 +548,14 @@ fn evaluate<'script>(
                 let strict = matches!(op, Instruction::StrictEqual | Instruction::StrictNotEqual);
                 let negate = matches!(op, Instruction::LooseNotEqual | Instruction::StrictNotEqual);
                 apply_binary(&mut stack, |lhs, rhs| {
-                    let equal =
-                        operands_equal(lhs, rhs, strict, string_units, &mut string_pairs_left)?;
+                    let equal = operands_equal(
+                        lhs,
+                        rhs,
+                        strict,
+                        string_units,
+                        &mut string_pairs_left,
+                        &mut string_conversion_credits_left,
+                    )?;
                     Ok(Value::Boolean(equal ^ negate))
                 })?;
             }
@@ -556,7 +564,13 @@ fn evaluate<'script>(
             | Instruction::GreaterThan
             | Instruction::GreaterThanOrEqual => {
                 apply_binary(&mut stack, |lhs, rhs| {
-                    let order = operands_order(lhs, rhs, string_units, &mut string_pairs_left)?;
+                    let order = operands_order(
+                        lhs,
+                        rhs,
+                        string_units,
+                        &mut string_pairs_left,
+                        &mut string_conversion_credits_left,
+                    )?;
                     let result = match order {
                         Some(Ordering::Less) => {
                             matches!(op, Instruction::LessThan | Instruction::LessThanOrEqual)
@@ -662,6 +676,7 @@ fn operands_equal(
     strict: bool,
     string_units: &[u16],
     string_pairs_left: &mut usize,
+    credits_left: &mut usize,
 ) -> Result<bool, EvalError> {
     match (lhs, rhs) {
         (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(if strict {
@@ -683,7 +698,9 @@ fn operands_equal(
             if strict || matches!(scalar, Value::Null | Value::Undefined) {
                 Ok(false)
             } else {
-                Err(EvalError::UnsupportedStringOperation)
+                let lhs = lhs.to_number(string_units, credits_left)?;
+                let rhs = rhs.to_number(string_units, credits_left)?;
+                Ok(lhs == rhs)
             }
         }
     }
@@ -694,11 +711,9 @@ fn operands_order(
     rhs: Operand,
     string_units: &[u16],
     string_pairs_left: &mut usize,
+    credits_left: &mut usize,
 ) -> Result<Option<Ordering>, EvalError> {
     match (lhs, rhs) {
-        (Operand::Scalar(lhs), Operand::Scalar(rhs)) => {
-            Ok(lhs.to_number().partial_cmp(&rhs.to_number()))
-        }
         (Operand::String(lhs), Operand::String(rhs)) => {
             let lhs = lhs.get(string_units).ok_or(EvalError::InvalidScript)?;
             let rhs = rhs.get(string_units).ok_or(EvalError::InvalidScript)?;
@@ -706,7 +721,11 @@ fn operands_order(
             // Slice ordering compares u16 values, then lengths if the prefix matches.
             Ok(Some(lhs.cmp(rhs)))
         }
-        _ => Err(EvalError::UnsupportedStringOperation),
+        _ => {
+            let lhs = lhs.to_number(string_units, credits_left)?;
+            let rhs = rhs.to_number(string_units, credits_left)?;
+            Ok(lhs.partial_cmp(&rhs))
+        }
     }
 }
 
@@ -958,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn string_order_checks_both_ranges_before_charging() {
+    fn string_comparisons_check_ranges_before_charging() {
         let script = crate::parse_script("'a' < 'b'").unwrap();
         let [
             Instruction::String(a),
@@ -970,16 +989,50 @@ mod tests {
         };
         // Only the first range fits in this truncated pool.
         let short_pool = &script.string_units()[..1];
-        for (&lhs, &rhs) in [(a, b), (b, a)] {
+        let (a, b) = (Operand::String(*a), Operand::String(*b));
+        let number = Operand::Scalar(Value::Number(0.0));
+        for (lhs, rhs) in [(a, b), (b, a), (b, number), (number, b)] {
             assert_eq!(
-                operands_order(
-                    Operand::String(lhs),
-                    Operand::String(rhs),
-                    short_pool,
-                    &mut 0
+                operands_order(lhs, rhs, short_pool, &mut 0, &mut 0),
+                Err(EvalError::InvalidScript)
+            );
+            assert_eq!(
+                operands_equal(lhs, rhs, false, short_pool, &mut 0, &mut 0),
+                Err(EvalError::InvalidScript)
+            );
+        }
+    }
+
+    #[test]
+    fn comparisons_check_arity_even_when_conversion_credits_are_exhausted() {
+        let source = format!(
+            "const ws = '{}'; let i = 0; while (i++ < 64) {{ +ws; }} +'{}'; ''",
+            " ".repeat(4094),
+            " ".repeat(63),
+        );
+        let script = crate::parse_script(&source).unwrap();
+        let mut ops = script.instructions().to_vec();
+        for op in [
+            Instruction::LessThan,
+            Instruction::LessThanOrEqual,
+            Instruction::GreaterThan,
+            Instruction::GreaterThanOrEqual,
+            Instruction::LooseEqual,
+            Instruction::LooseNotEqual,
+        ] {
+            // Only the empty String remains on the stack; converting it before
+            // detecting the missing operand would fail with conversion exhaustion.
+            ops.push(op);
+            assert_eq!(
+                super::evaluate(
+                    &ops,
+                    script.max_stack_depth(),
+                    script.binding_slots(),
+                    script.string_units(),
                 ),
                 Err(EvalError::InvalidScript)
             );
+            ops.pop();
         }
     }
 

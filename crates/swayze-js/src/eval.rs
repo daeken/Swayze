@@ -171,6 +171,9 @@ pub enum EvalError {
     StringConcatenationBudgetExceeded,
     /// The primitive convenience API received a runtime String, not a literal.
     RuntimeStringResultRequiresScratch,
+    /// A reached `.length` receiver is not a primitive String.
+    /// This is a subset error, not JavaScript `undefined` or a `TypeError`.
+    UnsupportedPropertyReceiver,
 }
 
 impl fmt::Display for EvalError {
@@ -197,6 +200,9 @@ impl fmt::Display for EvalError {
             }
             Self::RuntimeStringResultRequiresScratch => {
                 "runtime JavaScript string result requires evaluation scratch"
+            }
+            Self::UnsupportedPropertyReceiver => {
+                "JavaScript .length receiver is outside the primitive String subset"
             }
         })
     }
@@ -716,6 +722,11 @@ fn evaluate(
                 })?;
             }
             Instruction::Void => apply_unary(&mut stack, |_| Ok(Value::Undefined))?,
+            Instruction::StringLength => {
+                apply_unary(&mut stack, |value| {
+                    string_length(value, scratch.pools(string_units))
+                })?;
+            }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
@@ -767,6 +778,15 @@ fn evaluate(
         [value] => Ok(*value),
         _ => Err(EvalError::InvalidScript),
     }
+}
+
+fn string_length(value: Operand, pools: StringPools<'_>) -> Result<Value, EvalError> {
+    let Operand::String(string) = value else {
+        return Err(EvalError::UnsupportedPropertyReceiver);
+    };
+    let units = string.get(pools).ok_or(EvalError::InvalidScript)?;
+    // Use the checked slice length. Both endpoints are u16, so this is exact.
+    Ok(Value::Number(units.len() as f64))
 }
 
 fn operands_equal(
@@ -1143,6 +1163,50 @@ mod tests {
             );
         }
         assert_eq!(script.evaluate_primitive(), Ok(PrimitiveValue::String(&[])));
+    }
+
+    #[test]
+    fn string_length_dispatch_checks_arity_and_only_reached_instructions() {
+        use Instruction::{Discard, JumpStatement, Number, StringLength};
+        assert_eq!(
+            evaluate(&[StringLength], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[Number(1.0), Discard, StringLength, Number(2.0)], 1, 0),
+            Err(EvalError::InvalidScript),
+        );
+        assert_eq!(
+            evaluate(&[JumpStatement(2), StringLength, Number(2.0)], 1, 0),
+            Ok(Value::Number(2.0)),
+        );
+        assert_eq!(
+            evaluate(&[Number(1.0), StringLength, Discard, Number(2.0)], 1, 0),
+            Err(EvalError::UnsupportedPropertyReceiver),
+        );
+    }
+
+    #[test]
+    fn string_length_checks_literal_range_including_empty_wrong_offset() {
+        use Instruction::{Discard, String};
+        let script = crate::parse_script("'x', ''").unwrap();
+        let [String(nonempty), Discard, String(empty)] = *script.instructions() else {
+            panic!("expected one unit followed by an empty range at offset 1");
+        };
+        for range in [nonempty, empty] {
+            let value = Operand::String(StringOperand::Literal(range));
+            assert_eq!(
+                string_length(value, StringPools::literals(&[])),
+                Err(EvalError::InvalidScript)
+            );
+        }
+        assert_eq!(
+            string_length(
+                Operand::String(StringOperand::Literal(empty)),
+                StringPools::literals(&[0xD800])
+            ),
+            Ok(Value::Number(0.0)),
+        );
     }
 
     #[test]

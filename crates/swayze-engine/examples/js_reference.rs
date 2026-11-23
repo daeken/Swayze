@@ -577,6 +577,16 @@ fn fixtures() -> Vec<String> {
             "let x='old'; (x += (x = -0))",
             "let x=''; false && (x += 1e21); x",
             "true + null + false",
+            "''.length",
+            r#"'é😀\uD800\0'.length"#,
+            r#"'e\u0301'.length"#,
+            "let s='😀'; s+='\\uD800'; s.length",
+            "let n=0; (++n,'😀').length*10+n",
+            "-'😀'.length + 4",
+            "'😀'.length ** 2",
+            "false && null.length",
+            "'use strict'\n. /*\u{2028}*/ length",
+            "let s='x'; for (; s.length < 4; s += 'y') {} s.length",
         ]
         .map(str::to_owned),
     );

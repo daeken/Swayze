@@ -272,6 +272,45 @@ mod tests {
     use crate::{PrimitiveValue, Value, parse_script, parser::Instruction};
 
     #[test]
+    fn string_length_checks_full_ranges_against_warm_logical_prefix() {
+        use crate::eval::{Operand, string_length};
+        let script = parse_script("'a' + 'b'").unwrap();
+        let [
+            Instruction::String(a),
+            Instruction::String(b),
+            Instruction::Add,
+        ] = *script.instructions()
+        else {
+            panic!("expected two String operands and Add");
+        };
+        let mut scratch = EvalScratch::new();
+        let literals = script.string_units();
+        let warm = scratch
+            .concatenate(
+                literals,
+                StringOperand::Literal(a),
+                StringOperand::Literal(b),
+            )
+            .unwrap();
+        assert_eq!(
+            string_length(Operand::String(warm), scratch.pools(literals)),
+            Ok(Value::Number(2.0))
+        );
+        scratch.reset();
+        assert!(!scratch.chunks.is_empty());
+        let read = |start, end| {
+            string_length(
+                Operand::String(StringOperand::Runtime(RuntimeRange { start, end })),
+                scratch.pools(literals),
+            )
+        };
+        assert_eq!(read(0, 0), Ok(Value::Number(0.0)));
+        assert_eq!(read(0, 2), Err(EvalError::InvalidScript)); // stale initialized units
+        assert_eq!(read(2, 2), Err(EvalError::InvalidScript)); // empty past logical end
+        assert_eq!(read(1, 0), Err(EvalError::InvalidScript)); // inverted range
+    }
+
+    #[test]
     fn aliases_across_growth_and_mixed_pool_appends_leave_snapshots_intact() {
         let text = "a".repeat(1023);
         let script = parse_script(&format!("'{text}' + 'b'")).unwrap();

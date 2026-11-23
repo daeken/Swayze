@@ -204,8 +204,19 @@ Each quoted token may occupy up to 4,096 UTF-8 bytes, including the quotes.
 All literals in a script together may decode to at most 16,384 UTF-16 code
 units, including literals in skipped code. Exhaustive `Limit`/`JsLimit`
 matches must handle `StringLiteralBytes` and `StringLiteralUnits`; the
-caller-configurable `Limits`/`JsLimits` fields did not change. Evaluation
-allocates no String storage and moves only private checked ranges.
+caller-configurable `Limits`/`JsLimits` fields did not change. Reading a
+literal does not allocate runtime String storage.
+
+A primary (including a parenthesized expression) may take one read-only
+`.length` suffix. It returns the exact UTF-16 code-unit count as a Number from
+a literal or runtime String in one dispatch, without scanning or allocating.
+Trivia, including line breaks, is allowed around the dot but the name must
+be raw ASCII `length`. A reached non-String receiver produces
+`UnsupportedPropertyReceiver`, a Swayze subset error, not JavaScript
+`undefined` or a `TypeError`. Property writes, updates, indexing, arbitrary
+properties, and ungrouped suffix chains are outside the subset. Existing
+numeric adjacency restrictions still apply; `(1).length` and `1 .length`
+parse, but reach the receiver error when evaluated.
 
 Only the empty String is falsy, and every String is non-nullish. String
 equality and ordering between two Strings compare UTF-16 code units without normalization. For

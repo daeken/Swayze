@@ -240,6 +240,7 @@ fn compound_power_uses_the_existing_standalone_store_rules() {
     for (source, expected) in [
         ("let x=2;x/*💡\n*/**=x**2;x", 16.0),
         ("let x=-2;x**=(null, true ? -3 : 2);x", -0.125),
+        ("let x=2;x**=3,2;x", 8.0),
         ("let x=1;x**=1e309;x", f64::NAN),
         ("let x;x**=false;x", 1.0),
         (
@@ -254,7 +255,6 @@ fn compound_power_uses_the_existing_standalone_store_rules() {
         ("let x=2;(x)@**=@3;x", "assignment expressions"),
         ("let x=2;0,-x@**=@3;x", "assignment expressions"),
         ("let x=2;for(;x+1@**=@2;){}x", "assignment expressions"),
-        ("let x=2;x**=1@,@2;x", "sequence"),
         ("let x=2;x**=2\n@x@", "explicit semicolons"),
         (
             "const x=2;for(;false;x@**=@missing){}x",

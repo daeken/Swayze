@@ -1955,6 +1955,68 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
 }
 
 #[test]
+fn assignment_statement_sequence_joins_at_the_suffix_and_discards_only_suffix_values() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{
+        Boolean, Discard, ShortCircuitStatement, StoreBinding, StoreBindingKeep, Undefined, Void,
+    };
+
+    assert_postfix(
+        "let x=true,y;{x||=false,y=x,void x;}y",
+        &[
+            Boolean(true),
+            init_let(0),
+            Undefined,
+            init_let(1),
+            LoadBinding(0),
+            ShortCircuitStatement {
+                target: 8,
+                condition: ShortCircuitCondition::Truthy,
+            },
+            Boolean(false),
+            StoreBinding(0),
+            LoadBinding(0), // both paths enter the suffix with an empty stack
+            StoreBindingKeep(1),
+            Discard,
+            LoadBinding(0),
+            Void,
+            Discard, // statement terminator consumes the last operand
+            LoadBinding(1),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn no_comma_assignment_statements_keep_their_consuming_opcodes() {
+    use crate::parser::ShortCircuitCondition;
+    use Instruction::{Boolean, ShortCircuitStatement, StoreBinding, Undefined};
+
+    assert_postfix(
+        "let x;x=true;x+=true;x||=false;x",
+        &[
+            Undefined,
+            init_let(0),
+            Boolean(true),
+            StoreBinding(0),
+            LoadBinding(0),
+            Boolean(true),
+            Add,
+            StoreBinding(0),
+            LoadBinding(0),
+            ShortCircuitStatement {
+                target: 12,
+                condition: ShortCircuitCondition::Truthy,
+            },
+            Boolean(false),
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn assignment_statements_require_explicit_semicolons() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [

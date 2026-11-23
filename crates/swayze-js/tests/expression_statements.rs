@@ -115,15 +115,17 @@ fn statement_expressions_do_not_enable_other_syntax() {
 }
 
 #[test]
-fn assignment_rhs_still_requires_parentheses_for_comma_sequences() {
-    let script = parse_script("let x=0; (1,2); {1,2; x=(1,42);} x").unwrap();
-    assert_eq!(script.evaluate_value(), Ok(Value::Number(42.0)));
-    for source in ["let x=0; 1,2; x=1@,42; x", "let x=0; {1,2; x=1@,42;} x"] {
-        assert_error(
-            source,
-            1,
-            ErrorKind::Unsupported,
-            "assignment RHS requires parentheses",
+fn only_parentheses_put_the_entire_sequence_in_the_assignment_rhs() {
+    for (source, expected) in [
+        ("let x=0; (1,2); {1,2; x=(1,42);} x", 42.0),
+        ("let x=0; 1,2; x=1,42; x", 1.0),
+        ("let x=0; {1,2; x=1,42;} x", 1.0),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(
+            script.evaluate_value(),
+            Ok(Value::Number(expected)),
+            "{source}"
         );
     }
 }

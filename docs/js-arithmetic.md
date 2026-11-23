@@ -70,7 +70,11 @@ as in `0, x += y = 3, x + y`.
 Declaration separators and commas disallowed by the enclosing assignment or
 ternary syntax do not start sequence operands.
 Declarations, assignments, updates, and nonfinal expression statements require
-explicit semicolons. Expression statements discard their values. The script
+explicit semicolons. A root or block statement that starts with an assignment
+can continue with a comma sequence: `x ||= 4, y += x;`. The leading assignment
+finishes or skips before the remaining operands run, and the statement yields
+no value. A statement that starts with `++` or `--` still cannot continue with
+a comma. Expression statements discard their values. The script
 must end in a root-level expression, whose trailing semicolon is optional;
 only trivia may follow it. This is not general JavaScript Script completion.
 Unavailable bindings

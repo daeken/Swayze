@@ -409,7 +409,10 @@ fn fixtures() -> Vec<String> {
             "let i=0,n=0; for (n ||= 2, i = 1; i < 3; i += 1, n += i) { if (i === 1) { break; } } i*100+n",
             "let x=0,y=9; for (++x, y=0; y<2; x++, ++y) { continue; } x*100+y",
             "let i=2,n=0; for (i--, n=i; i>0; --i, n+=i) { break; } i*10+n",
-            "let i=0,n=0; for (; i<2; i /* same line */ ++, n=n*10+i) { continue; } n"
+            "let i=0,n=0; for (; i<2; i /* same line */ ++, n=n*10+i) { continue; } n",
+            "let x=0,y=0; x ||= 4, y += x; y",
+            "let x=3,y=0; { x ||= 4, y += x; } y",
+            "let x=2,y=0; x += x = 5, y = true ? x *= 2 : 1; x * 100 + y"
         ]
         .map(str::to_owned),
     );

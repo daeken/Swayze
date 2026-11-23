@@ -416,10 +416,12 @@
 //! or changing guest state. Execution does not recurse in Rust. The only guest
 //! execution allocation is the fallible exact reserve for an eligible
 //! `memory.grow`, during start or invocation. The reserve and the drop of the
-//! old buffer happen outside any memory borrow. The private `RefCell<Vec<u8>>`
-//! only lends bytes within one operation, never across guest dispatch or host
-//! reentry. Capacity is checked before copy or zero-fill. Byte pushes cannot
-//! allocate while capacity suffices, as guaranteed by `Vec`.
+//! old buffer happen outside any memory borrow. A private `RefCell` holds a
+//! single contiguous `Vec<[u8; 1024]>`. Each 64-KiB page is exactly 64 chunks:
+//! this amortizes the push loop without a page-sized temporary. Capacity is
+//! checked before copy or zero-fill. Each chunk is appended with `Vec::push`,
+//! which is guaranteed not to allocate when capacity suffices. No memory view
+//! outlives its operation or crosses guest dispatch or host reentry.
 //! Zero selects the else arm (or skips straight to the join if no `else` is
 //! present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of operand types and a fixed stack of control
@@ -533,8 +535,10 @@
 //! way to write it. It checks the exact name and export kind before checking the
 //! full range against the instance's current size. It does not dispatch guest
 //! instructions or use guest fuel, allocate, or retain the destination. An
-//! unaligned guest access or a host copy may cross the internal page seam;
-//! only the full range relative to the current size matters.
+//! unaligned guest access or a host copy may cross a chunk or page seam.
+//! Safe flattened slices let guest accesses, host copies, and active data
+//! initialization use byte ranges; only the full range relative to the current
+//! size matters.
 //! [`Instance::read_global`] returns an owned snapshot of an explicitly named
 //! global's current value, preserving its exact type and bits. Both immutable
 //! and mutable globals can be read, but neither can be written or borrowed by
@@ -550,11 +554,13 @@
 //!
 //! A memory can grow successfully at most twice in an instance's lifetime.
 //! The maximum simultaneous **requested** linear-memory backing is 192 KiB
-//! (64 KiB old plus 128 KiB fresh during a one-to-two-page grow), not a bound
-//! on RSS, allocator overhead, or other allocations. Initial zero-fill plus
-//! successful growth zero-fill touches at most 128 KiB in total because only
-//! newly exposed bytes are zeroed. Growth copies old bytes at most once,
-//! at most 64 KiB, separate from active data, guest accesses, and host copies.
+//! (64 KiB old plus 128 KiB fresh during a one-to-two-page grow). Chunks
+//! have no padding. The request size isn't a bound on capacity the allocator
+//! actually provides, allocator overhead, RSS, or other allocations. Initial
+//! zero-fill and successful growth zero-fill initialize at most 128 KiB of
+//! backing in total because only newly exposed bytes are zeroed. Growth copies
+//! at most 64 KiB of old backing, separate from active data, guest accesses,
+//! and host copies.
 //! Failed reserves may be retried, but each eligible dispatched grow makes
 //! one attempt, so there are at most 1024 such attempts per invocation or
 //! start, separate from the one possible initial reserve during instantiation.
@@ -779,14 +785,16 @@
 //! stores, concrete types above live and dead floors, and the exact dispatch
 //! boundary for each opcode.
 //! Layout probes with Rust 1.99.1 on arm64 macOS in debug and release measured
-//! `LinearMemory` at 32 → 40 bytes and `Instance` at 432 → 440 bytes; `Module`
-//! remained 272 bytes. These measurements exclude heap backing and do not
-//! guarantee the same layout on other targets.
+//! `LinearMemory` at 40 bytes, `Instance` at 440 bytes, and `Module` at 272 bytes,
+//! unchanged by switching from byte to chunk backing. These measurements
+//! exclude heap backing and do not guarantee the same layout on other targets.
 //! Growth tests check optional and padded declared maxima, unsigned deltas,
 //! reserve bounds and injected failure/retry, stack and dispatch limits, and
 //! persistence through exports, calls, start, and traps. Start growth cannot
 //! bypass initial data preflight. Seam tests cover all access widths, exact
-//! float bits, overlapping active data, and detached host snapshots.
+//! float bits, overlapping active data, and detached host snapshots. The
+//! internal chunk-seam test also checks overlapping data initialization,
+//! an unaligned store and load, and a host copy before and after growth.
 //! Data tests cover section order and framing, index and offset encodings, the
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap

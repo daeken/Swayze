@@ -1988,6 +1988,57 @@ fn assignment_statement_sequence_joins_at_the_suffix_and_discards_only_suffix_va
 }
 
 #[test]
+fn update_statements_use_the_same_consuming_store_with_or_without_a_suffix() {
+    use crate::parser::{Update, UpdateResult};
+    use Instruction::{Discard, StoreBinding, StoreBindingKeep, UpdateBinding};
+
+    for (leading, operation) in [
+        ("++x", Add),
+        ("x++", Add),
+        ("--x", Subtract),
+        ("x--", Subtract),
+    ] {
+        assert_postfix(
+            &format!("let x=0;{leading};x"),
+            &[
+                Number(0.0),
+                init_let(0),
+                LoadBinding(0),
+                Number(1.0),
+                operation,
+                StoreBinding(0),
+                LoadBinding(0),
+            ],
+            2,
+        );
+        assert_postfix(
+            &format!("let x=0,y=0;{{{leading},y=x++,x;}}y"),
+            &[
+                Number(0.0),
+                init_let(0),
+                Number(0.0),
+                init_let(1),
+                LoadBinding(0),
+                Number(1.0),
+                operation,
+                StoreBinding(0), // enter the suffix with an empty stack
+                UpdateBinding {
+                    slot: 0,
+                    op: Update::Increment,
+                    result: UpdateResult::Old,
+                },
+                StoreBindingKeep(1),
+                Discard,
+                LoadBinding(0),
+                Discard,
+                LoadBinding(1),
+            ],
+            2,
+        );
+    }
+}
+
+#[test]
 fn no_comma_assignment_statements_keep_their_consuming_opcodes() {
     use crate::parser::ShortCircuitCondition;
     use Instruction::{Boolean, ShortCircuitStatement, StoreBinding, Undefined};

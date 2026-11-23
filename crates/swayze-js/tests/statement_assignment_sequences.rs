@@ -102,18 +102,6 @@ fn separators_require_operands_and_do_not_interrupt_a_consequent_or_declaration(
         Unsupported,
         "cannot initialize declarations",
     );
-    for source in [
-        "let x; @++@x,1;x",
-        "let x; x@--@,1;x",
-        "let x; { @--@x,1; } x",
-        "let x; { x@++@,1; } x",
-    ] {
-        assert_marked_error(
-            source,
-            Unsupported,
-            "outside the subset at the start of a statement",
-        );
-    }
 }
 
 #[test]

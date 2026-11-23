@@ -412,7 +412,10 @@ fn fixtures() -> Vec<String> {
             "let i=0,n=0; for (; i<2; i /* same line */ ++, n=n*10+i) { continue; } n",
             "let x=0,y=0; x ||= 4, y += x; y",
             "let x=3,y=0; { x ||= 4, y += x; } y",
-            "let x=2,y=0; x += x = 5, y = true ? x *= 2 : 1; x * 100 + y"
+            "let x=2,y=0; x += x = 5, y = true ? x *= 2 : 1; x * 100 + y",
+            "let x=0,y=0; x++, y += x; y",
+            "let x=4,y=0; { --x, y=x--, y+=x; } x*10+y",
+            "let x=1,y=7; ++x, y ||= x = 99, y += x; x*100+y"
         ]
         .map(str::to_owned),
     );

@@ -1,10 +1,10 @@
 use swayze_js::{
-    ErrorKind, EvalError, Limit, Limits, Span, Value, parse_script, parse_script_with_limits,
+    Error, ErrorKind, EvalError, Limit, Limits, Span, Value, parse_script, parse_script_with_limits,
 };
 
 const FORMS: [(&str, f64); 4] = [("++x", 1.0), ("x++", 1.0), ("--x", -1.0), ("x--", -1.0)];
 
-fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
+fn assert_error_at(marked: &str, kind: ErrorKind) -> Error {
     let (prefix, rest) = marked.split_once('@').unwrap();
     let (token, suffix) = rest.split_once('@').unwrap();
     let source = format!("{prefix}{token}{suffix}");
@@ -18,7 +18,12 @@ fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
         },
         "{source:?}: {error}"
     );
-    assert!(error.message().contains(message), "{source:?}: {error}");
+    error
+}
+
+fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
+    let error = assert_error_at(marked, kind);
+    assert!(error.message().contains(message), "{marked:?}: {error}");
 }
 
 #[test]
@@ -45,6 +50,126 @@ fn all_four_forms_work_in_statements_and_both_for_clauses() {
         );
         let source = format!("let x=42;for({form};false;{form}){{{form};}}x");
         assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(42.0 + step));
+    }
+}
+
+#[test]
+fn statement_sequences_store_before_the_suffix_in_root_and_braced_scopes() {
+    for (leading, step) in FORMS {
+        for (following, offset) in [("x++", 0.0), ("++x", 1.0)] {
+            let sequence = format!("{leading},y=x,z={following},x+=y;");
+            for statement in [sequence.clone(), format!("{{{sequence}}}")] {
+                let source = format!("let x=3,y=0,z=0;{statement}x*100+y*10+z");
+                let first = 3.0 + step;
+                let expected = (2.0 * first + 1.0) * 100.0 + first * 10.0 + first + offset;
+                let script = parse_script(&source).unwrap();
+                assert_eq!(script.evaluate(), Ok(expected), "{source}");
+                assert_eq!(script.evaluate(), Ok(expected), "{source}");
+            }
+        }
+    }
+    for (source, expected) in [
+        ("let x=0,y=0; x++, y += x; y", 1.0),
+        ("let x=20,y; {let x=2; --x,y=x++,++x;} y*100+x", 120.0),
+        ("let x=0,y=0; if(false){++x,y=x;} x*10+y", 0.0),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn statement_update_sequences_require_a_nonempty_suffix_and_explicit_semicolon() {
+    use ErrorKind::{Malformed, Unsupported};
+    for source in [
+        "let x=0; ++x,/*💡*/@;@ x",
+        "let x=0; x--,/*💡*/@,@ x; x",
+        "let x=0; {x++,0,/*💡*/@;@} x",
+    ] {
+        assert_error(source, Malformed, "expected an operand");
+    }
+    assert_error(
+        "let x=0; x++,/*💡*/@@",
+        Malformed,
+        "expected an operand before end of source",
+    );
+    assert_error(
+        "let x=0; {--x,/*💡*/@}@ x",
+        Unsupported,
+        "braces are not expression tokens",
+    );
+    for source in [
+        "let x=0; ++x,x/*💡*/@@",
+        "let x=0; x++,null/*💡*/@@",
+        "let x=0; {++x,x/*💡*/@}@ x",
+        "let x=0; {x--,null/*💡*/@}@ x",
+        "let x=0; x++,null/*💡\u{2028}*/@x@",
+    ] {
+        assert_eq!(
+            assert_error_at(source, Unsupported).message(),
+            "increments and decrements require explicit semicolons",
+            "{source}",
+        );
+    }
+    for source in ["let x=0; x++,x;/*💡*/@@", "let x=0; {--x,null;}/*💡*/@@"] {
+        assert_error(source, Unsupported, "a final expression is required");
+    }
+}
+
+#[test]
+fn statement_update_sequences_check_all_targets_statically() {
+    use ErrorKind::Unsupported;
+    for (source, message) in [
+        ("if(false){++/*💡*/@absent@,0;} 0", "unbound name"),
+        ("@undefined@--,0;0", "unbound name"),
+        ("const x=0; @--@x,missing; x", "assignment to const"),
+        (
+            "if(false){const x=0; x/*💡*/@++@,0;}0",
+            "assignment to const",
+        ),
+        ("let x=0; { @x@++,0; let x; } x", "initialization"),
+        ("let x=0; if(false){++x,@y@=2;let y;} x", "initialization"),
+        ("let x=0; if(false){x--,@missing@=2;}x", "unbound name"),
+        (
+            "let x=0; {const y=0; --x,false && y@++@;} x",
+            "assignment to const",
+        ),
+    ] {
+        assert_error(source, Unsupported, message);
+    }
+}
+
+#[test]
+fn only_a_comma_can_continue_a_statement_leading_bare_name_update() {
+    use ErrorKind::Unsupported;
+    for (source, message) in [
+        ("let x=0; x@++@ + 1; x", "outside the subset"),
+        ("let x=0; { @++@x ** 2; } x", "outside the subset"),
+        ("let x=0; @++@x ** 2, x; x", "outside the subset"),
+        ("let x=0; { x@++@ + 1, x; } x", "outside the subset"),
+        ("let x=0; @--@(x), x; x", "identifier"),
+        ("let x=0; { (x)@--@, x; } x", "identifier"),
+        ("let x=0; ++x@.@p, x; x", "token"),
+        ("let x=0; { x@[@0]++, x; } x", "token"),
+        ("let x=0; x@++@++, x; x", "outside the subset"),
+    ] {
+        assert_error(source, Unsupported, message);
+    }
+    // Grouping the leading update with the operator or putting it after
+    // the first comma uses ordinary value-producing expression rules.
+    for source in [
+        "let x=0; (x++ + 1)",
+        "let x=0,y; 0,y=x++ + 1; y",
+        "let x=-1,y; ++x,y=++x ** 2; y",
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(1.0),
+            "{source}"
+        );
     }
 }
 
@@ -180,8 +305,6 @@ fn for_update_sequence_delimiters_and_targets_keep_their_diagnostics() {
             Unsupported,
             "binding name",
         ),
-        ("let x;@++@x,0;x", Unsupported, "expressions"),
-        ("let x;{x@--@,0;}x", Unsupported, "expressions"),
     ] {
         assert_error(source, kind, message);
     }
@@ -276,6 +399,9 @@ fn respects_ecmascript_line_terminators_without_asi() {
                 for marked in [
                     format!("let x=0;x{trivia}@{op}@;x"),
                     format!("let x=0;if(true){{x{trivia}@{op}@;}}x"),
+                    format!("let x=0;x{trivia}@{op}@,null;x"),
+                    format!("let x=0;{{x{trivia}@{op}@,null;}}x"),
+                    format!("let x=0;++x,x{trivia}@{op}@;x"),
                     format!("let x=0;for(x{trivia}@{op}@;false;){{}}x"),
                     format!("let x=0;for(;false;x{trivia}@{op}@){{}}x"),
                     format!("let x=0;for(x{trivia}@{op}@,null;false;){{}}x"),
@@ -286,6 +412,9 @@ fn respects_ecmascript_line_terminators_without_asi() {
                 }
             }
             let source = format!("let x=0;++{trivia}x;x++{trivia};x");
+            assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(2.0));
+            let source =
+                format!("let x=0;++{trivia}x{trivia},null{trivia};{{x/*💡*/++{trivia},null;}}x");
             assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(2.0));
         }
     }
@@ -406,6 +535,141 @@ fn token_and_work_budgets_include_trivia_and_only_one_target_lookup() {
         let error = parse_script_with_limits(source, limits).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::LimitExceeded(ceiling));
         assert_eq!(error.span(), span);
+    }
+}
+
+#[test]
+fn statement_update_suffix_shares_inclusive_parse_budgets() {
+    for (leading, step) in FORMS {
+        let source = format!("let x=false;{leading}/*💡*/,x=(x),x;x");
+        let last = source.len() - 1;
+        let comma = source.find(',').unwrap();
+        let open = source.find('(').unwrap();
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 17,
+            max_nesting_depth: 2,
+            // Twelve emissions, the suffix assignment's name charge, two
+            // pending pushes, and two units per lookup at five access sites.
+            max_work: source.len() + 25,
+        };
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 12, "{source}");
+        assert_eq!(script.max_stack_depth(), 2, "{source}");
+        assert_eq!(script.evaluate(), Ok(step), "{source}");
+        for (limits, limit, start) in [
+            (
+                Limits {
+                    max_source_bytes: last,
+                    ..limits
+                },
+                Limit::SourceBytes,
+                last,
+            ),
+            (
+                Limits {
+                    max_tokens: 16,
+                    ..limits
+                },
+                Limit::Tokens,
+                last,
+            ),
+            (
+                Limits {
+                    max_tokens: 7,
+                    ..limits
+                },
+                Limit::Tokens,
+                comma,
+            ),
+            (
+                Limits {
+                    max_nesting_depth: 1,
+                    ..limits
+                },
+                Limit::NestingDepth,
+                open,
+            ),
+            (
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+                Limit::Work,
+                last,
+            ),
+            // Lex through the comma once and emit two declaration and three
+            // update instructions, leaving no work for the store at the comma.
+            (
+                Limits {
+                    max_work: comma + 1 + 5,
+                    ..limits
+                },
+                Limit::Work,
+                comma,
+            ),
+        ] {
+            let error = parse_script_with_limits(&source, limits).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::LimitExceeded(limit),
+                "{source}: {error}"
+            );
+            assert_eq!(
+                error.span(),
+                Span {
+                    start,
+                    end: start + 1
+                },
+                "{source}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn statement_update_suffix_shares_inclusive_prepared_and_dispatch_caps() {
+    // Two setup instructions, four for the leading update, 2,043 pairs
+    // of literal/discard, three or four for the final suffix operand and its
+    // discard, then the final load.
+    for (operand, count, expected) in [
+        ("!false", 4096, Ok(1.0)),
+        ("!!false", 4097, Err(EvalError::LimitExceeded)),
+    ] {
+        let source = format!("let x=0;x++,{}{operand};x", "false,".repeat(2043));
+        let script = parse_script_with_limits(
+            &source,
+            Limits {
+                max_tokens: 8192,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(script.instruction_count(), count);
+        assert_eq!(script.max_stack_depth(), 2);
+        assert_eq!(script.evaluate(), expected);
+    }
+
+    // Two setup dispatches, 11 per taken iteration with the suffix or nine
+    // without it, four for the last test, and a final load. Padding reaches
+    // 16,384 exactly in each case.
+    for (statement, iterations, padding) in [("++i,null;", 1488, 9), ("i++;", 1819, 6)] {
+        for extra in [0, 1] {
+            let source = format!(
+                "let i=0;while(i<{iterations}){{{statement}}}{}i",
+                "+ ".repeat(padding + extra)
+            );
+            let expected = if extra == 0 {
+                Ok(f64::from(iterations))
+            } else {
+                Err(EvalError::DispatchLimitExceeded)
+            };
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                expected,
+                "{source}"
+            );
+        }
     }
 }
 

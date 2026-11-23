@@ -61,9 +61,9 @@ pub enum Limit {
     Work,
     /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
-    /// Fixed source-byte ceiling for one String literal, including its quotes.
+    /// Fixed source-byte ceiling for the whole quoted String token, including both quotes.
     StringLiteralBytes,
-    /// Fixed aggregate ceiling on decoded UTF-16 units of all String literals.
+    /// Fixed ceiling on aggregate decoded UTF-16 code units across all String literals in one Script.
     StringLiteralUnits,
     Allocation,
 }
@@ -122,8 +122,12 @@ impl Error {
             Limit::NestingDepth => "expression nesting ceiling exceeded",
             Limit::Work => "parse work ceiling exceeded",
             Limit::DecimalLiteralBytes => "decimal literal byte ceiling exceeded",
-            Limit::StringLiteralBytes => "string literal byte ceiling exceeded",
-            Limit::StringLiteralUnits => "aggregate string literal UTF-16 unit ceiling exceeded",
+            Limit::StringLiteralBytes => {
+                "quoted string literal byte ceiling exceeded (including quotes)"
+            }
+            Limit::StringLiteralUnits => {
+                "aggregate UTF-16 code unit ceiling across all string literals in one script exceeded"
+            }
             Limit::Allocation => "unable to allocate parser storage",
         };
         Self {

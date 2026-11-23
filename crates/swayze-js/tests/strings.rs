@@ -22,11 +22,12 @@ fn assert_scalar(source: &str, expected: Value) {
     assert_eq!(script.evaluate_value(), Ok(expected), "{source:?}");
 }
 
-fn assert_error(source: &str, kind: ErrorKind, start: usize, end: usize) {
+fn assert_error(source: &str, kind: ErrorKind, start: usize, end: usize) -> &'static str {
     let error = parse_script(source).unwrap_err();
     assert_eq!(error.kind(), kind, "{source:?}: {error}");
     assert_eq!(error.span(), Span { start, end }, "{source:?}: {error}");
     assert!(source.get(start..end).is_some());
+    error.message()
 }
 
 #[test]
@@ -166,7 +167,10 @@ fn literal_byte_cap_includes_quotes_and_cannot_split_utf8() {
 
     let prefix = "/*😀*/ ";
     let source = format!("{prefix}'{}😀'", "a".repeat(4093));
-    assert_error(&source, limit, prefix.len() + 4094, prefix.len() + 4098);
+    assert_eq!(
+        assert_error(&source, limit, prefix.len() + 4094, prefix.len() + 4098),
+        "quoted string literal byte ceiling exceeded (including quotes)",
+    );
     assert_error(&format!("'{}'", "a".repeat(4095)), limit, 4096, 4097);
     assert_error(&format!("'{}", "a".repeat(4096)), limit, 4096, 4097);
     assert_error(&format!("'{}\r", "a".repeat(4095)), limit, 4096, 4097);
@@ -199,7 +203,10 @@ fn unit_cap_is_aggregate_inclusive_and_counts_skipped_literals() {
     let escaped = format!("{prefix}'1234567\\u{{10000}}'");
     assert_error(&escaped, limit, prefix.len() + 8, prefix.len() + 17);
     let over = format!("{prefix}'123456😀z'");
-    assert_error(&over, limit, prefix.len() + 11, prefix.len() + 12);
+    assert_eq!(
+        assert_error(&over, limit, prefix.len() + 11, prefix.len() + 12),
+        "aggregate UTF-16 code unit ceiling across all string literals in one script exceeded",
+    );
 }
 
 #[test]
@@ -412,7 +419,7 @@ fn equality_pair_budget_is_inclusive_shared_and_fresh_per_eval() {
         &format!("{prelude}false && (x == x)"),
         Value::Boolean(false),
     );
-    let exhausted = parse_script(&format!("{prelude}x === x")).unwrap();
+    let exhausted = parse_script(&format!("{prelude}'z' === 'z'")).unwrap();
     assert_eq!(exhausted.evaluate_primitive(), Err(pair_budget));
     assert_eq!(exhausted.evaluate_value(), Err(pair_budget));
     assert_eq!(exhausted.evaluate(), Err(pair_budget));

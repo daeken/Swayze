@@ -46,10 +46,10 @@
 //! LEB32 type index followed by the literal reserved byte `0x00` (not a LEB32
 //! table index). It requires a defined table even in unreachable code; a
 //! defined zero-entry table qualifies. The control constructs may nest together.
-//! `if` and `block` accept block type byte `0x40` (void), `0x7f` (one i32
-//! result), or `0x7e` (one i64 result), with no block parameters. A void `if`
-//! may omit `else`; a value-producing `if` requires it. `loop` accepts only
-//! `0x40`.
+//! `if` and `block` accept block type byte `0x40` (void) or one result type:
+//! `0x7f` (i32), `0x7e` (i64), `0x7d` (f32), or `0x7c` (f64). They do not
+//! accept block parameters. A void `if` may omit `else`; a value-producing
+//! `if` requires it. `loop` accepts only `0x40`.
 //! `br` and `br_if` take an unsigned LEB32 label depth: zero names the innermost
 //! frame, and each enclosing frame, including `if`, adds one to the depth. A
 //! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
@@ -58,7 +58,7 @@
 //! always targets the function label. `br_table` takes an unsigned LEB32 count
 //! (0 to 16), exactly that many unsigned LEB32 label depths, and a mandatory
 //! unsigned LEB32 default depth. All listed labels and the default must have
-//! the same label result: void (including a loop continue), i32, or i64.
+//! the same label result: void (including a loop continue), i32, i64, f32, or f64.
 //! Other block types and typed `select` are unsupported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
@@ -167,10 +167,10 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! sign operations, and comparisons each count as one dispatch. None uses native
 //! floating-point operations or quiets signaling NaNs. Floats are supported as
-//! operands, private globals, and private declared locals only. Float function
-//! signatures (and thus host arguments and results), control label results,
-//! memory instructions, and other floating-point numeric instructions remain
-//! unsupported.
+//! operands, private globals, private declared locals, and `block` and `if`
+//! results. Both fallthrough and branch exits preserve all result bits. Float
+//! function signatures (and thus host arguments and results), memory instructions,
+//! and other floating-point numeric instructions remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -494,6 +494,11 @@
 //! `block` exits, and taken and untaken branches. They check typed table labels,
 //! arm and transfer validation at the active floor, counted unknown operands,
 //! and shared body, control, operand, and dispatch limits.
+//! Float control tests check exact negative-zero and signaling NaN bits through
+//! both `if` arms, normal block exits, and `br`, `br_if` (taken and untaken),
+//! and `br_table` (explicit and default). They check typed table diagnostics at
+//! the incompatible label immediate, active floors and concrete dead-tail
+//! results, and the unchanged body, stack, control, table, and dispatch ceilings.
 //! Loop tests cover outer continues across mixed frame kinds, preserved locals
 //! and stack prefixes, different taken and fallthrough stack effects, full body
 //! validation, shared caps, and the exact dispatch boundary in a called nested

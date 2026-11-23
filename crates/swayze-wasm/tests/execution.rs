@@ -11,6 +11,8 @@ mod branch;
 mod branch_table;
 #[path = "execution/call_indirect.rs"]
 mod call_indirect;
+#[path = "execution/float_control.rs"]
+mod float_control;
 #[path = "execution/float_locals.rs"]
 mod float_locals;
 #[path = "execution/float_operands.rs"]
@@ -1419,7 +1421,7 @@ fn zero_test_and_ordering_comparisons_select_conditional_arms() {
 
 #[test]
 fn rejects_bad_if_block_type_and_missing_condition() {
-    for found in [0x7d, 0, 0xff] {
+    for found in [0x7b, 0, 0xff] {
         bad_body(
             &[0, 0x41, 1, 0x04, found],
             4,
@@ -1823,7 +1825,7 @@ fn block_floors_protect_enclosing_arm_operands_even_on_untaken_paths() {
 
 #[test]
 fn validates_block_type_and_delimiters_at_the_body_boundary() {
-    for found in [0x7d, 0, 0xff] {
+    for found in [0x7b, 0, 0xff] {
         bad_body(
             &[0, 0x02, found],
             2,

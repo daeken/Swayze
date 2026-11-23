@@ -145,8 +145,8 @@ impl IntegerField {
     }
 }
 
-/// A concrete operand type. Only integers are supported in declarations and
-/// across the host boundary.
+/// A concrete operand type. Only integers are supported in function
+/// signatures and across the host boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValType {
     I32,
@@ -2782,6 +2782,8 @@ impl<'a> Reader<'a> {
             Some(EMPTY_BLOCK_TYPE) => Ok(None),
             Some(I32) => Ok(Some(ValType::I32)),
             Some(I64) => Ok(Some(ValType::I64)),
+            Some(0x7d) => Ok(Some(ValType::F32)),
+            Some(0x7c) => Ok(Some(ValType::F64)),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {

@@ -223,7 +223,7 @@ impl fmt::Display for Error {
             InvalidTableLimits { minimum, maximum } => {
                 write!(f, "table minimum {minimum} exceeds maximum {maximum}")
             }
-            MissingTable => f.write_str("element segment requires a defined table"),
+            MissingTable => f.write_str("a defined table is required"),
             TruncatedMemoryLimitsFlags => f.write_str("missing memory limits flags"),
             UnsupportedMemoryLimitsFlags { flags } => {
                 write!(f, "unsupported memory limits flags {flags:#04x}")
@@ -316,14 +316,15 @@ impl std::error::Error for Error {}
 /// Oversized table counts, entry bounds, or element segment counts are reported
 /// as [`ErrorKind::UnsupportedCount`], and a reversed table bounds pair as
 /// [`ErrorKind::InvalidTableLimits`] at the start of the maximum field.
-/// [`ErrorKind::MissingTable`] points to the start of an active segment's table
-/// index. An element function-index vector above the remaining aggregate budget
-/// reports [`ErrorKind::LimitExceeded`] at the start of its count field.
+/// [`ErrorKind::MissingTable`] points to the `call_indirect` opcode or the start
+/// of an active segment's table index. An element function-index vector above
+/// the remaining aggregate budget reports [`ErrorKind::LimitExceeded`] at the
+/// start of its count field.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
 /// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent.
-/// For `memory.size`, a malformed reserved byte is reported as
+/// For `memory.size` or `call_indirect`, a malformed reserved byte is reported as
 /// [`ErrorKind::TruncatedByte`] or [`ErrorKind::UnexpectedByte`].
 /// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
 /// segment's memory index. A data length above the remaining aggregate budget
@@ -418,14 +419,14 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 )?;
             }
             10 => {
-                let declarations = function_count.map(|count| &function_types[..count as usize]);
-                functions = validate_code(
-                    &mut section,
-                    declarations,
-                    types[0],
-                    memory_bytes.is_some(),
-                    &globals[..global_count],
-                )?;
+                let environment = BodyEnvironment {
+                    types: &types[..type_count.unwrap_or(0) as usize],
+                    functions: &function_types[..function_count.unwrap_or(0) as usize],
+                    has_table: table_entries.is_some(),
+                    has_memory: memory_bytes.is_some(),
+                    globals: &globals[..global_count],
+                };
+                functions = validate_code(&mut section, &environment)?;
             }
             11 => data_segments = validate_data(&mut section, memory_bytes.is_some())?,
             _ => {
@@ -509,7 +510,9 @@ const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 
-#[derive(Clone, Copy, Debug)]
+// All supported parameters are i32; their count and the result kind are
+// therefore a complete structural signature, independent of type indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FunctionType {
     parameters: u32,
     result: ResultKind,
@@ -819,7 +822,7 @@ enum Instruction {
     LocalTee(u32),
     GlobalGet(u32),
     GlobalSet(u32),
-    Call(u32),
+    Call(CallTarget),
     Unary(UnaryOp),
     Binary(BinaryOp),
     LoadI32 { kind: LoadKind, offset: u32 },
@@ -829,6 +832,12 @@ enum Instruction {
     Jump { target: usize },
     Branch { edge: BranchEdge, conditional: bool },
     BranchTable { first: usize, explicit_count: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CallTarget {
+    Direct(u32),
+    Indirect(FunctionType),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1094,7 +1103,22 @@ pub(super) fn execute(
             }
             Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
             Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
-            Instruction::Call(index) => {
+            Instruction::Call(target) => {
+                let index = match target {
+                    CallTarget::Direct(index) => index as usize,
+                    CallTarget::Indirect(expected) => {
+                        // Dispatch was charged above. Trap on an invalid target
+                        // before checking whether another frame can be entered.
+                        let table = instance.table.as_ref().expect("validated table presence");
+                        let index = table
+                            .resolve(frame.pop() as u32)
+                            .map_err(InvokeError::Trap)?;
+                        if module.functions[index].signature != expected {
+                            return Err(InvokeError::Trap(Trap::IndirectCallTypeMismatch));
+                        }
+                        index
+                    }
+                };
                 if active + 1 == ExecutionLimit::CallDepth.maximum() {
                     return Err(InvokeError::LimitExceeded {
                         limit: ExecutionLimit::CallDepth,
@@ -1102,7 +1126,6 @@ pub(super) fn execute(
                 }
                 // Keep the caller's prefix; the argument suffix is already in
                 // parameter order. Reset reused frame storage before entering.
-                let index = index as usize;
                 let end = frame.depth;
                 frame.depth -= module.functions[index].signature.parameters as usize;
                 let callee = CallFrame::new(index, &frame.operands[frame.depth..end]);
@@ -1304,15 +1327,23 @@ fn decode_memarg(
     Ok(memory_offset)
 }
 
+struct BodyEnvironment<'a> {
+    types: &'a [FunctionType],
+    functions: &'a [FunctionType],
+    has_table: bool,
+    has_memory: bool,
+    globals: &'a [Global],
+}
+
 fn decode_plain(
     body: &mut Reader<'_>,
     opcode: u8,
     offset: usize,
     local_bound: u32,
-    function_bound: u32,
-    has_memory: bool,
-    globals: &[Global],
+    environment: &BodyEnvironment<'_>,
 ) -> Result<Instruction, Error> {
+    let globals = environment.globals;
+    let has_memory = environment.has_memory;
     let load = |body: &mut Reader<'_>, kind: LoadKind| {
         let offset = decode_memarg(body, offset, kind.width(), has_memory)?;
         Ok(Instruction::LoadI32 { kind, offset })
@@ -1324,7 +1355,22 @@ fn decode_plain(
     Ok(match opcode {
         0x00 => Instruction::Unreachable,
         0x01 => Instruction::Nop,
-        0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
+        0x10 => Instruction::Call(CallTarget::Direct(body.index(
+            IntegerField::FunctionIndex,
+            environment.functions.len() as u32,
+        )?)),
+        0x11 => {
+            let index = body.index(IntegerField::TypeIndex, environment.types.len() as u32)?;
+            // Core 1.0 reserves a literal zero byte here, not a LEB32 index.
+            body.expect_byte(0)?;
+            if !environment.has_table {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::MissingTable,
+                });
+            }
+            Instruction::Call(CallTarget::Indirect(environment.types[index as usize]))
+        }
         0x1a => Instruction::Drop,
         0x1b => Instruction::Select,
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
@@ -1399,36 +1445,31 @@ fn decode_plain(
 
 fn validate_code(
     section: &mut Reader<'_>,
-    declarations: Option<&[FunctionType]>,
-    first_type: FunctionType,
-    has_memory: bool,
-    globals: &[Global],
+    environment: &BodyEnvironment<'_>,
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
-    let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |types| {
-        let count = types.len() as u32;
-        count..=count
-    });
+    let declaration_count = environment.functions.len() as u32;
+    let allowed_counts = if declaration_count == 0 {
+        1..=MAX_FUNCTIONS
+    } else {
+        declaration_count..=declaration_count
+    };
     let count = section.count(IntegerField::CodeCount, allowed_counts)?;
     let mut functions = Vec::new();
     functions
         .try_reserve_exact(count as usize)
         .map_err(|_| allocation_error)?;
     for index in 0..count {
-        let (signature, function_types) = match declarations {
-            Some(types) => (types[index as usize], types),
-            // Preserve framing and ordering diagnostics for incomplete modules:
-            // without declarations there are no call targets, and the first type
-            // gives the placeholder signature until the final required-section check.
-            None => (first_type, &[][..]),
-        };
-        functions.push(validate_body(
-            section,
-            signature,
-            function_types,
-            has_memory,
-            globals,
-        )?);
+        // Preserve framing and ordering diagnostics for incomplete modules:
+        // without declarations there are no direct call targets, and the first
+        // type (if any) stands in until the final required-section check.
+        let signature = environment
+            .functions
+            .get(index as usize)
+            .or_else(|| environment.types.first())
+            .copied()
+            .unwrap_or(FunctionType::PLACEHOLDER);
+        functions.push(validate_body(section, signature, environment)?);
     }
     Ok(functions)
 }
@@ -1436,9 +1477,7 @@ fn validate_code(
 fn validate_body(
     section: &mut Reader<'_>,
     signature: FunctionType,
-    function_types: &[FunctionType],
-    has_memory: bool,
-    globals: &[Global],
+    environment: &BodyEnvironment<'_>,
 ) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -1663,15 +1702,8 @@ fn validate_body(
                 depth = frames[nesting].mark_unreachable();
             }
             _ => {
-                let instruction = decode_plain(
-                    &mut body,
-                    opcode,
-                    offset,
-                    local_bound,
-                    function_types.len() as u32,
-                    has_memory,
-                    globals,
-                )?;
+                let instruction =
+                    decode_plain(&mut body, opcode, offset, local_bound, environment)?;
                 depth = match instruction {
                     Instruction::Unreachable => frames[nesting].mark_unreachable(),
                     Instruction::Nop => depth,
@@ -1680,9 +1712,13 @@ fn validate_body(
                     | Instruction::LocalGet(_)
                     | Instruction::GlobalGet(_)
                     | Instruction::MemorySize => depth + 1,
-                    Instruction::Call(index) => {
-                        let callee = function_types[index as usize];
-                        consume(callee.parameters as usize)? + callee.result.count()
+                    Instruction::Call(target) => {
+                        let (signature, selectors) = match target {
+                            CallTarget::Direct(index) => (environment.functions[index as usize], 0),
+                            CallTarget::Indirect(expected) => (expected, 1),
+                        };
+                        consume(signature.parameters as usize + selectors)?
+                            + signature.result.count()
                     }
                     Instruction::Drop | Instruction::LocalSet(_) | Instruction::GlobalSet(_) => {
                         consume(1)?

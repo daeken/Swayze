@@ -9,6 +9,8 @@ mod bits;
 mod branch;
 #[path = "execution/branch_table.rs"]
 mod branch_table;
+#[path = "execution/call_indirect.rs"]
+mod call_indirect;
 #[path = "execution/function_exit.rs"]
 mod function_exit;
 #[path = "execution/globals.rs"]
@@ -848,9 +850,9 @@ fn validates_later_unexported_bodies_with_their_own_local_space_and_frames() {
             },
         ),
         (
-            &[0, 0x11, 0, 0x0b],
+            &[0, 0x12, 0, 0x0b],
             2,
-            ErrorKind::UnsupportedOpcode { opcode: 0x11 },
+            ErrorKind::UnsupportedOpcode { opcode: 0x12 },
         ),
         (
             &[0, 0x10, 0x80],
@@ -1764,9 +1766,9 @@ fn block_requires_a_new_result_and_checks_all_fallthrough_code() {
         ErrorKind::InvalidResultDepth { depth: 2 },
     );
     bad_body(
-        &[&branch[..], &[0x11, 0x0b, 0x0b]].concat(),
+        &[&branch[..], &[0x12, 0x0b, 0x0b]].concat(),
         branch.len(),
-        ErrorKind::UnsupportedOpcode { opcode: 0x11 },
+        ErrorKind::UnsupportedOpcode { opcode: 0x12 },
     );
     bad_body(
         &[&branch[..], &[0x0d, 0x80]].concat(),
@@ -2080,9 +2082,9 @@ fn rejects_loop_floor_violations_and_nonempty_results() {
             ErrorKind::InvalidResultDepth { depth: 1 },
         ),
         (
-            &[0x11, 0x0b, 0x0b],
+            &[0x12, 0x0b, 0x0b],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x11 },
+            ErrorKind::UnsupportedOpcode { opcode: 0x12 },
         ),
         (&[0x0b, 0x0b, 0x0b], 2, ErrorKind::TrailingBodyBytes),
     ] {
@@ -2237,8 +2239,8 @@ fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x1a, 0x1b,
-            0x20, 0x21, 0x22, 0x23, 0x24, 0x28, 0x36, 0x3a, 0x3b, 0x3f, 0x41,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1a,
+            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x28, 0x36, 0x3a, 0x3b, 0x3f, 0x41,
         ]
         .contains(&opcode)
             && !(0x2c..=0x2f).contains(&opcode)

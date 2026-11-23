@@ -563,6 +563,28 @@ fn fixtures() -> Vec<Fixture> {
         with_elements(&[(2, &[0])], Outcome::ElementSegmentOutOfBounds(0)),
         with_elements(&[(-1, &[])], Outcome::ElementSegmentOutOfBounds(0)),
     ]);
+    // Equal signatures at different type indices match. Other entries cover
+    // a signature mismatch, a null slot, and unsigned index bounds.
+    let indirect =
+        b"\0asm\x01\0\0\0\x01\x0f\x03\x60\x01\x7f\x01\x7f\x60\x01\x7f\x01\x7f\x60\0\x01\x7f\
+                     \x03\x04\x03\0\x01\x02\x04\x04\x01\x70\0\x03\x07\x05\x01\x01x\0\0\
+                     \x09\x08\x01\0\x41\0\x0b\x02\x01\x02\
+                     \x0a\x18\x03\x09\0\x20\0\x20\0\x11\0\0\x0b\
+                     \x07\0\x20\0\x41\x01\x6a\x0b\x04\0\x41\x2a\x0b";
+    for (selector, result) in [
+        (0, Ok(1)),
+        (1, Err(WasmTrap::IndirectCallTypeMismatch)),
+        (2, Err(WasmTrap::UninitializedElement)),
+        (3, Err(WasmTrap::TableOutOfBounds)),
+        (-1, Err(WasmTrap::TableOutOfBounds)),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(result),
+            bytes: indirect.to_vec(),
+            export: "x",
+            args: vec![selector],
+        });
+    }
     cases
 }
 

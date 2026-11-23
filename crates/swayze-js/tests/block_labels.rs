@@ -95,7 +95,6 @@ fn invalid_jumps_and_duplicates_are_checked_in_skipped_code() {
         ("a:{break a;const x=0;x=1;}42", Unsupported, "="),
         ("a:{break a;first;second;}42", Unsupported, "first"),
         ("a:{let x=0;break a;}x", Unsupported, "x"),
-        ("a:b:{}42", Unsupported, "b"),
         ("a:if(true){}42", Unsupported, "if"),
         ("a:42", Unsupported, "42"),
     ] {
@@ -269,22 +268,24 @@ fn mixed_target_traversal_and_block_break_fixups_are_metered_exactly() {
 
 #[test]
 fn block_labels_add_no_instructions_and_only_reached_jumps_dispatch() {
-    let jumps = "break a;".repeat(4095);
-    for (extra, count, result) in [
-        ("", 4096, Ok(42.0)),
-        ("break a;", 4097, Err(EvalError::LimitExceeded)),
-    ] {
-        let source = format!("a:{{{jumps}{extra}}}42");
-        let script = parse_script_with_limits(
-            &source,
-            Limits {
-                max_tokens: 12_300,
-                ..Limits::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(script.instruction_count(), count);
-        assert_eq!(script.evaluate(), result);
+    for (labels, other) in [("a:", "a"), ("first:a:", "first")] {
+        let jumps = format!("break a;break {other};").repeat(2047);
+        for (extra, count, result) in [
+            ("", 4096, Ok(42.0)),
+            ("break a;", 4097, Err(EvalError::LimitExceeded)),
+        ] {
+            let source = format!("{labels}{{{jumps}break a;{extra}}}42");
+            let script = parse_script_with_limits(
+                &source,
+                Limits {
+                    max_tokens: 12_300,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(script.instruction_count(), count);
+            assert_eq!(script.evaluate(), result);
+        }
     }
 
     // Two to initialize, 12 per iteration (including the named break), one
@@ -294,9 +295,11 @@ fn block_labels_add_no_instructions_and_only_reached_jumps_dispatch() {
         ("+ ", Ok(1365.0)),
         ("+ + ", Err(EvalError::DispatchLimitExceeded)),
     ] {
-        let source = format!(
-            "let n=0;while(true){{done:{{n++;break done;n=999;}}if(n===1365){{break;}}}}{prefix}n"
-        );
-        assert_eq!(parse_script(&source).unwrap().evaluate(), result);
+        for labels in ["done:", "done:alias:"] {
+            let source = format!(
+                "let n=0;while(true){{{labels}{{n++;break done;n=999;}}if(n===1365){{break;}}}}{prefix}n"
+            );
+            assert_eq!(parse_script(&source).unwrap().evaluate(), result);
+        }
     }
 }

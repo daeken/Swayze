@@ -1000,7 +1000,8 @@ enum Pending {
     Group,
     AssignmentGroup {
         access: usize,
-        base_depth: usize,
+        binary: Option<Operator>,
+        rhs_base_depth: usize,
     },
     Consequent {
         branch: usize,
@@ -2163,15 +2164,25 @@ impl Parser<'_> {
         )
     }
 
-    fn begin_group_assignment(&mut self, name: Span, operator: Span) -> Result<(), Error> {
-        let access = self.begin_write(name, operator, false)?;
-        let Some((group @ Pending::Group, _)) = self.pending.last_mut() else {
+    fn begin_group_assignment(
+        &mut self,
+        name: Span,
+        binary: Option<Operator>,
+        operator: Span,
+    ) -> Result<(), Error> {
+        let access = self.begin_write(name, operator, binary.is_some())?;
+        let Some(group @ (Pending::Group, _)) = self.pending.last_mut() else {
             return Err(Error::malformed(operator, "expected an assignment group"));
         };
-        *group = Pending::AssignmentGroup {
-            access,
-            base_depth: self.stack_depth,
-        };
+        *group = (
+            Pending::AssignmentGroup {
+                access,
+                binary,
+                // Keep the loaded target, if any, below every RHS operand.
+                rhs_base_depth: self.stack_depth,
+            },
+            operator,
+        );
         Ok(())
     }
 
@@ -2278,9 +2289,16 @@ impl Parser<'_> {
                 (
                     Some(write),
                     Instruction::StoreBinding(slot),
-                    Some(op @ Instruction::StoreBinding(UNPATCHED)),
+                    Some(
+                        op @ (Instruction::StoreBinding(UNPATCHED)
+                        | Instruction::StoreBindingKeep(UNPATCHED)),
+                    ),
                 ) => {
-                    *op = resolved;
+                    *op = if matches!(op, Instruction::StoreBindingKeep(_)) {
+                        Instruction::StoreBindingKeep(slot)
+                    } else {
+                        resolved
+                    };
                     if let Some(load) = write.load {
                         let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
                             self.instructions.get_mut(load)
@@ -2293,11 +2311,6 @@ impl Parser<'_> {
                         *op = Instruction::LoadBinding(slot);
                     }
                 }
-                (
-                    Some(WriteAccess { load: None, .. }),
-                    Instruction::StoreBinding(slot),
-                    Some(op @ Instruction::StoreBindingKeep(UNPATCHED)),
-                ) => *op = Instruction::StoreBindingKeep(slot),
                 _ => {
                     return Err(Error::malformed(
                         access.name,
@@ -2365,7 +2378,7 @@ impl Parser<'_> {
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
                         span,
-                        "assignment expressions require a simple name and '=' at the start of an expression group",
+                        "assignment expressions require a simple name followed by '=' or an eager compound operator at the start of an expression group",
                     ));
                 }
                 (_, TokenKind::Declaration(_)) => {
@@ -2437,12 +2450,18 @@ impl Parser<'_> {
                         self.lexer.charge(1, span)?;
                         let following = self.next_token()?;
                         if let Some(Token {
-                            kind: TokenKind::Assignment(None),
+                            kind: TokenKind::Assignment(binary),
                             span: operator,
                             ..
                         }) = following
+                            && !matches!(
+                                binary,
+                                Some(
+                                    Operator::LogicalAnd | Operator::LogicalOr | Operator::Coalesce
+                                )
+                            )
                         {
-                            self.begin_group_assignment(span, operator)?;
+                            self.begin_group_assignment(span, binary, operator)?;
                             after_open = false;
                             next = self.next_token()?;
                             continue;
@@ -2572,12 +2591,22 @@ impl Parser<'_> {
                     self.reduce_expression()?;
                     match self.pending.pop() {
                         Some((Pending::Group, _)) => self.nesting_depth -= 1,
-                        Some((Pending::AssignmentGroup { access, base_depth }, _)) => {
-                            if self.stack_depth.checked_sub(base_depth) != Some(1) {
+                        Some((
+                            Pending::AssignmentGroup {
+                                access,
+                                binary,
+                                rhs_base_depth,
+                            },
+                            operator,
+                        )) => {
+                            if self.stack_depth.checked_sub(rhs_base_depth) != Some(1) {
                                 return Err(Error::malformed(
                                     span,
                                     "assignment value must leave one result",
                                 ));
+                            }
+                            if let Some(binary) = binary {
+                                self.emit(binary.instruction(), operator)?;
                             }
                             self.finish_write(access, span, true)?;
                             self.nesting_depth -= 1;

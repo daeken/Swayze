@@ -148,7 +148,6 @@ fn rejects_other_targets_operators_and_assignment_expressions() {
         ("let x=1;x@.@p+=2;x", Unsupported, "token"),
         ("let x=1;x@[@0]+=2;x", Unsupported, "token"),
         ("let x=1;(x)@+=@2;x", Unsupported, "assignment expressions"),
-        ("let x=1;(x@+=@2)", Unsupported, "assignment expressions"),
         ("let x=1;x+=x@*=@2;x", Unsupported, "assignment expressions"),
         (
             "let x=1;for(;x@+=@1;){}x",

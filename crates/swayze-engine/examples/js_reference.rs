@@ -360,7 +360,11 @@ fn fixtures() -> Vec<String> {
             "let x; (x = null)",
             "let x; let y = 0; let v = (x = (y = y + 1)); x * 100 + y * 10 + v",
             "let x = false; if ((x = (0, true))) {} x",
-            "let x = 42; false && (x = 0); x"
+            "let x = 42; false && (x = 0); x",
+            "let x = 10; let r = (x -= (x = 3)); r * 10 + x",
+            "let x = -1; let r = (x >>>= 0); r + x",
+            "let x = 0; let r = (x *= -1); (1 / x) + (1 / r)",
+            "let x = true; (x **= (2, 4))"
         ]
         .map(str::to_owned),
     );

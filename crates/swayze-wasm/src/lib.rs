@@ -122,11 +122,9 @@
 //! any start, elements, and code may contain zero to eight function exports.
 //! Tables, memory, and globals cannot be exported. Name matching is exact (no
 //! Unicode normalization), and duplicate export names are rejected. Each export
-//! refers to a defined function by its zero-based declaration index. The host API
-//! accepts only i32 parameters and a void or i32 result. An i64 parameter or
-//! result in an exported function is rejected with
-//! [`ErrorKind::UnsupportedExportSignature`] at the export's function index.
-//! Distinct names may refer to the same function.
+//! refers to a defined function by its zero-based declaration index, and any
+//! supported function signature can be exported. Distinct names may refer to
+//! the same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
@@ -147,9 +145,9 @@
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
-//! i64 values stay inside the guest: they can be operands (including load
-//! results and stored values), locals, private globals, `block` and `if`
-//! results, and private function parameters or results.
+//! i64 values can be operands (including load results and stored values),
+//! locals, private globals, `block` and `if` results, and function parameters
+//! or results, including across the host boundary.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
 //! i64) and an i32 condition, pushed in first-candidate, second-candidate,
@@ -252,12 +250,14 @@
 //! ([`InstantiationError::StartTrap`]) or
 //! host execution limit ([`InstantiationError::StartLimitExceeded`]) discards
 //! the unpublished instance. No instantiation failure exposes an instance.
-//! [`Instance::invoke_i32_with_args`] and [`Instance::invoke_void_with_args`]
-//! scan at most eight export names for an exact match, then check the argument
-//! count and declared result kind, in that order, before executing any guest
-//! instruction or making any guest state change. A wrong result kind is
-//! [`InvokeError::ResultMismatch`], not a trap. Execution does not recurse in
-//! Rust. The only guest execution allocation is the fallible single-page
+//! [`Instance::invoke_with_values`] accepts tagged [`Value`] arguments and
+//! returns `None` for void or the exact tagged integer for an i32 or i64 result.
+//! The i32-argument methods share the same preflight: scan at most eight export
+//! names for an exact match, check arity, check the declared result kind, then
+//! check each positional argument type from first to last. There is no numeric
+//! coercion. Any preflight error returns before executing a guest instruction
+//! or changing guest state. Execution does not recurse in Rust. The only guest
+//! execution allocation is the fallible single-page
 //! reserve for an eligible `memory.grow`, during start or invocation. After a
 //! page is installed, it is never resized or reallocated. A failed reserve can
 //! be retried by a later dispatch within the same execution limits. Zero selects the else arm (or skips straight to the join if
@@ -502,7 +502,10 @@
 //! globals through indirect calls.
 //! Mixed-signature tests cover full-width arguments and returns, structural
 //! equality and same-arity mismatches, active floors and concrete results in
-//! dead tails, and rejection at the export and start boundaries.
+//! dead tails, and the unchanged void-only, parameterless start boundary.
+//! Host invocation tests check exact mixed arguments and tagged results, shared
+//! side-effect-free preflight and error precedence, exact names and aliases,
+//! and state persistence across successes, traps, and host limits.
 //! Global tests cover section order, the shared declaration cap, exact typed
 //! initializer expressions and framing, index decoding and bounds, mutability
 //! and type-check precedence, operand floors and caps, and unsupported imports,
@@ -538,7 +541,9 @@ mod binary;
 mod memory;
 mod table;
 
-pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, ValType, validate_module};
+pub use binary::{
+    Error, ErrorKind, IntegerField, LengthField, Limit, ValType, Value, validate_module,
+};
 
 use memory::{DataSegment, LinearMemory, MemoryLimits};
 use std::{cell::Cell, convert::Infallible, fmt};
@@ -562,7 +567,7 @@ pub struct Module {
     start_function: Option<usize>,
     // None means absent; Some may have a minimum of zero and no declared maximum.
     memory_limits: Option<MemoryLimits>,
-    global_initial_values: [binary::Value; binary::MAX_GLOBALS as usize],
+    global_initial_values: [Value; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
     // None means absent; Some(0) means a declared zero-entry table.
     table_entries: Option<usize>,
@@ -604,7 +609,7 @@ impl Module {
             table,
         };
         if let Some(index) = self.start_function {
-            binary::execute(&instance, index, &[]).map_err(|error| match error {
+            binary::execute(&instance, index, std::iter::empty()).map_err(|error| match error {
                 binary::ExecutionError::Trap(trap) => InstantiationError::StartTrap(trap),
                 binary::ExecutionError::LimitExceeded { limit } => {
                     InstantiationError::StartLimitExceeded { limit }
@@ -687,7 +692,7 @@ pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
     // Validation allows stores only to mutable slots and with the initial value's type.
-    globals: [Cell<binary::Value>; binary::MAX_GLOBALS as usize],
+    globals: [Cell<Value>; binary::MAX_GLOBALS as usize],
     table: Option<FunctionTable>,
 }
 
@@ -710,8 +715,9 @@ impl Instance<'_> {
     /// Invoke the exact named i32-result export, passing arguments in parameter order.
     ///
     /// Checks, in order, for a matching name ([`InvokeError::ExportNotFound`]),
-    /// the declared argument count ([`InvokeError::ArityMismatch`]), and an
-    /// i32 result ([`InvokeError::ResultMismatch`]). These checks happen before
+    /// the declared argument count ([`InvokeError::ArityMismatch`]), an i32
+    /// result ([`InvokeError::ResultMismatch`]), and that all parameters are
+    /// i32 ([`InvokeError::ArgumentTypeMismatch`]). These checks happen before
     /// executing any guest instruction or changing memory or globals.
     /// Assignments to parameters do not affect the supplied slice, and declared
     /// locals are initialized to zero on each invocation. A guest trap stops
@@ -722,12 +728,11 @@ impl Instance<'_> {
     /// allocation during execution is an eligible `memory.grow` attempting to
     /// reserve the single 64-KiB page of an initially empty memory.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
-        self.invoke(name, args, ResultKind::I32)?
-            // Preflight checked the same signature that chooses the result.
-            .ok_or(InvokeError::ResultMismatch {
-                expected: ResultKind::I32,
-                actual: ResultKind::Void,
-            })
+        // Preflight checked the same signature that chooses the result.
+        match self.invoke(name, args.iter().copied().map(Value::I32), ResultKind::I32)? {
+            Some(Value::I32(value)) => Ok(value),
+            _ => unreachable!("checked i32 result kind"),
+        }
     }
 
     /// Invoke the exact named export as a `() -> ()` function.
@@ -747,21 +752,53 @@ impl Instance<'_> {
 
     /// Invoke the exact named void export, passing arguments in parameter order.
     ///
-    /// Checks the name, argument count, and declared result kind, in that order,
-    /// before guest execution. Returns [`InvokeError::ResultMismatch`] for an
-    /// i32 result rather than discarding it. Other errors and effects are the
-    /// same as for [`Self::invoke_i32_with_args`], including persistence of
-    /// stores and growth completed before a guest trap or host limit.
+    /// Checks the name, argument count, declared result kind, and that all
+    /// parameters are i32, in that order, before guest execution. Returns
+    /// [`InvokeError::ResultMismatch`] for a value result rather than discarding
+    /// it. Other errors and effects are the same as for
+    /// [`Self::invoke_i32_with_args`], including persistence of stores and
+    /// growth completed before a guest trap or host limit.
     pub fn invoke_void_with_args(&self, name: &str, args: &[i32]) -> Result<(), InvokeError> {
-        self.invoke(name, args, ResultKind::Void).map(|_| ())
+        self.invoke(name, args.iter().copied().map(Value::I32), ResultKind::Void)
+            .map(|_| ())
+    }
+
+    /// Invoke an exact named export with up to four tagged arguments in parameter order.
+    ///
+    /// Checks the name, argument count, declared result kind, and argument types,
+    /// in that order. The first argument of the wrong type is reported with its
+    /// zero-based index. No guest instructions run and no guest state changes
+    /// unless all checks pass. No argument or result is coerced or truncated.
+    /// Returns `None` for [`ResultKind::Void`] or the exact tagged result otherwise.
+    /// Execution has the same effects, traps, and limits as
+    /// [`Self::invoke_i32_with_args`].
+    ///
+    /// ```
+    /// use swayze_wasm::{ResultKind, Value, validate_module};
+    /// // (func (export "echo") (param i64) (result i64) local.get 0)
+    /// let bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7e\x01\x7e\x03\x02\x01\0\
+    ///               \x07\x08\x01\x04echo\0\0\x0a\x06\x01\x04\0\x20\0\x0b";
+    /// let module = validate_module(bytes)?;
+    /// let instance = module.instantiate()?;
+    /// let args = [Value::I64(i64::MIN)];
+    /// assert_eq!(instance.invoke_with_values("echo", &args, ResultKind::I64)?, Some(args[0]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn invoke_with_values(
+        &self,
+        name: &str,
+        args: &[Value],
+        expected: ResultKind,
+    ) -> Result<Option<Value>, InvokeError> {
+        self.invoke(name, args.iter().copied(), expected)
     }
 
     fn invoke(
         &self,
         name: &str,
-        args: &[i32],
+        args: impl ExactSizeIterator<Item = Value> + Clone,
         expected: ResultKind,
-    ) -> Result<Option<i32>, InvokeError> {
+    ) -> Result<Option<Value>, InvokeError> {
         let export = self
             .module
             .exports
@@ -779,6 +816,8 @@ pub enum ResultKind {
     Void,
     /// The function returns one `i32` value.
     I32,
+    /// The function returns one `i64` value.
+    I64,
 }
 
 impl fmt::Display for ResultKind {
@@ -786,6 +825,7 @@ impl fmt::Display for ResultKind {
         f.write_str(match self {
             Self::Void => "void",
             Self::I32 => "i32",
+            Self::I64 => "i64",
         })
     }
 }
@@ -805,6 +845,15 @@ pub enum InvokeError {
         expected: ResultKind,
         /// Result kind declared by the exported function.
         actual: ResultKind,
+    },
+    /// An argument's type differs from the corresponding parameter's type.
+    ArgumentTypeMismatch {
+        /// Zero-based position in the parameter list.
+        index: usize,
+        /// Type declared by the exported function at this position.
+        expected: ValType,
+        /// Type of the supplied argument at this position.
+        actual: ValType,
     },
     /// Guest execution stopped at a trapping instruction.
     Trap(Trap),
@@ -828,6 +877,14 @@ impl fmt::Display for InvokeError {
                     "WebAssembly invocation expects result kind {expected}, got {actual}"
                 )
             }
+            Self::ArgumentTypeMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "WebAssembly export expects {expected} for argument {index}, got {actual}"
+            ),
             Self::Trap(trap) => write!(f, "WebAssembly trapped: {trap}"),
             Self::LimitExceeded { limit } => write!(
                 f,
@@ -845,6 +902,7 @@ impl std::error::Error for InvokeError {
             Self::ExportNotFound
             | Self::ArityMismatch { .. }
             | Self::ResultMismatch { .. }
+            | Self::ArgumentTypeMismatch { .. }
             | Self::LimitExceeded { .. } => None,
         }
     }

@@ -15,6 +15,8 @@ mod call_indirect;
 mod function_exit;
 #[path = "execution/globals.rs"]
 mod globals;
+#[path = "execution/host_invocation.rs"]
+mod host_invocation;
 #[path = "execution/i64_control.rs"]
 mod i64_control;
 #[path = "execution/i64_locals.rs"]

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Opt-in Wasm i32 smoke check (both profiles); requires Node.js v22 on PATH.
+# Opt-in Wasm integer smoke check (both profiles); requires Node.js v22 on PATH.
 # No corpus or input files. Not part of tools/check.sh.
 set -eu
 if [ "$#" -ne 0 ]; then

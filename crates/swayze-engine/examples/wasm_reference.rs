@@ -1,7 +1,9 @@
 //! Opt-in differential Wasm smoke check: run tools/check-wasm-reference.sh.
 
 use std::{error::Error, process::Command};
-use swayze_engine::{WasmInstantiationError, WasmInvokeError, WasmTrap, validate_module};
+use swayze_engine::{
+    WasmInstantiationError, WasmInvokeError, WasmResultKind, WasmTrap, WasmValue, validate_module,
+};
 
 const EXPORT: &str = "answer";
 const REFERENCE: &str = r#"
@@ -24,9 +26,11 @@ for (const fixture of fixtures) {
     }
     const invoke = instance.exports[name];
     try {
-        const value = invoke(...args.map(Number));
+        const value = invoke(...args.map(arg => arg.endsWith('n') ? BigInt(arg.slice(0, -1)) : Number(arg)));
         if (value === undefined) {
             console.log('void');
+        } else if (typeof value === 'bigint') {
+            console.log(`${value}n`);
         } else {
             if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
             console.log(value);
@@ -84,17 +88,18 @@ fn singleton_module(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Invocation(Result<i32, WasmTrap>),
+    I64Invocation(Result<i64, WasmTrap>),
     VoidInvocation(Result<(), WasmTrap>),
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
     StartTrap(WasmTrap),
 }
 
-struct Fixture {
+struct Fixture<A = i32> {
     expected: Outcome,
     bytes: Vec<u8>,
     export: &'static str,
-    args: Vec<i32>,
+    args: Vec<A>,
 }
 
 impl Fixture {
@@ -120,11 +125,26 @@ impl Fixture {
         }
     }
 
+    fn into_typed(self) -> Fixture<WasmValue> {
+        Fixture {
+            expected: self.expected,
+            bytes: self.bytes,
+            export: self.export,
+            args: self.args.into_iter().map(WasmValue::I32).collect(),
+        }
+    }
+}
+
+impl Fixture<WasmValue> {
     fn encode(&self) -> String {
         use std::fmt::Write;
         let mut encoded = format!("{}:{}", hex(&self.bytes), hex(self.export.as_bytes()));
         for arg in &self.args {
-            write!(&mut encoded, ":{arg}").unwrap();
+            match arg {
+                WasmValue::I32(arg) => write!(&mut encoded, ":{arg}"),
+                WasmValue::I64(arg) => write!(&mut encoded, ":{arg}n"),
+            }
+            .unwrap();
         }
         encoded
     }
@@ -840,6 +860,31 @@ fn fixtures() -> Vec<Fixture> {
     cases
 }
 
+fn typed_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    // One export (i64, i32) -> i64: add the sign-extended i32 to the i64.
+    let add = b"\0asm\x01\0\0\0\x01\x07\x01\x60\x02\x7e\x7f\x01\x7e\
+                \x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x0a\x01\x08\0\x20\0\x20\x01\xac\x7c\x0b";
+    let add_cases = [(i64::MAX, 1), (i64::MIN, -1), (1_i64 << 53, 1), (-1, 0)]
+        .into_iter()
+        .map(|(wide, narrow)| Fixture {
+            expected: Outcome::I64Invocation(Ok(wide.wrapping_add(i64::from(narrow)))),
+            bytes: add.to_vec(),
+            export: "x",
+            args: vec![WasmValue::I64(wide), WasmValue::I32(narrow)],
+        });
+    let void_with_i64 = b"\0asm\x01\0\0\0\x01\x05\x01\x60\x01\x7e\0\
+                          \x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x0b\x01\x09\0\x20\0\x50\x04\x40\0\x0b\x0b";
+    let void_cases = [(1_i64 << 32, Ok(())), (0, Err(WasmTrap::Unreachable))]
+        .into_iter()
+        .map(|(arg, expected)| Fixture {
+            expected: Outcome::VoidInvocation(expected),
+            bytes: void_with_i64.to_vec(),
+            export: "x",
+            args: vec![WasmValue::I64(arg)],
+        });
+    add_cases.chain(void_cases)
+}
+
 fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {
     let mut bytes = singleton_module(1, &[0], &[0x20, 0, 0x28, 2, 0], Some(1));
     let mut payload = vec![u8::try_from(segments.len()).unwrap()];
@@ -894,7 +939,7 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
+fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
     let module = validate_module(&fixture.bytes)?;
     let instance = match module.instantiate() {
         Ok(instance) => instance,
@@ -907,22 +952,30 @@ fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
         Err(WasmInstantiationError::StartTrap(trap)) => return Ok(Outcome::StartTrap(trap)),
         Err(error) => return Err(error.into()),
     };
-    if matches!(fixture.expected, Outcome::VoidInvocation(_)) {
-        return match instance.invoke_void_with_args(fixture.export, &fixture.args) {
-            Ok(()) => Ok(Outcome::VoidInvocation(Ok(()))),
-            Err(WasmInvokeError::Trap(trap)) => Ok(Outcome::VoidInvocation(Err(trap))),
-            Err(host_error) => Err(host_error.into()),
-        };
-    }
-    match instance.invoke_i32_with_args(fixture.export, &fixture.args) {
-        Ok(value) => Ok(Outcome::Invocation(Ok(value))),
-        Err(WasmInvokeError::Trap(trap)) => Ok(Outcome::Invocation(Err(trap))),
+    let expected_kind = match fixture.expected {
+        Outcome::VoidInvocation(_) => WasmResultKind::Void,
+        Outcome::I64Invocation(_) => WasmResultKind::I64,
+        _ => WasmResultKind::I32,
+    };
+    match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
+        Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
+        Ok(Some(WasmValue::I64(value))) => Ok(Outcome::I64Invocation(Ok(value))),
+        Ok(None) => Ok(Outcome::VoidInvocation(Ok(()))),
+        Err(WasmInvokeError::Trap(trap)) => Ok(match expected_kind {
+            WasmResultKind::Void => Outcome::VoidInvocation(Err(trap)),
+            WasmResultKind::I32 => Outcome::Invocation(Err(trap)),
+            WasmResultKind::I64 => Outcome::I64Invocation(Err(trap)),
+        }),
         Err(host_error) => Err(host_error.into()),
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cases = fixtures();
+    let cases: Vec<_> = fixtures()
+        .into_iter()
+        .map(Fixture::into_typed)
+        .chain(typed_fixtures())
+        .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
     let output = Command::new("node")
@@ -950,8 +1003,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
         let agrees = match actual {
             Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
+            Outcome::I64Invocation(Ok(value)) => {
+                reference
+                    .strip_suffix('n')
+                    .and_then(|text| text.parse::<i64>().ok())
+                    == Some(value)
+            }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
-            Outcome::Invocation(Err(_)) | Outcome::VoidInvocation(Err(_)) => reference == "trap",
+            Outcome::Invocation(Err(_))
+            | Outcome::I64Invocation(Err(_))
+            | Outcome::VoidInvocation(Err(_)) => reference == "trap",
             Outcome::DataSegmentOutOfBounds(_)
             | Outcome::ElementSegmentOutOfBounds(_)
             | Outcome::StartTrap(_) => reference == "instantiation-error",
@@ -964,7 +1025,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (i32 or void results, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (i32, i64, or void results, invocation traps, or instantiation errors)"
     );
     Ok(())
 }

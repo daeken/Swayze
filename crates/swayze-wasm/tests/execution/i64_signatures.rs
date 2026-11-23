@@ -1,5 +1,5 @@
 use super::{i64_operands::push_i64, *};
-use swayze_wasm::{ResultKind, ValType};
+use swayze_wasm::{ResultKind, ValType, Value};
 
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
@@ -16,7 +16,7 @@ const NEED_I64: ErrorKind = ErrorKind::TypeMismatch {
     actual: ValType::I32,
 };
 
-fn types(signatures: &[(&[u8], Option<u8>)]) -> Vec<u8> {
+pub(super) fn types(signatures: &[(&[u8], Option<u8>)]) -> Vec<u8> {
     let mut bytes = vec![signatures.len() as u8];
     for &(params, result) in signatures {
         bytes.extend([0x60, params.len() as u8]);
@@ -235,29 +235,23 @@ fn i64_function_results_and_parameter_writes_are_checked_in_private_bodies() {
 }
 
 #[test]
-fn rejects_i64_parameters_or_results_at_the_export_index() {
-    for (params, result) in [
-        (&MIXED[..], None),
-        (&[I64], Some(I32)),
-        (&[], Some(I64)),
-        (&MIXED, Some(I64)),
-    ] {
-        let ty = types(&[(&[], None), (params, result)]);
-        let prefix = module(&[(1, &ty), (3, &[2, 0, 1])]);
-        let code = code_bodies(&[b"\0\x0b", TRAP_BODY]);
-        let mut private = prefix.clone();
-        push_section(&mut private, 10, &code);
-        validate_module(&private).unwrap();
-
-        let mut exported = prefix;
-        let at = push_section(&mut exported, 7, b"\x01\x01x\0\x81\0") + 4;
-        push_section(&mut exported, 10, &code);
-        expect_error(
-            &exported,
-            at,
-            ErrorKind::UnsupportedExportSignature { function: 1 },
-        );
-    }
+fn accepts_padded_export_indices_for_i64_signatures() {
+    let ty = types(&[(&[], None), (&[I32, I64], Some(I64))]);
+    let bytes = module(&[
+        (1, &ty),
+        (3, &[2, 0, 1]),
+        (7, b"\x01\x01x\0\x81\0"), // Padded index 1 (not the first function).
+        (10, &code_bodies(&[b"\0\x0b", b"\0\x20\x01\x0b"])),
+    ]);
+    let validated = validate_module(&bytes).unwrap();
+    assert_eq!(
+        validated.instantiate().unwrap().invoke_with_values(
+            "x",
+            &[Value::I32(0), Value::I64(RIGHT)],
+            ResultKind::I64,
+        ),
+        Ok(Some(Value::I64(RIGHT)))
+    );
 }
 
 #[test]
@@ -286,7 +280,7 @@ fn start_remains_void_and_parameterless_and_reports_the_actual_result() {
         ),
     ] {
         let ty = types(&[(params, result)]);
-        let mut bytes = module(&[(1, &ty), (3, FUNCTION)]);
+        let mut bytes = module(&[(1, &ty), (3, FUNCTION), (7, EXPORT)]);
         let at = push_section(&mut bytes, 8, &[0x80, 0]);
         let code_start = bytes.len();
         push_section(&mut bytes, 10, &code_body(TRAP_BODY));

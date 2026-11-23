@@ -1,4 +1,4 @@
-use crate::InstantiationError;
+use crate::{InstantiationError, Trap};
 use std::fmt;
 
 pub(super) const MAX_TABLE_ENTRIES: u32 = 16;
@@ -54,6 +54,13 @@ impl FunctionTable {
             }
         }
         table
+    }
+
+    pub(super) fn resolve(&self, selector: u32) -> Result<usize, Trap> {
+        if selector >= self.len as u32 {
+            return Err(Trap::TableOutOfBounds);
+        }
+        self.entries[selector as usize].ok_or(Trap::UninitializedElement)
     }
 }
 

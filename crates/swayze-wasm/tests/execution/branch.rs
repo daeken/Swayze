@@ -73,9 +73,9 @@ fn dead_branch_tails_still_check_syntax_indices_and_stack_rules() {
     let branch = &[0, 0x41, 42, 0x02, 0x40, 0x0c, 0][..];
     for (tail, offset, kind) in [
         (
-            &[0x11, 0x0b, 0x0b][..],
+            &[0x12, 0x0b, 0x0b][..],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x11 },
+            ErrorKind::UnsupportedOpcode { opcode: 0x12 },
         ),
         (
             &[0x0c, 0x80],

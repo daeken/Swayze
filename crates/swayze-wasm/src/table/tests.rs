@@ -381,7 +381,7 @@ fn rejects_post_mvp_segment_forms_and_wrong_offset_expressions() {
 }
 
 #[test]
-fn rejects_table_import_export_and_instructions() {
+fn rejects_table_import_export_and_unsupported_instructions() {
     let mut import = bytes(&[]);
     let position = import.len();
     push_section(&mut import, 2, &[1, 1, b'm', 1, b't', 1, 0x70, 0, 1]);
@@ -398,8 +398,8 @@ fn rejects_table_import_export_and_instructions() {
         },
     );
 
-    for opcode in [0x11, 0x25, 0x26, 0xfc] {
-        // call_indirect, table.get, table.set, table.grow prefix
+    for opcode in [0x25, 0x26, 0xfc] {
+        // table.get, table.set, table.grow prefix
         bad_section(
             &[(1, TYPES), (3, &[1, 0]), (TABLE, TABLE_16)],
             10,

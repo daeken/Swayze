@@ -21,15 +21,19 @@
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
-//! `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`, `if`, `block`,
-//! `loop`, `br <depth>` (`0x0c`), `br_if <depth>`, `br_table` (`0x0e`), and
-//! `return` (`0x0f`). Local indices start at zero and address parameters first,
-//! then locals in declaration order. Both can be assigned.
+//! `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`,
+//! `call_indirect` (`0x11`), `if`, `block`, `loop`, `br <depth>` (`0x0c`),
+//! `br_if <depth>`, `br_table` (`0x0e`), and `return` (`0x0f`). Local indices
+//! start at zero and address parameters first, then locals in declaration order.
+//! Both can be assigned.
 //! `call` takes an unsigned LEB32 index into the exact function declarations,
-//! including forward and self references. The control constructs may nest
-//! together. `if` and `block` accept block type byte `0x40` (void) or `0x7f`
-//! (one i32 result), with no block parameters. A void `if` may omit `else`;
-//! an i32-result `if` requires it. `loop` accepts only `0x40`.
+//! including forward and self references. `call_indirect` takes an unsigned
+//! LEB32 type index followed by the literal reserved byte `0x00` (not a LEB32
+//! table index). It requires a defined table even in unreachable code; a
+//! defined zero-entry table qualifies. The control constructs may nest together.
+//! `if` and `block` accept block type byte `0x40` (void) or `0x7f` (one i32
+//! result), with no block parameters. A void `if` may omit `else`; an i32-result
+//! `if` requires it. `loop` accepts only `0x40`.
 //! `br` and `br_if` take an unsigned LEB32 label depth: zero names the innermost
 //! frame, and each enclosing frame, including `if`, adds one to the depth. A
 //! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
@@ -39,7 +43,7 @@
 //! (0 to 16), exactly that many unsigned LEB32 label depths, and a mandatory
 //! unsigned LEB32 default depth. All listed labels and the default must have
 //! the same label result arity: void (including a loop continue) or one i32.
-//! Other block types, typed `select`, and indirect calls are unsupported.
+//! Other block types and typed `select` are unsupported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
 //! any memory, global, export, element, and code sections. It may be empty (a
@@ -48,8 +52,8 @@
 //! `0x01` (minimum and maximum), followed by unsigned LEB32 entry counts. The
 //! minimum and any explicit maximum are at most 16, and the maximum must not
 //! be less than the minimum. The minimum is the fixed instance size, which may
-//! be zero. The table cannot be imported, exported, grown, or accessed by guest
-//! instructions in this slice.
+//! be zero. The table cannot be imported, exported, or mutated after
+//! instantiation. Guest code can only use it as the target of `call_indirect`.
 //!
 //! If present, the memory section follows any function and table sections and
 //! precedes any global, export, element, and code sections. It may be empty (a
@@ -119,7 +123,9 @@
 //! one; the binary operators consume two and push one. `call` consumes as many
 //! i32s as the target function's type has parameters (the top operand is the
 //! last parameter) and pushes one `i32` for a result function or nothing for
-//! a void function.
+//! a void function. `call_indirect` consumes an i32 selector above the arguments
+//! and uses the immediate's type for the parameter count and result kind.
+//! Both calls validate their operands above the active frame's entry floor.
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
@@ -167,7 +173,7 @@
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
 //! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
-//! with private decoded bodies, their arities, named export entries, the table
+//! with private decoded bodies, their signatures, named export entries, the table
 //! and memory sizes (if defined), global initial values, and active element and
 //! data segments. It does not allocate linear memory. A separate fallible
 //! [`Module::instantiate`] step checks all segment ranges before initializing
@@ -218,6 +224,13 @@
 //! declared locals start at zero for every frame. A callee starts with no
 //! operands. A callee returning i32 pushes that value onto the caller's
 //! remaining operands; a void callee leaves them unchanged.
+//! `call_indirect` interprets the selector as `u32` and traps with
+//! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
+//! [`Trap::UninitializedElement`] for a null entry, or
+//! [`Trap::IndirectCallTypeMismatch`] if the selected function's parameters or
+//! result kind differ from the expected signature. Type indices need not be
+//! equal if the signatures match. A successful lookup uses the same frame
+//! machinery as `call`.
 //! [`Instance::invoke_i32`] and [`Instance::invoke_void`] are equivalent to
 //! passing an empty argument slice to their respective typed methods.
 //! The top operand is the right-hand side of each binary
@@ -255,16 +268,17 @@
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
 //! including `unreachable`, `nop`, `drop`, `select`, memory and global
-//! instructions, a `call`, an `if` test, an executed `else` jump, a `br`, a
-//! `br_if` with either outcome, a `br_table` regardless of its length or selected
-//! target, or a `return`.
+//! instructions, either kind of call, an `if` test, an executed `else` jump,
+//! a `br`, a `br_if` with either outcome, a `br_table` regardless of its length
+//! or selected target, or a `return`.
 //! An omitted `else` introduces no dispatch. Skipped instructions, `block`,
 //! `loop`, and `end` delimiters, and unwinding a completed call frame cost nothing.
 //! A continue does not reset the budget: all loop
 //! iterations and calls share it, including recursive guest calls.
 //! An invocation can return just after its last allowed dispatch. If the next
 //! instruction would exceed the dispatch budget, that limit takes precedence
-//! over executing it.
+//! over executing it. For an indirect call with a dispatch available, the
+//! bounds, null, and signature checks take precedence over the call-depth limit.
 //! The same instance can be invoked again with fresh call-local state and budgets.
 //! All functions in an instance share its memory and globals. Completed memory
 //! and global stores persist across calls, exports, traps, and host limits.
@@ -373,6 +387,10 @@
 //! malformed and unsupported encodings, validation of every referenced function,
 //! absent versus zero-entry tables, null slots, overlap order, fresh instances,
 //! full-range preflight, and coexistence and failure precedence with data.
+//! Indirect-call tests cover exact immediate encoding, operand floors and caps,
+//! parameter order, matching duplicate type declarations, void and i32 results,
+//! target traps and their ordering against both budgets, and shared memory and
+//! globals through indirect calls.
 //! Global tests cover section order, declaration counts and encodings, exact
 //! initializer expressions, index decoding and bounds, mutability and operand
 //! floors in all bodies, and unsupported imports, exports, and global offsets.
@@ -513,10 +531,6 @@ pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
     globals: [Cell<i32>; binary::MAX_GLOBALS as usize],
-    #[allow(
-        dead_code,
-        reason = "reserved for indirect calls; no table instructions yet"
-    )]
     table: Option<FunctionTable>,
 }
 
@@ -680,8 +694,9 @@ impl std::error::Error for InvokeError {
 /// Fixed host resource bounds for one invocation. These are not Wasm traps.
 ///
 /// Dispatch is budgeted before executing an instruction. If no dispatches
-/// remain when a call would also exceed the frame limit, the dispatch limit
-/// is reported instead.
+/// remain, the dispatch limit takes precedence over executing the next
+/// instruction. A `call_indirect` with a dispatch available checks table
+/// bounds, null, and signature before checking the frame limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionLimit {
     /// Simultaneously live function frames, including the exported function.
@@ -709,6 +724,12 @@ pub enum Trap {
     IntegerOverflow,
     /// The full range of a load or store was not within the instance's memory.
     MemoryOutOfBounds,
+    /// A `call_indirect` selector was outside the table's logical length.
+    TableOutOfBounds,
+    /// A `call_indirect` selected a null table entry.
+    UninitializedElement,
+    /// A `call_indirect` selected a function with a different structural type.
+    IndirectCallTypeMismatch,
     /// An `unreachable` instruction was executed.
     Unreachable,
 }
@@ -720,6 +741,9 @@ impl fmt::Display for Trap {
             Self::IntegerDivideByZero => f.write_str("integer divide by zero"),
             Self::IntegerOverflow => f.write_str("integer overflow"),
             Self::MemoryOutOfBounds => f.write_str("out of bounds memory access"),
+            Self::TableOutOfBounds => f.write_str("out of bounds table access"),
+            Self::UninitializedElement => f.write_str("uninitialized table element"),
+            Self::IndirectCallTypeMismatch => f.write_str("indirect call type mismatch"),
         }
     }
 }

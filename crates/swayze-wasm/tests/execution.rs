@@ -11,6 +11,8 @@ mod branch;
 mod branch_table;
 #[path = "execution/call_indirect.rs"]
 mod call_indirect;
+#[path = "execution/float_locals.rs"]
+mod float_locals;
 #[path = "execution/float_operands.rs"]
 mod float_operands;
 #[path = "execution/function_exit.rs"]
@@ -1056,7 +1058,7 @@ fn bounds_total_declared_locals_independently_of_parameters() {
 #[test]
 fn zero_count_groups_use_body_bytes_but_not_local_slots() {
     let mut body = vec![126];
-    for ty in [0x7f, 0x7e].into_iter().cycle().take(126) {
+    for ty in [0x7f, 0x7e, 0x7d, 0x7c].into_iter().cycle().take(126) {
         body.extend([0, ty]);
     }
     body.extend([0x41, 9, 0x0b]);
@@ -1068,11 +1070,11 @@ fn zero_count_groups_use_body_bytes_but_not_local_slots() {
 fn validates_all_local_group_types_even_for_zero_counts() {
     for count in [0, 1] {
         bad_body(
-            &[2, 1, 0x7f, count, 0x7d, 0x41, 1, 0x0b],
+            &[2, 1, 0x7f, count, 0x7b, 0x41, 1, 0x0b],
             4,
             ErrorKind::UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7d,
+                found: 0x7b,
             },
         );
     }

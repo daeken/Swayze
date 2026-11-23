@@ -27,6 +27,7 @@
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
 //! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`, `f64.sqrt`,
+//! `f32.mul`, `f64.mul`,
 //! `f32.eq`, `f32.ne`, `f32.lt`, `f32.gt`, `f32.le`, `f32.ge`,
 //! `f64.eq`, `f64.ne`, `f64.lt`, `f64.gt`, `f64.le`, `f64.ge`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
@@ -208,6 +209,13 @@
 //! to nearest (ties to even; no exact midpoint is possible). The square root
 //! uses exact integer arithmetic with a radicand of at most 106 bits and at most
 //! 24 (f32) or 53 (f64) restoring steps within one guest dispatch.
+//! `mul` (`0x94` for f32, `0xa2` for f64) consumes two operands and returns
+//! a result of the same width. For finite nonzero inputs it uses a full exact
+//! integer significand product (at most 48 or 106 bits) and rounds once to the
+//! destination, nearest with ties to even, including gradual underflow and
+//! overflow to infinity. The result has the XOR of the operand signs, including
+//! zero and infinity, except that any NaN or zero times infinity returns the
+//! positive canonical quiet NaN.
 //! `min` and `max` (`0x96`/`0x97` for f32, `0xa4`/`0xa5` for f64) consume two
 //! operands of their width and return the exact encoding of the lesser or
 //! greater operand, respectively. Mixed-sign zeros return -0 for `min` and +0
@@ -220,8 +228,8 @@
 //! only `ne` returns 1. Positive and negative zero compare equal; all other
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
-//! width conversions, sign operations, rounding, square root, `min`/`max`, and
-//! comparisons each count as one dispatch. None uses native floating-point
+//! width conversions, sign operations, rounding, square root, `mul`, `min`/`max`,
+//! and comparisons each count as one dispatch. None uses native floating-point
 //! operations. Floats are supported as operands, private globals, locals, `block`
 //! and `if` results, and function parameters and results, including across the
 //! host boundary. Fallthrough, `return`, and branch exits preserve all result bits.
@@ -542,6 +550,12 @@
 //! finite input. Deterministic per-exponent samples compared with native roots
 //! are evidence, not a proof. Validation checks include live and dead floors
 //! and concrete operand and result types; execution checks the dispatch limit.
+//! Float multiplication tests check exact midpoint and neighbor encodings at
+//! normal, subnormal, and overflow boundaries, including underflow to signed
+//! zero and a case that would double-round. They exercise all special-value
+//! classes in both operand orders and signs, live and dead typing, and exact
+//! dispatch charging. Deterministic finite pairs compared with native products
+//! provide independent evidence, not a proof.
 //! Float width-conversion tests check exact round trips, signed zeros and
 //! infinities, canonical NaNs, and both neighbors of ties at normal, subnormal,
 //! underflow, and overflow boundaries. They also cover live and dead typing

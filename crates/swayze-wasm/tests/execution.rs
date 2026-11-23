@@ -19,6 +19,8 @@ mod float_conversions;
 mod float_locals;
 #[path = "execution/float_min_max.rs"]
 mod float_min_max;
+#[path = "execution/float_mul.rs"]
+mod float_mul;
 #[path = "execution/float_operands.rs"]
 mod float_operands;
 #[path = "execution/float_rounding.rs"]
@@ -2272,7 +2274,7 @@ fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1a,
-            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40,
+            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0x94, 0xa2,
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)

@@ -1564,30 +1564,36 @@ enum FloatBinaryOp {
     Min,
     Max,
     Copysign,
+    Mul,
 }
 
 impl FloatBinaryOp {
     fn apply(self, width: FloatWidth, lhs: Operand, rhs: Operand) -> Operand {
         match width {
             FloatWidth::F32 => Operand::F32(self.apply_bits(
+                width,
                 u64::from(lhs.f32_bits()),
                 u64::from(rhs.f32_bits()),
-                u64::from(F32_SIGN),
-                u64::from(F32_INFINITY),
-                u64::from(F32_CANONICAL_NAN),
             ) as u32),
-            FloatWidth::F64 => Operand::F64(self.apply_bits(
-                lhs.f64_bits(),
-                rhs.f64_bits(),
-                F64_SIGN,
-                F64_INFINITY,
-                F64_CANONICAL_NAN,
-            )),
+            FloatWidth::F64 => Operand::F64(self.apply_bits(width, lhs.f64_bits(), rhs.f64_bits())),
         }
     }
 
-    fn apply_bits(self, lhs: u64, rhs: u64, sign: u64, infinity: u64, canonical_nan: u64) -> u64 {
+    fn apply_bits(self, width: FloatWidth, lhs: u64, rhs: u64) -> u64 {
+        let (sign, infinity, canonical_nan, fraction_bits, bias) = match width {
+            FloatWidth::F32 => (
+                u64::from(F32_SIGN),
+                u64::from(F32_INFINITY),
+                u64::from(F32_CANONICAL_NAN),
+                23,
+                127,
+            ),
+            FloatWidth::F64 => (F64_SIGN, F64_INFINITY, F64_CANONICAL_NAN, 52, 1023),
+        };
         let min = match self {
+            Self::Mul => {
+                return mul_bits(lhs, rhs, sign, infinity, canonical_nan, fraction_bits, bias);
+            }
             Self::Min => true,
             Self::Max => false,
             Self::Copysign => return (lhs & !sign) | (rhs & sign),
@@ -1603,6 +1609,85 @@ impl FloatBinaryOp {
             (Some(Equal), false) => lhs & rhs,
         }
     }
+}
+
+fn mul_bits(
+    lhs: u64,
+    rhs: u64,
+    sign_mask: u64,
+    infinity: u64,
+    canonical_nan: u64,
+    fraction_bits: u32,
+    bias: i32,
+) -> u64 {
+    let sign = (lhs ^ rhs) & sign_mask;
+    let lhs = lhs & !sign_mask;
+    let rhs = rhs & !sign_mask;
+    if lhs > infinity || rhs > infinity {
+        return canonical_nan;
+    }
+    if lhs == infinity || rhs == infinity {
+        return if lhs == 0 || rhs == 0 {
+            canonical_nan
+        } else {
+            sign | infinity
+        };
+    }
+    if lhs == 0 || rhs == 0 {
+        return sign;
+    }
+
+    // Each magnitude is m * 2^(e-h), where h is the fraction width and
+    // m is in [2^h, 2^(h+1)). For subnormals the nonzero fraction shifts
+    // left by 1..=h, giving e in -149..=127 (f32) or -1074..=1023 (f64).
+    let implicit_bit = 1 << fraction_bits;
+    let min_exponent = 1 - bias;
+    let decode = |magnitude| {
+        let fraction: u64 = magnitude & (implicit_bit - 1);
+        let field = (magnitude >> fraction_bits) as i32;
+        if field == 0 {
+            let shift = fraction_bits - fraction.ilog2();
+            (fraction << shift, min_exponent - shift as i32)
+        } else {
+            (implicit_bit | fraction, field - bias)
+        }
+    };
+    let (lhs_m, lhs_e) = decode(lhs);
+    let (rhs_m, rhs_e) = decode(rhs);
+    let product = u128::from(lhs_m) * u128::from(rhs_m);
+    // The full product occupies 48 or 106 bits at most, with its top bit
+    // at 2h or 2h+1. Its top exponent is in -298..=255 or -2148..=2047.
+    let top = product.ilog2() as i32;
+    let h = fraction_bits as i32;
+    let exponent = lhs_e + rhs_e + top - 2 * h;
+    if exponent > bias {
+        return sign | infinity;
+    }
+
+    // Round once, in units of 2^(max(exponent, min_exponent)-h). In
+    // particular, do not round to normal precision before shifting into
+    // the subnormal range. The right shift is h or h+1 for normal results,
+    // and at most 195 or 1178 with underflow. At >=128 the full product is
+    // strictly below half a destination unit, so no shift is necessary.
+    let shift = top - h + (min_exponent - exponent).max(0);
+    if shift >= 128 {
+        return sign;
+    }
+    let midpoint = 1_u128 << (shift - 1);
+    let remainder = product & ((midpoint << 1) - 1);
+    let retained = product >> shift;
+    let up = remainder > midpoint || (remainder == midpoint && retained & 1 != 0);
+    let rounded = retained as u64 + u64::from(up);
+
+    let magnitude = if exponent < min_exponent {
+        // 0..=2^h: a carry out of the fraction gives the least normal.
+        rounded
+    } else {
+        // 2^h..=2^(h+1): remove the implicit bit, then let addition carry
+        // into the exponent, including to infinity at the overflow tie.
+        (((exponent + bias) as u64) << fraction_bits) + (rounded - implicit_bit)
+    };
+    sign | magnitude
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2804,6 +2889,7 @@ fn decode_plain(
             Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
         0x91 => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Sqrt),
+        0x94 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Mul),
         0x96 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Min),
         0x97 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Max),
         0x98 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Copysign),
@@ -2816,6 +2902,7 @@ fn decode_plain(
             Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
         0x9f => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Sqrt),
+        0xa2 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Mul),
         0xa4 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Min),
         0xa5 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Max),
         0xa6 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Copysign),

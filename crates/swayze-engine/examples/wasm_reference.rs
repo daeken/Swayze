@@ -1371,6 +1371,60 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
         export: "x",
         args: vec![WasmValue::F64(1)],
     });
+    let binary_module = |ty, op| {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x07\x01\x60\x02".to_vec();
+        bytes.extend([ty, ty, 1, ty]);
+        bytes.extend(b"\x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x09\x01\x07\0\x20\0\x20\x01");
+        bytes.extend([op, 0x0b]);
+        bytes
+    };
+    // Exact signed-zero ties, adjacent values, and carry into normal or infinity.
+    for (lhs, rhs, expected) in [
+        (1, 0x3eff_ffff, 0),
+        (0x8000_0001, 0x3f00_0000, 0x8000_0000),
+        (1, 0x3f00_0001, 1),
+        (0x0080_0000, 0x3f7f_ffff, 0x0080_0000),
+        (0x7f7f_ffff, 0x4000_0000, 0x7f80_0000),
+        (0xbfc0_0000, 0x4000_0000, 0xc040_0000),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::F32Invocation(Ok(expected)),
+            bytes: binary_module(0x7d, 0x94),
+            export: "x",
+            args: vec![WasmValue::F32(lhs), WasmValue::F32(rhs)],
+        });
+    }
+    for (lhs, rhs, expected) in [
+        (1, 0x3fdf_ffff_ffff_ffff, 0),
+        (
+            0x8000_0000_0000_0001,
+            0x3fe0_0000_0000_0000,
+            0x8000_0000_0000_0000,
+        ),
+        (1, 0x3fe0_0000_0000_0001, 1),
+        (
+            0x0010_0000_0000_0000,
+            0x3fef_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+        ),
+        (
+            0x7fef_ffff_ffff_ffff,
+            0x4000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+        ),
+        (
+            0xbff8_0000_0000_0000,
+            0x4000_0000_0000_0000,
+            0xc008_0000_0000_0000,
+        ),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::F64Invocation(Ok(expected)),
+            bytes: binary_module(0x7c, 0xa2),
+            export: "x",
+            args: vec![WasmValue::F64(lhs), WasmValue::F64(rhs)],
+        });
+    }
     for (opcode, lhs, rhs, expected) in [
         (0x96, 0.0_f32, -0.0_f32, -0.0_f32),
         (0x96, -0.0, 0.0, -0.0),
@@ -1379,13 +1433,6 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
         (0x96, -2.0, -3.0, -3.0),
         (0x97, 2.0, f32::INFINITY, f32::INFINITY),
     ] {
-        let binary_module = |ty, op| {
-            let mut bytes = b"\0asm\x01\0\0\0\x01\x07\x01\x60\x02".to_vec();
-            bytes.extend([ty, ty, 1, ty]);
-            bytes.extend(b"\x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x09\x01\x07\0\x20\0\x20\x01");
-            bytes.extend([op, 0x0b]);
-            bytes
-        };
         cases.push(Fixture {
             expected: Outcome::F32Invocation(Ok(expected.to_bits())),
             bytes: binary_module(0x7d, opcode),

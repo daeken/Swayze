@@ -1,6 +1,7 @@
 use crate::{
     ExecutionLimit, Export, Instance, InvokeError, Module, ResultKind, Trap,
     memory::{AccessWidth, DataSegment, LoadKind, MEMORY_PAGE_BYTES},
+    table::{ElementSegment, MAX_TABLE_ENTRIES},
 };
 use std::{fmt, ops::RangeInclusive, str};
 
@@ -46,6 +47,10 @@ pub enum ErrorKind {
     DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
+    TruncatedTableLimitsFlags,
+    UnsupportedTableLimitsFlags { flags: u8 },
+    InvalidTableLimits { minimum: u32, maximum: u32 },
+    MissingTable,
     TruncatedMemoryLimitsFlags,
     UnsupportedMemoryLimitsFlags { flags: u8 },
     InvalidMemoryLimits { minimum: u32, maximum: u32 },
@@ -88,6 +93,13 @@ pub enum IntegerField {
     ResultCount,
     FunctionCount,
     ExportCount,
+    TableCount,
+    TableMinimum,
+    TableMaximum,
+    TableIndex,
+    ElementCount,
+    /// Number of function indices in an active element segment.
+    ElementFunctionCount,
     MemoryCount,
     GlobalCount,
     DataCount,
@@ -134,6 +146,8 @@ pub enum Limit {
     ExportNameBytes,
     /// Total retained payload bytes across all data segments, including overlaps.
     DataBytes,
+    /// Total retained function indices across all active element segments, including overlaps.
+    ElementFunctionIndices,
 }
 
 impl Limit {
@@ -149,6 +163,7 @@ impl Limit {
             Self::ControlDepth => 16,
             Self::CustomNameBytes | Self::ExportNameBytes => 4 * 1024,
             Self::DataBytes => MEMORY_PAGE_BYTES,
+            Self::ElementFunctionIndices => 64,
         }
     }
 }
@@ -201,6 +216,14 @@ impl fmt::Display for Error {
             DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
+            TruncatedTableLimitsFlags => f.write_str("missing table limits flags"),
+            UnsupportedTableLimitsFlags { flags } => {
+                write!(f, "unsupported table limits flags {flags:#04x}")
+            }
+            InvalidTableLimits { minimum, maximum } => {
+                write!(f, "table minimum {minimum} exceeds maximum {maximum}")
+            }
+            MissingTable => f.write_str("element segment requires a defined table"),
             TruncatedMemoryLimitsFlags => f.write_str("missing memory limits flags"),
             UnsupportedMemoryLimitsFlags { flags } => {
                 write!(f, "unsupported memory limits flags {flags:#04x}")
@@ -266,10 +289,11 @@ impl std::error::Error for Error {}
 /// section and vector caps. Allocations retain up to eight bodies bounded by
 /// [`Limit::BodyInstructions`], with a separate table-target array per body (at
 /// most one target per [`Limit::CodeBodyBytes`] byte). There are up to eight
-/// export entries with names bounded by [`Limit::ExportNameBytes`], plus up
-/// to eight active data segments bounded in total by [`Limit::DataBytes`].
-/// Validation neither allocates linear memory nor checks that the data ranges
-/// fit; both belong to instantiation.
+/// export entries with names bounded by [`Limit::ExportNameBytes`], up to eight
+/// active data segments bounded in total by [`Limit::DataBytes`], and up to eight
+/// active element segments bounded in total by [`Limit::ElementFunctionIndices`].
+/// Validation does not allocate linear memory or check segment ranges; both
+/// belong to instantiation.
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -289,6 +313,12 @@ impl std::error::Error for Error {}
 /// as [`ErrorKind::UnsupportedCount`] with [`IntegerField::BranchTableCount`].
 /// [`ErrorKind::BranchTableArityMismatch`] points to the first table label
 /// immediate (including the default) whose arity differs from the first label's.
+/// Oversized table counts, entry bounds, or element segment counts are reported
+/// as [`ErrorKind::UnsupportedCount`], and a reversed table bounds pair as
+/// [`ErrorKind::InvalidTableLimits`] at the start of the maximum field.
+/// [`ErrorKind::MissingTable`] points to the start of an active segment's table
+/// index. An element function-index vector above the remaining aggregate budget
+/// reports [`ErrorKind::LimitExceeded`] at the start of its count field.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -324,6 +354,8 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
+    let mut table_entries = None;
+    let mut element_segments = Vec::new();
     let mut memory_bytes = None;
     let mut globals = [Global::default(); MAX_GLOBALS as usize];
     let mut global_count = 0;
@@ -354,7 +386,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3 | 5 | 6 | 7 | 10 | 11) {
+        if id <= last_standard && matches!(id, 1 | 3..=7 | 9..=11) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -374,9 +406,17 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 }
                 function_count = Some(count);
             }
+            4 => table_entries = validate_table(&mut section)?,
             5 => memory_bytes = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
             7 => exports = validate_exports(&mut section, function_count)?,
+            9 => {
+                element_segments = validate_elements(
+                    &mut section,
+                    table_entries.is_some(),
+                    function_count.unwrap_or(0),
+                )?;
+            }
             10 => {
                 let declarations = function_count.map(|count| &function_types[..count as usize]);
                 functions = validate_code(
@@ -419,6 +459,8 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         functions,
         exports,
         memory_bytes,
+        table_entries,
+        element_segments,
         global_initial_values: globals.map(|global| global.initial_value),
         data_segments,
     })
@@ -460,6 +502,7 @@ const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
 pub(super) const MAX_GLOBALS: u32 = 8;
 const MAX_DATA_SEGMENTS: u32 = 8;
+const MAX_ELEMENT_SEGMENTS: u32 = 8;
 const MAX_MEMORY_PAGES: u32 = 1;
 const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
@@ -500,6 +543,36 @@ fn validate_types(
         *signature = FunctionType { parameters, result };
     }
     Ok(count)
+}
+
+fn validate_table(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
+    if section.count(IntegerField::TableCount, 0..=1)? == 0 {
+        return Ok(None);
+    }
+    section.expect_byte(0x70)?; // Core 1.0 funcref (anyfunc)
+    let offset = section.position();
+    let flags = section
+        .byte()
+        .ok_or_else(|| section.error(ErrorKind::TruncatedTableLimitsFlags))?;
+    if !matches!(flags, 0x00 | 0x01) {
+        return Err(Error {
+            offset,
+            kind: ErrorKind::UnsupportedTableLimitsFlags { flags },
+        });
+    }
+    let minimum = section.count(IntegerField::TableMinimum, 0..=MAX_TABLE_ENTRIES)?;
+    if flags == 0x01 {
+        let offset = section.position();
+        let maximum = section.count(IntegerField::TableMaximum, 0..=MAX_TABLE_ENTRIES)?;
+        if maximum < minimum {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::InvalidTableLimits { minimum, maximum },
+            });
+        }
+    }
+    // No growth: the maximum is validated but only the initial size matters.
+    Ok(Some(minimum as usize))
 }
 
 fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
@@ -605,6 +678,58 @@ fn validate_exports(
         });
     }
     Ok(exports)
+}
+
+fn validate_elements(
+    section: &mut Reader<'_>,
+    has_table: bool,
+    function_count: u32,
+) -> Result<Vec<ElementSegment>, Error> {
+    let allocation_error = section.error(ErrorKind::AllocationFailed);
+    let count = section.count(IntegerField::ElementCount, 0..=MAX_ELEMENT_SEGMENTS)?;
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(count as usize)
+        .map_err(|_| allocation_error)?;
+    let limit = Limit::ElementFunctionIndices;
+    let mut budget = limit.maximum() as u32;
+    for _ in 0..count {
+        // Core 1.0 encodes a table index, not a post-MVP segment flags byte.
+        let index_offset = section.position();
+        section.index(IntegerField::TableIndex, 1)?;
+        if !has_table {
+            return Err(Error {
+                offset: index_offset,
+                kind: ErrorKind::MissingTable,
+            });
+        }
+        let offset = section.i32_const_expr()? as u32;
+        let count_offset = section.position();
+        let count = section.integer(IntegerField::ElementFunctionCount)?;
+        if count > budget {
+            return Err(Error {
+                offset: count_offset,
+                kind: ErrorKind::LimitExceeded { limit },
+            });
+        }
+        budget -= count;
+        let mut function_indices = Vec::new();
+        function_indices
+            .try_reserve_exact(count as usize)
+            .map_err(|_| Error {
+                offset: count_offset,
+                kind: ErrorKind::AllocationFailed,
+            })?;
+        for _ in 0..count {
+            function_indices
+                .push(section.index(IntegerField::FunctionIndex, function_count)? as usize);
+        }
+        segments.push(ElementSegment {
+            offset,
+            function_indices,
+        });
+    }
+    Ok(segments)
 }
 
 fn validate_data(section: &mut Reader<'_>, has_memory: bool) -> Result<Vec<DataSegment>, Error> {

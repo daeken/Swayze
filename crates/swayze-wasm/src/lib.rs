@@ -3,11 +3,12 @@
 //! # Supported slice
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
-//! custom sections within [`Limit`], and optional memory, global, and data
-//! sections. Modules with functions must have one to eight types, one to eight
-//! function declarations, and exactly as many code bodies as function
-//! declarations, in that section order. Each type must have zero to four `i32`
-//! parameters and either no result (void) or one `i32` result, even if unused.
+//! custom sections within [`Limit`], and optional table, memory, global,
+//! element, and data sections. Modules with functions must have one to eight
+//! types, one to eight function declarations, and exactly as many code bodies
+//! as function declarations, in that section order. Each type must have zero
+//! to four `i32` parameters and either no result (void) or one `i32` result,
+//! even if unused.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 `i32` locals in total. The
 //! number of groups and each group's local count are unsigned LEB32; zero-count
@@ -40,12 +41,22 @@
 //! the same label result arity: void (including a loop continue) or one i32.
 //! Other block types, typed `select`, and indirect calls are unsupported.
 //!
-//! If present, the memory section follows any function section and precedes
-//! any global, export, and code sections. It may be empty (a zero-length vector) or
-//! declare one private, unshared memory32. The limits use flag byte `0x00`
-//! (minimum only) or `0x01` (minimum and maximum), followed by unsigned LEB32
-//! page counts. The minimum and any explicit maximum must be zero or one
-//! 64-KiB page, and the maximum must not be less than the minimum. The minimum
+//! The optional table section (ID 4) follows any function section and precedes
+//! any memory, global, export, element, and code sections. It may be empty (a
+//! zero-length vector) or declare one private `funcref` table, using literal
+//! element type byte `0x70`. Its limits use flag byte `0x00` (minimum only) or
+//! `0x01` (minimum and maximum), followed by unsigned LEB32 entry counts. The
+//! minimum and any explicit maximum are at most 16, and the maximum must not
+//! be less than the minimum. The minimum is the fixed instance size, which may
+//! be zero. The table cannot be imported, exported, grown, or accessed by guest
+//! instructions in this slice.
+//!
+//! If present, the memory section follows any function and table sections and
+//! precedes any global, export, element, and code sections. It may be empty (a
+//! zero-length vector) or declare one private, unshared memory32. The limits use
+//! flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
+//! unsigned LEB32 page counts. The minimum and any explicit maximum must be zero
+//! or one 64-KiB page, and the maximum must not be less than the minimum. The minimum
 //! is the fixed instance size. Loads, stores, and `memory.size` require a
 //! defined memory, which may have zero pages. Loads and stores take an unsigned
 //! LEB32 alignment exponent and an unsigned LEB32 byte offset. The exponent
@@ -54,14 +65,26 @@
 //! `memory.size` takes a literal reserved byte `0x00`, not a general LEB32 index.
 //! Other memory instructions, including `memory.grow`, are unsupported.
 //!
-//! The optional global section (ID 6) follows any type, function, and memory
-//! sections and precedes any export and code sections. It may contain zero to
-//! eight defined `i32` globals, indexed from zero in declaration order. Each
-//! declaration uses value type byte `0x7f`, literal mutability byte `0x00`
-//! (immutable) or `0x01` (mutable), and exactly `i32.const <signed LEB32> end`.
+//! The optional global section (ID 6) follows any type, function, table, and
+//! memory sections and precedes any export, element, and code sections. It may
+//! contain zero to eight defined `i32` globals, indexed from zero in declaration
+//! order. Each declaration uses value type byte `0x7f`, literal mutability byte
+//! `0x00` (immutable) or `0x01` (mutable), and exactly `i32.const <signed LEB32> end`.
 //! Every body can read either kind and can set only mutable globals, including
 //! globals at later indices. Global imports, exports, and initializer reads
 //! are unsupported.
+//!
+//! The optional element section (ID 9) follows any table, memory, global, and
+//! export sections and precedes any code and data sections. It may contain zero
+//! to eight active segments, retaining at most 64 function indices total,
+//! counting repeats and overlaps. Each segment requires a defined table and
+//! encodes the Core 1.0 table index zero as unsigned LEB32, exactly
+//! `i32.const <signed LEB32> end`, and an unsigned LEB32 count followed by that
+//! many unsigned LEB32 indices into the defined function declarations. Padded
+//! LEB32 encodings are accepted if valid. Both i32-result and void functions can
+//! be referenced. An element section with no segments does not require a table;
+//! a segment with no function indices still does. Passive and declarative
+//! segments, element expressions, and global offsets are unsupported.
 //!
 //! The optional data section (ID 11) follows any memory, global, export, and
 //! code sections. It may contain zero to eight active segments with at most 64 KiB of
@@ -71,12 +94,13 @@
 //! An empty segment vector does not require memory. Passive segments, bulk
 //! memory, and global offsets are unsupported.
 //!
-//! An optional export section between function and code (after memory and
-//! globals, if present) may contain zero to eight function exports. Memory and
-//! globals cannot be exported. Name matching is exact (no Unicode normalization),
-//! and duplicate export names are rejected. Each export refers to a defined
-//! function (void or i32-result) by its zero-based declaration index. Distinct
-//! names may refer to the same function.
+//! An optional export section between function and code (after table, memory,
+//! and globals and before elements, if present) may contain zero to eight
+//! function exports. Tables, memory, and globals cannot be exported. Name
+//! matching is exact (no Unicode normalization), and duplicate export names
+//! are rejected. Each export refers to a defined function (void or i32-result)
+//! by its zero-based declaration index. Distinct names may refer to the same
+//! function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import, start, and data count)
@@ -143,17 +167,23 @@
 //! Validation resolves every function's type index and validates all global
 //! declarations before decoding any body. It checks the entire input, even
 //! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
-//! with private decoded bodies, their arities, named export entries, the memory
-//! size (if defined), global initial values, and the active data segments. It
-//! does not allocate linear memory. A separate fallible [`Module::instantiate`]
-//! step checks all segment ranges before allocating and zeroing fresh private
-//! linear memory. It then applies the segments in source order; the last
-//! segment to write a byte wins. Data offsets are interpreted as `u32` bits
-//! and widened before adding the payload length. An empty segment may
-//! start at the end of memory, but not beyond it. An out-of-bounds segment is an
-//! [`InstantiationError::DataSegmentOutOfBounds`], not a validation error or an
-//! invocation trap. Global initial values are copied into fixed private slots
-//! with no allocation. Failed instantiation exposes no instance.
+//! with private decoded bodies, their arities, named export entries, the table
+//! and memory sizes (if defined), global initial values, and active element and
+//! data segments. It does not allocate linear memory. A separate fallible
+//! [`Module::instantiate`] step checks all segment ranges before initializing
+//! either table or memory. The first out-of-bounds element segment takes
+//! precedence over the first out-of-bounds data segment, and both take
+//! precedence over memory allocation failure. Offsets are interpreted as `u32`
+//! bits and widened before adding the segment length. An empty segment may
+//! start at the end of its table or memory, but not beyond it. Out-of-bounds
+//! segments are reported by zero-based source index as
+//! [`InstantiationError::ElementSegmentOutOfBounds`] or
+//! [`InstantiationError::DataSegmentOutOfBounds`], not validation errors or
+//! invocation traps. The fixed private table starts with all entries null;
+//! fresh linear memory starts with all bytes zero. Segments of each kind are
+//! applied in source order; the last write to an entry or byte wins. Global
+//! initial values are copied into fixed private slots with no allocation.
+//! Failed instantiation exposes no instance.
 //! [`Instance::invoke_i32_with_args`] and [`Instance::invoke_void_with_args`]
 //! scan at most eight export names for an exact match, then check the argument
 //! count and declared result kind, in that order, before executing any guest
@@ -238,8 +268,8 @@
 //! The same instance can be invoked again with fresh call-local state and budgets.
 //! All functions in an instance share its memory and globals. Completed memory
 //! and global stores persist across calls, exports, traps, and host limits.
-//! Separate instances have independent memory and globals. Empty, custom-only,
-//! memory-only, globals-only, and other unexported modules have no callable exports.
+//! Separate instances have independent tables, memory, and globals. Empty,
+//! custom-only, and other unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -339,6 +369,10 @@
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap
 //! order, and reinitialization from the same module into independent instances.
+//! Table and element tests cover exact caps, frame and padded LEB32 decoding,
+//! malformed and unsupported encodings, validation of every referenced function,
+//! absent versus zero-entry tables, null slots, overlap order, fresh instances,
+//! full-range preflight, and coexistence and failure precedence with data.
 //! Global tests cover section order, declaration counts and encodings, exact
 //! initializer expressions, index decoding and bounds, mutability and operand
 //! floors in all bodies, and unsupported imports, exports, and global offsets.
@@ -349,12 +383,13 @@
 //! group counts against the remaining local budget without expanding groups,
 //! uses bounded borrowed frames, and decodes instructions into a fixed-size
 //! scratch array. After checking `end` and the complete body frame, it calls
-//! `Vec::try_reserve_exact` for the count and copies those instructions. The body, export, and data segment vectors are
-//! reserved fallibly after checking their counts. Each name and segment payload
-//! is reserved fallibly after checking its length, with an aggregate limit for
-//! data payloads. The count caps bound aggregate decoding to eight body budgets and
-//! duplicate checks to at most 28 comparisons of bounded names. There is no
-//! unsafe code, Rust recursion, or external dependency.
+//! `Vec::try_reserve_exact` for the count and copies those instructions. Body,
+//! export, element segment, and data segment vectors are reserved fallibly
+//! after checking their counts. Each name and segment payload is reserved
+//! fallibly after checking its length, with separate aggregate limits for
+//! element indices and data bytes. The count caps bound aggregate decoding to
+//! eight body budgets and duplicate checks to at most 28 comparisons of bounded
+//! names. There is no unsafe code, Rust recursion, or external dependency.
 //! This is not full Core 1.0 validation or a conformance or security proof.
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!
@@ -362,11 +397,13 @@
 
 mod binary;
 mod memory;
+mod table;
 
 pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, validate_module};
 
 use memory::{DataSegment, LinearMemory};
 use std::{cell::Cell, convert::Infallible, fmt};
+use table::{ElementSegment, FunctionTable};
 
 /// An owned, opaque module produced only by successful [`validate_module`].
 ///
@@ -375,6 +412,7 @@ use std::{cell::Cell, convert::Infallible, fmt};
 /// let forged = Module {
 ///     functions: Vec::new(), exports: Vec::new(), memory_bytes: None, data_segments: Vec::new(),
 ///     global_initial_values: [0; 8],
+///     table_entries: None, element_segments: Vec::new(),
 /// };
 /// ```
 #[derive(Debug)]
@@ -385,6 +423,9 @@ pub struct Module {
     memory_bytes: Option<usize>,
     global_initial_values: [i32; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
+    // None means absent; Some(0) means a declared zero-entry table.
+    table_entries: Option<usize>,
+    element_segments: Vec<ElementSegment>,
 }
 
 #[derive(Debug)]
@@ -396,17 +437,26 @@ struct Export {
 impl Module {
     /// Create an independent instance without executing guest code.
     ///
-    /// Active data segments are checked against the fixed memory size before
-    /// allocating or writing any linear memory. A one-page memory is allocated
-    /// fallibly, zeroed, then initialized by the segments in source order.
-    /// No linear memory is allocated for an absent or zero-page memory.
+    /// Check active segment ranges in source order within each kind: elements
+    /// before data. Neither table nor memory is initialized until all checks
+    /// pass. A one-page memory is allocated fallibly and zeroed; an absent or
+    /// zero-page memory has no allocation. A defined table uses fixed storage
+    /// and starts all null. Segments of each kind are applied in source order.
     /// Global initial values are copied into fixed, independent instance slots.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
-        let memory = LinearMemory::new(self.memory_bytes.unwrap_or(0), &self.data_segments)?;
+        let memory_bytes = self.memory_bytes.unwrap_or(0);
+        FunctionTable::preflight(self.table_entries.unwrap_or(0), &self.element_segments)?;
+        LinearMemory::preflight(memory_bytes, &self.data_segments)?;
+
+        let memory = LinearMemory::new_preflighted(memory_bytes, &self.data_segments)?;
+        let table = self
+            .table_entries
+            .map(|len| FunctionTable::new_preflighted(len, &self.element_segments));
         Ok(Instance {
             module: self,
             memory,
             globals: self.global_initial_values.map(Cell::new),
+            table,
         })
     }
 }
@@ -421,6 +471,11 @@ pub enum InstantiationError {
         /// Zero-based index of the first out-of-bounds segment in source order.
         segment_index: usize,
     },
+    /// An active element segment does not fit in the initial table.
+    ElementSegmentOutOfBounds {
+        /// Zero-based index of the first out-of-bounds segment in source order.
+        segment_index: usize,
+    },
 }
 
 impl fmt::Display for InstantiationError {
@@ -428,6 +483,12 @@ impl fmt::Display for InstantiationError {
         match self {
             Self::MemoryAllocationFailed => {
                 f.write_str("could not reserve WebAssembly linear memory")
+            }
+            Self::ElementSegmentOutOfBounds { segment_index } => {
+                write!(
+                    f,
+                    "WebAssembly element segment {segment_index} is out of bounds"
+                )
             }
             Self::DataSegmentOutOfBounds { segment_index } => {
                 write!(
@@ -441,7 +502,7 @@ impl fmt::Display for InstantiationError {
 
 impl std::error::Error for InstantiationError {}
 
-/// An instance of a validated module, with private, persistent memory and globals.
+/// An instance of a validated module, with a private table, memory, and globals.
 ///
 /// Invocation through `&self` can change this state. An instance is `Send`
 /// (it can move to another thread when its module borrow permits), but not
@@ -452,6 +513,11 @@ pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
     globals: [Cell<i32>; binary::MAX_GLOBALS as usize],
+    #[allow(
+        dead_code,
+        reason = "reserved for indirect calls; no table instructions yet"
+    )]
+    table: Option<FunctionTable>,
 }
 
 impl Instance<'_> {

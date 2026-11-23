@@ -86,6 +86,7 @@ enum Outcome {
     Invocation(Result<i32, WasmTrap>),
     VoidInvocation(Result<(), WasmTrap>),
     DataSegmentOutOfBounds(usize),
+    ElementSegmentOutOfBounds(usize),
 }
 
 struct Fixture {
@@ -552,6 +553,16 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![input],
         });
     }
+    // Two slots, with an empty segment allowed exactly at the end.
+    cases.extend([
+        with_elements(&[(0, &[0, 0]), (2, &[])], Outcome::Invocation(Ok(42))),
+        with_elements(
+            &[(0, &[0]), (3, &[])],
+            Outcome::ElementSegmentOutOfBounds(1),
+        ),
+        with_elements(&[(2, &[0])], Outcome::ElementSegmentOutOfBounds(0)),
+        with_elements(&[(-1, &[])], Outcome::ElementSegmentOutOfBounds(0)),
+    ]);
     cases
 }
 
@@ -576,6 +587,30 @@ fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixt
     }
 }
 
+fn with_elements(segments: &[(i32, &[u8])], expected: Outcome) -> Fixture {
+    let mut bytes = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0\
+                      \x04\x04\x01\x70\0\x02\x07\x05\x01\x01x\0\0"
+        .to_vec();
+    let mut payload = vec![u8::try_from(segments.len()).unwrap()];
+    for &(offset, functions) in segments {
+        payload.extend([0, 0x41]); // Table index zero, i32.const.
+        payload.extend(sleb32(offset, 1));
+        assert!(functions.len() < 128);
+        payload.extend([0x0b, functions.len() as u8]);
+        payload.extend_from_slice(functions);
+    }
+    assert!(payload.len() < 128);
+    bytes.extend([9, payload.len() as u8]);
+    bytes.extend(payload);
+    bytes.extend([10, 6, 1, 4, 0, 0x41, 42, 0x0b]);
+    Fixture {
+        expected,
+        bytes,
+        export: "x",
+        args: vec![],
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     bytes
@@ -591,6 +626,9 @@ fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
         Ok(instance) => instance,
         Err(WasmInstantiationError::DataSegmentOutOfBounds { segment_index }) => {
             return Ok(Outcome::DataSegmentOutOfBounds(segment_index));
+        }
+        Err(WasmInstantiationError::ElementSegmentOutOfBounds { segment_index }) => {
+            return Ok(Outcome::ElementSegmentOutOfBounds(segment_index));
         }
         Err(error) => return Err(error.into()),
     };
@@ -639,7 +677,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
             Outcome::VoidInvocation(Ok(())) => reference == "void",
             Outcome::Invocation(Err(_)) | Outcome::VoidInvocation(Err(_)) => reference == "trap",
-            Outcome::DataSegmentOutOfBounds(_) => reference == "instantiation-error",
+            Outcome::DataSegmentOutOfBounds(_) | Outcome::ElementSegmentOutOfBounds(_) => {
+                reference == "instantiation-error"
+            }
         };
         if !agrees || actual != expected {
             return Err(format!(

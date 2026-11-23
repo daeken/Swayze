@@ -54,8 +54,11 @@ can also appear as explicitly grouped expressions, such as `(x = a)`,
 right-hand value. An eager compound reads the target before evaluating the
 right-hand side, then stores and returns the numeric result. A logical
 compound returns the old value on a skip, with no write. Otherwise it stores
-and returns the right-hand value without coercion. A comma right-hand side
-needs its own group, as in `(x = (a, b))`. Use `if ((x += a))` for a compound
+and returns the right-hand value without coercion. In `(x = a, b)`, the
+assignment stores `a` and the sequence yields `b`. In `(x = (a, b))`, the
+sequence is the right-hand side, so the assignment stores and returns `b`.
+A skipped logical assignment still proceeds to the next sequence operand.
+Use `if ((x += a))` for a compound
 assignment in a control test: the required test parentheses do not count as
 an explicit expression group.
 A lexical initializer, an existing assignment's right-hand side, either

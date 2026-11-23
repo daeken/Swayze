@@ -424,16 +424,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             Unsupported,
             "assignment expressions",
         ),
-        (
-            "let x; (x&&=1@,@2)",
-            Unsupported,
-            "sequence in an assignment RHS",
-        ),
-        (
-            "let x; (x??=true?1:2@,@3)",
-            Unsupported,
-            "sequence in an assignment RHS",
-        ),
         ("let x,y;(x+=y@*=@2)", Unsupported, "assignment expressions"),
         (
             "let x;false && (0,x@>>>=@1)",
@@ -460,11 +450,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             Unsupported,
             "assignment expressions",
         ),
-        (
-            "let x;false && (x += true?1:2@,@3)",
-            Unsupported,
-            "sequence in an assignment RHS",
-        ),
         ("let x;(x**=@)@", Malformed, "expected an operand"),
         (
             "let x;true || (x**=1@@",
@@ -476,16 +461,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             "let x;(x=true ? x@+=@1 : 2)",
             Unsupported,
             "assignment expressions",
-        ),
-        (
-            "let x, a=1, b=2; (x = a@,@ b)",
-            Unsupported,
-            "sequence in an assignment RHS",
-        ),
-        (
-            "let x;(x=true?0:1@,@2)",
-            Unsupported,
-            "sequence in an assignment RHS",
         ),
         ("let x;(x=@)@", Malformed, "expected an operand"),
         (

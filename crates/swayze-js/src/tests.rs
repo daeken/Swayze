@@ -1662,6 +1662,80 @@ fn grouped_logical_loads_once_and_skips_past_store_keep() {
 }
 
 #[test]
+fn grouped_assignment_sequence_stores_after_its_rhs_join_and_before_discard() {
+    use Instruction::{Boolean, Discard, Jump, JumpIfFalse, StoreBindingKeep, Undefined};
+    assert_postfix(
+        "let x,y; 1+(x=y=true?2:3, y=4, x+y)",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Number(1.0),
+            Boolean(true),
+            JumpIfFalse(9),
+            Number(2.0),
+            Jump(10),
+            Number(3.0),
+            StoreBindingKeep(1),
+            StoreBindingKeep(0),
+            Discard,
+            Number(4.0),
+            StoreBindingKeep(1),
+            Discard,
+            LoadBinding(0),
+            LoadBinding(1),
+            Add,
+            Add,
+        ],
+        3,
+    );
+    assert_postfix(
+        "let x=8; 1+(x/=2, x)",
+        &[
+            Number(8.0),
+            init_let(0),
+            Number(1.0),
+            LoadBinding(0),
+            Number(2.0),
+            Divide,
+            StoreBindingKeep(0),
+            Discard,
+            LoadBinding(0),
+            Add,
+        ],
+        3,
+    );
+}
+
+#[test]
+fn grouped_logical_assignment_skip_targets_the_sequence_discard() {
+    use crate::parser::ShortCircuitCondition::{Falsy, NonNullish, Truthy};
+    use Instruction::{Boolean, Discard, ShortCircuit, StoreBindingKeep};
+    for (operator, condition) in [("&&=", Falsy), ("||=", Truthy), ("??=", NonNullish)] {
+        assert_postfix(
+            &format!("let x=0; 1+(x{operator}false, x)"),
+            &[
+                Number(0.0),
+                init_let(0),
+                Number(1.0),
+                LoadBinding(0),
+                ShortCircuit {
+                    target: 7,
+                    condition,
+                },
+                Boolean(false),
+                StoreBindingKeep(0),
+                Discard,
+                LoadBinding(0),
+                Add,
+            ],
+            2,
+        );
+    }
+}
+
+#[test]
 fn initializerless_let_pushes_undefined_and_initializes_its_own_slot() {
     assert_postfix(
         "let first; let second=first; let third; second",

@@ -139,8 +139,6 @@ fn only_simple_prefixes_at_the_test_start_are_newly_admitted() {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");
     }
     for source in [
-        "let x,y; if ((x=y=1@,@ true)) {} x",
-        "let x; for (; (x=1@,@ true);) {} x",
         "let x; for (x=1@,@ true; false;) {} x",
         "let x; for (; false; x=1@,@ true) {} x",
     ] {

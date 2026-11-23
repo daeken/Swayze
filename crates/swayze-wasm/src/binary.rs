@@ -269,8 +269,9 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// A `br_if` label outside the supported target set is reported as
-/// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`].
+/// A `br_if` depth that does not name an enclosing block or loop is reported as
+/// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
+/// the immediate. This includes depths naming an `if` or the function label.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -649,7 +650,7 @@ enum Instruction {
     ContinueIfNonzero { target: LoopTarget, floor: usize },
 }
 
-/// The first decoded slot of the innermost loop body, no later than the
+/// The first decoded slot of the target loop body, no later than the
 /// continue instruction itself. Forward block and if edges do not use this.
 #[derive(Clone, Copy, Debug)]
 struct LoopTarget(usize);
@@ -1131,7 +1132,8 @@ fn validate_body(
     })?;
     let local_bound = parameter_count + validate_locals(&mut body)?;
     // Forward transfers reserve slots that their matching delimiters backpatch.
-    // Each block chains just its own branches by PC; each link is visited once.
+    // Each target block chains its incoming branches by PC, even from nested
+    // frames; each link is visited once.
     // A loop branch is resolved immediately to the PC saved at entry.
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
     let mut previous_branch = [None; Limit::BodyInstructions.maximum()];
@@ -1250,31 +1252,35 @@ fn validate_body(
                 depth = base;
             }
             BR_IF => {
-                // Decode the entire immediate even when there is no supported target.
-                let supported = matches!(
-                    kind,
-                    Some(ControlKind::Block { .. } | ControlKind::Loop { .. })
-                );
-                body.index(IntegerField::LabelIndex, u32::from(supported))?;
-                match kind {
-                    Some(ControlKind::Block { last_branch }) => {
-                        // Check both operands, retaining the result on fallthrough.
+                // Count all explicit frames. An if label or the implicit
+                // function label is not a supported destination.
+                let label_offset = body.position();
+                let label = body.index(IntegerField::LabelIndex, nesting as u32)?;
+                let target = &mut frames[nesting - 1 - label as usize];
+                // `consume` checks the active floor; only the taken edge uses
+                // the target floor. Fallthrough pops just the condition.
+                match &mut target.kind {
+                    ControlKind::Block { last_branch } => {
                         depth = consume(2)? + 1;
-                        previous_branch[pc] = last_branch;
-                        frames[nesting - 1].kind = ControlKind::Block {
-                            last_branch: Some(pc),
-                        };
+                        previous_branch[pc] = *last_branch;
+                        *last_branch = Some(pc);
                     }
-                    Some(ControlKind::Loop { body_pc }) => {
-                        // There are no loop label operands. Check and pop only
-                        // the condition here; the taken edge resets to base.
+                    ControlKind::Loop { body_pc } => {
                         depth = consume(1)?;
                         decoded[pc] = Instruction::ContinueIfNonzero {
-                            target: LoopTarget::at_branch(body_pc, pc),
-                            floor: base,
+                            target: LoopTarget::at_branch(*body_pc, pc),
+                            floor: target.base,
                         };
                     }
-                    _ => unreachable!("label validation requires a block or loop"),
+                    ControlKind::Then { .. } | ControlKind::Else { .. } => {
+                        return Err(Error {
+                            offset: label_offset,
+                            kind: ErrorKind::InvalidIndex {
+                                field: IntegerField::LabelIndex,
+                                index: label,
+                            },
+                        });
+                    }
                 }
             }
             _ => {

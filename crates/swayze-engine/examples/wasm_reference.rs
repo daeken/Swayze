@@ -409,6 +409,27 @@ fn fixtures() -> Vec<Fixture> {
             &[0x20, 0, 0x20, 1, opcode],
         ));
     }
+    // Exit the outer block from an if, crossing the live value 7.
+    let outer_exit = [
+        0x41, 3, 0x02, 0x7f, 0x41, 7, 0x20, 0, 0x04, 0x7f, 0x41, 39, 0x41, 1, 0x0d, 1, 0x05, 0x41,
+        39, 0x0b, 0x6a, 0x0b, 0x6a,
+    ];
+    for (input, expected) in [(0, 49), (1, 42)] {
+        cases.push(Fixture::new(expected, &[input], &outer_exit));
+    }
+    // Continue the outer loop from its nested block until the count is zero.
+    let outer_continue = [
+        0x41, 3, 0x03, 0x40, 0x20, 1, 0x20, 0, 0x6a, 0x21, 1, 0x02, 0x7f, 0x20, 0, 0x41, 1, 0x6b,
+        0x22, 0, 0x0d, 1, 0x20, 1, 0x0b, 0x21, 1, 0x0b, 0x20, 1, 0x6a,
+    ];
+    for (input, expected) in [(1, 4), (4, 13)] {
+        cases.push(Fixture::with_locals(
+            expected,
+            &[input],
+            &[1, 1, 0x7f],
+            &outer_continue,
+        ));
+    }
     cases
 }
 

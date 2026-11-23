@@ -43,6 +43,8 @@ mod float_to_int;
 mod function_exit;
 #[path = "execution/global_exports.rs"]
 mod global_exports;
+#[path = "execution/global_imports.rs"]
+mod global_imports;
 #[path = "execution/globals.rs"]
 mod globals;
 #[path = "execution/host_invocation.rs"]

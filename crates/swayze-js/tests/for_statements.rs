@@ -146,7 +146,7 @@ fn checks_inactive_headers_and_bodies_with_lexical_diagnostics() {
 }
 
 #[test]
-fn requires_braces_delimiters_and_simple_assignment_clauses() {
+fn requires_braces_delimiters_and_assignment_clauses() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, needle) in [
         ("for ;", Malformed, ";"),
@@ -156,7 +156,7 @@ fn requires_braces_delimiters_and_simple_assignment_clauses() {
         ("for(let i=0;false;){}42", Unsupported, "let"),
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
-        ("for(i+=1;false;){}42", Unsupported, "+="),
+        ("for(i**=1;false;){}42", Unsupported, "**="),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
         ("for(;i=1;){}42", Unsupported, "="),
         ("for(;false;i++){}42", Unsupported, "++"),

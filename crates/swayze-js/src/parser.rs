@@ -385,7 +385,7 @@ enum TokenKind {
     For,
     Break,
     Continue,
-    Equals,
+    Assignment(Option<Operator>),
     Operator(Operator),
     Open,
     Close,
@@ -547,7 +547,7 @@ impl Lexer<'_> {
                     "HTML comments are outside the subset",
                 ));
             }
-            '<' | '>' => self.relational_or_shift(c, start)?,
+            '<' | '>' => self.relational_or_shift(c)?,
             '(' => TokenKind::Open,
             ')' => TokenKind::Close,
             '{' => TokenKind::OpenBrace,
@@ -632,7 +632,7 @@ impl Lexer<'_> {
         }
         if first == '=' {
             if self.peek() != Some('>') {
-                return Ok(TokenKind::Equals);
+                return Ok(TokenKind::Assignment(None));
             }
             self.consume('>')?;
         } else {
@@ -652,6 +652,17 @@ impl Lexer<'_> {
         if doubled {
             self.consume(first)?;
         }
+        let op = match (first, doubled) {
+            ('&', false) => Operator::BitwiseAnd,
+            ('^', false) => Operator::BitwiseXor,
+            ('|', false) => Operator::BitwiseOr,
+            ('&', true) => Operator::LogicalAnd,
+            ('|', true) => Operator::LogicalOr,
+            _ => unreachable!("not a bitwise or logical operator"),
+        };
+        if !doubled {
+            return self.operator_or_assignment(op);
+        }
         if self.peek() == Some('=') {
             self.consume('=')?;
             return Err(Error::unsupported(
@@ -659,20 +670,13 @@ impl Lexer<'_> {
                     start,
                     end: self.offset,
                 },
-                "compound assignments are outside the subset",
+                "logical assignments are outside the subset",
             ));
         }
-        Ok(TokenKind::Operator(match (first, doubled) {
-            ('&', false) => Operator::BitwiseAnd,
-            ('^', false) => Operator::BitwiseXor,
-            ('|', false) => Operator::BitwiseOr,
-            ('&', true) => Operator::LogicalAnd,
-            ('|', true) => Operator::LogicalOr,
-            _ => unreachable!("not a bitwise or logical operator"),
-        }))
+        Ok(TokenKind::Operator(op))
     }
 
-    fn relational_or_shift(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
+    fn relational_or_shift(&mut self, first: char) -> Result<TokenKind, Error> {
         if self.peek() == Some(first) {
             self.consume(first)?;
             let op = if first == '<' {
@@ -683,17 +687,7 @@ impl Lexer<'_> {
             } else {
                 Operator::ShiftRight
             };
-            if self.peek() == Some('=') {
-                self.consume('=')?;
-                return Err(Error::unsupported(
-                    Span {
-                        start,
-                        end: self.offset,
-                    },
-                    "compound assignments are outside the subset",
-                ));
-            }
-            return Ok(TokenKind::Operator(op));
+            return self.operator_or_assignment(op);
         }
         let inclusive = self.peek() == Some('=');
         if inclusive {
@@ -734,11 +728,9 @@ impl Lexer<'_> {
     }
 
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
-        if let Some(next) = self.peek()
-            && (next == '=' || (next == c && matches!(c, '+' | '-' | '*')))
-        {
-            self.consume(next)?;
-            if c == '*' && next == '*' && self.rest().starts_with('=') {
+        if matches!(c, '+' | '-' | '*') && self.peek() == Some(c) {
+            self.consume(c)?;
+            if c == '*' && self.peek() == Some('=') {
                 self.consume('=')?;
             }
             return Err(Error::unsupported(
@@ -749,14 +741,23 @@ impl Lexer<'_> {
                 "longer punctuator is outside the arithmetic subset",
             ));
         }
-        Ok(TokenKind::Operator(match c {
+        self.operator_or_assignment(match c {
             '+' => Operator::Add,
             '-' => Operator::Subtract,
             '*' => Operator::Multiply,
             '/' => Operator::Divide,
             '%' => Operator::Remainder,
             _ => unreachable!("not an arithmetic operator"),
-        }))
+        })
+    }
+
+    fn operator_or_assignment(&mut self, op: Operator) -> Result<TokenKind, Error> {
+        if self.peek() == Some('=') {
+            self.consume('=')?;
+            Ok(TokenKind::Assignment(Some(op)))
+        } else {
+            Ok(TokenKind::Operator(op))
+        }
     }
 
     fn decimal_digits(&mut self) -> Result<(), Error> {
@@ -882,8 +883,14 @@ struct Access {
     name: Span,
     scope: usize,
     instruction: usize,
-    // Present for a write, for the diagnostic if the resolved binding is const.
-    equals: Option<Span>,
+    write: Option<WriteAccess>,
+}
+
+#[derive(Clone, Copy)]
+struct WriteAccess {
+    operator_span: Span,
+    // For a compound assignment, patch this load to the same slot as the store.
+    load: Option<usize>,
 }
 
 enum ExpressionEnd {
@@ -973,12 +980,12 @@ impl Parser<'_> {
                 TokenKind::Identifier => {
                     let next = self.next_token()?;
                     if let Some(Token {
-                        kind: TokenKind::Equals,
+                        kind: TokenKind::Assignment(op),
                         span,
                         ..
                     }) = next
                     {
-                        self.parse_assignment_statement(first.span, span)?;
+                        self.parse_assignment_statement(first.span, op, span)?;
                         continue;
                     }
                     self.lookahead = Some(next);
@@ -1210,15 +1217,15 @@ impl Parser<'_> {
     }
 
     fn parse_for_assignment(&mut self, first: Token, end: ExpressionEnd) -> Result<Span, Error> {
-        let unsupported = "for initializers and updates must be simple assignments";
+        let unsupported = "for initializers and updates must be assignments to names";
         if !matches!(first.kind, TokenKind::Identifier) {
             return Err(Error::unsupported(first.span, unsupported));
         }
-        let equals = self.require_token("expected '=' after the assignment name")?;
-        if !matches!(equals.kind, TokenKind::Equals) {
-            return Err(Error::unsupported(equals.span, unsupported));
-        }
-        self.parse_assignment(first.span, equals.span, end)
+        let operator = self.require_token("expected an assignment operator after the name")?;
+        let TokenKind::Assignment(op) = operator.kind else {
+            return Err(Error::unsupported(operator.span, unsupported));
+        };
+        self.parse_assignment(first.span, op, operator.span, end)
     }
 
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
@@ -1258,14 +1265,15 @@ impl Parser<'_> {
             TokenKind::If | TokenKind::While | TokenKind::For => self.open_statement(first),
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
             TokenKind::Identifier => {
-                let equals = self.require_token("expected '=' after the assignment name")?;
-                if !matches!(equals.kind, TokenKind::Equals) {
+                let operator =
+                    self.require_token("expected an assignment operator after the name")?;
+                let TokenKind::Assignment(op) = operator.kind else {
                     return Err(Error::unsupported(
-                        equals.span,
-                        "only simple assignments are supported in these blocks",
+                        operator.span,
+                        "only assignments to names are supported in these blocks",
                     ));
-                }
-                self.parse_assignment_statement(first.span, equals.span)
+                };
+                self.parse_assignment_statement(first.span, op, operator.span)
             }
             _ => Err(Error::unsupported(
                 first.span,
@@ -1393,11 +1401,20 @@ impl Parser<'_> {
             return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
         let equals = self.require_token("expected '=' after the binding name")?;
-        if !matches!(equals.kind, TokenKind::Equals) {
-            return Err(Error::malformed(
-                equals.span,
-                "expected '=' after the binding name",
-            ));
+        match equals.kind {
+            TokenKind::Assignment(None) => {}
+            TokenKind::Assignment(Some(_)) => {
+                return Err(Error::unsupported(
+                    equals.span,
+                    "compound assignments cannot initialize declarations",
+                ));
+            }
+            _ => {
+                return Err(Error::malformed(
+                    equals.span,
+                    "expected '=' after the binding name",
+                ));
+            }
         }
         let first = self.require_token("expected a binding initializer")?;
         let missing_semicolon = match kind {
@@ -1418,28 +1435,44 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_assignment_statement(&mut self, name: Span, equals: Span) -> Result<(), Error> {
+    fn parse_assignment_statement(
+        &mut self,
+        name: Span,
+        op: Option<Operator>,
+        operator_span: Span,
+    ) -> Result<(), Error> {
         let end = ExpressionEnd::Semicolon("assignments require explicit semicolons");
-        self.parse_assignment(name, equals, end)?;
+        self.parse_assignment(name, op, operator_span, end)?;
         Ok(())
     }
 
     fn parse_assignment(
         &mut self,
         name: Span,
-        equals: Span,
+        op: Option<Operator>,
+        operator_span: Span,
         end: ExpressionEnd,
     ) -> Result<Span, Error> {
         // Record the target before the RHS reads to preserve diagnostic order.
-        let access = self.record_access(name, Some(equals))?;
+        let write = WriteAccess {
+            operator_span,
+            load: op.map(|_| self.instructions.len()),
+        };
+        let access = self.record_access(name, Some(write))?;
+        if op.is_some() {
+            self.emit(Instruction::LoadBinding(UNPATCHED), name)?;
+        }
         let first = self.require_token("expected an assignment value")?;
         let end = self.parse_expression(first, end)?;
+        if let Some(op) = op {
+            self.emit(op.instruction(), operator_span)?;
+        }
         self.accesses[access].instruction = self.instructions.len();
         self.emit(Instruction::StoreBinding(UNPATCHED), end)?;
         Ok(end)
     }
 
-    fn record_access(&mut self, name: Span, equals: Option<Span>) -> Result<usize, Error> {
+    fn record_access(&mut self, name: Span, write: Option<WriteAccess>) -> Result<usize, Error> {
         let index = self.accesses.len();
         let scope = self.current_scope();
         try_push(
@@ -1448,7 +1481,7 @@ impl Parser<'_> {
                 name,
                 scope,
                 instruction: self.instructions.len(),
-                equals,
+                write,
             },
             name,
         )?;
@@ -1491,15 +1524,15 @@ impl Parser<'_> {
                         "access before lexical binding initialization is outside the subset",
                     ));
                 }
-                if let Some(equals) = access.equals
+                if let Some(write) = access.write
                     && binding.kind == BindingKind::Const
                 {
                     return Err(Error::unsupported(
-                        equals,
+                        write.operator_span,
                         "assignment to const is outside the subset",
                     ));
                 }
-                return Ok(if access.equals.is_some() {
+                return Ok(if access.write.is_some() {
                     Instruction::StoreBinding(slot)
                 } else {
                     Instruction::LoadBinding(slot)
@@ -1508,7 +1541,7 @@ impl Parser<'_> {
             let Some(parent) = self.scopes[scope].parent else {
                 // Only an unbound read gets the immutable default. A declaration
                 // in any visible scope, even in its TDZ, wins over this fallback.
-                if access.equals.is_none() && self.is_undefined_name(access.name) {
+                if access.write.is_none() && self.is_undefined_name(access.name) {
                     return Ok(Instruction::Undefined);
                 }
                 return Err(Error::unsupported(
@@ -1522,16 +1555,35 @@ impl Parser<'_> {
     }
 
     fn resolve_accesses(&mut self) -> Result<(), Error> {
-        // One site per emitted load or store. The search alone takes extra work.
+        // Resolve each name site once, even when it emits both a load and a store.
         for index in 0..self.accesses.len() {
             let access = self.accesses[index];
             let resolved = self.resolve_access(access)?;
-            match self.instructions.get_mut(access.instruction) {
-                Some(op @ Instruction::LoadBinding(UNPATCHED)) if access.equals.is_none() => {
+            match (
+                access.write,
+                resolved,
+                self.instructions.get_mut(access.instruction),
+            ) {
+                (None, _, Some(op @ Instruction::LoadBinding(UNPATCHED))) => {
                     *op = resolved;
                 }
-                Some(op @ Instruction::StoreBinding(UNPATCHED)) if access.equals.is_some() => {
+                (
+                    Some(write),
+                    Instruction::StoreBinding(slot),
+                    Some(op @ Instruction::StoreBinding(UNPATCHED)),
+                ) => {
                     *op = resolved;
+                    if let Some(load) = write.load {
+                        let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
+                            self.instructions.get_mut(load)
+                        else {
+                            return Err(Error::malformed(
+                                access.name,
+                                "invalid pending compound assignment load",
+                            ));
+                        };
+                        *op = Instruction::LoadBinding(slot);
+                    }
                 }
                 _ => {
                     return Err(Error::malformed(
@@ -1545,6 +1597,8 @@ impl Parser<'_> {
     }
 
     fn parse_expression(&mut self, first: Token, end_kind: ExpressionEnd) -> Result<Span, Error> {
+        // Compound assignment keeps its loaded LHS below the RHS operands.
+        let base_depth = self.stack_depth;
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
         let for_delimiter = match end_kind {
             ExpressionEnd::ForSemicolon => Some("expected ';' between for clauses"),
@@ -1575,7 +1629,7 @@ impl Parser<'_> {
                 after_line_break,
             } = token;
             match (needs_operand, kind) {
-                (_, TokenKind::Equals) => {
+                (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
                         span,
                         "assignment expressions are outside the subset",
@@ -1809,7 +1863,7 @@ impl Parser<'_> {
         if at_eof && let Some(message) = for_delimiter {
             return Err(Error::malformed(end, message));
         }
-        if self.stack_depth != 1 {
+        if self.stack_depth.checked_sub(base_depth) != Some(1) {
             return Err(Error::malformed(
                 end,
                 "expected exactly one complete expression",

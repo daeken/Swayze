@@ -674,6 +674,20 @@ fn fixtures() -> Vec<Fixture> {
         expression.extend([0x7f, 0x42, 0x7f, op, 0xa7]); // i64::MIN and -1.
         cases.push(Fixture::with_outcome(expected, &[], &[0], &expression));
     }
+    // Check the count result and full-width shifted/rotated bits through i64.eq.
+    cases.extend([
+        Fixture::new(64, &[], &[0x42, 0, 0x79, 0xa7]),
+        Fixture::new(64, &[], &[0x42, 0, 0x7a, 0xa7]),
+        Fixture::new(64, &[], &[0x42, 0x7f, 0x7b, 0xa7]),
+        Fixture::new(1, &[], &[0x42, 1, 0x42, 0xc1, 0, 0x86, 0x42, 2, 0x51]),
+        Fixture::new(1, &[], &[0x42, 0x7f, 0x42, 0x7f, 0x88, 0x42, 1, 0x51]),
+        Fixture::new(1, &[], &[0x42, 0x7f, 0x42, 0x7f, 0x87, 0x42, 0x7f, 0x51]),
+        Fixture::new(
+            1,
+            &[],
+            &[0x42, 1, 0x42, 0x7f, 0x89, 0x42, 1, 0x42, 1, 0x8a, 0x51],
+        ),
+    ]);
     cases
 }
 

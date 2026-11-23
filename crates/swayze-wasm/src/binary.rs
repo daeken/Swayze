@@ -983,16 +983,32 @@ enum Instruction {
     I64Eqz,
     I64Unary(I64UnaryOp),
     I64Binary(I64BinaryOp),
-    LoadI32 { kind: LoadKind, offset: u32 },
-    LoadI64 { kind: LoadKind, offset: u32 },
-    StoreI32 { width: AccessWidth, offset: u32 },
-    StoreI64 { width: AccessWidth, offset: u32 },
+    Load {
+        kind: LoadKind,
+        offset: u32,
+        ty: ValType,
+    },
+    Store {
+        width: AccessWidth,
+        offset: u32,
+        ty: ValType,
+    },
     MemorySize,
     MemoryGrow,
-    JumpIfZero { target: usize },
-    Jump { target: usize },
-    Branch { edge: BranchEdge, conditional: bool },
-    BranchTable { first: usize, explicit_count: u32 },
+    JumpIfZero {
+        target: usize,
+    },
+    Jump {
+        target: usize,
+    },
+    Branch {
+        edge: BranchEdge,
+        conditional: bool,
+    },
+    BranchTable {
+        first: usize,
+        explicit_count: u32,
+    },
 }
 
 /// A WebAssembly integer tagged with its exact width.
@@ -1766,36 +1782,32 @@ pub(super) fn execute(
                 let lhs = frame.pop().as_i64();
                 frame.push(op.apply(lhs, rhs).map_err(ExecutionError::Trap)?);
             }
-            Instruction::LoadI32 { kind, offset } => {
+            Instruction::Load { kind, offset, ty } => {
                 let address = frame.pop_i32();
                 let value = instance
                     .memory
                     .load(address, offset, kind)
                     .map_err(ExecutionError::Trap)?;
-                frame.push_i32(value as i32);
+                // Float loads tag the raw bits; they never create a native float.
+                frame.push(match ty {
+                    ValType::I32 => Operand::I32(value as i32),
+                    ValType::I64 => Operand::I64(value),
+                    ValType::F32 => Operand::F32(value as u32),
+                    ValType::F64 => Operand::F64(value as u64),
+                });
             }
-            Instruction::LoadI64 { kind, offset } => {
-                let address = frame.pop_i32();
-                let value = instance
-                    .memory
-                    .load(address, offset, kind)
-                    .map_err(ExecutionError::Trap)?;
-                frame.push(Operand::I64(value));
-            }
-            Instruction::StoreI32 { width, offset } => {
-                let value = frame.pop_i32();
-                let address = frame.pop_i32();
-                instance
-                    .memory
-                    .store(address, offset, width, i64::from(value))
-                    .map_err(ExecutionError::Trap)?;
-            }
-            Instruction::StoreI64 { width, offset } => {
-                let value = frame.pop().as_i64();
+            Instruction::Store { width, offset, ty } => {
+                let value = frame.pop();
+                let bits = match ty {
+                    ValType::I32 => i64::from(value.as_i32()),
+                    ValType::I64 => value.as_i64(),
+                    ValType::F32 => i64::from(value.f32_bits()),
+                    ValType::F64 => value.f64_bits() as i64,
+                };
                 let address = frame.pop_i32();
                 instance
                     .memory
-                    .store(address, offset, width, value)
+                    .store(address, offset, width, bits)
                     .map_err(ExecutionError::Trap)?;
             }
             Instruction::MemorySize => frame.push_i32(instance.memory.size_in_pages()),
@@ -2133,15 +2145,13 @@ fn validate_plain_stack(
             Some(environment.globals[index as usize].operand_type()),
             None,
         ),
-        Instruction::Unary(_) | Instruction::MemoryGrow | Instruction::LoadI32 { .. } => {
-            (1, i32_type, i32_type)
-        }
-        Instruction::LoadI64 { .. } => (1, i32_type, Some(I64)),
-        Instruction::StoreI32 { .. } => (2, i32_type, None),
-        Instruction::StoreI64 { .. } => {
-            // As for i32 stores, report underflow before checking either type.
+        Instruction::Unary(_) | Instruction::MemoryGrow => (1, i32_type, i32_type),
+        Instruction::Load { ty, .. } => (1, i32_type, Some(ty)),
+        Instruction::Store { ty, .. } => {
+            // Report underflow before checking either type, then check the
+            // value before the address (even for a concrete value in dead code).
             operands.depth_after_pop(frame, 2, offset)?;
-            operands.pop(frame, 1, Some(I64), offset)?;
+            operands.pop(frame, 1, Some(ty), offset)?;
             (1, i32_type, None)
         }
         Instruction::Binary(_) => (2, i32_type, i32_type),
@@ -2210,17 +2220,11 @@ fn decode_plain(
     let has_memory = environment.has_memory;
     let load = |body: &mut Reader<'_>, kind: LoadKind, ty| {
         let offset = decode_memarg(body, offset, kind.width(), has_memory)?;
-        Ok(match ty {
-            IntegerType::I32 => Instruction::LoadI32 { kind, offset },
-            IntegerType::I64 => Instruction::LoadI64 { kind, offset },
-        })
+        Ok(Instruction::Load { kind, offset, ty })
     };
     let store = |body: &mut Reader<'_>, width: AccessWidth, ty| {
         let offset = decode_memarg(body, offset, width, has_memory)?;
-        Ok(match ty {
-            IntegerType::I32 => Instruction::StoreI32 { width, offset },
-            IntegerType::I64 => Instruction::StoreI64 { width, offset },
-        })
+        Ok(Instruction::Store { width, offset, ty })
     };
     Ok(match opcode {
         0x00 => Instruction::Unreachable,
@@ -2260,25 +2264,29 @@ fn decode_plain(
             }
             Instruction::GlobalSet(index)
         }
-        0x28 => load(body, LoadKind::WordUnsigned, IntegerType::I32)?,
-        0x29 => load(body, LoadKind::Doubleword, IntegerType::I64)?,
-        0x2c => load(body, LoadKind::ByteSigned, IntegerType::I32)?,
-        0x2d => load(body, LoadKind::ByteUnsigned, IntegerType::I32)?,
-        0x2e => load(body, LoadKind::HalfwordSigned, IntegerType::I32)?,
-        0x2f => load(body, LoadKind::HalfwordUnsigned, IntegerType::I32)?,
-        0x30 => load(body, LoadKind::ByteSigned, IntegerType::I64)?,
-        0x31 => load(body, LoadKind::ByteUnsigned, IntegerType::I64)?,
-        0x32 => load(body, LoadKind::HalfwordSigned, IntegerType::I64)?,
-        0x33 => load(body, LoadKind::HalfwordUnsigned, IntegerType::I64)?,
-        0x34 => load(body, LoadKind::WordSigned, IntegerType::I64)?,
-        0x35 => load(body, LoadKind::WordUnsigned, IntegerType::I64)?,
-        0x36 => store(body, AccessWidth::Word, IntegerType::I32)?,
-        0x37 => store(body, AccessWidth::Doubleword, IntegerType::I64)?,
-        0x3a => store(body, AccessWidth::Byte, IntegerType::I32)?,
-        0x3b => store(body, AccessWidth::Halfword, IntegerType::I32)?,
-        0x3c => store(body, AccessWidth::Byte, IntegerType::I64)?,
-        0x3d => store(body, AccessWidth::Halfword, IntegerType::I64)?,
-        0x3e => store(body, AccessWidth::Word, IntegerType::I64)?,
+        0x28 => load(body, LoadKind::WordUnsigned, ValType::I32)?,
+        0x29 => load(body, LoadKind::Doubleword, ValType::I64)?,
+        0x2a => load(body, LoadKind::WordUnsigned, ValType::F32)?,
+        0x2b => load(body, LoadKind::Doubleword, ValType::F64)?,
+        0x2c => load(body, LoadKind::ByteSigned, ValType::I32)?,
+        0x2d => load(body, LoadKind::ByteUnsigned, ValType::I32)?,
+        0x2e => load(body, LoadKind::HalfwordSigned, ValType::I32)?,
+        0x2f => load(body, LoadKind::HalfwordUnsigned, ValType::I32)?,
+        0x30 => load(body, LoadKind::ByteSigned, ValType::I64)?,
+        0x31 => load(body, LoadKind::ByteUnsigned, ValType::I64)?,
+        0x32 => load(body, LoadKind::HalfwordSigned, ValType::I64)?,
+        0x33 => load(body, LoadKind::HalfwordUnsigned, ValType::I64)?,
+        0x34 => load(body, LoadKind::WordSigned, ValType::I64)?,
+        0x35 => load(body, LoadKind::WordUnsigned, ValType::I64)?,
+        0x36 => store(body, AccessWidth::Word, ValType::I32)?,
+        0x37 => store(body, AccessWidth::Doubleword, ValType::I64)?,
+        0x38 => store(body, AccessWidth::Word, ValType::F32)?,
+        0x39 => store(body, AccessWidth::Doubleword, ValType::F64)?,
+        0x3a => store(body, AccessWidth::Byte, ValType::I32)?,
+        0x3b => store(body, AccessWidth::Halfword, ValType::I32)?,
+        0x3c => store(body, AccessWidth::Byte, ValType::I64)?,
+        0x3d => store(body, AccessWidth::Halfword, ValType::I64)?,
+        0x3e => store(body, AccessWidth::Word, ValType::I64)?,
         0x3f | 0x40 => {
             // Core 1.0 reserves a literal zero byte here, not a LEB32 index.
             body.expect_byte(0)?;

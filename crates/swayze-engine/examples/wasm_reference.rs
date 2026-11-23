@@ -977,6 +977,35 @@ fn fixtures() -> Vec<Fixture> {
             ],
         ));
     }
+    // Mix integer and float accesses to the same bytes; never pass a float to the host.
+    let f32_alias = [
+        0x20, 0, 0x20, 1, 0x36, 2, 0, // i32.store bits at address
+        0x20, 0, 0x2a, 2, 0, 0xbc, // i32.reinterpret_f32(f32.load)
+    ];
+    for (address, expected) in [
+        (1, Ok(0x7f80_0042)),
+        (65533, Err(WasmTrap::MemoryOutOfBounds)),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(expected),
+            bytes: singleton_module(2, &[0], &f32_alias, Some(1)),
+            export: EXPORT,
+            args: vec![address, 0x7f80_0042],
+        });
+    }
+    let f64_alias = [
+        0x20, 0, 0x44, 0x42, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0x39, 3, 0, // f64.store signaling NaN
+        0x20, 0, 0x29, 3, 0, // i64.load
+        0x44, 0x42, 0, 0, 0, 0, 0, 0xf0, 0x7f, 0xbd, 0x51,
+    ];
+    for (address, expected) in [(65528, Ok(1)), (65529, Err(WasmTrap::MemoryOutOfBounds))] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(expected),
+            bytes: singleton_module(1, &[0], &f64_alias, Some(1)),
+            export: EXPORT,
+            args: vec![address],
+        });
+    }
     cases
 }
 

@@ -555,7 +555,7 @@ fn known_floats_cannot_cross_integer_storage_and_call_boundaries() {
 }
 
 #[test]
-fn float_signatures_loop_results_memory_and_other_numeric_ops_stay_unsupported() {
+fn float_signatures_loop_results_and_other_numeric_ops_stay_unsupported() {
     let unexpected = |expected, found| ErrorKind::UnexpectedByte { expected, found };
     for ty in [0x7d, 0x7c] {
         bad_payload(1, &[1, 0x60, 1, ty, 0], 3, unexpected(0x7f, ty));
@@ -568,11 +568,12 @@ fn float_signatures_loop_results_memory_and_other_numeric_ops_stay_unsupported()
         bad_body(&[0, 0x03, ty, 0x0b, 0x0b], 2, unexpected(0x40, ty));
     }
     bad_payload(6, &[1, 0x7f, 0, F32_CONST], 3, unexpected(0x41, F32_CONST));
-    // Test with a defined memory, and in dead code so underflow is irrelevant.
-    for opcode in [0x2a, 0x2b, 0x38, 0x39, 0x92, 0xa0, 0xa8, 0xb2, 0x1c] {
-        let mut bytes = module(&[(1, TYPE), (3, FUNCTION), (5, &[1, 0, 1])]);
-        let start = push_section(&mut bytes, 10, &code_body(&[0, 0, opcode, 0, 0, 0x0b]));
-        expect_error(&bytes, start + 4, ErrorKind::UnsupportedOpcode { opcode });
+    for opcode in [0x92, 0xa0, 0xa8, 0xb2, 0x1c] {
+        bad_body(
+            &[0, 0, opcode, 0x0b],
+            2,
+            ErrorKind::UnsupportedOpcode { opcode },
+        );
     }
 }
 

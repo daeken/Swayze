@@ -166,21 +166,27 @@ fn start_and_invocations_move_exact_bits_into_independent_instance_slots() {
     );
     read(&a, trap32, trap64);
     read(&b, SNAN32_BITS, SNAN64_BITS);
-    read(&validated.instantiate().unwrap(), SNAN32_BITS, SNAN64_BITS);
+
+    // Starting a new instance writes the original sNaNs to its own slots,
+    // without restoring those bits over the already-live instance's writes.
+    let fresh = validated.instantiate().unwrap();
+    read(&fresh, SNAN32_BITS, SNAN64_BITS);
+    read(&a, trap32, trap64);
 }
 
 #[test]
 fn float_initializers_check_mutability_opcode_width_and_end_in_order() {
     use ErrorKind::*;
-    for (decl, ty, wrong_width, same_width_int) in
-        [(F32_SNAN, F32, 0x44, 0x41), (F64_SNAN, F64, 0x43, 0x42)]
-    {
+    for (decl, ty, wrong_width, same_width_int) in [
+        (F32_SNAN, F32, F64_SNAN, 0x41),
+        (F64_SNAN, F64, F32_SNAN, 0x42),
+    ] {
         let opcode = decl[2];
         let initializer = &decl[..decl.len() - 1];
         for (declaration, offset, kind) in [
             (&decl[..1], 2, TruncatedGlobalMutability),
             (
-                &[decl[0], 2, wrong_width],
+                &[decl[0], 2, wrong_width[2]],
                 2,
                 InvalidGlobalMutability { byte: 2 },
             ),
@@ -202,7 +208,18 @@ fn float_initializers_check_mutability_opcode_width_and_end_in_order() {
         ] {
             bad_payload(6, &[&[1][..], declaration].concat(), offset, kind);
         }
-        for found in [wrong_width, same_width_int, 0x23] {
+        // Even a complete other-width constant and end fail at the opcode.
+        let payload = [&[1][..], &decl[..2], &wrong_width[2..]].concat();
+        bad_payload(
+            6,
+            &payload,
+            3,
+            UnexpectedByte {
+                expected: opcode,
+                found: wrong_width[2],
+            },
+        );
+        for found in [same_width_int, 0x23] {
             // global.get is not allowed, even referring to an earlier same-type immutable global.
             let payload = [&[2][..], decl, &decl[..2], &[found, 0, 0x0b]].concat();
             bad_payload(
@@ -217,11 +234,12 @@ fn float_initializers_check_mutability_opcode_width_and_end_in_order() {
         }
         for len in 3..initializer.len() {
             let mut bytes = module(&[]);
-            let start = push_section(&mut bytes, 6, &[&[1][..], &initializer[..len]].concat());
+            push_section(&mut bytes, 6, &[&[1][..], &initializer[..len]].concat());
+            let global_end = bytes.len();
             // There are enough following bytes to fill even an empty immediate,
             // but all of them belong to the next section.
             push_section(&mut bytes, 0, &[0; 9]);
-            expect_error(&bytes, start + 1 + len, TruncatedFloatConst { ty });
+            expect_error(&bytes, global_end, TruncatedFloatConst { ty });
         }
     }
 }

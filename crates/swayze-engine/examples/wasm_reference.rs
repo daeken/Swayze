@@ -328,6 +328,28 @@ fn fixtures() -> Vec<Fixture> {
             args: args.to_vec(),
         });
     }
+    for (store, load, bits, address, value, result) in [
+        (0x3a, 0x2c, 0, 65535, 0x180, -128),
+        (0x3a, 0x2d, 0, 65535, 0x180, 128),
+        (0x3b, 0x2e, 1, 65533, 0x18000, -32768),
+        (0x3b, 0x2f, 1, 65533, 0x18000, 32768),
+    ] {
+        let body = [0x20, 0, 0x20, 1, store, bits, 0, 0x20, 0, load, bits, 0];
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(result)),
+            bytes: singleton_module(2, &[0], &body, Some(1)),
+            export: EXPORT,
+            args: vec![address, value],
+        });
+    }
+    for pages in [0, 1] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(i32::from(pages))),
+            bytes: singleton_module(0, &[0], &[0x3f, 0], Some(pages)),
+            export: EXPORT,
+            args: vec![],
+        });
+    }
     cases.extend([
         with_data(
             &[(0, &[1, 2, 3, 4]), (1, &[9])],

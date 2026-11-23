@@ -1,4 +1,7 @@
-use crate::{ExecutionLimit, Export, Instance, InvokeError, Module, Trap, memory::DataSegment};
+use crate::{
+    ExecutionLimit, Export, Instance, InvokeError, Module, Trap,
+    memory::{AccessWidth, DataSegment, LoadKind, MEMORY_PAGE_BYTES},
+};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -199,7 +202,10 @@ impl fmt::Display for Error {
                 f.write_str("memory instruction or data segment requires a defined memory")
             }
             InvalidMemoryAlignment { exponent } => {
-                write!(f, "i32 memory alignment exponent {exponent} exceeds 2")
+                write!(
+                    f,
+                    "i32 memory alignment exponent {exponent} exceeds natural alignment"
+                )
             }
             TruncatedByte { expected } => write!(f, "missing expected byte {expected:#04x}"),
             UnexpectedByte { expected, found } => {
@@ -258,7 +264,9 @@ impl std::error::Error for Error {}
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
-/// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent;
+/// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent.
+/// For `memory.size`, a malformed reserved byte is reported as
+/// [`ErrorKind::TruncatedByte`] or [`ErrorKind::UnexpectedByte`].
 /// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
 /// segment's memory index. A data length above the remaining aggregate budget
 /// is reported as [`ErrorKind::LimitExceeded`] at the start of the length field.
@@ -414,7 +422,6 @@ const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
 const MAX_DATA_SEGMENTS: u32 = 8;
 const MAX_MEMORY_PAGES: u32 = 1;
-const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
@@ -568,8 +575,6 @@ const IF: u8 = 0x04;
 const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR_IF: u8 = 0x0d;
-const I32_LOAD: u8 = 0x28;
-const I32_STORE: u8 = 0x36;
 const I32_CONST: u8 = 0x41;
 
 #[derive(Clone, Copy, Debug)]
@@ -581,8 +586,9 @@ enum Instruction {
     Call(u32),
     Eqz,
     Binary(BinaryOp),
-    LoadI32 { offset: u32 },
-    StoreI32 { offset: u32 },
+    LoadI32 { kind: LoadKind, offset: u32 },
+    StoreI32 { width: AccessWidth, offset: u32 },
+    MemorySize,
     JumpIfZero { target: usize },
     Jump { target: usize },
     BranchIfNonzero { target: usize, floor: usize },
@@ -776,21 +782,22 @@ pub(super) fn execute(
                 let lhs = &mut frame.operands[frame.depth - 1];
                 *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
             }
-            Instruction::LoadI32 { offset } => {
+            Instruction::LoadI32 { kind, offset } => {
                 let address_and_result = &mut frame.operands[frame.depth - 1];
                 *address_and_result = instance
                     .memory
-                    .load_i32(*address_and_result, offset)
+                    .load_i32(*address_and_result, offset, kind)
                     .map_err(InvokeError::Trap)?;
             }
-            Instruction::StoreI32 { offset } => {
+            Instruction::StoreI32 { width, offset } => {
                 let value = frame.pop();
                 let address = frame.pop();
                 instance
                     .memory
-                    .store_i32(address, offset, value)
+                    .store_i32(address, offset, width, value)
                     .map_err(InvokeError::Trap)?;
             }
+            Instruction::MemorySize => frame.push(instance.memory.size_in_pages()),
             Instruction::JumpIfZero { target } => {
                 if frame.pop() == 0 {
                     frame.pc = target;
@@ -856,6 +863,36 @@ fn check_result_depth(depth: usize, expected: usize, offset: usize) -> Result<()
     }
 }
 
+fn require_memory(has_memory: bool, offset: usize) -> Result<(), Error> {
+    if has_memory {
+        Ok(())
+    } else {
+        Err(Error {
+            offset,
+            kind: ErrorKind::MissingMemory,
+        })
+    }
+}
+
+fn decode_memarg(
+    body: &mut Reader<'_>,
+    opcode_offset: usize,
+    width: AccessWidth,
+    has_memory: bool,
+) -> Result<u32, Error> {
+    let alignment_offset = body.position();
+    let exponent = body.integer(IntegerField::MemoryAlignment)?;
+    let memory_offset = body.integer(IntegerField::MemoryOffset)?;
+    if exponent > width.alignment_exponent() {
+        return Err(Error {
+            offset: alignment_offset,
+            kind: ErrorKind::InvalidMemoryAlignment { exponent },
+        });
+    }
+    require_memory(has_memory, opcode_offset)?;
+    Ok(memory_offset)
+}
+
 fn decode_plain(
     body: &mut Reader<'_>,
     opcode: u8,
@@ -864,36 +901,32 @@ fn decode_plain(
     function_bound: u32,
     has_memory: bool,
 ) -> Result<Instruction, Error> {
+    let load = |body: &mut Reader<'_>, kind: LoadKind| {
+        let offset = decode_memarg(body, offset, kind.width(), has_memory)?;
+        Ok(Instruction::LoadI32 { kind, offset })
+    };
+    let store = |body: &mut Reader<'_>, width: AccessWidth| {
+        let offset = decode_memarg(body, offset, width, has_memory)?;
+        Ok(Instruction::StoreI32 { width, offset })
+    };
     Ok(match opcode {
         0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
-        I32_LOAD | I32_STORE => {
-            let alignment_offset = body.position();
-            let exponent = body.integer(IntegerField::MemoryAlignment)?;
-            let memory_offset = body.integer(IntegerField::MemoryOffset)?;
-            if exponent > 2 {
-                return Err(Error {
-                    offset: alignment_offset,
-                    kind: ErrorKind::InvalidMemoryAlignment { exponent },
-                });
-            }
-            if !has_memory {
-                return Err(Error {
-                    offset,
-                    kind: ErrorKind::MissingMemory,
-                });
-            }
-            if opcode == I32_LOAD {
-                Instruction::LoadI32 {
-                    offset: memory_offset,
-                }
-            } else {
-                Instruction::StoreI32 {
-                    offset: memory_offset,
-                }
-            }
+        0x28 => load(body, LoadKind::Full)?,
+        0x2c => load(body, LoadKind::ByteSigned)?,
+        0x2d => load(body, LoadKind::ByteUnsigned)?,
+        0x2e => load(body, LoadKind::HalfwordSigned)?,
+        0x2f => load(body, LoadKind::HalfwordUnsigned)?,
+        0x36 => store(body, AccessWidth::Word)?,
+        0x3a => store(body, AccessWidth::Byte)?,
+        0x3b => store(body, AccessWidth::Halfword)?,
+        0x3f => {
+            // Core 1.0 reserves a literal zero byte here, not a LEB32 index.
+            body.expect_byte(0)?;
+            require_memory(has_memory, offset)?;
+            Instruction::MemorySize
         }
         I32_CONST => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
         0x45 => Instruction::Eqz,
@@ -1130,7 +1163,9 @@ fn validate_body(
                     has_memory,
                 )?;
                 depth = match instruction {
-                    Instruction::Const(_) | Instruction::LocalGet(_) => depth + 1,
+                    Instruction::Const(_) | Instruction::LocalGet(_) | Instruction::MemorySize => {
+                        depth + 1
+                    }
                     Instruction::Call(index) => {
                         consume(function_arities[index as usize] as usize)? + 1
                     }

@@ -1120,14 +1120,14 @@ impl Operand {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum IntegerSource {
+enum IntegerType {
     I32S,
     I32U,
     I64S,
     I64U,
 }
 
-impl IntegerSource {
+impl IntegerType {
     fn operand_type(self) -> ValType {
         match self {
             Self::I32S | Self::I32U => ValType::I32,
@@ -1145,6 +1145,32 @@ impl IntegerSource {
         // unsigned_abs also gives the exact magnitude of i64::MIN.
         (signed.unsigned_abs(), signed < 0)
     }
+
+    fn encode_truncated_magnitude(self, magnitude: u64, negative: bool) -> Result<Operand, Trap> {
+        let limit = match (self, negative) {
+            (Self::I32S, true) => 1 << 31,
+            (Self::I32S, false) => (1 << 31) - 1,
+            (Self::I64S, true) => 1 << 63,
+            (Self::I64S, false) => (1 << 63) - 1,
+            (Self::I32U | Self::I64U, true) => 0,
+            (Self::I32U, false) => u64::from(u32::MAX),
+            (Self::I64U, false) => u64::MAX,
+        };
+        // Check after discarding the fractional bits: unsigned accepts negative
+        // zero magnitudes, and signed accepts the extra magnitude of MIN.
+        if magnitude > limit {
+            return Err(Trap::IntegerOverflow);
+        }
+        let bits = if negative {
+            magnitude.wrapping_neg()
+        } else {
+            magnitude
+        };
+        Ok(match self {
+            Self::I32S | Self::I32U => Operand::I32(bits as i32),
+            Self::I64S | Self::I64U => Operand::I64(bits as i64),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1152,7 +1178,8 @@ enum Conversion {
     WrapI64,
     ExtendI32S,
     ExtendI32U,
-    IntToFloat(IntegerSource, FloatWidth),
+    TruncFloat(FloatWidth, IntegerType),
+    IntToFloat(IntegerType, FloatWidth),
     DemoteF64,
     PromoteF32,
     I32ReinterpretF32,
@@ -1167,6 +1194,7 @@ impl Conversion {
         match self {
             Self::WrapI64 => (I64, I32),
             Self::ExtendI32S | Self::ExtendI32U => (I32, I64),
+            Self::TruncFloat(width, target) => (width.operand_type(), target.operand_type()),
             Self::IntToFloat(source, width) => (source.operand_type(), width.operand_type()),
             Self::DemoteF64 => (F64, F32),
             Self::PromoteF32 => (F32, F64),
@@ -1177,11 +1205,15 @@ impl Conversion {
         }
     }
 
-    fn apply(self, value: Operand) -> Operand {
-        match self {
+    fn apply(self, value: Operand) -> Result<Operand, Trap> {
+        Ok(match self {
             Self::WrapI64 => Operand::I32(value.as_i64() as i32),
             Self::ExtendI32S => Operand::I64(i64::from(value.as_i32())),
             Self::ExtendI32U => Operand::I64(i64::from(value.as_i32() as u32)),
+            Self::TruncFloat(width, target) => {
+                let (magnitude, negative) = truncated_float_magnitude(value, width)?;
+                target.encode_truncated_magnitude(magnitude, negative)?
+            }
             Self::IntToFloat(source, width) => {
                 let (magnitude, negative) = source.magnitude_and_sign(value);
                 let bits = integer_to_float_bits(magnitude, negative, width);
@@ -1196,7 +1228,7 @@ impl Conversion {
             Self::I64ReinterpretF64 => Operand::I64(value.f64_bits() as i64),
             Self::F32ReinterpretI32 => Operand::F32(value.as_i32() as u32),
             Self::F64ReinterpretI64 => Operand::F64(value.as_i64() as u64),
-        }
+        })
     }
 }
 
@@ -1206,6 +1238,44 @@ const F32_INFINITY: u32 = 0x7f80_0000;
 const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
 const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
 const F64_CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+fn truncated_float_magnitude(value: Operand, width: FloatWidth) -> Result<(u64, bool), Trap> {
+    let (bits, sign, infinity, fraction_bits, bias) = match width {
+        FloatWidth::F32 => (
+            u64::from(value.f32_bits()),
+            u64::from(F32_SIGN),
+            u64::from(F32_INFINITY),
+            23,
+            127,
+        ),
+        FloatWidth::F64 => (value.f64_bits(), F64_SIGN, F64_INFINITY, 52, 1023),
+    };
+    let negative = bits & sign != 0;
+    let magnitude = bits & !sign;
+    if magnitude > infinity {
+        return Err(Trap::InvalidConversionToInteger);
+    }
+    let exponent = (magnitude >> fraction_bits) as i32 - bias;
+    if exponent < 0 {
+        return Ok((0, negative)); // Includes zeros, subnormals, and all other |x| < 1.
+    }
+    if exponent >= 64 {
+        // Infinities and finite |x| >= 2^64 cannot fit even the widest target.
+        return Err(Trap::IntegerOverflow);
+    }
+
+    // Normal and finite, with its leading bit at an exponent in 0..=63.
+    // Moving that bit into place cannot overflow u64; right shifts discard
+    // exactly the fractional bits (both directions shift by at most 52).
+    let implicit_bit = 1 << fraction_bits;
+    let significand = implicit_bit | (magnitude & (implicit_bit - 1));
+    let integral = if exponent < fraction_bits {
+        significand >> (fraction_bits - exponent)
+    } else {
+        significand << (exponent - fraction_bits)
+    };
+    Ok((integral, negative))
+}
 
 fn integer_to_float_bits(magnitude: u64, negative: bool, width: FloatWidth) -> u64 {
     if magnitude == 0 {
@@ -2059,7 +2129,7 @@ fn execute(
             }
             Instruction::Const(value) => frame.push(value),
             Instruction::Convert(op) => {
-                let value = op.apply(frame.pop());
+                let value = op.apply(frame.pop()).map_err(ExecutionError::Trap)?;
                 frame.push(value);
             }
             Instruction::FloatUnary(width, op) => {
@@ -2750,17 +2820,25 @@ fn decode_plain(
         0xa5 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Max),
         0xa6 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Copysign),
         0xa7 => Instruction::Convert(Conversion::WrapI64),
+        0xa8 => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F32, IntegerType::I32S)),
+        0xa9 => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F32, IntegerType::I32U)),
+        0xaa => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F64, IntegerType::I32S)),
+        0xab => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F64, IntegerType::I32U)),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),
-        0xb2 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32S, FloatWidth::F32)),
-        0xb3 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32U, FloatWidth::F32)),
-        0xb4 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64S, FloatWidth::F32)),
-        0xb5 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64U, FloatWidth::F32)),
+        0xae => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F32, IntegerType::I64S)),
+        0xaf => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F32, IntegerType::I64U)),
+        0xb0 => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F64, IntegerType::I64S)),
+        0xb1 => Instruction::Convert(Conversion::TruncFloat(FloatWidth::F64, IntegerType::I64U)),
+        0xb2 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I32S, FloatWidth::F32)),
+        0xb3 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I32U, FloatWidth::F32)),
+        0xb4 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I64S, FloatWidth::F32)),
+        0xb5 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I64U, FloatWidth::F32)),
         0xb6 => Instruction::Convert(Conversion::DemoteF64),
-        0xb7 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32S, FloatWidth::F64)),
-        0xb8 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I32U, FloatWidth::F64)),
-        0xb9 => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64S, FloatWidth::F64)),
-        0xba => Instruction::Convert(Conversion::IntToFloat(IntegerSource::I64U, FloatWidth::F64)),
+        0xb7 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I32S, FloatWidth::F64)),
+        0xb8 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I32U, FloatWidth::F64)),
+        0xb9 => Instruction::Convert(Conversion::IntToFloat(IntegerType::I64S, FloatWidth::F64)),
+        0xba => Instruction::Convert(Conversion::IntToFloat(IntegerType::I64U, FloatWidth::F64)),
         0xbb => Instruction::Convert(Conversion::PromoteF32),
         0xbc => Instruction::Convert(Conversion::I32ReinterpretF32),
         0xbd => Instruction::Convert(Conversion::I64ReinterpretF64),
@@ -3396,12 +3474,12 @@ mod tests {
             (-1, -1, 0xffff_ffff),
         ] {
             let input = Operand::I32(input);
-            let extended_s = Conversion::ExtendI32S.apply(input);
-            let extended_u = Conversion::ExtendI32U.apply(input);
+            let extended_s = Conversion::ExtendI32S.apply(input).unwrap();
+            let extended_u = Conversion::ExtendI32U.apply(input).unwrap();
             assert_eq!(extended_s, Operand::I64(signed));
             assert_eq!(extended_u, Operand::I64(unsigned));
-            assert_eq!(Conversion::WrapI64.apply(extended_s), input);
-            assert_eq!(Conversion::WrapI64.apply(extended_u), input);
+            assert_eq!(Conversion::WrapI64.apply(extended_s), Ok(input));
+            assert_eq!(Conversion::WrapI64.apply(extended_u), Ok(input));
         }
     }
 

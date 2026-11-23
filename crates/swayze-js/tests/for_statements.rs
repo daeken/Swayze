@@ -102,6 +102,31 @@ fn leading_update_power_conditionals_and_sequences_run_on_the_right_loop_edges()
 }
 
 #[test]
+fn declaration_header_continue_runs_entire_seeded_updater_in_order() {
+    let source = "let seen=0;
+        for (let i=0; i<2; i++ + (seen = seen*10 + i), seen += 1) {continue;}
+        seen";
+    let script = parse_script(source).unwrap();
+    // The postfix store runs before the RHS sees i; the comma operand runs last.
+    assert_eq!(script.evaluate(), Ok(23.0));
+}
+
+#[test]
+fn comment_newline_may_follow_but_not_precede_the_postfix_operator_in_a_seed() {
+    let source = "let seen=0;
+        for (let i=0; i<2; i++/*\n*/ + (seen = seen*10 + i), seen += 1) {continue;}
+        seen";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(23.0));
+
+    let source = source.replace("i++/*\n*/", "i/*\n*/++");
+    let error = assert_error_at(&source, ErrorKind::Unsupported, "++");
+    assert_eq!(
+        error.message(),
+        "a line terminator cannot precede a postfix update"
+    );
+}
+
+#[test]
 fn assignment_sequences_run_left_to_right_on_entry_fallthrough_and_continue() {
     let script = parse_script(
         "let x=99,y=99,trace=0;

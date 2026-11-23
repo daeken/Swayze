@@ -174,7 +174,9 @@ impl Script {
     /// as above, and store the result of adding or subtracting `1`. Neither
     /// prefix nor postfix form leaves a result.
     /// A conditional expression evaluates its test and only the selected arm,
-    /// preserving the selected value and type. An `if` statement uses the same
+    /// preserving the selected value and type. A comma sequence evaluates its operands
+    /// from left to right, discarding each but the last without coercion.
+    /// An `if` statement uses the same
     /// truthiness but executes only the selected branch, leaving no operand
     /// stack result. A falsy test with no `else` performs no writes.
     /// A `while` statement evaluates its test before each iteration and runs its
@@ -305,6 +307,9 @@ fn evaluate(
                     return Err(EvalError::InvalidScript);
                 }
                 *value = stack.pop().ok_or(EvalError::InvalidScript)?;
+            }
+            Instruction::Discard => {
+                stack.pop().ok_or(EvalError::InvalidScript)?;
             }
             Instruction::Add => apply_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
             Instruction::Subtract => apply_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
@@ -491,6 +496,8 @@ mod tests {
         for (ops, peak) in [
             (&[][..], 0),
             (&[one, one][..], 2),
+            (&[Instruction::Discard, one][..], 1), // Discard on an empty stack.
+            (&[one, Instruction::Discard][..], 1), // No final result.
             (&[Instruction::Subtract][..], 1),
             (&[Instruction::Positive, one][..], 1),
             (&[Instruction::Negate, one][..], 1),

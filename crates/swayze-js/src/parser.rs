@@ -204,6 +204,7 @@ pub(crate) enum Instruction {
         kind: BindingKind,
     },
     StoreBinding(usize),
+    Discard,
     Add,
     Subtract,
     Multiply,
@@ -1038,8 +1039,9 @@ enum ExpressionEnd {
     Semicolon(&'static str),
     Declarator(DeclaratorEnd),
     StatementTest,
-    ForSemicolon,
-    ForClose,
+    ForInit,
+    ForTest,
+    ForUpdate,
 }
 
 #[derive(Clone, Copy)]
@@ -1469,7 +1471,7 @@ impl Parser<'_> {
                 self.parse_declaration_list(kind, DeclaratorEnd::ForHeader)?;
             }
             _ => {
-                self.parse_required_store(init, ExpressionEnd::ForSemicolon, unsupported_store)?;
+                self.parse_required_store(init, ExpressionEnd::ForInit, unsupported_store)?;
             }
         }
 
@@ -1481,7 +1483,7 @@ impl Parser<'_> {
             self.emit(Instruction::Boolean(true), first.span)?;
             first.span
         } else {
-            self.parse_expression(first, ExpressionEnd::ForSemicolon)?.0
+            self.parse_expression(first, ExpressionEnd::ForTest)?.0
         };
         let exit = self.emit_statement_test(end)?;
 
@@ -1502,7 +1504,7 @@ impl Parser<'_> {
             self.emit(Instruction::JumpStatement(UNPATCHED), first.span)?;
             let update = self.instructions.len();
             let close =
-                self.parse_required_store(first, ExpressionEnd::ForClose, unsupported_store)?;
+                self.parse_required_store(first, ExpressionEnd::ForUpdate, unsupported_store)?;
             self.emit(Instruction::LoopBack(test), close)?;
             self.patch_jump(skip_update, close)?;
             (update, close)
@@ -1830,11 +1832,8 @@ impl Parser<'_> {
         let kind = next.as_ref().map(|t| t.kind);
         // Only a complete, explicitly delimited update is a supported write.
         match (end, kind) {
-            (
-                ExpressionEnd::Semicolon(_) | ExpressionEnd::ForSemicolon,
-                Some(TokenKind::Semicolon),
-            )
-            | (ExpressionEnd::ForClose, Some(TokenKind::Close)) => {}
+            (ExpressionEnd::Semicolon(_) | ExpressionEnd::ForInit, Some(TokenKind::Semicolon))
+            | (ExpressionEnd::ForUpdate, Some(TokenKind::Close)) => {}
             (ExpressionEnd::Semicolon(_), None | Some(TokenKind::CloseBrace)) => {
                 return Err(Error::unsupported(
                     span,
@@ -1848,13 +1847,13 @@ impl Parser<'_> {
                 ));
             }
             (
-                ExpressionEnd::ForSemicolon,
+                ExpressionEnd::ForInit,
                 None | Some(TokenKind::Close | TokenKind::OpenBrace | TokenKind::CloseBrace),
             ) => {
                 return Err(Error::malformed(span, FOR_SEMICOLON));
             }
             (
-                ExpressionEnd::ForClose,
+                ExpressionEnd::ForUpdate,
                 None | Some(TokenKind::Semicolon | TokenKind::OpenBrace | TokenKind::CloseBrace),
             ) => {
                 return Err(Error::malformed(span, "expected ')' after the for update"));
@@ -2065,10 +2064,10 @@ impl Parser<'_> {
         let base_depth = self.stack_depth;
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
         let for_delimiter = match end_kind {
-            ExpressionEnd::ForSemicolon | ExpressionEnd::Declarator(DeclaratorEnd::ForHeader) => {
-                Some(FOR_SEMICOLON)
-            }
-            ExpressionEnd::ForClose => Some("expected ')' after the for update"),
+            ExpressionEnd::ForInit
+            | ExpressionEnd::ForTest
+            | ExpressionEnd::Declarator(DeclaratorEnd::ForHeader) => Some(FOR_SEMICOLON),
+            ExpressionEnd::ForUpdate => Some("expected ')' after the for update"),
             _ => None,
         };
         let missing_semicolon = match end_kind {
@@ -2077,6 +2076,7 @@ impl Parser<'_> {
             _ => None,
         };
         let mut needs_operand = true;
+        let mut after_open = false;
         let mut next = Some(first);
         let (end, delimiter) = loop {
             let Some(token) = next else {
@@ -2192,9 +2192,7 @@ impl Parser<'_> {
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Pending::Op(prefix), span)?;
                 }
-                (true, TokenKind::Close)
-                    if matches!(self.pending.last(), Some((Pending::Group, _))) =>
-                {
+                (true, TokenKind::Close) if after_open => {
                     if statement_test && self.pending.len() == 1 {
                         return Err(Error::malformed(
                             span,
@@ -2219,19 +2217,33 @@ impl Parser<'_> {
                     }
                     return Err(Error::malformed(span, "empty parenthesized expression"));
                 }
-                (_, TokenKind::Comma) => {
-                    if !matches!(end_kind, ExpressionEnd::Declarator(_)) {
-                        return Err(Error::unsupported(
-                            span,
-                            "comma expressions are outside the subset",
-                        ));
+                (false, TokenKind::Comma) => {
+                    // Comma is looser than ?:, so join completed conditionals before
+                    // deciding which surrounding grammar production owns the comma.
+                    self.reduce_expression()?;
+                    match self.pending.last() {
+                        Some((Pending::Consequent { .. }, _)) => {
+                            return Err(Error::malformed(span, "expected ':' before ','"));
+                        }
+                        None if matches!(end_kind, ExpressionEnd::Declarator(_)) => {
+                            break (span, Some(kind));
+                        }
+                        Some((Pending::Group, _)) => {}
+                        None if matches!(
+                            end_kind,
+                            ExpressionEnd::Script | ExpressionEnd::ForTest
+                        ) => {}
+                        _ => {
+                            return Err(Error::unsupported(
+                                span,
+                                "a sequence in an assignment RHS requires parentheses",
+                            ));
+                        }
                     }
-                    if needs_operand {
-                        return Err(Error::malformed(span, "expected an operand"));
-                    }
-                    // Reduce complete operators and conditionals below, then
-                    // require that no group or unfinished conditional encloses this comma.
-                    break (span, Some(kind));
+                    // Discard the left result before the next operand, with no pending
+                    // operator or additional nesting for a flat sequence.
+                    self.emit(Instruction::Discard, span)?;
+                    needs_operand = true;
                 }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
                 (false, TokenKind::Operator(Operator::Not)) => {
@@ -2279,7 +2291,7 @@ impl Parser<'_> {
                                 "expected ':' before closing parenthesis",
                             ));
                         }
-                        None if matches!(end_kind, ExpressionEnd::ForClose) => {
+                        None if matches!(end_kind, ExpressionEnd::ForUpdate) => {
                             break (span, Some(kind));
                         }
                         None if let Some(message) = for_delimiter => {
@@ -2318,22 +2330,17 @@ impl Parser<'_> {
                     }
                     return Err(Error::malformed(span, "expected a binary operator"));
                 }
-                (false, TokenKind::Semicolon) if matches!(end_kind, ExpressionEnd::ForClose) => {
+                (false, TokenKind::Semicolon) if matches!(end_kind, ExpressionEnd::ForUpdate) => {
                     return Err(Error::malformed(span, "expected ')' after the for update"));
                 }
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
+            after_open = matches!(kind, TokenKind::Open);
             next = self.next_token()?;
         };
         let at_eof = delimiter.is_none();
         self.reduce_expression()?;
         if let Some((pending, _)) = self.pending.last() {
-            if matches!(delimiter, Some(TokenKind::Comma)) {
-                return Err(Error::unsupported(
-                    end,
-                    "comma expressions are outside the subset",
-                ));
-            }
             let message = match pending {
                 Pending::Group if at_eof => "expected a closing parenthesis before end of source",
                 Pending::Group => "semicolon inside a parenthesized expression",
@@ -2524,7 +2531,8 @@ impl Parser<'_> {
             {
                 return Err(Error::malformed(span, "invalid loop back edge"));
             }
-            Instruction::InitBinding { .. }
+            Instruction::Discard
+            | Instruction::InitBinding { .. }
             | Instruction::StoreBinding(_)
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfFalseStatement(_)

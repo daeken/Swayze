@@ -872,6 +872,28 @@ fn conditionals_compile_to_forward_jumps_and_join_at_the_same_stack_depth() {
 }
 
 #[test]
+fn sequence_discards_each_completed_left_operand_before_the_next() {
+    use Instruction::{Boolean, Discard, Jump, JumpIfFalse};
+    assert_postfix(
+        "9+(true?2:3,4,5)",
+        &[
+            Number(9.),
+            Boolean(true),
+            JumpIfFalse(5),
+            Number(2.),
+            Jump(6),
+            Number(3.),
+            Discard,
+            Number(4.),
+            Discard,
+            Number(5.),
+            Add,
+        ],
+        2,
+    );
+}
+
+#[test]
 fn malformed_conditional_delimiters_and_longer_punctuators() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, start, end) in [

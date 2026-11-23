@@ -364,7 +364,11 @@ fn fixtures() -> Vec<String> {
             "let x = 10; let r = (x -= (x = 3)); r * 10 + x",
             "let x = -1; let r = (x >>>= 0); r + x",
             "let x = 0; let r = (x *= -1); (1 / x) + (1 / r)",
-            "let x = true; (x **= (2, 4))"
+            "let x = true; (x **= (2, 4))",
+            "let x = -0; (x &&= (x = 99))",
+            "let x = 2; 10 + (x ||= (x = 99)) + x",
+            "let x = null; let r = (x ??= (x = 21) + x); r + x",
+            "let x = false; (x ||= undefined)"
         ]
         .map(str::to_owned),
     );

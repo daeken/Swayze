@@ -108,6 +108,82 @@ fn grouped_compound_retains_and_stores_negative_zero_in_the_same_run() {
 }
 
 #[test]
+fn grouped_logical_assignments_preserve_the_selected_tag_and_only_run_taken_rhs() {
+    use Value::{Boolean, Null, Number, Undefined};
+    for (op, initial, rhs, expected, taken) in [
+        ("&&=", "0", "7", Number(0.0), false),
+        ("&&=", "-0", "7", Number(-0.0), false),
+        ("&&=", "0/0", "7", Number(f64::NAN), false),
+        ("&&=", "null", "7", Null, false),
+        ("&&=", "undefined", "7", Undefined, false),
+        ("&&=", "false", "7", Boolean(false), false),
+        ("&&=", "1/0", "undefined", Undefined, true),
+        ("||=", "true", "7", Boolean(true), false),
+        ("||=", "-1", "7", Number(-1.0), false),
+        ("||=", "-0", "null", Null, true),
+        ("||=", "0/0", "-0", Number(-0.0), true),
+        ("??=", "null", "false", Boolean(false), true),
+        ("??=", "undefined", "0/0", Number(f64::NAN), true),
+        ("??=", "false", "7", Boolean(false), false),
+        ("??=", "-0", "7", Number(-0.0), false),
+        ("??=", "0/0", "7", Number(f64::NAN), false),
+    ] {
+        for (tail, expected) in [
+            ("result", expected),
+            ("x", expected),
+            ("n", Number(f64::from(u8::from(taken)))),
+        ] {
+            let source =
+                format!("let x={initial}, n=0; const result=(x{op}((n+=1),{rhs})); {tail}");
+            let actual = parse_script(&source).unwrap().evaluate_value().unwrap();
+            match (actual, expected) {
+                (Number(actual), Number(expected)) if expected.is_nan() => {
+                    assert!(actual.is_nan(), "{source}");
+                }
+                (Number(actual), Number(expected)) => {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{source}");
+                }
+                _ => assert_eq!(actual, expected, "{source}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_logical_assignments_compose_with_rhs_writes_and_branches() {
+    for (source, expected) in [
+        (
+            "let x=1,n=0; (x&&=((n+=1),(x||=(n+=100)),(x=2)+x))*100+x*10+n",
+            441.0,
+        ),
+        (
+            "let x=0,n=0; (x||=((n+=1),(x??=(n+=100)),(x=2)+x))*100+x*10+n",
+            441.0,
+        ),
+        (
+            "let x,n=0; (x??=((n+=1),(x||=2),(x&&=x+2)))*100+x*10+n",
+            441.0,
+        ),
+        ("let x=0; 10+(x||=true ? 3 : (x=7))+x", 16.0),
+        ("let x=2; 10+(x||=(x=9))+x", 14.0),
+        ("let x=0; 10+(x||=null ?? 3)+x", 16.0),
+        ("let x; 10+(x??=false || 3)+x", 16.0),
+        (
+            "const x=8; let out; { let x; (out??=(x||=4)); } out*10+x",
+            48.0,
+        ),
+        (
+            "let x,n=0; for((x??=2);(x&&=x-1);(n||=x)) {continue;} n*10+x",
+            10.0,
+        ),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+    }
+}
+
+#[test]
 fn nested_writes_run_in_order_and_evaluate_the_rhs_only_once() {
     for (source, expected) in [
         ("let x; let y; const z=(x=(y=4)); x*100+y*10+z", 444.0),
@@ -256,6 +332,71 @@ fn target_checks_are_deferred_and_apply_even_to_skipped_code() {
 }
 
 #[test]
+fn grouped_logical_assignments_validate_skipped_targets_and_rhs() {
+    use ErrorKind::{Malformed, Unsupported};
+    let tdz = "before lexical binding initialization";
+    for (marked, kind, message) in [
+        (
+            "const x=0; (x/*☃*/@&&=@missing)",
+            Unsupported,
+            "assignment to const",
+        ),
+        (
+            "const x=1; (x/*☃*/@||=@missing)",
+            Unsupported,
+            "assignment to const",
+        ),
+        (
+            "const x=false; (x/*☃*/@??=@missing)",
+            Unsupported,
+            "assignment to const",
+        ),
+        ("false && (@missing@||=1)", Unsupported, "unbound name"),
+        ("true || (@undefined@??=1)", Unsupported, "unbound name"),
+        ("let x=0; { true || (@x@??=1); let x; } x", Unsupported, tdz),
+        ("let x=0; (x&&=/*☃*/@missing@)", Unsupported, "unbound name"),
+        ("let x=1; (x||=/*☃*/@y@); let y; x", Unsupported, tdz),
+        (
+            "let x=false; const y=0; (x??=(y@=@1))",
+            Unsupported,
+            "assignment to const",
+        ),
+        ("let x=false; (x&&=@)@", Malformed, "expected an operand"),
+        (
+            "let x=true; (x||=1@@",
+            Malformed,
+            "expected a closing parenthesis",
+        ),
+        (
+            "let x=false; (x??=0 ?? 1 @||@ 2)",
+            Malformed,
+            "cannot be mixed",
+        ),
+    ] {
+        assert_marked_error(marked, kind, message);
+    }
+}
+
+#[test]
+fn standalone_logical_assignments_still_leave_no_expression_result() {
+    let source = "let x,y=1,n=0;
+        x ??= (n+=1); x ||= (n+=100); x &&= (n+=1);
+        for(y||=(n+=100);x>0;y&&=(n+=1)) { x=0; continue; }
+        x*100+y*10+n";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(33.0));
+    assert_marked_error(
+        "let x; x??=1@@",
+        ErrorKind::Unsupported,
+        "require explicit semicolons",
+    );
+    assert_marked_error(
+        "let x; x??=1;@@",
+        ErrorKind::Unsupported,
+        "a final expression is required",
+    );
+}
+
+#[test]
 fn rejects_targets_and_positions_outside_the_slice() {
     use ErrorKind::{Malformed, Unsupported};
     for (marked, kind, message) in [
@@ -267,12 +408,32 @@ fn rejects_targets_and_positions_outside_the_slice() {
         ("(null@=@1)", Unsupported, "assignment expressions"),
         ("let x;((x)@+=@1)", Unsupported, "assignment expressions"),
         (
-            "let x;true || (x@&&=@1)",
+            "let x;true || x@&&=@1",
             Unsupported,
             "assignment expressions",
         ),
-        ("let x;(x@||=@1)", Unsupported, "assignment expressions"),
-        ("let x;(x@??=@1)", Unsupported, "assignment expressions"),
+        ("let x;((x)@||=@1)", Unsupported, "assignment expressions"),
+        ("let x;(0,x@??=@1)", Unsupported, "assignment expressions"),
+        (
+            "let x;let y=x@||=@1;y",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x; if(x@??=@1){} x",
+            Unsupported,
+            "assignment expressions",
+        ),
+        (
+            "let x; (x&&=1@,@2)",
+            Unsupported,
+            "sequence in an assignment RHS",
+        ),
+        (
+            "let x; (x??=true?1:2@,@3)",
+            Unsupported,
+            "sequence in an assignment RHS",
+        ),
         (
             "let x;(@--@x)",
             Unsupported,
@@ -505,6 +666,59 @@ fn grouped_compound_work_charges_one_lookup_and_each_emission_at_its_span() {
 }
 
 #[test]
+fn grouped_logical_work_charges_the_branch_and_resolves_the_target_once() {
+    let source = "let x;(x/*α*/\u{2028}&&=true)";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 8,
+        max_nesting_depth: 1,
+        // Six emissions, a group marker and attachment, and one lookup
+        // (a single candidate visit plus one byte of comparison).
+        max_work: source.len() + 10,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 6);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate_value(), Ok(Value::Undefined));
+
+    let target = source.rfind('x').unwrap();
+    let operator = source.find("&&=").unwrap();
+    let close = source.len() - 1;
+    for (max_work, start, len) in [
+        (operator + 3 + 4, target, 1),    // target load
+        (operator + 3 + 5, operator, 3),  // skip branch
+        (source.len() + 7, close, 1),     // store-keep
+        (limits.max_work - 1, target, 1), // name comparison
+    ] {
+        let error = parse_script_with_limits(source, Limits { max_work, ..limits }).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + len
+            }
+        );
+    }
+    let error = parse_script_with_limits(
+        source,
+        Limits {
+            max_tokens: 7,
+            ..limits
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Tokens));
+    assert_eq!(
+        error.span(),
+        Span {
+            start: close,
+            end: close + 1
+        }
+    );
+}
+
+#[test]
 fn grouped_identifier_lookahead_preserves_read_budgets() {
     let source = "let x;(x/*α*/\u{2028}==undefined)";
     let limits = Limits {
@@ -538,7 +752,7 @@ fn grouped_identifier_lookahead_preserves_read_budgets() {
 }
 
 #[test]
-fn nested_writes_use_one_group_entry_each_and_only_compounds_save_lhs_operands() {
+fn nested_writes_use_one_group_entry_each_and_only_eager_compounds_save_lhs_operands() {
     let depth = 1000;
     let limits = Limits {
         max_nesting_depth: depth,
@@ -546,6 +760,7 @@ fn nested_writes_use_one_group_entry_each_and_only_compounds_save_lhs_operands()
     };
     for (decl, group, rhs, peak, instructions, result) in [
         ("let x;", "(x=", "null", 1, depth + 3, Value::Null),
+        ("let x;", "(x??=", "null", 1, 3 * depth + 3, Value::Null),
         (
             "let x=1;",
             "(x+=",
@@ -586,20 +801,35 @@ fn skipped_store_keep_counts_toward_prepared_instruction_limit() {
         max_tokens: 5000,
         ..Limits::default()
     };
-    // The compound needs two more instructions (target load and binary op).
-    for (op, unary_count) in [("=", 4090), ("|=", 4088)] {
+    for (start, unary_count, expected) in [
+        ("let x; true || (x=", 4090, Value::Boolean(true)),
+        ("let x; true || (x|=", 4088, Value::Boolean(true)),
+        // The logical compound skips its own store rather than relying on an outer branch.
+        ("let x; (x&&=", 4090, Value::Undefined),
+    ] {
         let prefix = "!".repeat(unary_count);
-        let at_cap =
-            parse_script_with_limits(&format!("let x; true || (x{op}{prefix}false)"), limits)
-                .unwrap();
+        let at_cap = parse_script_with_limits(&format!("{start}{prefix}false)"), limits).unwrap();
         assert_eq!(at_cap.instruction_count(), 4096);
-        assert_eq!(at_cap.evaluate_value(), Ok(Value::Boolean(true)));
+        assert_eq!(at_cap.evaluate_value(), Ok(expected));
         let over_cap =
-            parse_script_with_limits(&format!("let x; true || (x{op}{prefix}!false)"), limits)
-                .unwrap();
+            parse_script_with_limits(&format!("{start}{prefix}!false)"), limits).unwrap();
         assert_eq!(over_cap.instruction_count(), 4097);
         assert_eq!(over_cap.evaluate_value(), Err(EvalError::LimitExceeded));
     }
+}
+
+#[test]
+fn grouped_logical_dispatch_limit_counts_the_store_only_on_the_rhs_path() {
+    // 4 initialization dispatches, 909 iterations of (4 test + 3 skip +
+    // 10 take + 1 back edge), 4 for the final test, and 14 for the tail.
+    let body = "let x=1,n=0; while(n<909) { (x||=(n+=100000)); (x&&=((n+=1),1)); }";
+    let evaluate = |tail| {
+        parse_script(&format!("{body} {}n", "+ ".repeat(tail)))
+            .unwrap()
+            .evaluate()
+    };
+    assert_eq!(evaluate(13), Ok(909.0));
+    assert_eq!(evaluate(14), Err(EvalError::DispatchLimitExceeded));
 }
 
 #[test]

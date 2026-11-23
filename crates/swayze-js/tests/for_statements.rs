@@ -450,7 +450,7 @@ fn stores_remain_standalone_in_both_clauses() {
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(2.0));
 
     let requires_group = "a sequence in an assignment RHS requires parentheses";
-    let assignment_expr = "assignment expressions require a simple name followed by '=' or an eager compound operator at the start of an expression group";
+    let assignment_expr = "assignment expressions require a simple name followed by an assignment operator at the start of an expression group";
     let update_expr = "increment and decrement expressions are outside the subset";
     for (source, marked, message) in [
         ("let i;for(i??=null,0;false;){}0", ",", requires_group),

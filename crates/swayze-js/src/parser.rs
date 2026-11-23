@@ -239,7 +239,7 @@ pub(crate) enum Instruction {
         target: usize,
         condition: ShortCircuitCondition,
     },
-    // Unlike an expression, a logical assignment consumes its only operand on both paths.
+    // A standalone logical assignment consumes its only operand on both paths.
     ShortCircuitStatement {
         target: usize,
         condition: ShortCircuitCondition,
@@ -1000,7 +1000,7 @@ enum Pending {
     Group,
     AssignmentGroup {
         access: usize,
-        binary: Option<Operator>,
+        tail: AssignmentTail,
         rhs_base_depth: usize,
     },
     Consequent {
@@ -1011,6 +1011,13 @@ enum Pending {
         jump: usize,
         join_depth: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+enum AssignmentTail {
+    Simple,
+    Eager(Operator),
+    ShortCircuit(usize),
 }
 
 // All unresolved jump targets and binding operands are patched before returning a Script.
@@ -2167,18 +2174,31 @@ impl Parser<'_> {
     fn begin_group_assignment(
         &mut self,
         name: Span,
-        binary: Option<Operator>,
+        op: Option<Operator>,
         operator: Span,
     ) -> Result<(), Error> {
-        let access = self.begin_write(name, operator, binary.is_some())?;
+        let access = self.begin_write(name, operator, op.is_some())?;
+        // The assignment operator is not part of the RHS expression grammar.
+        let tail = match op {
+            None => AssignmentTail::Simple,
+            Some(op) => match op.instruction() {
+                branch @ Instruction::ShortCircuit { .. } => {
+                    let skip = self.instructions.len();
+                    self.emit(branch, operator)?;
+                    AssignmentTail::ShortCircuit(skip)
+                }
+                _ => AssignmentTail::Eager(op),
+            },
+        };
         let Some(group @ (Pending::Group, _)) = self.pending.last_mut() else {
             return Err(Error::malformed(operator, "expected an assignment group"));
         };
         *group = (
             Pending::AssignmentGroup {
                 access,
-                binary,
-                // Keep the loaded target, if any, below every RHS operand.
+                tail,
+                // An eager compound keeps its loaded target below the RHS. A
+                // logical compound has popped it on the fallthrough path.
                 rhs_base_depth: self.stack_depth,
             },
             operator,
@@ -2378,7 +2398,7 @@ impl Parser<'_> {
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
                         span,
-                        "assignment expressions require a simple name followed by '=' or an eager compound operator at the start of an expression group",
+                        "assignment expressions require a simple name followed by an assignment operator at the start of an expression group",
                     ));
                 }
                 (_, TokenKind::Declaration(_)) => {
@@ -2450,18 +2470,12 @@ impl Parser<'_> {
                         self.lexer.charge(1, span)?;
                         let following = self.next_token()?;
                         if let Some(Token {
-                            kind: TokenKind::Assignment(binary),
+                            kind: TokenKind::Assignment(op),
                             span: operator,
                             ..
                         }) = following
-                            && !matches!(
-                                binary,
-                                Some(
-                                    Operator::LogicalAnd | Operator::LogicalOr | Operator::Coalesce
-                                )
-                            )
                         {
-                            self.begin_group_assignment(span, binary, operator)?;
+                            self.begin_group_assignment(span, op, operator)?;
                             after_open = false;
                             next = self.next_token()?;
                             continue;
@@ -2594,7 +2608,7 @@ impl Parser<'_> {
                         Some((
                             Pending::AssignmentGroup {
                                 access,
-                                binary,
+                                tail,
                                 rhs_base_depth,
                             },
                             operator,
@@ -2605,10 +2619,15 @@ impl Parser<'_> {
                                     "assignment value must leave one result",
                                 ));
                             }
-                            if let Some(binary) = binary {
+                            if let AssignmentTail::Eager(binary) = tail {
                                 self.emit(binary.instruction(), operator)?;
                             }
                             self.finish_write(access, span, true)?;
+                            if let AssignmentTail::ShortCircuit(skip) = tail {
+                                // Both paths leave one value above rhs_base_depth:
+                                // the old value on skip, or the RHS after the store.
+                                self.patch_jump(skip, span)?;
+                            }
                             self.nesting_depth -= 1;
                         }
                         Some((Pending::Consequent { .. }, _)) => {

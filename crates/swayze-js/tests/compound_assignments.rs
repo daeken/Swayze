@@ -300,12 +300,12 @@ fn logical_assignment_does_not_participate_in_rhs_precedence() {
 }
 
 #[test]
-fn logical_assignment_punctuators_require_statement_targets_and_explicit_delimiters() {
+fn logical_assignment_punctuators_respect_targets_and_delimiters() {
     use ErrorKind::Unsupported;
     for (op, split) in [("&&=", "&&"), ("||=", "||"), ("??=", "??")] {
         for (source, message) in [
             (format!("let x=1;(x)@{op}@2;x"), "assignment expressions"),
-            (format!("let x=1;(x@{op}@2)"), "assignment expressions"),
+            (format!("let x=1;(0,x@{op}@2)"), "assignment expressions"),
             (format!("let x=1;x=x@{op}@2;x"), "assignment expressions"),
             (
                 format!("let x=1;for(;x@{op}@2;){{}}x"),

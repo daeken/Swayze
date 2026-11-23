@@ -1478,6 +1478,32 @@ fn grouped_compound_loads_before_rhs_and_joins_at_the_binary_operation() {
 }
 
 #[test]
+fn grouped_logical_loads_once_and_skips_past_store_keep() {
+    use crate::parser::ShortCircuitCondition::{Falsy, NonNullish, Truthy};
+    use Instruction::{Boolean, ShortCircuit, StoreBindingKeep};
+
+    for (operator, condition) in [("&&=", Falsy), ("||=", Truthy), ("??=", NonNullish)] {
+        assert_postfix(
+            &format!("let x=0;1+(x{operator}false)"),
+            &[
+                Number(0.0),
+                init_let(0),
+                Number(1.0),
+                LoadBinding(0),
+                ShortCircuit {
+                    target: 7,
+                    condition,
+                },
+                Boolean(false),
+                StoreBindingKeep(0),
+                Add,
+            ],
+            2,
+        );
+    }
+}
+
+#[test]
 fn initializerless_let_pushes_undefined_and_initializes_its_own_slot() {
     assert_postfix(
         "let first; let second=first; let third; second",
@@ -1560,7 +1586,7 @@ fn assignment_statements_require_explicit_semicolons() {
         ("let x=1; (x + x=2)", Unsupported, 15, 16),
         ("let x=1; let y=x=2; y", Unsupported, 16, 17),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
-        ("let x=1; (x||=2)", Unsupported, 11, 14),
+        ("let x=1; ((x)||=2)", Unsupported, 13, 16),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),
         ("let x=1; x/*🚧", Malformed, 10, 16),

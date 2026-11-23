@@ -46,10 +46,17 @@ fn assert_error(marked: &str, width: usize, kind: ErrorKind, message: &str) {
 }
 
 #[test]
+fn only_tokens_after_the_root_semicolon_force_a_discard() {
+    let script = parse_script("42; /* first ; */ \n // second ;").unwrap();
+    assert_eq!(script.instruction_count(), 1);
+    assert_eq!(script.evaluate_value(), Ok(Value::Number(42.0)));
+    assert_error("42;;@", 0, ErrorKind::Unsupported, "final expression");
+}
+
+#[test]
 fn requires_explicit_boundaries_and_a_root_final_expression() {
     use ErrorKind::{Malformed, Unsupported};
     for source in [
-        "1;;@",
         "1; {} /* trivia */@",
         "1; let x=2; // only statements@",
         "{1;}@",
@@ -59,6 +66,8 @@ fn requires_explicit_boundaries_and_a_root_final_expression() {
     for (source, width) in [
         ("1/*\u{2028}*/@2", 1),
         ("{1@} 2", 1),
+        ("{1\n@} 2", 1),
+        ("{1/*\u{2028}*/@} 2", 1),
         ("{undefined/* trailing trivia */@", 0),
         ("{1\n@let x=2;} 3", 3),
     ] {
@@ -104,6 +113,20 @@ fn statement_expressions_do_not_enable_other_syntax() {
     }
     // A leading '{' starts a block, so its content cannot be an object literal.
     assert_error("{1@: 2;} 3", 1, Malformed, "without a matching '?'");
+}
+
+#[test]
+fn assignment_rhs_still_requires_parentheses_for_comma_sequences() {
+    let script = parse_script("let x=0; (1,2); {1,2; x=(1,42);} x").unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Number(42.0)));
+    for source in ["let x=0; 1,2; x=1@,42; x", "let x=0; {1,2; x=1@,42;} x"] {
+        assert_error(
+            source,
+            1,
+            ErrorKind::Unsupported,
+            "assignment RHS requires parentheses",
+        );
+    }
 }
 
 #[test]

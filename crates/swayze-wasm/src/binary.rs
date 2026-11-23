@@ -1183,6 +1183,7 @@ enum FloatUnaryOp {
     Abs,
     Neg,
     Round(FloatRounding),
+    Sqrt,
 }
 
 impl FloatUnaryOp {
@@ -1201,6 +1202,22 @@ impl FloatUnaryOp {
                 127,
             ) as u32),
             (FloatWidth::F64, Self::Round(mode)) => Operand::F64(mode.round_bits(
+                value.f64_bits(),
+                F64_SIGN,
+                F64_INFINITY,
+                F64_CANONICAL_NAN,
+                52,
+                1023,
+            )),
+            (FloatWidth::F32, Self::Sqrt) => Operand::F32(sqrt_bits(
+                u64::from(value.f32_bits()),
+                u64::from(F32_SIGN),
+                u64::from(F32_INFINITY),
+                u64::from(F32_CANONICAL_NAN),
+                23,
+                127,
+            ) as u32),
+            (FloatWidth::F64, Self::Sqrt) => Operand::F64(sqrt_bits(
                 value.f64_bits(),
                 F64_SIGN,
                 F64_INFINITY,
@@ -1268,6 +1285,61 @@ impl FloatRounding {
         // Adding one unit to the truncated encoding can carry into the exponent.
         sign | (whole + if up { unit } else { 0 })
     }
+}
+
+fn sqrt_bits(
+    bits: u64,
+    sign_mask: u64,
+    infinity: u64,
+    canonical_nan: u64,
+    fraction_bits: u32,
+    bias: i32,
+) -> u64 {
+    if bits & !sign_mask == 0 || bits == infinity {
+        return bits;
+    }
+    if bits & sign_mask != 0 || bits > infinity {
+        return canonical_nan;
+    }
+
+    // Write the input as m * 2^(e-h), with h fraction bits and m in
+    // [2^h, 2^(h+1)). For a subnormal, shift its leading one into place.
+    let implicit_bit = 1 << fraction_bits;
+    let fraction = bits & (implicit_bit - 1);
+    let field = (bits >> fraction_bits) as i32;
+    let (m, e) = if field == 0 {
+        let shift = fraction_bits - fraction.ilog2();
+        (fraction << shift, 1 - bias - shift as i32)
+    } else {
+        (implicit_bit | fraction, field - bias)
+    };
+    // The exact root is sqrt(N) * 2^(floor(e/2)-h). N has at most
+    // 2(h+1) bits (48 or 106), so u128 covers the radicand and all intermediates.
+    let n = u128::from(m) << (fraction_bits + (e & 1) as u32);
+    let mut root = 0;
+    let mut remainder = 0;
+    // One guest dispatch, with exactly h+1 (24 or 53) restoring steps here.
+    // For each processed prefix, root is its floor square root and remainder
+    // is the prefix minus root^2. Bring down two bits and try growing to
+    // 2*root+1; its square exceeds (2*root)^2 by 4*root+1.
+    for pair in (0..=fraction_bits).rev() {
+        remainder = (remainder << 2) | ((n >> (2 * pair)) & 3);
+        let trial = (root << 2) | 1;
+        root <<= 1;
+        if remainder >= trial {
+            remainder -= trial;
+            root |= 1;
+        }
+    }
+    // (root + 1/2)^2 = root^2 + root + 1/4. Integral N cannot tie,
+    // and is above the midpoint exactly when remainder > root.
+    root += u128::from(remainder > root);
+
+    // The minimum output exponents (-75 and -537) are normal. At the
+    // upper end N <= (2^(h+1)-1)*2^(h+1), still 1/4 below the squared
+    // midpoint to 2^(h+1), so rounding cannot carry into the exponent.
+    let exponent = (e.div_euclid(2) + bias) as u64;
+    (exponent << fraction_bits) | (root as u64 - implicit_bit)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2514,6 +2586,7 @@ fn decode_plain(
         0x90 => {
             Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
+        0x91 => Instruction::FloatUnary(FloatWidth::F32, FloatUnaryOp::Sqrt),
         0x96 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Min),
         0x97 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Max),
         0x98 => Instruction::FloatBinary(FloatWidth::F32, FloatBinaryOp::Copysign),
@@ -2525,6 +2598,7 @@ fn decode_plain(
         0x9e => {
             Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Round(FloatRounding::Nearest))
         }
+        0x9f => Instruction::FloatUnary(FloatWidth::F64, FloatUnaryOp::Sqrt),
         0xa4 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Min),
         0xa5 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Max),
         0xa6 => Instruction::FloatBinary(FloatWidth::F64, FloatBinaryOp::Copysign),

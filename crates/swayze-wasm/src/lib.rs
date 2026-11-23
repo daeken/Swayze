@@ -20,8 +20,8 @@
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
-//! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`,
-//! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`,
+//! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
+//! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`, `f64.sqrt`,
 //! `f32.eq`, `f32.ne`, `f32.lt`, `f32.gt`, `f32.le`, `f32.ge`,
 //! `f64.eq`, `f64.ne`, `f64.lt`, `f64.gt`, `f64.le`, `f64.ge`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
@@ -169,6 +169,13 @@
 //! and finite integral values unchanged. For any NaN, Swayze deterministically
 //! returns the positive canonical quiet NaN (`0x7fc00000` for f32,
 //! `0x7ff8000000000000` for f64), not the input NaN's sign or payload.
+//! `sqrt` (`0x91` for f32, `0x9f` for f64) consumes one operand and produces
+//! a result of the same width. Both signed zeros and positive infinity are
+//! unchanged; negative nonzero inputs and all NaNs return the positive canonical
+//! quiet NaN above. Positive finite inputs, including subnormals, are rounded
+//! to nearest (ties to even; no exact midpoint is possible). The square root
+//! uses exact integer arithmetic with a radicand of at most 106 bits and at most
+//! 24 (f32) or 53 (f64) restoring steps within one guest dispatch.
 //! `min` and `max` (`0x96`/`0x97` for f32, `0xa4`/`0xa5` for f64) consume two
 //! operands of their width and return the exact encoding of the lesser or
 //! greater operand, respectively. Mixed-sign zeros return -0 for `min` and +0
@@ -181,10 +188,10 @@
 //! only `ne` returns 1. Positive and negative zero compare equal; all other
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
-//! sign operations, rounding, `min`/`max`, and comparisons each count as one
-//! dispatch. None uses native floating-point operations. Floats are supported as
-//! operands, private globals, locals, `block` and `if` results, and function
-//! parameters and results, including across the host boundary. Fallthrough,
+//! sign operations, rounding, square root, `min`/`max`, and comparisons each
+//! count as one dispatch. None uses native floating-point operations. Floats are
+//! supported as operands, private globals, locals, `block` and `if` results, and
+//! function parameters and results, including across the host boundary. Fallthrough,
 //! `return`, and branch exits preserve all result bits. Loop results and
 //! floating-point numeric instructions beyond those listed remain unsupported.
 //! The two extensions pop an i32 and push an i64,
@@ -497,6 +504,11 @@
 //! charging. Before/after layout probes with pinned Rust on arm64 macOS agreed
 //! in debug and release: 16 bytes per operand, 32 per decoded instruction,
 //! 856 per call frame, and 17,512 bytes summed across body-validation scratch.
+//! Float square-root tests check exact bits at zeros, infinities, NaNs,
+//! subnormal and normal boundaries, near rounding midpoints, and at the largest
+//! finite input. Deterministic per-exponent samples compared with native roots
+//! are evidence, not a proof. Validation checks include live and dead floors
+//! and concrete operand and result types; execution checks the dispatch limit.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

@@ -214,6 +214,7 @@ pub(crate) enum Instruction {
     Negate,
     Not,
     BitwiseNot,
+    Void,
     BitwiseAnd,
     BitwiseXor,
     BitwiseOr,
@@ -319,6 +320,7 @@ enum Operator {
     Negate,
     Not,
     BitwiseNot,
+    Void,
 }
 
 impl Operator {
@@ -338,7 +340,7 @@ impl Operator {
             Self::ShiftLeft | Self::ShiftRight | Self::ShiftRightUnsigned => 8,
             Self::Add | Self::Subtract => 9,
             Self::Multiply | Self::Divide | Self::Remainder => 10,
-            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot => 11,
+            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void => 11,
         }
     }
 
@@ -375,6 +377,7 @@ impl Operator {
             Self::Negate => Instruction::Negate,
             Self::Not => Instruction::Not,
             Self::BitwiseNot => Instruction::BitwiseNot,
+            Self::Void => Instruction::Void,
         }
     }
 }
@@ -506,7 +509,7 @@ fn is_excluded_name(name: &str) -> bool {
             | "delete" | "enum" | "export" | "extends"
             | "finally" | "function" | "import" | "in" | "instanceof"
             | "new" | "return" | "super" | "switch" | "this" | "throw"
-            | "try" | "typeof" | "var" | "void" | "with" | "await" | "yield"
+            | "try" | "typeof" | "var" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
             // Contextual syntax, strict-mode restricted names, and selected globals.
@@ -677,6 +680,7 @@ impl Lexer<'_> {
             "true" => Ok(TokenKind::Boolean(true)),
             "false" => Ok(TokenKind::Boolean(false)),
             "null" => Ok(TokenKind::Null),
+            "void" => Ok(TokenKind::Operator(Operator::Void)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
@@ -1730,6 +1734,12 @@ impl Parser<'_> {
                     "null cannot be used as a binding name",
                 ));
             }
+            TokenKind::Operator(Operator::Void) => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "void cannot be used as a binding name",
+                ));
+            }
             TokenKind::If
             | TokenKind::Else
             | TokenKind::While
@@ -2180,6 +2190,7 @@ impl Parser<'_> {
                         Operator::Subtract => Operator::Negate,
                         Operator::Not => Operator::Not,
                         Operator::BitwiseNot => Operator::BitwiseNot,
+                        Operator::Void => Operator::Void,
                         Operator::Divide => {
                             // In operand position a slash could begin a regexp, not division.
                             return Err(Error::unsupported(
@@ -2258,10 +2269,6 @@ impl Parser<'_> {
                         "'~' is only supported as a prefix operator",
                     ));
                 }
-                (false, TokenKind::Operator(op)) => {
-                    self.push_infix(op, span)?;
-                    needs_operand = true;
-                }
                 (false, TokenKind::Question) => {
                     // Lower precedence than every operator here, but do not close an
                     // enclosing conditional: this one starts within that arm.
@@ -2316,7 +2323,8 @@ impl Parser<'_> {
                     TokenKind::Number(_)
                     | TokenKind::Boolean(_)
                     | TokenKind::Null
-                    | TokenKind::Identifier,
+                    | TokenKind::Identifier
+                    | TokenKind::Operator(Operator::Void),
                 ) => {
                     if after_line_break && for_delimiter.is_none() {
                         self.reduce_expression()?;
@@ -2329,6 +2337,10 @@ impl Parser<'_> {
                         }
                     }
                     return Err(Error::malformed(span, "expected a binary operator"));
+                }
+                (false, TokenKind::Operator(op)) => {
+                    self.push_infix(op, span)?;
+                    needs_operand = true;
                 }
                 (false, TokenKind::Semicolon) if matches!(end_kind, ExpressionEnd::ForUpdate) => {
                     return Err(Error::malformed(span, "expected ')' after the for update"));
@@ -2544,7 +2556,8 @@ impl Parser<'_> {
             Instruction::Positive
             | Instruction::Negate
             | Instruction::Not
-            | Instruction::BitwiseNot => (1, 1),
+            | Instruction::BitwiseNot
+            | Instruction::Void => (1, 1),
             Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply

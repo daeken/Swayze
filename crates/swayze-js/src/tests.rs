@@ -2000,6 +2000,16 @@ fn mixed_operators_charge_token_and_work_budgets() {
 }
 
 #[test]
+fn void_replaces_one_operand_in_postfix_order() {
+    use Instruction::{Not, Void};
+    assert_postfix(
+        "1+!void -2",
+        &[Number(1.), Number(2.), Negate, Void, Not, Add],
+        2,
+    );
+}
+
+#[test]
 fn long_prefix_chains_are_iterative_without_using_nesting_budget() {
     let count = 10_000;
     let source = "- ".repeat(count) + "0";

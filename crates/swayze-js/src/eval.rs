@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     Script,
-    parser::{BindingKind, Instruction},
+    parser::{BindingKind, Instruction, ShortCircuitCondition},
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
@@ -20,6 +20,10 @@ pub enum Value {
     Number(f64),
     /// A JavaScript Boolean.
     Boolean(bool),
+    /// The JavaScript `null` value.
+    Null,
+    /// The JavaScript `undefined` value.
+    Undefined,
 }
 
 impl Value {
@@ -27,7 +31,8 @@ impl Value {
         match self {
             Self::Number(value) => value,
             Self::Boolean(true) => 1.0,
-            Self::Boolean(false) => 0.0,
+            Self::Boolean(false) | Self::Null => 0.0,
+            Self::Undefined => f64::NAN,
         }
     }
 
@@ -35,6 +40,7 @@ impl Value {
         match self {
             Self::Number(value) => value != 0.0 && !value.is_nan(),
             Self::Boolean(value) => value,
+            Self::Null | Self::Undefined => false,
         }
     }
 
@@ -43,6 +49,7 @@ impl Value {
             // Binary64 equality equates signed zeros and never equates NaN.
             (Self::Number(lhs), Self::Number(rhs)) => lhs == rhs,
             (Self::Boolean(lhs), Self::Boolean(rhs)) => lhs == rhs,
+            (Self::Null, Self::Null) | (Self::Undefined, Self::Undefined) => true,
             _ => false,
         }
     }
@@ -60,7 +67,7 @@ pub enum EvalError {
     InvalidScript,
     /// The evaluator could not allocate bounded operand or binding storage.
     AllocationFailed,
-    /// The numeric convenience API received a Boolean result instead of a Number.
+    /// The numeric convenience API received a non-Number result.
     NonNumericResult,
 }
 
@@ -71,7 +78,7 @@ impl fmt::Display for EvalError {
             Self::DispatchLimitExceeded => "JavaScript evaluation dispatch limit exceeded",
             Self::InvalidScript => "invalid prepared JavaScript instruction sequence",
             Self::AllocationFailed => "could not allocate JavaScript operand or binding storage",
-            Self::NonNumericResult => "script result is a Boolean, not a Number",
+            Self::NonNumericResult => "script result is not a Number",
         })
     }
 }
@@ -81,32 +88,34 @@ impl std::error::Error for EvalError {}
 impl Script {
     /// Evaluate the Script and return its Number result without coercing it.
     ///
-    /// Use [`Script::evaluate_value`] to accept Boolean results as well.
+    /// Use [`Script::evaluate_value`] to accept any supported value.
     ///
     /// # Errors
     ///
     /// Returns any error from [`Script::evaluate_value`], or
-    /// [`EvalError::NonNumericResult`] if the final value is a Boolean.
+    /// [`EvalError::NonNumericResult`] if the final value is not a Number.
     pub fn evaluate(&self) -> Result<f64, EvalError> {
         match self.evaluate_value()? {
             Value::Number(value) => Ok(value),
-            Value::Boolean(_) => Err(EvalError::NonNumericResult),
+            Value::Boolean(_) | Value::Null | Value::Undefined => Err(EvalError::NonNumericResult),
         }
     }
 
-    /// Evaluate the Script and return the final expression's Number or Boolean value.
+    /// Evaluate the Script and return the final expression's tagged primitive value.
     ///
-    /// Arithmetic and relational operators convert Boolean operands to `1` for
-    /// `true` and `+0` for `false`. Arithmetic returns a Number; relational
+    /// Arithmetic and relational operators leave Numbers unchanged and convert
+    /// `true` to `1`, `false` and `null` to `+0`, and `undefined` to NaN.
+    /// Arithmetic returns a Number; relational
     /// operators return a Boolean, always `false` if either operand is NaN.
     /// Strict equality and inequality compare tags and values without coercion
     /// and return a Boolean.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
-    /// conditional operator (`?:`) share truthiness: `false`, either signed zero,
-    /// and NaN are falsy, and all other supported values are truthy. `!` returns
-    /// a Boolean. `&&` returns a falsy left operand, and `||` returns a truthy
-    /// left operand; otherwise they evaluate and return the right operand.
+    /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
+    /// either signed zero, and NaN are falsy; all other supported values are truthy.
+    /// `!` returns a Boolean. `&&` returns a falsy left operand, `||` returns a
+    /// truthy left operand, and `??` returns a left operand that is neither `null`
+    /// nor `undefined`. Otherwise they evaluate and return the right operand.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. An `if` statement uses the same
     /// truthiness but executes only the selected branch, leaving no operand
@@ -197,6 +206,8 @@ fn evaluate(
             Instruction::Boolean(value) => {
                 push_operand(&mut stack, max_operands, Value::Boolean(value))?;
             }
+            Instruction::Null => push_operand(&mut stack, max_operands, Value::Null)?,
+            Instruction::Undefined => push_operand(&mut stack, max_operands, Value::Undefined)?,
             Instruction::LoadBinding(slot) => {
                 let binding = bindings
                     .get(slot)
@@ -267,13 +278,17 @@ fn evaluate(
                     ip = target;
                 }
             }
-            Instruction::ShortCircuit {
-                target,
-                when_truthy,
-            } => {
+            Instruction::ShortCircuit { target, condition } => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 let lhs = stack.last().ok_or(EvalError::InvalidScript)?;
-                if lhs.to_boolean() == when_truthy {
+                let skip_rhs = match condition {
+                    ShortCircuitCondition::Falsy => !lhs.to_boolean(),
+                    ShortCircuitCondition::Truthy => lhs.to_boolean(),
+                    ShortCircuitCondition::NonNullish => {
+                        !matches!(lhs, Value::Null | Value::Undefined)
+                    }
+                };
+                if skip_rhs {
                     ip = target;
                 } else {
                     stack.pop();
@@ -498,12 +513,12 @@ mod tests {
             LoadBinding(0),
             ShortCircuit {
                 target: 7,
-                when_truthy: false,
+                condition: ShortCircuitCondition::Falsy,
             },
             Boolean(true),
             ShortCircuit {
                 target: 7,
-                when_truthy: true,
+                condition: ShortCircuitCondition::Truthy,
             },
             LoadBinding(1),
             JumpIfFalseStatement(11),
@@ -554,18 +569,21 @@ mod tests {
 
     #[test]
     fn short_circuit_skips_rhs_or_pops_lhs_and_evaluates_rhs() {
-        use Instruction::{Boolean, LoadBinding, Number, ShortCircuit};
+        use Instruction::{Boolean, LoadBinding, Null, Number, ShortCircuit, Undefined};
+        use ShortCircuitCondition::{Falsy, NonNullish, Truthy};
         // An uninitialized slot makes RHS execution observable. Valid scripts
         // cannot include the bad load, even when it would never be executed.
-        for (when_truthy, skip, fall_through, expected) in [
-            (false, Boolean(false), Boolean(true), Value::Boolean(false)),
-            (true, Number(7.0), Number(0.0), Value::Number(7.0)),
+        for (condition, skip, fall_through, expected) in [
+            (Falsy, Boolean(false), Boolean(true), Value::Boolean(false)),
+            (Truthy, Number(7.0), Number(0.0), Value::Number(7.0)),
+            (NonNullish, Boolean(false), Null, Value::Boolean(false)),
+            (NonNullish, Number(0.0), Undefined, Value::Number(0.0)),
         ] {
             let mut ops = [
                 skip,
                 ShortCircuit {
                     target: 3,
-                    when_truthy,
+                    condition,
                 },
                 LoadBinding(0),
             ];
@@ -579,24 +597,23 @@ mod tests {
 
     #[test]
     fn short_circuit_requires_a_forward_target_and_an_operand() {
-        use Instruction::{Boolean, ShortCircuit};
-        for when_truthy in [false, true] {
-            let fell_through = Boolean(!when_truthy);
+        use Instruction::{Boolean, Null, ShortCircuit};
+        use ShortCircuitCondition::{Falsy, NonNullish, Truthy};
+        for (condition, taken, fallthrough) in [
+            (Falsy, Boolean(false), Boolean(true)),
+            (Truthy, Boolean(true), Boolean(false)),
+            (NonNullish, Boolean(false), Null),
+        ] {
             for target in [0, 1, 4, usize::MAX] {
-                let ops = [
-                    fell_through,
-                    ShortCircuit {
-                        target,
-                        when_truthy,
-                    },
-                    Boolean(true),
-                ];
-                assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+                for lhs in [taken, fallthrough] {
+                    let ops = [lhs, ShortCircuit { target, condition }, Boolean(true)];
+                    assert_eq!(evaluate(&ops, 1, 0), Err(EvalError::InvalidScript));
+                }
             }
             let ops = [
                 ShortCircuit {
                     target: 2,
-                    when_truthy,
+                    condition,
                 },
                 Boolean(true),
             ];

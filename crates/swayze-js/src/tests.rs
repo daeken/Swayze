@@ -532,21 +532,22 @@ fn precedence_associativity_and_grouping() {
 }
 
 #[test]
-fn equal_precedence_logical_operators_associate_left() {
+fn equal_precedence_short_circuit_operators_associate_left() {
+    use crate::parser::ShortCircuitCondition::{Falsy, NonNullish, Truthy};
     use Instruction::ShortCircuit;
-    for (symbol, when_truthy) in [("&&", false), ("||", true)] {
+    for (symbol, condition) in [("&&", Falsy), ("||", Truthy), ("??", NonNullish)] {
         assert_postfix(
             &format!("1{symbol}2{symbol}3"),
             &[
                 Number(1.),
                 ShortCircuit {
                     target: 3,
-                    when_truthy,
+                    condition,
                 },
                 Number(2.),
                 ShortCircuit {
                     target: 5,
-                    when_truthy,
+                    condition,
                 },
                 Number(3.),
             ],
@@ -558,12 +559,12 @@ fn equal_precedence_logical_operators_associate_left() {
                 Number(1.),
                 ShortCircuit {
                     target: 5,
-                    when_truthy,
+                    condition,
                 },
                 Number(2.),
                 ShortCircuit {
                     target: 5,
-                    when_truthy,
+                    condition,
                 },
                 Number(3.),
             ],
@@ -592,7 +593,7 @@ fn logical_punctuators_use_maximal_munch_without_crossing_trivia() {
         ("1!", Unsupported, 1, 2),
         ("1||2++", Unsupported, 4, 6),
         ("1&&2?.x", Unsupported, 4, 6),
-        ("1||2??3", Unsupported, 4, 6),
+        ("1||2??3", Malformed, 4, 6),
         ("1&&2??=3", Unsupported, 4, 7),
     ] {
         assert_error(source, kind, start, end);
@@ -704,7 +705,7 @@ fn malformed_conditional_delimiters_and_longer_punctuators() {
     ] {
         assert_error(source, Malformed, start, end);
     }
-    for (source, end) in [("1??2", 3), ("1??=2", 4), ("1?.x", 3), ("1?.(2)", 3)] {
+    for (source, end) in [("1??=2", 4), ("1?.x", 3), ("1?.(2)", 3)] {
         assert_error(source, Unsupported, 1, end);
     }
     assert_error("1?2:3\n4", Unsupported, 6, 7);
@@ -887,7 +888,7 @@ fn consts_decline_reserved_and_non_subset_names_without_splitting() {
         "eval",
         "arguments",
         "NaN",
-        "undefined",
+        "null",
     ] {
         let source = format!("const {name}=1; 2");
         assert_error(&source, Unsupported, 6, 6 + name.len());

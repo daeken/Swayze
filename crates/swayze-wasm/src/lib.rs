@@ -20,6 +20,8 @@
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
+//! `f32.eq`, `f32.ne`, `f32.lt`, `f32.gt`, `f32.le`, `f32.ge`,
+//! `f64.eq`, `f64.ne`, `f64.lt`, `f64.gt`, `f64.le`, `f64.ge`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
 //! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
 //! `i64.div_s`, `i64.div_u`, `i64.rem_s`, `i64.rem_u`,
@@ -150,13 +152,19 @@
 //! i64 and f64. For both widths, `abs` clears the sign bit and `neg` flips it;
 //! each consumes one operand and produces one of the same type. `copysign`
 //! consumes two operands of its width, taking the magnitude bits from the first
-//! (lhs) and only the sign bit from the second (rhs). Constants, reinterpretations,
-//! and sign operations each count as one dispatch. None uses native floating-point
-//! arithmetic or quiets signaling NaNs; sign operations leave all non-sign bits,
-//! including NaN payloads, unchanged. Floats are operand-only: function signatures
-//! (and thus exports and host arguments/results), locals, globals, control label
-//! results, floating-point memory instructions, and other floating-point numeric
-//! instructions remain unsupported.
+//! (lhs) and only the sign bit from the second (rhs). Sign operations leave all
+//! non-sign bits, including NaN payloads, unchanged. For both widths, `eq`, `ne`,
+//! `lt`, `gt`, `le`, and `ge` (`0x5b`–`0x60` for f32, `0x61`–`0x66` for f64)
+//! consume two operands of their exact width in lhs, rhs order and push an i32
+//! Boolean (0 or 1). Either quiet or signaling NaN makes the pair unordered:
+//! only `ne` returns 1. Positive and negative zero compare equal; all other
+//! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
+//! use raw bits without changing the input encodings. Constants, reinterpretations,
+//! sign operations, and comparisons each count as one dispatch. None uses native
+//! floating-point operations or quiets signaling NaNs. Floats are operand-only:
+//! function signatures (and thus exports and host arguments/results), locals,
+//! globals, control label results, floating-point memory instructions, and other
+//! floating-point numeric instructions remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -443,6 +451,11 @@
 //! signs of zero, infinities, normals, subnormals, and quiet and signaling NaNs.
 //! They check `copysign` operand order, typed live and dead operands and floor
 //! diagnostics, and shared stack, instruction, and dispatch limits.
+//! Float comparison tests exercise every predicate and width over pairs in both
+//! orders, including both zero signs, subnormal boundaries, opposite signs,
+//! infinities, and both signs of quiet and signaling NaNs. They check exact i32
+//! Booleans, operand and result types in live and dead code, underflow precedence
+//! and polymorphic floors, shared caps, and exact fuel for each opcode.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

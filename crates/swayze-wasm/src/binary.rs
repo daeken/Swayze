@@ -5,7 +5,7 @@ use crate::{
     },
     table::{ElementSegment, MAX_TABLE_ENTRIES},
 };
-use std::{fmt, ops::RangeInclusive, str};
+use std::{cmp::Ordering, fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -972,6 +972,7 @@ enum Instruction {
     Convert(Conversion),
     FloatUnary(FloatWidth, FloatUnaryOp),
     FloatCopysign(FloatWidth),
+    FloatCompare(FloatWidth, FloatComparison),
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
@@ -1131,6 +1132,8 @@ impl Conversion {
 
 const F32_SIGN: u32 = 1 << 31;
 const F64_SIGN: u64 = 1 << 63;
+const F32_INFINITY: u32 = 0x7f80_0000;
+const F64_INFINITY: u64 = 0x7ff0_0000_0000_0000;
 
 #[derive(Clone, Copy, Debug)]
 enum FloatWidth {
@@ -1169,6 +1172,64 @@ impl FloatUnaryOp {
             (FloatWidth::F64, Self::Neg) => Operand::F64(value.f64_bits() ^ F64_SIGN),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FloatComparison {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl FloatComparison {
+    fn apply(self, width: FloatWidth, lhs: Operand, rhs: Operand) -> i32 {
+        use Ordering::{Equal, Greater, Less};
+        let order = match width {
+            FloatWidth::F32 => compare_float_bits(
+                u64::from(lhs.f32_bits()),
+                u64::from(rhs.f32_bits()),
+                u64::from(F32_SIGN),
+                u64::from(F32_INFINITY),
+            ),
+            FloatWidth::F64 => {
+                compare_float_bits(lhs.f64_bits(), rhs.f64_bits(), F64_SIGN, F64_INFINITY)
+            }
+        };
+        let Some(order) = order else {
+            return i32::from(matches!(self, Self::Ne)); // NaNs are unordered.
+        };
+        i32::from(match self {
+            Self::Eq => order == Equal,
+            Self::Ne => order != Equal,
+            Self::Lt => order == Less,
+            Self::Gt => order == Greater,
+            Self::Le => order != Greater,
+            Self::Ge => order != Less,
+        })
+    }
+}
+
+fn compare_float_bits(lhs: u64, rhs: u64, sign: u64, infinity: u64) -> Option<Ordering> {
+    let lhs_magnitude = lhs & !sign;
+    let rhs_magnitude = rhs & !sign;
+    // An all-ones exponent and nonzero fraction exceeds infinity's magnitude,
+    // whether the NaN is quiet or signaling.
+    if lhs_magnitude > infinity || rhs_magnitude > infinity {
+        return None;
+    }
+    // Ignore the sign of zero for comparison only. For equal signs, exponent
+    // and fraction bits order magnitudes; negative numbers reverse that order.
+    let lhs_negative = lhs & sign != 0 && lhs_magnitude != 0;
+    let rhs_negative = rhs & sign != 0 && rhs_magnitude != 0;
+    Some(match (lhs_negative, rhs_negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => rhs_magnitude.cmp(&lhs_magnitude),
+        (false, false) => lhs_magnitude.cmp(&rhs_magnitude),
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1636,6 +1697,11 @@ pub(super) fn execute(
                 let lhs = frame.pop();
                 frame.push(width.copysign(lhs, rhs));
             }
+            Instruction::FloatCompare(width, op) => {
+                let rhs = frame.pop();
+                let lhs = frame.pop();
+                frame.push(Operand::I32(op.apply(width, lhs, rhs)));
+            }
             Instruction::LocalGet(index) => frame.push(frame.locals[index as usize].into()),
             Instruction::LocalSet(index) => {
                 frame.locals[index as usize] = frame.pop().into_integer()
@@ -2047,6 +2113,7 @@ fn validate_plain_stack(
             let ty = Some(width.operand_type());
             (2, ty, ty)
         }
+        Instruction::FloatCompare(width, _) => (2, Some(width.operand_type()), i32_type),
         Instruction::LocalGet(index) => (0, None, Some(local_zeros[index as usize].operand_type())),
         Instruction::GlobalGet(index) => (
             0,
@@ -2257,6 +2324,18 @@ fn decode_plain(
         0x58 => Instruction::I64Binary(I64BinaryOp::LeU),
         0x59 => Instruction::I64Binary(I64BinaryOp::GeS),
         0x5a => Instruction::I64Binary(I64BinaryOp::GeU),
+        0x5b => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Eq),
+        0x5c => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Ne),
+        0x5d => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Lt),
+        0x5e => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Gt),
+        0x5f => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Le),
+        0x60 => Instruction::FloatCompare(FloatWidth::F32, FloatComparison::Ge),
+        0x61 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Eq),
+        0x62 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Ne),
+        0x63 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Lt),
+        0x64 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Gt),
+        0x65 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Le),
+        0x66 => Instruction::FloatCompare(FloatWidth::F64, FloatComparison::Ge),
         0x67 => Instruction::Unary(UnaryOp::Clz),
         0x68 => Instruction::Unary(UnaryOp::Ctz),
         0x69 => Instruction::Unary(UnaryOp::Popcnt),

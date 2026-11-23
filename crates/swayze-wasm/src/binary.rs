@@ -1,6 +1,8 @@
 use crate::{
     ExecutionLimit, Export, Instance, InvokeError, Module, ResultKind, Trap,
-    memory::{AccessWidth, DataSegment, LoadKind, MEMORY_PAGE_BYTES},
+    memory::{
+        AccessWidth, DataSegment, LoadKind, MAX_MEMORY_PAGES, MEMORY_PAGE_BYTES, MemoryLimits,
+    },
     table::{ElementSegment, MAX_TABLE_ENTRIES},
 };
 use std::{fmt, ops::RangeInclusive, str};
@@ -333,8 +335,8 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
 /// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent.
-/// For `memory.size` or `call_indirect`, a malformed reserved byte is reported as
-/// [`ErrorKind::TruncatedByte`] or [`ErrorKind::UnexpectedByte`].
+/// For `memory.size`, `memory.grow`, or `call_indirect`, a malformed reserved
+/// byte is reported as [`ErrorKind::TruncatedByte`] or [`ErrorKind::UnexpectedByte`].
 /// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
 /// segment's memory index. A data length above the remaining aggregate budget
 /// is reported as [`ErrorKind::LimitExceeded`] at the start of the length field.
@@ -367,7 +369,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut start = None;
     let mut table_entries = None;
     let mut element_segments = Vec::new();
-    let mut memory_bytes = None;
+    let mut memory_limits = None;
     let mut globals = [Global::default(); MAX_GLOBALS as usize];
     let mut global_count = 0;
     let mut data_segments = Vec::new();
@@ -418,7 +420,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 function_count = Some(count);
             }
             4 => table_entries = validate_table(&mut section)?,
-            5 => memory_bytes = validate_memory(&mut section)?,
+            5 => memory_limits = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
             7 => exports = validate_exports(&mut section, function_count)?,
             8 => {
@@ -439,12 +441,12 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     types: &types[..type_count.unwrap_or(0) as usize],
                     functions: &function_types[..function_count.unwrap_or(0) as usize],
                     has_table: table_entries.is_some(),
-                    has_memory: memory_bytes.is_some(),
+                    has_memory: memory_limits.is_some(),
                     globals: &globals[..global_count],
                 };
                 functions = validate_code(&mut section, &environment)?;
             }
-            11 => data_segments = validate_data(&mut section, memory_bytes.is_some())?,
+            11 => data_segments = validate_data(&mut section, memory_limits.is_some())?,
             _ => {
                 return Err(Error {
                     offset: id_offset,
@@ -489,7 +491,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         functions,
         exports,
         start_function,
-        memory_bytes,
+        memory_limits,
         table_entries,
         element_segments,
         global_initial_values: globals.map(|global| global.initial_value),
@@ -534,7 +536,6 @@ const MAX_EXPORTS: u32 = 8;
 pub(super) const MAX_GLOBALS: u32 = 8;
 const MAX_DATA_SEGMENTS: u32 = 8;
 const MAX_ELEMENT_SEGMENTS: u32 = 8;
-const MAX_MEMORY_PAGES: u32 = 1;
 const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
@@ -608,7 +609,7 @@ fn validate_table(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
     Ok(Some(minimum as usize))
 }
 
-fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
+fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Error> {
     if section.count(IntegerField::MemoryCount, 0..=1)? == 0 {
         return Ok(None);
     }
@@ -625,7 +626,7 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
         });
     }
     let minimum = section.count(IntegerField::MemoryMinimum, 0..=MAX_MEMORY_PAGES)?;
-    if flags == 0x01 {
+    let maximum = if flags == 0x01 {
         let offset = section.position();
         let maximum = section.count(IntegerField::MemoryMaximum, 0..=MAX_MEMORY_PAGES)?;
         if maximum < minimum {
@@ -634,9 +635,14 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
                 kind: ErrorKind::InvalidMemoryLimits { minimum, maximum },
             });
         }
-    }
-    // No growth: the maximum is validated but only the initial size matters.
-    Ok(Some(minimum as usize * MEMORY_PAGE_BYTES))
+        Some(maximum)
+    } else {
+        None
+    };
+    Ok(Some(MemoryLimits {
+        minimum_pages: minimum,
+        maximum_pages: maximum,
+    }))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -858,6 +864,7 @@ enum Instruction {
     LoadI32 { kind: LoadKind, offset: u32 },
     StoreI32 { width: AccessWidth, offset: u32 },
     MemorySize,
+    MemoryGrow,
     JumpIfZero { target: usize },
     Jump { target: usize },
     Branch { edge: BranchEdge, conditional: bool },
@@ -1205,6 +1212,10 @@ pub(super) fn execute(
                     .map_err(ExecutionError::Trap)?;
             }
             Instruction::MemorySize => frame.push(instance.memory.size_in_pages()),
+            Instruction::MemoryGrow => {
+                let delta = frame.pop() as u32;
+                frame.push(instance.memory.grow(delta));
+            }
             Instruction::JumpIfZero { target } => {
                 if frame.pop() == 0 {
                     frame.pc = target;
@@ -1446,11 +1457,15 @@ fn decode_plain(
         0x36 => store(body, AccessWidth::Word)?,
         0x3a => store(body, AccessWidth::Byte)?,
         0x3b => store(body, AccessWidth::Halfword)?,
-        0x3f => {
+        0x3f | 0x40 => {
             // Core 1.0 reserves a literal zero byte here, not a LEB32 index.
             body.expect_byte(0)?;
             require_memory(has_memory, offset)?;
-            Instruction::MemorySize
+            if opcode == 0x3f {
+                Instruction::MemorySize
+            } else {
+                Instruction::MemoryGrow
+            }
         }
         I32_CONST => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
         0x45 => Instruction::Unary(UnaryOp::Eqz),
@@ -1773,6 +1788,7 @@ fn validate_body(
                     }
                     Instruction::LocalTee(_)
                     | Instruction::Unary(_)
+                    | Instruction::MemoryGrow
                     | Instruction::LoadI32 { .. } => consume(1)? + 1,
                     Instruction::StoreI32 { .. } => consume(2)?,
                     Instruction::Binary(_) => consume(2)? + 1,

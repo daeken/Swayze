@@ -2090,14 +2090,17 @@ impl Parser<'_> {
             .map_or(Span::at(self.lexer.offset), |t| t.span);
         let kind = next.as_ref().map(|t| t.kind);
         // Only a complete, explicitly delimited update is a supported write.
-        // Unlike an assignment statement, a statement-leading update owns no comma.
+        // A comma starts the same discarded suffix as after an assignment.
         match (end, kind) {
             (
                 ExpressionEnd::StatementStore | ExpressionEnd::ForStore(ForClauseEnd::Init),
                 Some(TokenKind::Semicolon),
             )
             | (ExpressionEnd::ForStore(ForClauseEnd::Update), Some(TokenKind::Close))
-            | (ExpressionEnd::ForStore(_), Some(TokenKind::Comma)) => {}
+            | (
+                ExpressionEnd::StatementStore | ExpressionEnd::ForStore(_),
+                Some(TokenKind::Comma),
+            ) => {}
             (ExpressionEnd::StatementStore, None | Some(TokenKind::CloseBrace)) => {
                 return Err(Error::unsupported(
                     span,

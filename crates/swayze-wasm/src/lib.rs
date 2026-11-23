@@ -793,6 +793,10 @@ use table::{ElementSegment, FunctionTable};
 
 /// An owned, opaque module produced only by successful [`validate_module`].
 ///
+/// [`Debug`](fmt::Debug) reports only counts of functions, exports, data segments,
+/// and element segments, even in pretty output. It does not format guest names,
+/// bytes, instructions, or values.
+///
 /// ```compile_fail
 /// use swayze_wasm::Module;
 /// let forged = Module {
@@ -802,7 +806,6 @@ use table::{ElementSegment, FunctionTable};
 ///     table_entries: None, element_segments: Vec::new(),
 /// };
 /// ```
-#[derive(Debug)]
 pub struct Module {
     functions: Vec<binary::ValidatedCode>,
     exports: Vec<Export>,
@@ -816,13 +819,27 @@ pub struct Module {
     element_segments: Vec<ElementSegment>,
 }
 
-#[derive(Debug)]
 struct Export {
     name: String,
     function_index: usize,
 }
 
+impl fmt::Debug for Module {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_metadata(f, "Module")
+    }
+}
+
 impl Module {
+    fn fmt_metadata(&self, f: &mut fmt::Formatter<'_>, type_name: &str) -> fmt::Result {
+        f.debug_struct(type_name)
+            .field("function_count", &self.functions.len())
+            .field("export_count", &self.exports.len())
+            .field("data_segment_count", &self.data_segments.len())
+            .field("element_segment_count", &self.element_segments.len())
+            .finish_non_exhaustive()
+    }
+
     /// Create an independent instance and run its optional start function.
     ///
     /// Check active segment ranges in source order within each kind: elements
@@ -929,13 +946,21 @@ impl std::error::Error for InstantiationError {
 /// (it can move to another thread when its module borrow permits), but not
 /// `Sync`: sharing one instance between threads requires synchronization.
 /// The immutable module can be shared to create independent instances.
-#[derive(Debug)]
+///
+/// [`Debug`](fmt::Debug) reports only the associated [`Module`]'s counts, even
+/// in pretty output. It does not inspect memory, tables, or globals.
 pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
     // Validation allows stores only to mutable slots and with the initial value's type.
     globals: [Cell<binary::Operand>; binary::MAX_GLOBALS as usize],
     table: Option<FunctionTable>,
+}
+
+impl fmt::Debug for Instance<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.module.fmt_metadata(f, "Instance")
+    }
 }
 
 impl Instance<'_> {

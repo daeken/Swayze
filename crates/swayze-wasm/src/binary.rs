@@ -1001,7 +1001,10 @@ pub(super) fn execute(
                 first,
                 explicit_count,
             } => {
-                // A selector at or above the explicit length chooses the default.
+                // Clamp in u32 before casting: index is at most explicit_count
+                // (16), where the default lives. The decoder appended all
+                // explicit_count + 1 edges starting at first, so first + index
+                // is below table_targets.len() (at most MAX_BODY_TABLE_TARGETS).
                 let index = (frame.pop() as u32).min(explicit_count) as usize;
                 frame.take_branch(code.table_targets[first + index], code.instructions.len());
             }
@@ -1550,6 +1553,9 @@ fn validate_body(
         }
         check_operand_depth(depth, offset)?;
     };
+    // The successful function end closes the exact body frame. Every inner
+    // frame has now closed and patched its incoming edges; unvalidated and
+    // partially fixed instructions and targets never leave the scratch arrays.
     let mut instructions = Vec::new();
     let mut retained_targets = Vec::new();
     let allocation_error = Error {

@@ -48,12 +48,14 @@ a general assertion rewriter. **Raw** mode is reserved for reviewed positive
 are reported as not run, never as passes. No negative, module or harness-heavy
 cases are credited.
 
-The first cohort covers numeric separators, U+2028 in a String, and unary
-positive and negative zero. The unresolvable-reference test (`typeof x`)
-was first reproduced as unsupported and is now a required regression. All
-five are adapted sloppy-mode cases. A required variant becoming unsupported,
-a wrong result, or no required passes exits 1; infrastructure errors exit 2.
-An unsupported frontier case alone does not fail the run. Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
+The required adapted sloppy-mode cases cover numeric separators in integer,
+fraction and exponent positions; U+2028, U+2029 and U+180E in Strings; unary
+positive and negative zero; and `typeof x` for an unbound name. The two
+no-substitution template literal cases are frontier cases: they are run, but
+the lexer currently reports them as unsupported. A required variant becoming
+unsupported, a wrong result, or no required passes exits 1; infrastructure
+errors exit 2. An unsupported frontier case alone does not fail the run.
+Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
 against the full pinned blob. Reproduce a frontier result before changing the
 engine, rerun the same blob after the fix, then promote the case to required.
 This is regression evidence for a small subset, not a Test262 conformance score.

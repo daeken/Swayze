@@ -7,7 +7,7 @@ mod eval;
 mod parser;
 mod radix_integer;
 
-pub use eval::{EvalError, PrimitiveValue, Value};
+pub use eval::{EvalError, EvalScratch, PrimitiveValue, Value};
 pub use parser::{
     Error, ErrorKind, Limit, Limits, Script, Span, parse_script, parse_script_with_limits,
 };

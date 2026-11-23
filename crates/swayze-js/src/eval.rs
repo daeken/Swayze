@@ -2,7 +2,7 @@ use std::{cmp::Ordering, fmt};
 
 use crate::{
     Script,
-    parser::{BindingKind, Instruction, ShortCircuitCondition, StringRange, Update, UpdateResult},
+    parser::{BindingKind, Instruction, ShortCircuitCondition, Update, UpdateResult},
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
@@ -10,7 +10,11 @@ const MAX_INSTRUCTIONS: usize = 4096;
 const MAX_DISPATCHES: usize = 16_384;
 const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
 
+mod string_concat;
 mod string_number;
+
+pub use string_concat::EvalScratch;
+use string_concat::{StringOperand, StringPools};
 
 /// A scalar value in the supported JavaScript subset.
 ///
@@ -29,21 +33,21 @@ pub enum Value {
     Undefined,
 }
 
-/// A supported primitive result. String results borrow the prepared Script's
-/// immutable UTF-16 storage and may contain unpaired surrogates.
+/// A supported primitive result. Strings borrow immutable UTF-16 units from
+/// the prepared Script or the caller's evaluation scratch.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PrimitiveValue<'script> {
+pub enum PrimitiveValue<'a> {
     /// Number, Boolean, `null`, or `undefined`.
     Scalar(Value),
     /// JavaScript String code units, without normalization or replacement.
-    String(&'script [u16]),
+    String(&'a [u16]),
 }
 
 #[derive(Clone, Copy)]
 enum Operand {
     Scalar(Value),
-    // Checked on literal dispatch; moves only copy the range into the same pool.
-    String(StringRange),
+    // Literal dispatch and concatenation check ranges before creating operands.
+    String(StringOperand),
 }
 
 impl Operand {
@@ -54,11 +58,15 @@ impl Operand {
         }
     }
 
-    fn to_number(self, string_units: &[u16], credits_left: &mut usize) -> Result<f64, EvalError> {
+    fn to_number(
+        self,
+        strings: StringPools<'_>,
+        credits_left: &mut usize,
+    ) -> Result<f64, EvalError> {
         match self {
             Self::Scalar(value) => Ok(value.to_number()),
             Self::String(range) => {
-                let units = range.get(string_units).ok_or(EvalError::InvalidScript)?;
+                let units = range.get(strings).ok_or(EvalError::InvalidScript)?;
                 string_number::convert(units, credits_left)
             }
         }
@@ -152,7 +160,7 @@ pub enum EvalError {
     DispatchLimitExceeded,
     /// The instruction sequence has invalid control flow, operands, or binding-slot usage.
     InvalidScript,
-    /// The evaluator could not allocate bounded operand or binding storage.
+    /// The evaluator could not allocate bounded operand, binding, or runtime String storage.
     AllocationFailed,
     /// The numeric convenience API received a non-Number result.
     NonNumericResult,
@@ -164,6 +172,12 @@ pub enum EvalError {
     StringComparisonLimitExceeded,
     /// An operator's String-to-Number conversion would exceed the 262,144-credit evaluation budget.
     StringNumericConversionLimitExceeded,
+    /// A concatenation would produce more than 4,094 UTF-16 units.
+    StringConcatenationLengthLimitExceeded,
+    /// A concatenation would exceed the evaluation's 32,768 appended-unit budget.
+    StringConcatenationBudgetExceeded,
+    /// The primitive convenience API received a runtime String, not a literal.
+    RuntimeStringResultRequiresScratch,
 }
 
 impl fmt::Display for EvalError {
@@ -172,7 +186,7 @@ impl fmt::Display for EvalError {
             Self::LimitExceeded => "prepared JavaScript instruction limit exceeded",
             Self::DispatchLimitExceeded => "JavaScript evaluation dispatch limit exceeded",
             Self::InvalidScript => "invalid prepared JavaScript instruction sequence",
-            Self::AllocationFailed => "could not allocate JavaScript operand or binding storage",
+            Self::AllocationFailed => "could not allocate JavaScript evaluation storage",
             Self::NonNumericResult => "script result is not a Number",
             Self::NonScalarResult => "script result is not a scalar",
             Self::UnsupportedStringOperation => {
@@ -181,6 +195,15 @@ impl fmt::Display for EvalError {
             Self::StringComparisonLimitExceeded => "JavaScript string comparison limit exceeded",
             Self::StringNumericConversionLimitExceeded => {
                 "JavaScript string numeric conversion limit exceeded"
+            }
+            Self::StringConcatenationLengthLimitExceeded => {
+                "JavaScript string concatenation length limit exceeded"
+            }
+            Self::StringConcatenationBudgetExceeded => {
+                "JavaScript string concatenation append budget exceeded"
+            }
+            Self::RuntimeStringResultRequiresScratch => {
+                "runtime JavaScript string result requires evaluation scratch"
             }
         })
     }
@@ -191,16 +214,17 @@ impl std::error::Error for EvalError {}
 impl Script {
     /// Evaluate the Script and return its Number result without coercing it.
     ///
-    /// Use [`Script::evaluate_primitive`] to accept any supported value.
+    /// Use [`Script::evaluate_primitive_with_scratch`] to accept any supported value.
     ///
     /// # Errors
     ///
-    /// Returns any error from [`Script::evaluate_primitive`], or
-    /// [`EvalError::NonNumericResult`] if the final value is not a Number.
+    /// Returns execution errors, or [`EvalError::NonNumericResult`] if the final
+    /// value is not a Number.
     pub fn evaluate(&self) -> Result<f64, EvalError> {
-        match self.evaluate_primitive()? {
-            PrimitiveValue::Scalar(Value::Number(value)) => Ok(value),
-            _ => Err(EvalError::NonNumericResult),
+        match self.evaluate_value() {
+            Ok(Value::Number(value)) => Ok(value),
+            Ok(_) | Err(EvalError::NonScalarResult) => Err(EvalError::NonNumericResult),
+            Err(error) => Err(error),
         }
     }
 
@@ -208,12 +232,12 @@ impl Script {
     ///
     /// # Errors
     ///
-    /// Returns any error from [`Script::evaluate_primitive`], or
-    /// [`EvalError::NonScalarResult`] if the final value is a String.
+    /// Returns execution errors, or [`EvalError::NonScalarResult`] if the final
+    /// value is a String (literal or runtime).
     pub fn evaluate_value(&self) -> Result<Value, EvalError> {
-        match self.evaluate_primitive()? {
-            PrimitiveValue::Scalar(value) => Ok(value),
-            PrimitiveValue::String(_) => Err(EvalError::NonScalarResult),
+        match self.run(&mut EvalScratch::new())? {
+            Operand::Scalar(value) => Ok(value),
+            Operand::String(_) => Err(EvalError::NonScalarResult),
         }
     }
 
@@ -238,7 +262,7 @@ impl Script {
     /// to a signed 32-bit integer. Binary operators that coerce Strings convert
     /// the left operand and then the right, once each, after evaluating both
     /// operand expressions. Eager compounds use the value loaded before the RHS
-    /// runs and store the Number only after the operation succeeds.
+    /// runs and store the result only after the operation succeeds.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators truncate and wrap the coerced Number to 32 bits
@@ -254,9 +278,9 @@ impl Script {
     /// Booleans, and Strings numerically after conversion. Strings compare code
     /// units with other Strings; mixed strict equality and String/nullish loose
     /// equality are false without conversion. `!==` and `!=` negate their
-    /// corresponding equality results. Binary `+` (including concatenation)
-    /// and binary `-` remain unsupported on Strings, as do the corresponding
-    /// compounds.
+    /// corresponding equality results. Binary `+` and `+=` concatenate two
+    /// Strings in left-to-right UTF-16 order, without normalization. Mixed
+    /// String/scalar addition and binary `-` and `-=` on Strings are unsupported.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -322,7 +346,10 @@ impl Script {
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
     /// before validating decimal syntax. Skipped instructions, scalar operands,
     /// and noncoercing comparisons cost no conversion credits.
-    /// String operands only copy ranges; evaluation allocates no String storage.
+    /// Concatenations may produce at most 4,094 UTF-16 units each and append at
+    /// most 32,768 units in total per call, including discarded results. This
+    /// append budget is independent of the other budgets. Skipped and empty
+    /// concatenations append no units and do not allocate runtime String storage.
     ///
     /// # Errors
     ///
@@ -334,14 +361,67 @@ impl Script {
     /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
     /// if a comparison would exceed its pair budget. Returns
     /// [`EvalError::StringNumericConversionLimitExceeded`] if an operator's
-    /// String-to-Number conversion would exceed its credit budget.
+    /// String-to-Number conversion would exceed its credit budget. A reached
+    /// concatenation can return [`EvalError::StringConcatenationLengthLimitExceeded`]
+    /// or [`EvalError::StringConcatenationBudgetExceeded`]. After successful
+    /// execution this method returns [`EvalError::RuntimeStringResultRequiresScratch`]
+    /// for a final runtime String (even an empty one). Use
+    /// [`Script::evaluate_primitive_with_scratch`] to borrow such a result.
     pub fn evaluate_primitive(&self) -> Result<PrimitiveValue<'_>, EvalError> {
-        evaluate(
+        match self.run(&mut EvalScratch::new())? {
+            Operand::Scalar(value) => Ok(PrimitiveValue::Scalar(value)),
+            Operand::String(StringOperand::Literal(range)) => range
+                .get(self.string_units())
+                .map(PrimitiveValue::String)
+                .ok_or(EvalError::InvalidScript),
+            Operand::String(StringOperand::Runtime(_)) => {
+                Err(EvalError::RuntimeStringResultRequiresScratch)
+            }
+        }
+    }
+
+    /// Evaluate the Script, accepting literal and runtime String results.
+    ///
+    /// The result borrows from the Script and scratch for its lifetime. Each
+    /// call resets scratch's logical length while retaining its capacity; it
+    /// does not zeroize the allocation. The execution semantics and errors are
+    /// those of [`Script::evaluate_primitive`], except that runtime String
+    /// results are returned rather than producing a result-type error.
+    ///
+    /// ```compile_fail,E0499
+    /// use swayze_js::{EvalScratch, parse_script};
+    /// let script = parse_script("'a' + 'b'").unwrap();
+    /// let mut scratch = EvalScratch::new();
+    /// let first = script.evaluate_primitive_with_scratch(&mut scratch).unwrap();
+    /// let second = script.evaluate_primitive_with_scratch(&mut scratch).unwrap();
+    /// assert_eq!(first, second); // `first` still borrows `scratch`
+    /// ```
+    pub fn evaluate_primitive_with_scratch<'a>(
+        &'a self,
+        scratch: &'a mut EvalScratch,
+    ) -> Result<PrimitiveValue<'a>, EvalError> {
+        match self.run(scratch)? {
+            Operand::Scalar(value) => Ok(PrimitiveValue::Scalar(value)),
+            Operand::String(range) => range
+                .get(scratch.pools(self.string_units()))
+                .map(PrimitiveValue::String)
+                .ok_or(EvalError::InvalidScript),
+        }
+    }
+
+    fn run(&self, scratch: &mut EvalScratch) -> Result<Operand, EvalError> {
+        scratch.reset();
+        let result = evaluate(
             self.instructions(),
             self.max_stack_depth(),
             self.binding_slots(),
             self.string_units(),
-        )
+            scratch,
+        );
+        if result.is_err() {
+            scratch.reset();
+        }
+        result
     }
 }
 
@@ -351,12 +431,13 @@ struct Slot {
     value: Operand,
 }
 
-fn evaluate<'script>(
+fn evaluate(
     ops: &[Instruction],
     max_operands: usize,
     binding_slots: usize,
-    string_units: &'script [u16],
-) -> Result<PrimitiveValue<'script>, EvalError> {
+    string_units: &[u16],
+    scratch: &mut EvalScratch,
+) -> Result<Operand, EvalError> {
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
@@ -409,7 +490,11 @@ fn evaluate<'script>(
             }
             Instruction::String(range) => {
                 range.get(string_units).ok_or(EvalError::InvalidScript)?;
-                push_operand(&mut stack, max_operands, Operand::String(range))?;
+                push_operand(
+                    &mut stack,
+                    max_operands,
+                    Operand::String(StringOperand::Literal(range)),
+                )?;
             }
             Instruction::Boolean(value) => {
                 push_operand(
@@ -457,7 +542,10 @@ fn evaluate<'script>(
             }
             Instruction::UpdateBinding { slot, op, result } => {
                 let value = writable_binding(&mut bindings, slot)?;
-                let old = value.to_number(string_units, &mut string_conversion_credits_left)?;
+                let old = value.to_number(
+                    scratch.pools(string_units),
+                    &mut string_conversion_credits_left,
+                )?;
                 let new = update_number(op, old);
                 let result = match result {
                     UpdateResult::New => new,
@@ -477,70 +565,79 @@ fn evaluate<'script>(
                 if !matches!(rhs, Operand::Scalar(Value::Number(1.0))) {
                     return Err(EvalError::InvalidScript);
                 }
-                let old = lhs.to_number(string_units, &mut string_conversion_credits_left)?;
+                let old = lhs.to_number(
+                    scratch.pools(string_units),
+                    &mut string_conversion_credits_left,
+                )?;
                 Ok(Value::Number(update_number(op, old)))
             })?,
-            Instruction::Add => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
-            Instruction::Subtract => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
+            Instruction::Add => {
+                apply_binary_operand(&mut stack, |lhs, rhs| add(lhs, rhs, string_units, scratch))?
+            }
+            Instruction::Subtract => apply_binary(&mut stack, |lhs, rhs| {
+                Ok(Value::Number(
+                    lhs.require_scalar()?.to_number() - rhs.require_scalar()?.to_number(),
+                ))
+            })?,
             Instruction::Multiply => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs * rhs,
             )?,
             Instruction::Divide => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs / rhs,
             )?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
             Instruction::Remainder => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs % rhs,
             )?,
             Instruction::Exponentiate => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 exponentiate,
             )?,
             Instruction::BitwiseAnd => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs & rhs),
             )?,
             Instruction::BitwiseXor => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs ^ rhs),
             )?,
             Instruction::BitwiseOr => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs | rhs),
             )?,
             // Rust's wrapping shifts use only the low five count bits for i32/u32.
             Instruction::ShiftLeft => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shl(number_to_uint32(rhs))),
             )?,
             Instruction::ShiftRight => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shr(number_to_uint32(rhs))),
             )?,
             Instruction::ShiftRightUnsigned => apply_numeric_binary(
                 &mut stack,
-                string_units,
+                scratch.pools(string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_uint32(lhs).wrapping_shr(number_to_uint32(rhs))),
             )?,
@@ -555,7 +652,7 @@ fn evaluate<'script>(
                         lhs,
                         rhs,
                         strict,
-                        string_units,
+                        scratch.pools(string_units),
                         &mut string_pairs_left,
                         &mut string_conversion_credits_left,
                     )?;
@@ -570,7 +667,7 @@ fn evaluate<'script>(
                     let order = operands_order(
                         lhs,
                         rhs,
-                        string_units,
+                        scratch.pools(string_units),
                         &mut string_pairs_left,
                         &mut string_conversion_credits_left,
                     )?;
@@ -593,15 +690,19 @@ fn evaluate<'script>(
             }
             Instruction::Positive => {
                 apply_unary(&mut stack, |value| {
-                    let number =
-                        value.to_number(string_units, &mut string_conversion_credits_left)?;
+                    let number = value.to_number(
+                        scratch.pools(string_units),
+                        &mut string_conversion_credits_left,
+                    )?;
                     Ok(Value::Number(number))
                 })?;
             }
             Instruction::Negate => {
                 apply_unary(&mut stack, |value| {
-                    let number =
-                        value.to_number(string_units, &mut string_conversion_credits_left)?;
+                    let number = value.to_number(
+                        scratch.pools(string_units),
+                        &mut string_conversion_credits_left,
+                    )?;
                     Ok(Value::Number(-number))
                 })?;
             }
@@ -610,8 +711,10 @@ fn evaluate<'script>(
             }
             Instruction::BitwiseNot => {
                 apply_unary(&mut stack, |value| {
-                    let number =
-                        value.to_number(string_units, &mut string_conversion_credits_left)?;
+                    let number = value.to_number(
+                        scratch.pools(string_units),
+                        &mut string_conversion_credits_left,
+                    )?;
                     Ok(Value::Number(f64::from(!number_to_int32(number))))
                 })?;
             }
@@ -664,11 +767,7 @@ fn evaluate<'script>(
     }
 
     match stack.as_slice() {
-        [Operand::Scalar(value)] => Ok(PrimitiveValue::Scalar(*value)),
-        [Operand::String(range)] => range
-            .get(string_units)
-            .map(PrimitiveValue::String)
-            .ok_or(EvalError::InvalidScript),
+        [value] => Ok(*value),
         _ => Err(EvalError::InvalidScript),
     }
 }
@@ -677,7 +776,7 @@ fn operands_equal(
     lhs: Operand,
     rhs: Operand,
     strict: bool,
-    string_units: &[u16],
+    strings: StringPools<'_>,
     string_pairs_left: &mut usize,
     credits_left: &mut usize,
 ) -> Result<bool, EvalError> {
@@ -688,8 +787,8 @@ fn operands_equal(
             lhs.loosely_equals(rhs)
         }),
         (Operand::String(lhs), Operand::String(rhs)) => {
-            let lhs = lhs.get(string_units).ok_or(EvalError::InvalidScript)?;
-            let rhs = rhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
+            let rhs = rhs.get(strings).ok_or(EvalError::InvalidScript)?;
             if lhs.len() != rhs.len() {
                 return Ok(false);
             }
@@ -701,8 +800,8 @@ fn operands_equal(
             if strict || matches!(scalar, Value::Null | Value::Undefined) {
                 Ok(false)
             } else {
-                let lhs = lhs.to_number(string_units, credits_left)?;
-                let rhs = rhs.to_number(string_units, credits_left)?;
+                let lhs = lhs.to_number(strings, credits_left)?;
+                let rhs = rhs.to_number(strings, credits_left)?;
                 Ok(lhs == rhs)
             }
         }
@@ -712,21 +811,21 @@ fn operands_equal(
 fn operands_order(
     lhs: Operand,
     rhs: Operand,
-    string_units: &[u16],
+    strings: StringPools<'_>,
     string_pairs_left: &mut usize,
     credits_left: &mut usize,
 ) -> Result<Option<Ordering>, EvalError> {
     match (lhs, rhs) {
         (Operand::String(lhs), Operand::String(rhs)) => {
-            let lhs = lhs.get(string_units).ok_or(EvalError::InvalidScript)?;
-            let rhs = rhs.get(string_units).ok_or(EvalError::InvalidScript)?;
+            let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
+            let rhs = rhs.get(strings).ok_or(EvalError::InvalidScript)?;
             charge_string_pairs(string_pairs_left, lhs.len().min(rhs.len()))?;
             // Slice ordering compares u16 values, then lengths if the prefix matches.
             Ok(Some(lhs.cmp(rhs)))
         }
         _ => {
-            let lhs = lhs.to_number(string_units, credits_left)?;
-            let rhs = rhs.to_number(string_units, credits_left)?;
+            let lhs = lhs.to_number(strings, credits_left)?;
+            let rhs = rhs.to_number(strings, credits_left)?;
             Ok(lhs.partial_cmp(&rhs))
         }
     }
@@ -783,9 +882,16 @@ fn apply_binary(
     stack: &mut Vec<Operand>,
     op: impl FnOnce(Operand, Operand) -> Result<Value, EvalError>,
 ) -> Result<(), EvalError> {
+    apply_binary_operand(stack, |lhs, rhs| op(lhs, rhs).map(Operand::Scalar))
+}
+
+fn apply_binary_operand(
+    stack: &mut Vec<Operand>,
+    op: impl FnOnce(Operand, Operand) -> Result<Operand, EvalError>,
+) -> Result<(), EvalError> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
     let lhs = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-    *lhs = Operand::Scalar(op(*lhs, rhs)?);
+    *lhs = op(*lhs, rhs)?;
     Ok(())
 }
 
@@ -796,27 +902,33 @@ fn update_number(op: Update, old: f64) -> f64 {
     }
 }
 
-fn apply_scalar_arithmetic(
-    stack: &mut Vec<Operand>,
-    op: impl FnOnce(f64, f64) -> f64,
-) -> Result<(), EvalError> {
-    apply_binary(stack, |lhs, rhs| {
-        let lhs = lhs.require_scalar()?;
-        let rhs = rhs.require_scalar()?;
-        Ok(Value::Number(op(lhs.to_number(), rhs.to_number())))
-    })
+fn add(
+    lhs: Operand,
+    rhs: Operand,
+    string_units: &[u16],
+    scratch: &mut EvalScratch,
+) -> Result<Operand, EvalError> {
+    match (lhs, rhs) {
+        (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(Operand::Scalar(Value::Number(
+            lhs.to_number() + rhs.to_number(),
+        ))),
+        (Operand::String(lhs), Operand::String(rhs)) => scratch
+            .concatenate(string_units, lhs, rhs)
+            .map(Operand::String),
+        _ => Err(EvalError::UnsupportedStringOperation),
+    }
 }
 
 fn apply_numeric_binary(
     stack: &mut Vec<Operand>,
-    string_units: &[u16],
+    strings: StringPools<'_>,
     credits_left: &mut usize,
     op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<(), EvalError> {
     // Both expressions have run; check arity before coercing left then right.
     apply_binary(stack, |lhs, rhs| {
-        let lhs = lhs.to_number(string_units, credits_left)?;
-        let rhs = rhs.to_number(string_units, credits_left)?;
+        let lhs = lhs.to_number(strings, credits_left)?;
+        let rhs = rhs.to_number(strings, credits_left)?;
         Ok(Value::Number(op(lhs, rhs)))
     })
 }
@@ -876,10 +988,21 @@ mod tests {
 
     // Keep the scalar instruction fixtures independent of the String pool.
     fn evaluate(ops: &[Instruction], peak: usize, slots: usize) -> Result<Value, EvalError> {
-        match super::evaluate(ops, peak, slots, &[])? {
-            PrimitiveValue::Scalar(value) => Ok(value),
-            PrimitiveValue::String(_) => panic!("unexpected String in scalar fixture"),
+        match super::evaluate(ops, peak, slots, &[], &mut EvalScratch::new())? {
+            Operand::Scalar(value) => Ok(value),
+            Operand::String(_) => panic!("unexpected String in scalar fixture"),
         }
+    }
+
+    fn evaluate_for_error(script: &Script, ops: &[Instruction]) -> Result<(), EvalError> {
+        super::evaluate(
+            ops,
+            script.max_stack_depth(),
+            script.binding_slots(),
+            script.string_units(),
+            &mut EvalScratch::new(),
+        )
+        .map(|_| ())
     }
 
     const INIT_CONST: Instruction = Instruction::InitBinding {
@@ -890,6 +1013,31 @@ mod tests {
         slot: 0,
         kind: BindingKind::Let,
     };
+
+    #[test]
+    fn compound_add_failure_stops_before_the_store() {
+        for (rhs, expected) in [
+            ("", EvalError::InvalidScript),
+            ("b", EvalError::StringConcatenationLengthLimitExceeded),
+        ] {
+            let lhs = "a".repeat(4094);
+            let script = crate::parse_script(&format!("let x = '{lhs}'; x += '{rhs}'; x")).unwrap();
+            let mut ops = script.instructions().to_vec();
+            let [
+                ..,
+                Instruction::Add,
+                store @ Instruction::StoreBinding(0),
+                Instruction::LoadBinding(0),
+            ] = ops.as_mut_slice()
+            else {
+                panic!("compound store must follow Add");
+            };
+            // Any attempt to dispatch the invalid store returns InvalidScript.
+            // It is only reached when the Add succeeds.
+            *store = Instruction::StoreBinding(usize::MAX);
+            assert_eq!(evaluate_for_error(&script, &ops), Err(expected));
+        }
+    }
 
     #[test]
     fn string_literal_dispatch_checks_range_even_if_empty_or_discarded() {
@@ -925,7 +1073,8 @@ mod tests {
             };
             assert_eq!(*actual, op);
             assert_eq!(
-                Operand::String(*range).to_number(&[], &mut 0),
+                Operand::String(StringOperand::Literal(*range))
+                    .to_number(StringPools::literals(&[]), &mut 0),
                 Err(EvalError::InvalidScript),
             );
             assert_eq!(
@@ -957,9 +1106,9 @@ mod tests {
         };
         // A malformed operand cannot pass literal dispatch. Inject it here to
         // distinguish which conversion ran first when both would fail.
-        let pool = &script.string_units()[..1];
-        let valid = Operand::String(*lhs);
-        let invalid = Operand::String(*rhs);
+        let pool = StringPools::literals(&script.string_units()[..1]);
+        let valid = Operand::String(StringOperand::Literal(*lhs));
+        let invalid = Operand::String(StringOperand::Literal(*rhs));
         let no_math = |_, _| panic!("numeric operation ran after a failed check");
         for mut stack in [vec![], vec![valid]] {
             let mut credits = 261;
@@ -999,14 +1148,7 @@ mod tests {
         let rhs_index = ops.len() - 4;
         let slot = script.binding_slots() - 1;
         assert_eq!(ops[rhs_index], Number(1.0));
-        let run = |ops: &[Instruction]| {
-            super::evaluate(
-                ops,
-                script.max_stack_depth(),
-                script.binding_slots(),
-                script.string_units(),
-            )
-        };
+        let run = |ops: &[Instruction]| evaluate_for_error(&script, ops);
         assert_eq!(
             run(&ops),
             Err(EvalError::StringNumericConversionLimitExceeded)
@@ -1033,12 +1175,7 @@ mod tests {
                 result: UpdateResult::Old,
             };
             assert_eq!(
-                super::evaluate(
-                    &ops,
-                    script.max_stack_depth(),
-                    script.binding_slots(),
-                    script.string_units()
-                ),
+                evaluate_for_error(&script, &ops),
                 Err(EvalError::InvalidScript),
             );
         }
@@ -1056,8 +1193,11 @@ mod tests {
             panic!("expected two literal instructions and a comparison");
         };
         // Only the first range fits in this truncated pool.
-        let short_pool = &script.string_units()[..1];
-        let (a, b) = (Operand::String(*a), Operand::String(*b));
+        let short_pool = StringPools::literals(&script.string_units()[..1]);
+        let (a, b) = (
+            Operand::String(StringOperand::Literal(*a)),
+            Operand::String(StringOperand::Literal(*b)),
+        );
         let number = Operand::Scalar(Value::Number(0.0));
         for (lhs, rhs) in [(a, b), (b, a), (b, number), (number, b)] {
             assert_eq!(
@@ -1092,12 +1232,7 @@ mod tests {
             // detecting the missing operand would fail with conversion exhaustion.
             ops.push(op);
             assert_eq!(
-                super::evaluate(
-                    &ops,
-                    script.max_stack_depth(),
-                    script.binding_slots(),
-                    script.string_units(),
-                ),
+                evaluate_for_error(&script, &ops),
                 Err(EvalError::InvalidScript)
             );
             ops.pop();

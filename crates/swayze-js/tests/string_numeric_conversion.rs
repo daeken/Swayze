@@ -675,8 +675,8 @@ fn rhs_errors_precede_coercion_and_skipped_binary_operators_do_not_convert() {
     let exhausted = unary_budget_prefix(63);
     for op in BINARY_OPS.into_iter().chain(BITWISE_OPS.map(|(op, _)| op)) {
         for source in [
-            format!("{exhausted}'' {op} ('' + '')"),
-            format!("{exhausted}let x = ''; x {op}= ('' + ''); x"),
+            format!("{exhausted}'' {op} ('' + 1)"),
+            format!("{exhausted}let x = ''; x {op}= ('' + 1); x"),
         ] {
             assert_eq!(
                 parse_script(&source).unwrap().evaluate(),

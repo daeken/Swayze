@@ -472,14 +472,7 @@ fn skipped_mixed_comparisons_still_validate_literals_and_bindings() {
 
 #[test]
 fn unsupported_operations_fail_only_when_dispatched() {
-    for expr in [
-        "'a' + 'b'",
-        "'2' + 1",
-        "1 + '2'",
-        "'2' - 1",
-        "1 - '2'",
-        "void ('' + '')",
-    ] {
+    for expr in ["'2' + 1", "1 + '2'", "'2' - 1", "1 - '2'", "'a' - 'b'"] {
         let script = parse_script(expr).unwrap();
         assert_eq!(
             script.evaluate_primitive(),

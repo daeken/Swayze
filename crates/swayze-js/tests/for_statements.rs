@@ -514,12 +514,12 @@ fn no_comma_stores_and_leading_update_restrictions_remain_unchanged() {
         ("let i;for(i, -i+=1;false;){}0", "+=", assignment_expr),
         ("let i;for(;false;((i)=1)){}0", "=", assignment_expr),
         (
-            "let i=0,j=0;for(i++,j++;false;){}0",
+            "let i=0,j=0;for(i++ + j,j++;false;){}0",
             "i|++",
             standalone_update,
         ),
         (
-            "let i=0,j=0;for(;false;++i,j--){}0",
+            "let i=0,j=0;for(;false;++i ** 2,j--){}0",
             "++",
             standalone_update,
         ),
@@ -1037,6 +1037,33 @@ fn non_store_clauses_share_exact_token_work_and_nesting_caps() {
 }
 
 #[test]
+fn update_sequence_suffix_uses_the_shared_header_nesting_budget() {
+    let source = "let x;for(++x,null;false;x++,(null)){}x";
+    let start = source.find("(null").unwrap();
+    let limits = Limits {
+        max_nesting_depth: 2,
+        ..Limits::default()
+    };
+    assert!(parse_script_with_limits(source, limits).is_ok());
+    let error = parse_script_with_limits(
+        source,
+        Limits {
+            max_nesting_depth: 1,
+            ..limits
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+    assert_eq!(
+        error.span(),
+        Span {
+            start,
+            end: start + 1
+        }
+    );
+}
+
+#[test]
 fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
     for (source, tokens, instructions, depth, value) in [
         (
@@ -1059,6 +1086,20 @@ fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
             16,
             2,
             Value::Number(2.0),
+        ),
+        (
+            "let x=false;for(++x;false;x--){}x",
+            18,
+            16,
+            2,
+            Value::Number(1.0),
+        ),
+        (
+            "let x=false;for(++x,/*é*/null;false;x--,false){}x",
+            22,
+            20,
+            2,
+            Value::Number(1.0),
         ),
     ] {
         // Besides scanned bytes and emissions: one header and one frame,
@@ -1111,23 +1152,26 @@ fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
 
 #[test]
 fn the_first_comma_meters_the_store_before_scanning_the_next_operand() {
-    let source = "let x;for(x=true,null;false;){}x";
-    let comma = source.find(',').unwrap();
-    let limits = Limits {
-        // Bytes through the comma, two declaration instructions, one
-        // header and one RHS literal instruction. The next charge is the store.
-        max_work: comma + 1 + 4,
-        ..Limits::default()
-    };
-    let error = parse_script_with_limits(source, limits).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
-    assert_eq!(
-        error.span(),
-        Span {
-            start: comma,
-            end: comma + 1
-        }
-    );
+    for (store, emissions) in [("x=true", 1), ("++x", 3), ("x--", 3)] {
+        let source = format!("let x;for({store},null;false;){{}}x");
+        let comma = source.find(',').unwrap();
+        let limits = Limits {
+            // Bytes through the comma, two declaration instructions, one
+            // header and the leading operand's emissions before StoreBinding.
+            max_work: comma + 1 + 3 + emissions,
+            ..Limits::default()
+        };
+        let error = parse_script_with_limits(&source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(
+            error.span(),
+            Span {
+                start: comma,
+                end: comma + 1
+            },
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -1147,6 +1191,39 @@ fn assignment_sequence_suffix_counts_even_in_an_unreached_update() {
         assert_eq!(script.instruction_count(), instructions);
         assert_eq!(script.max_stack_depth(), 1);
         assert_eq!(script.evaluate_value(), expected);
+    }
+}
+
+#[test]
+fn update_sequences_use_the_shared_prepared_and_dispatch_ceilings() {
+    let tail = ",null".repeat(2042);
+    let limits = Limits {
+        max_tokens: 8192,
+        max_nesting_depth: 1,
+        ..Limits::default()
+    };
+    for (final_expr, instructions, expected) in [
+        ("x", 4096, Ok(Value::Undefined)),
+        ("!x", 4097, Err(EvalError::LimitExceeded)),
+    ] {
+        let source = format!("let x;for(;false;x++{tail}){{}}{final_expr}");
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), instructions);
+        assert_eq!(script.max_stack_depth(), 2);
+        assert_eq!(script.evaluate_value(), expected);
+    }
+
+    // Eight setup dispatches, 13 per continuing iteration (4 test, 1 body
+    // jump, 1 continue, 4 update, 2 suffix, 1 back edge), then 4 for the
+    // failed test and 1 for the final load. Four unary ops land on 16,384.
+    for (padding, expected) in [(4, Ok(1260.0)), (5, Err(EvalError::DispatchLimitExceeded))] {
+        let source = format!(
+            "let i=0;for(++i,null;i<1260;i++,null){{continue;}}{}i",
+            "+ ".repeat(padding)
+        );
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.instruction_count(), 23 + padding);
+        assert_eq!(script.evaluate(), expected);
     }
 }
 

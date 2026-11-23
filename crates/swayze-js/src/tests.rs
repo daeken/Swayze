@@ -500,6 +500,43 @@ fn for_assignment_sequences_store_first_and_join_with_an_empty_stack() {
 }
 
 #[test]
+fn for_update_sequences_discard_only_the_suffix_values() {
+    use Instruction::{
+        Boolean, Discard, JumpIfFalseStatement, JumpStatement, LoopBack, Null, StoreBinding,
+        StoreBindingKeep, Subtract,
+    };
+
+    assert_postfix(
+        "let x=false;for(++x,x=true;false;x--,null){continue;}x",
+        &[
+            Boolean(false),
+            init_let(0),
+            LoadBinding(0),
+            Number(1.0),
+            Add,
+            StoreBinding(0), // leading prefix update leaves no operand
+            Boolean(true),
+            StoreBindingKeep(0),
+            Discard,
+            Boolean(false), // 9: test
+            JumpIfFalseStatement(21),
+            JumpStatement(19),
+            LoadBinding(0), // 12: update
+            Number(1.0),
+            Subtract,
+            StoreBinding(0), // leading postfix update leaves no operand
+            Null,
+            Discard,
+            LoopBack(9),
+            LoopBack(12),   // 19: continue
+            LoopBack(12),   // body fallthrough
+            LoadBinding(0), // 21: exit
+        ],
+        2,
+    );
+}
+
+#[test]
 fn for_expression_clauses_join_at_discards_before_statement_edges() {
     use crate::parser::ShortCircuitCondition;
     use Instruction::{

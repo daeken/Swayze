@@ -5,6 +5,20 @@ use crate::parser::Instruction::{
 };
 use crate::{ErrorKind, Limit, Limits, Span, parse_script, parse_script_with_limits};
 
+const fn init_const(slot: usize) -> Instruction {
+    InitBinding {
+        slot,
+        kind: BindingKind::Const,
+    }
+}
+
+const fn init_let(slot: usize) -> Instruction {
+    InitBinding {
+        slot,
+        kind: BindingKind::Let,
+    }
+}
+
 fn assert_postfix(source: &str, expected: &[Instruction], depth: usize) {
     let script = parse_script(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
     assert_eq!(script.instruction_count(), expected.len());
@@ -32,7 +46,7 @@ fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
         "let x=0;if(true){x=1;}else{x=2+(3+4);}x",
         &[
             Number(0.0),
-            InitBinding(BindingKind::Let),
+            init_let(0),
             Boolean(true),
             JumpIfFalseStatement(7),
             Number(1.0),
@@ -56,6 +70,33 @@ fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
 }
 
 #[test]
+fn sibling_bindings_and_a_later_root_binding_have_distinct_fixed_slots() {
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, StoreBinding};
+    assert_postfix(
+        "let out=0;if(false){let x=1;out=x;}else{const x=2;out=x;}const y=out;y",
+        &[
+            Number(0.0),
+            init_let(0),
+            Boolean(false),
+            JumpIfFalseStatement(9),
+            Number(1.0),
+            init_let(1),
+            LoadBinding(1),
+            StoreBinding(0),
+            JumpStatement(13),
+            Number(2.0),
+            init_const(2),
+            LoadBinding(2),
+            StoreBinding(0),
+            LoadBinding(0),
+            init_const(3),
+            LoadBinding(3),
+        ],
+        1,
+    );
+}
+
+#[test]
 fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
     use Instruction::{Boolean, JumpIfFalseStatement, LoopBack, StoreBinding};
 
@@ -63,7 +104,7 @@ fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
         "let x=1;while(x){x=x-(2+3);}x",
         &[
             Number(1.0),
-            InitBinding(BindingKind::Let),
+            init_let(0),
             LoadBinding(0),
             JumpIfFalseStatement(11),
             LoadBinding(0),
@@ -378,7 +419,7 @@ fn booleans_are_whole_tokens_not_names_or_prefixes_of_names() {
             assert_error(&name, Unsupported, 0, name.len());
             assert_postfix(
                 &format!("let {name}=true;{name}"),
-                &[Boolean(true), InitBinding(BindingKind::Let), LoadBinding(0)],
+                &[Boolean(true), init_let(0), LoadBinding(0)],
                 1,
             );
         }
@@ -402,11 +443,7 @@ fn booleans_are_whole_tokens_not_names_or_prefixes_of_names() {
     }
     assert_postfix(
         "const True=false; True",
-        &[
-            Boolean(false),
-            InitBinding(BindingKind::Const),
-            LoadBinding(0),
-        ],
+        &[Boolean(false), init_const(0), LoadBinding(0)],
         1,
     );
     assert_error("true=1; false", Unsupported, 4, 5);
@@ -789,11 +826,11 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
         "const x = 2; const y = x * 5; y + 1;",
         &[
             Number(2.),
-            InitBinding(BindingKind::Const),
+            init_const(0),
             LoadBinding(0),
             Number(5.),
             Multiply,
-            InitBinding(BindingKind::Const),
+            init_const(1),
             LoadBinding(1),
             Number(1.),
             Add,
@@ -804,13 +841,13 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
         "const constx=1; const const0=constx; const const_=const0; const const$=const_; const$",
         &[
             Number(1.),
-            InitBinding(BindingKind::Const),
+            init_const(0),
             LoadBinding(0),
-            InitBinding(BindingKind::Const),
+            init_const(1),
             LoadBinding(1),
-            InitBinding(BindingKind::Const),
+            init_const(2),
             LoadBinding(2),
-            InitBinding(BindingKind::Const),
+            init_const(3),
             LoadBinding(3),
         ],
         1,
@@ -821,9 +858,9 @@ fn consts_compile_to_ordered_slots_and_share_the_operand_stack() {
             Number(2.),
             Number(1.),
             Add,
-            InitBinding(BindingKind::Const),
+            init_const(0),
             LoadBinding(0),
-            InitBinding(BindingKind::Const),
+            init_const(1),
             LoadBinding(1),
         ],
         2,
@@ -920,7 +957,7 @@ fn duplicate_declarations_are_early_errors_and_unavailable_reads_are_unsupported
             parse_script(source)
                 .unwrap_err()
                 .message()
-                .contains("earlier declaration")
+                .contains("earlier visible declaration")
         );
     }
 }
@@ -973,9 +1010,9 @@ fn lets_and_assignments_compile_to_ordered_slot_operations() {
         "let x = 2; const step = 5; x = x * step; x + 1;",
         &[
             Number(2.),
-            InitBinding(BindingKind::Let),
+            init_let(0),
             Number(5.),
-            InitBinding(BindingKind::Const),
+            init_const(1),
             LoadBinding(0),
             LoadBinding(1),
             Multiply,
@@ -990,13 +1027,13 @@ fn lets_and_assignments_compile_to_ordered_slot_operations() {
         "let/**/let0=1; let let_=let0; let let$=let_; let Let=let$; Let",
         &[
             Number(1.),
-            InitBinding(BindingKind::Let),
+            init_let(0),
             LoadBinding(0),
-            InitBinding(BindingKind::Let),
+            init_let(1),
             LoadBinding(1),
-            InitBinding(BindingKind::Let),
+            init_let(2),
             LoadBinding(2),
-            InitBinding(BindingKind::Let),
+            init_let(3),
             LoadBinding(3),
         ],
         1,

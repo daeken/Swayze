@@ -109,18 +109,20 @@ impl Script {
     /// left operand; otherwise they evaluate and return the right operand.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. An `if` statement uses the same
-    /// truthiness but evaluates only the selected branch's assignments, leaving
-    /// no operand stack result. A falsy test with no `else` performs no writes.
+    /// truthiness but executes only the selected branch, leaving no operand
+    /// stack result. A falsy test with no `else` performs no writes.
     /// A `while` statement evaluates its test before each iteration and runs its
     /// body only when the test is truthy. `break;` exits the innermost enclosing
     /// loop, and `continue;` returns to its test. None leaves a result.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments use fresh immutable `const` and mutable `let` slots for
-    /// each call. Independent of parse limits, a script can have at most 4,096
-    /// prepared instructions, including jumps and skipped paths. Each call can
-    /// dispatch at most 16,384 instructions; each execution of an instruction
-    /// counts once, including tests, jumps, and repeated loop instructions.
+    /// each call. A block declaration initializes its slot each time it executes,
+    /// including on repeated loop iterations. Independent of parse limits, a
+    /// script can have at most 4,096 prepared instructions, including jumps and
+    /// skipped paths. Each call can dispatch at most 16,384 instructions; each
+    /// execution of an instruction counts once, including tests, jumps, and
+    /// repeated loop instructions.
     ///
     /// # Errors
     ///
@@ -137,9 +139,10 @@ impl Script {
     }
 }
 
-enum Slot {
-    Const(Value),
-    Let(Value),
+struct Slot {
+    init_at: usize,
+    kind: BindingKind,
+    value: Value,
 }
 
 fn evaluate(
@@ -166,12 +169,17 @@ fn evaluate(
         .try_reserve_exact(max_operands)
         .map_err(|_| EvalError::AllocationFailed)?;
 
-    // An initialized prefix in declaration order, local to this evaluation.
-    // Only the value of a mutable slot can be replaced.
-    let mut bindings = Vec::new();
+    // Each declaration has its own slot, local to this evaluation. Slots in
+    // untaken paths may remain empty. Only an initializer can reset a const.
+    // No clearing on scope exit is needed: the parser emits references only
+    // within the declaration's scope after its initializer. A jump can skip a
+    // block or leave it, but cannot enter a suffix from outside the block.
+    // Loop back edges restart at a test, before the body initializes again.
+    let mut bindings = Vec::<Option<Slot>>::new();
     bindings
         .try_reserve_exact(binding_slots)
         .map_err(|_| EvalError::AllocationFailed)?;
+    bindings.resize_with(binding_slots, || None);
 
     // `ops.len()` denotes exit, which is not a dispatch and needs no fuel.
     let mut remaining = MAX_DISPATCHES;
@@ -190,22 +198,32 @@ fn evaluate(
                 push_operand(&mut stack, max_operands, Value::Boolean(value))?;
             }
             Instruction::LoadBinding(slot) => {
-                let (Slot::Const(value) | Slot::Let(value)) =
-                    *bindings.get(slot).ok_or(EvalError::InvalidScript)?;
-                push_operand(&mut stack, max_operands, value)?;
+                let binding = bindings
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .ok_or(EvalError::InvalidScript)?;
+                push_operand(&mut stack, max_operands, binding.value)?;
             }
-            Instruction::InitBinding(kind) => {
-                if bindings.len() == binding_slots || stack.len() != 1 {
+            Instruction::InitBinding { slot, kind } => {
+                let binding = bindings.get_mut(slot).ok_or(EvalError::InvalidScript)?;
+                let init_at = ip - 1;
+                if stack.len() != 1 || binding.as_ref().is_some_and(|old| old.init_at != init_at) {
                     return Err(EvalError::InvalidScript);
                 }
                 let value = stack.pop().ok_or(EvalError::InvalidScript)?;
-                bindings.push(match kind {
-                    BindingKind::Const => Slot::Const(value),
-                    BindingKind::Let => Slot::Let(value),
+                *binding = Some(Slot {
+                    init_at,
+                    kind,
+                    value,
                 });
             }
             Instruction::StoreBinding(slot) => {
-                let Some(Slot::Let(value)) = bindings.get_mut(slot) else {
+                let Some(Some(Slot {
+                    kind: BindingKind::Let,
+                    value,
+                    ..
+                })) = bindings.get_mut(slot)
+                else {
                     return Err(EvalError::InvalidScript);
                 };
                 if stack.len() != 1 {
@@ -280,7 +298,7 @@ fn evaluate(
     }
 
     match stack.as_slice() {
-        [value] if bindings.len() == binding_slots => Ok(*value),
+        [value] => Ok(*value),
         _ => Err(EvalError::InvalidScript),
     }
 }
@@ -343,8 +361,14 @@ fn apply_relational(
 mod tests {
     use super::*;
 
-    const INIT_CONST: Instruction = Instruction::InitBinding(BindingKind::Const);
-    const INIT_LET: Instruction = Instruction::InitBinding(BindingKind::Let);
+    const INIT_CONST: Instruction = Instruction::InitBinding {
+        slot: 0,
+        kind: BindingKind::Const,
+    };
+    const INIT_LET: Instruction = Instruction::InitBinding {
+        slot: 0,
+        kind: BindingKind::Let,
+    };
 
     #[test]
     fn rejects_malformed_postfix() {
@@ -632,14 +656,21 @@ mod tests {
             (&[one, INIT_CONST, LoadBinding(usize::MAX)][..], 1, 1),
             (&[one, one, INIT_CONST, one][..], 2, 1), // excess operands at initialization
             (&[INIT_CONST, one, one][..], 2, 1),      // missing operand at initialization
-            (&[one, INIT_CONST, one, INIT_CONST, one][..], 1, 1), // excess initializations
+            (&[one, INIT_CONST, one, INIT_CONST, one][..], 1, 1), // distinct initializers of slot 0
             (
-                &[one, Instruction::Positive, Instruction::Positive][..],
+                &[
+                    one,
+                    Instruction::InitBinding {
+                        slot: usize::MAX,
+                        kind: BindingKind::Const,
+                    },
+                    one,
+                ][..],
                 1,
                 1,
-            ), // missing initialization
-            (&[one, INIT_CONST][..], 1, 1),           // no final expression
-            (&[one][..], 1, usize::MAX),              // invalid reservation
+            ),
+            (&[one, INIT_CONST][..], 1, 1), // no final expression
+            (&[one][..], 1, usize::MAX),    // invalid reservation
         ] {
             assert_eq!(evaluate(ops, peak, slots), Err(EvalError::InvalidScript));
         }
@@ -647,6 +678,27 @@ mod tests {
             evaluate(&[one, INIT_CONST, LoadBinding(0)], 1, 1),
             Ok(Value::Number(1.0))
         );
+    }
+
+    #[test]
+    fn initialization_can_skip_slots_but_access_requires_initialization() {
+        use Instruction::{JumpStatement, LoadBinding, Number, StoreBinding};
+        let mut ops = [
+            JumpStatement(3),
+            Number(2.0),
+            INIT_LET,
+            Number(3.0),
+            Instruction::InitBinding {
+                slot: 1,
+                kind: BindingKind::Const,
+            },
+            LoadBinding(1),
+        ];
+        assert_eq!(evaluate(&ops, 1, 2), Ok(Value::Number(3.0)));
+        ops[5] = LoadBinding(0);
+        assert_eq!(evaluate(&ops, 1, 2), Err(EvalError::InvalidScript));
+        ops[4] = StoreBinding(0);
+        assert_eq!(evaluate(&ops, 1, 2), Err(EvalError::InvalidScript));
     }
 
     #[test]
@@ -678,7 +730,13 @@ mod tests {
         let slots = (MAX_INSTRUCTIONS - 1) / 2;
         let mut ops = Vec::new();
         for slot in 0..slots {
-            ops.extend([Instruction::Number(slot as f64), INIT_CONST]);
+            ops.extend([
+                Instruction::Number(slot as f64),
+                Instruction::InitBinding {
+                    slot,
+                    kind: BindingKind::Const,
+                },
+            ]);
         }
         ops.extend([Instruction::LoadBinding(slots - 1), Instruction::Positive]);
         assert_eq!(ops.len(), MAX_INSTRUCTIONS);

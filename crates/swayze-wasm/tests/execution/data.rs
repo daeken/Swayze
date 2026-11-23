@@ -263,8 +263,8 @@ fn bounds_count_and_aggregate_retained_bytes_inclusively_even_with_overlap() {
     for _ in 2..8 {
         push_segment(&mut payload, PAGE, &[]);
     }
-    let module = data_module(&payload);
-    let instance = module.instantiate().unwrap();
+    let validated = data_module(&payload);
+    let instance = validated.instantiate().unwrap();
     assert_eq!(
         instance.invoke_i32_with_args("read", &[span as i32 - 4]),
         Ok(0x0202_0202)
@@ -274,7 +274,17 @@ fn bounds_count_and_aggregate_retained_bytes_inclusively_even_with_overlap() {
     let mut oversized = data_payload(&[(0, &first), (0, &second)]);
     oversized[0] = 3;
     let last_length = push_segment(&mut oversized, 0, &[3]);
-    bad_data(&oversized, last_length, ErrorKind::LimitExceeded { limit });
+    // More initial memory does not increase the aggregate data allowance.
+    for memory in [ONE_PAGE, TWO_PAGES] {
+        let mut bytes = module(&[(5, memory)]);
+        let start = push_section(&mut bytes, DATA, &oversized);
+        push_section(&mut bytes, 0, &[0]);
+        expect_error(
+            &bytes,
+            start + last_length,
+            ErrorKind::LimitExceeded { limit },
+        );
+    }
     payload[0] = 9;
     bad_data(
         &payload,

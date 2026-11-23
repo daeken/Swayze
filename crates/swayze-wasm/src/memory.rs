@@ -1,11 +1,8 @@
 use crate::{InstantiationError, ReadMemoryError, Trap};
-use std::{
-    cell::{Cell, OnceCell},
-    collections::TryReserveError,
-    fmt,
-};
+use std::{cell::RefCell, collections::TryReserveError, fmt, ops::Range};
 
-pub(super) const MAX_MEMORY_PAGES: u32 = 1;
+pub(super) const MAX_INSTANCE_MEMORY_PAGES: u32 = 2;
+pub(super) const MEMORY32_MAX_PAGES: u32 = 65_536;
 pub(super) const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -66,10 +63,10 @@ impl fmt::Debug for DataSegment {
 }
 
 pub(super) struct LinearMemory {
-    // Empty until a single, fully initialized page is installed. Existing
-    // pages are never reallocated, and no borrowed view escapes this type.
-    page: OnceCell<Vec<Cell<u8>>>,
-    maximum_pages: u32,
+    // A whole number of pages, never larger than `cap_pages`. No view escapes,
+    // and no allocation, deallocation, or guest dispatch holds a borrow.
+    bytes: RefCell<Vec<u8>>,
+    cap_pages: u32,
 }
 
 impl LinearMemory {
@@ -96,104 +93,123 @@ impl LinearMemory {
         limits: Option<MemoryLimits>,
         segments: &[DataSegment],
     ) -> Result<Self, InstantiationError> {
-        let maximum_pages =
-            limits.map_or(0, |limits| limits.maximum_pages.unwrap_or(MAX_MEMORY_PAGES));
-        if limits.is_none_or(|limits| limits.minimum_pages == 0) {
-            // Preflight only permits empty segments at offset zero in this case.
-            return Ok(Self {
-                page: OnceCell::new(),
-                maximum_pages,
-            });
+        let (minimum_pages, cap_pages) = limits.map_or((0, 0), |limits| {
+            (
+                limits.minimum_pages,
+                limits
+                    .maximum_pages
+                    .unwrap_or(MAX_INSTANCE_MEMORY_PAGES)
+                    .min(MAX_INSTANCE_MEMORY_PAGES),
+            )
+        });
+        let byte_len = minimum_pages as usize * MEMORY_PAGE_BYTES;
+        let mut bytes = Vec::new();
+        if byte_len != 0 {
+            bytes
+                .try_reserve_exact(byte_len)
+                .map_err(|_| InstantiationError::MemoryAllocationFailed)?;
+            Self::zero_tail(&mut bytes, byte_len);
         }
-        let mut bytes =
-            Self::allocate_page().map_err(|_| InstantiationError::MemoryAllocationFailed)?;
         // The preflight guarantees these conversions and ranges fit. Copy in
         // source order so later segments overwrite any earlier overlapping bytes.
         for segment in segments {
             let start = segment.offset as usize;
-            let destination = &mut bytes[start..start + segment.bytes.len()];
-            for (byte, &value) in destination.iter_mut().zip(&segment.bytes) {
-                *byte.get_mut() = value;
-            }
+            bytes[start..start + segment.bytes.len()].copy_from_slice(&segment.bytes);
         }
         Ok(Self {
-            page: OnceCell::from(bytes),
-            maximum_pages,
+            bytes: RefCell::new(bytes),
+            cap_pages,
         })
     }
 
-    fn allocate_page() -> Result<Vec<Cell<u8>>, TryReserveError> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(MEMORY_PAGE_BYTES)?;
-        // Capacity has already been reserved; zeroing does not allocate.
-        bytes.resize_with(MEMORY_PAGE_BYTES, || Cell::new(0));
-        Ok(bytes)
+    fn zero_tail(bytes: &mut Vec<u8>, byte_len: usize) {
+        // Vec::push is guaranteed not to allocate while capacity suffices.
+        assert!(bytes.capacity() >= byte_len);
+        while bytes.len() < byte_len {
+            bytes.push(0);
+        }
     }
 
     pub(super) fn size_in_pages(&self) -> i32 {
-        i32::from(self.page.get().is_some())
+        (self.bytes.borrow().len() / MEMORY_PAGE_BYTES) as i32
     }
 
     pub(super) fn grow(&self, delta: u32) -> i32 {
-        self.grow_with(delta, Self::allocate_page)
+        self.grow_with(delta, Vec::try_reserve_exact)
     }
 
     fn grow_with(
         &self,
         delta: u32,
-        allocate_page: impl FnOnce() -> Result<Vec<Cell<u8>>, TryReserveError>,
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
     ) -> i32 {
         let previous = self.size_in_pages();
         if delta == 0 {
             return previous;
         }
-        // Under the one-page cap the only possible growth is from zero to one.
-        if previous != 0 || delta != 1 || delta > self.maximum_pages {
+        // The current size never exceeds the cap. Check the delta against
+        // headroom before adding it, so even an unsigned -1 cannot wrap.
+        let previous_pages = previous as u32;
+        if delta > self.cap_pages - previous_pages {
             return -1;
         }
-        match allocate_page() {
-            Ok(page) => self.page.set(page).map_or(-1, |()| previous),
-            Err(_) => -1,
+        let byte_len = (previous_pages + delta) as usize * MEMORY_PAGE_BYTES;
+        let mut replacement = Vec::new();
+        if reserve(&mut replacement, byte_len).is_err() {
+            return -1;
         }
-    }
-
-    fn bytes(&self) -> &[Cell<u8>] {
-        self.page.get().map_or(&[], Vec::as_slice)
+        // We have reserved the complete new length, from an empty Vec. With
+        // no reentry the old length still matches the preflight and is
+        // strictly smaller. Use Vec::push's no-allocation guarantee rather
+        // than relying on the current allocation behavior of a bulk method.
+        assert!(replacement.is_empty() && replacement.capacity() >= byte_len);
+        {
+            let old = self.bytes.borrow();
+            assert_eq!(old.len(), previous_pages as usize * MEMORY_PAGE_BYTES);
+            for &byte in old.iter() {
+                replacement.push(byte);
+            }
+        }
+        Self::zero_tail(&mut replacement, byte_len);
+        let old = self.bytes.replace(replacement);
+        drop(old); // RefCell::replace has ended its mutable borrow before deallocation.
+        previous
     }
 
     pub(super) fn copy_out(&self, offset: u32, dest: &mut [u8]) -> Result<(), ReadMemoryError> {
-        let start = usize::try_from(offset).map_err(|_| ReadMemoryError::OutOfBounds)?;
+        let bytes = self.bytes.borrow();
+        let start = u64::from(offset);
         let end = start
-            .checked_add(dest.len())
+            .checked_add(dest.len() as u64)
+            .filter(|&end| end <= bytes.len() as u64)
             .ok_or(ReadMemoryError::OutOfBounds)?;
-        let bytes = self
-            .bytes()
-            .get(start..end)
-            .ok_or(ReadMemoryError::OutOfBounds)?;
-        for (dst, byte) in dest.iter_mut().zip(bytes) {
-            *dst = byte.get();
-        }
+        dest.copy_from_slice(&bytes[start as usize..end as usize]);
         Ok(())
     }
 
-    fn access(&self, base: i32, offset: u32, width: AccessWidth) -> Result<&[Cell<u8>], Trap> {
+    fn access_range(
+        byte_len: usize,
+        base: i32,
+        offset: u32,
+        width: AccessWidth,
+    ) -> Result<Range<usize>, Trap> {
         // Each input has at most 32 bits. Both the unsigned effective address
         // and its exclusive end fit in u64 without wrapping. Only narrow after
         // checking the entire range against the actual allocation length.
         let start = u64::from(base as u32) + u64::from(offset);
         let end = start + width as u64;
-        let bytes = self.bytes();
-        if end > bytes.len() as u64 {
+        if end > byte_len as u64 {
             return Err(Trap::MemoryOutOfBounds);
         }
-        Ok(&bytes[start as usize..end as usize])
+        Ok(start as usize..end as usize)
     }
 
     pub(super) fn load(&self, base: i32, offset: u32, kind: LoadKind) -> Result<i64, Trap> {
-        let bytes = self.access(base, offset, kind.width())?;
         let mut le = [0; 8];
-        for (dst, byte) in le.iter_mut().zip(bytes) {
-            *dst = byte.get();
+        {
+            let bytes = self.bytes.borrow();
+            let range = Self::access_range(bytes.len(), base, offset, kind.width())?;
+            le[..range.len()].copy_from_slice(&bytes[range]);
         }
         let value = i64::from_le_bytes(le);
         // The zero padding already handles unsigned extension.
@@ -215,20 +231,19 @@ impl LinearMemory {
         width: AccessWidth,
         value: i64,
     ) -> Result<(), Trap> {
-        // The range is checked before setting any cell. Zipping with the slice
-        // writes only the low bytes of the value.
-        let bytes = self.access(base, offset, width)?;
-        for (byte, value) in bytes.iter().zip(value.to_le_bytes()) {
-            byte.set(value);
-        }
+        let le = value.to_le_bytes();
+        let mut bytes = self.bytes.borrow_mut();
+        let range = Self::access_range(bytes.len(), base, offset, width)?;
+        bytes[range].copy_from_slice(&le[..width as usize]);
         Ok(())
     }
 }
 
 impl fmt::Debug for LinearMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let byte_len = self.bytes.borrow().len();
         f.debug_struct("LinearMemory")
-            .field("byte_len", &self.bytes().len())
+            .field("byte_len", &byte_len)
             .finish_non_exhaustive()
     }
 }
@@ -249,40 +264,63 @@ mod tests {
             )
             .unwrap()
         };
-        let no_reserve = || panic!("this delta must never request a reserve");
-        let blocked = make_memory(0, Some(0));
-        assert!(blocked.page.get().is_none());
-        assert_eq!(blocked.grow_with(1, no_reserve), -1);
+        let no_reserve = |_: &mut Vec<u8>, _| panic!("this delta must never request a reserve");
+        assert_eq!(make_memory(0, Some(0)).grow_with(1, no_reserve), -1);
+        assert_eq!(make_memory(1, Some(1)).grow_with(1, no_reserve), -1);
 
-        let memory = make_memory(0, None);
-        assert!(memory.page.get().is_none());
-        assert_eq!(memory.grow_with(0, no_reserve), 0);
-        for delta in [2, u32::MAX] {
-            assert_eq!(memory.grow_with(delta, no_reserve), -1);
-        }
-
-        // A capacity overflow supplies a TryReserveError deterministically,
-        // without needing an unsafe global allocator or inducing real OOM.
-        let error = Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err();
-        assert_eq!(memory.grow_with(1, || Err(error)), -1);
-        assert!(memory.page.get().is_none());
-        assert_eq!(
-            memory.load(0, 0, LoadKind::WordUnsigned),
-            Err(Trap::MemoryOutOfBounds)
-        );
-
-        assert_eq!(memory.grow(1), 0);
-        let bytes = memory.bytes();
-        assert_eq!(bytes.len(), MEMORY_PAGE_BYTES);
-        assert!(bytes.iter().all(|byte| byte.get() == 0));
-        for memory in [memory, make_memory(1, None)] {
-            let base = memory.bytes().as_ptr();
-            assert_eq!(memory.grow_with(0, no_reserve), 1);
-            for delta in [1, 2, u32::MAX] {
+        let memory = make_memory(0, Some(MEMORY32_MAX_PAGES));
+        assert_eq!(memory.bytes.borrow().capacity(), 0);
+        let tail = MEMORY_PAGE_BYTES as i32 - 4;
+        for previous in 0..=1 {
+            let base = memory.bytes.borrow().as_ptr();
+            assert_eq!(memory.grow_with(0, no_reserve), previous);
+            for delta in [MAX_INSTANCE_MEMORY_PAGES - previous as u32 + 1, u32::MAX] {
                 assert_eq!(memory.grow_with(delta, no_reserve), -1);
             }
-            assert_eq!(memory.size_in_pages(), 1);
-            assert_eq!(memory.bytes().as_ptr(), base);
+            let expected_len = (previous + 1) as usize * MEMORY_PAGE_BYTES;
+            for _ in 0..2 {
+                let fail = |fresh: &mut Vec<u8>, requested| {
+                    assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
+                    assert_eq!(requested, expected_len);
+                    assert!(memory.bytes.try_borrow_mut().is_ok()); // No live borrow at reserve.
+                    // Capacity overflow supplies a TryReserveError without real OOM.
+                    fresh.try_reserve_exact(usize::MAX)
+                };
+                assert_eq!(memory.grow_with(1, fail), -1);
+                assert_eq!(memory.size_in_pages(), previous);
+                assert_eq!(memory.bytes.borrow().as_ptr(), base);
+                assert_eq!(
+                    memory.load(tail, 0, LoadKind::WordUnsigned),
+                    if previous == 0 {
+                        Err(Trap::MemoryOutOfBounds)
+                    } else {
+                        Ok(0x1234_5678)
+                    }
+                );
+            }
+            assert_eq!(memory.grow(1), previous);
+            {
+                let bytes = memory.bytes.borrow();
+                assert_eq!(bytes.len(), expected_len);
+                // Scan the entire new page, including after a failed attempt.
+                assert!(
+                    bytes[previous as usize * MEMORY_PAGE_BYTES..]
+                        .iter()
+                        .all(|&b| b == 0)
+                );
+            }
+            if previous == 0 {
+                memory
+                    .store(tail, 0, AccessWidth::Word, 0x1234_5678)
+                    .unwrap();
+            }
         }
+        assert_eq!(memory.grow_with(0, no_reserve), 2);
+        assert_eq!(memory.grow_with(1, no_reserve), -1);
+        assert_eq!(memory.size_in_pages(), 2);
+        assert_eq!(
+            memory.load(tail, 0, LoadKind::WordUnsigned),
+            Ok(0x1234_5678)
+        );
     }
 }

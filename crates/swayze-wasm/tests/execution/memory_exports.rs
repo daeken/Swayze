@@ -1,7 +1,8 @@
 use super::*;
 use swayze_wasm::{InstantiationError, ReadMemoryError, ResultKind, Value};
 
-const ONE_PAGE: &[u8] = &[1, 0, 1];
+const ONE_PAGE: &[u8] = &[1, 1, 1, 1];
+const TWO_PAGES: &[u8] = &[1, 0, 2];
 const ZERO_PAGES: &[u8] = &[1, 1, 0, 1];
 const PAGE: u32 = 65_536;
 const MEM: &[u8] = b"\x01\x03mem\x02\0";
@@ -464,6 +465,74 @@ fn reads_see_start_after_data_and_do_not_bypass_failed_instantiation() {
             .instantiate()
             .unwrap_err(),
         InstantiationError::StartTrap(Trap::Unreachable)
+    );
+}
+
+#[test]
+fn data_and_detached_snapshots_cross_the_seam_in_a_two_page_initial_memory() {
+    // Two overlapping segments at PAGE-2 and PAGE-1, then a last byte and
+    // an empty segment exactly at the exclusive end (2*PAGE).
+    let data = b"\x04\0\x41\xfe\xff\x03\x0b\x04ABCD\0\x41\xff\xff\x03\x0b\x02xy\
+                 \0\x41\xff\xff\x07\x0b\x01z\0\x41\x80\x80\x08\x0b\0";
+    let validated = validate_module(&module(&[(5, TWO_PAGES), (7, MEM), (11, data)])).unwrap();
+    let instance = validated.instantiate().unwrap();
+    let mut full = vec![0xff; 2 * PAGE as usize];
+    instance.read_memory("mem", 0, &mut full).unwrap();
+    let seam = PAGE as usize;
+    assert_eq!(&full[seam - 3..seam + 3], b"\0AxyD\0");
+    assert_eq!(full.last(), Some(&b'z'));
+    assert!(full[..seam - 3].iter().all(|&b| b == 0));
+    assert!(full[seam + 3..full.len() - 1].iter().all(|&b| b == 0));
+
+    let mut dest = [0xcc; 6];
+    instance.read_memory("mem", PAGE - 3, &mut dest).unwrap();
+    assert_eq!(&dest, b"\0AxyD\0");
+    assert_eq!(
+        instance.read_memory("mem", 2 * PAGE - 1, &mut dest),
+        Err(ReadMemoryError::OutOfBounds)
+    );
+    assert_eq!(&dest, b"\0AxyD\0");
+    assert_eq!(instance.read_memory("mem", 2 * PAGE, &mut []), Ok(()));
+    assert_eq!(
+        instance.read_memory("mem", 2 * PAGE + 1, &mut []),
+        Err(ReadMemoryError::OutOfBounds)
+    );
+}
+
+#[test]
+fn start_grows_from_one_page_and_sees_preflighted_data_at_the_seam() {
+    let start = &[
+        0, 0x41, 1, 0x40, 0, 0x1a, // Grow one page to enable the straddling accesses.
+        0x41, 0, 0x41, 0, 0x28, 2, 0xfe, 0xff, 0x03, // Load at PAGE-2.
+        0x41, 1, 0x6a, 0x36, 2, 0xfe, 0xff, 0x03, 0x0b, // Increment and store there.
+    ];
+    let validate = |data: &[u8]| {
+        validate_module(&module(&[
+            (1, &[1, 0x60, 0, 0]),
+            (3, FUNCTION),
+            (5, &[1, 0, 1]),
+            (7, MEM),
+            (8, &[0]),
+            (10, &code_body(start)),
+            (11, data),
+        ]))
+        .unwrap()
+    };
+    let validated = validate(b"\x01\0\x41\xfe\xff\x03\x0b\x02\xff\xff");
+    for _ in 0..2 {
+        let instance = validated.instantiate().unwrap();
+        let mut dest = [0xcc; 4];
+        instance.read_memory("mem", PAGE - 2, &mut dest).unwrap();
+        assert_eq!(dest, [0, 0, 1, 0]);
+        assert_eq!(instance.read_memory("mem", 2 * PAGE, &mut []), Ok(()));
+    }
+    // An otherwise identical payload with a third byte would fit after
+    // grow, but fails data preflight before the start can dispatch.
+    assert_eq!(
+        validate(b"\x01\0\x41\xfe\xff\x03\x0b\x03\xff\xff!")
+            .instantiate()
+            .unwrap_err(),
+        InstantiationError::DataSegmentOutOfBounds { segment_index: 0 }
     );
 }
 

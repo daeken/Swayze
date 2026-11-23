@@ -162,6 +162,26 @@ fn float_accesses_preserve_raw_bits_and_alias_integer_bytes() {
 }
 
 #[test]
+fn unaligned_float_accesses_cross_the_page_seam_without_quieting_nans() {
+    for f in FORMATS {
+        let module = f.module(TWO_PAGES, &[f.align, 1]);
+        let instance = module.instantiate().unwrap();
+        let base = PAGE - 2; // Effective address PAGE - 1 for both widths.
+        let sign = 1 << (f.width() * 8 - 1);
+        for bits in [f.snan, sign] {
+            assert_eq!(f.write(&instance, base, bits), Ok(Some(Value::I32(42))));
+            assert_eq!(f.read(&instance, base), Ok(Some(f.integer(bits))));
+            for (i, &byte) in bits.to_le_bytes()[..f.width()].iter().enumerate() {
+                assert_eq!(
+                    instance.invoke_i32_with_args("byte", &[base + 1 + i as i32]),
+                    Ok(i32::from(byte))
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn float_accesses_check_the_whole_range_without_wrapping_or_partial_stores() {
     for f in FORMATS {
         let zero_pages = f.module(&[1, 0, 0], &[f.align, 0]);

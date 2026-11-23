@@ -6,7 +6,7 @@ use swayze_wasm::{
     InstantiationError, ReadGlobalError, ReadMemoryError, ResultKind, ValType, Value,
 };
 
-const ONE_PAGE: &[u8] = b"\x01\0\x01";
+const ONE_PAGE: &[u8] = b"\x01\x01\x01\x01";
 const GLOBALS: &[u8] = b"\x01\x7f\0\x41\x7e\x0b"; // (global i32 (i32.const -2))
 const GLOBAL_EXPORT: &[u8] = b"\x01\x01g\x03\0";
 const F32_NEG_ZERO: u32 = 0x8000_0000;

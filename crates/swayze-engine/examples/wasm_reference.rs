@@ -1710,6 +1710,37 @@ fn global_export_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     })
 }
 
+fn two_page_memory_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    // The four data bytes straddle the page boundary at offset 65,536.
+    let crossing = Fixture {
+        bytes: b"\0asm\x01\0\0\0\x05\x04\x01\x01\x02\x02\x07\x07\x01\x03mem\x02\0\
+                 \x0b\x0c\x01\0\x41\xfe\xff\x03\x0b\x04abcd"
+            .to_vec(),
+        export: "mem",
+        expected: Outcome::MemoryRead {
+            offset: 65_534,
+            bytes: *b"abcd",
+        },
+        args: vec![],
+    };
+    let grow = [(0, 2, 0), (1, 1, 1), (2, 1, -1)]
+        .into_iter()
+        .map(|(min, delta, old)| {
+            let mut bytes = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0".to_vec();
+            bytes.extend([5, 4, 1, 1, min, 2]);
+            bytes.extend([
+                7, 5, 1, 1, b'g', 0, 0, 10, 8, 1, 6, 0, 0x41, delta, 0x40, 0, 0x0b,
+            ]);
+            Fixture {
+                bytes,
+                export: "g",
+                expected: Outcome::Invocation(Ok(old)),
+                args: vec![],
+            }
+        });
+    std::iter::once(crossing).chain(grow)
+}
+
 fn global_offset_fixtures() -> [Fixture<WasmValue>; 2] {
     [
         Fixture {
@@ -1878,6 +1909,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain(empty_section_fixtures())
         .chain(table_export_fixtures())
         .chain(global_offset_fixtures())
+        .chain(two_page_memory_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.

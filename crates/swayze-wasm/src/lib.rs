@@ -92,11 +92,13 @@
 //! If present, the memory section follows any function and table sections and
 //! precedes any global, export, start, element, and code sections. It may be
 //! empty (a zero-length vector) or declare one unshared memory32. The
-//! limits use flag byte `0x00` (minimum only) or `0x01` (minimum and maximum), followed by
-//! unsigned LEB32 page counts. The minimum and any explicit maximum must be zero
-//! or one 64-KiB page, and the maximum must not be less than the minimum. The
-//! minimum is the initial size; an omitted maximum has an effective limit of one
-//! page. Loads, stores, `memory.size`, and `memory.grow` require a defined
+//! limits use flag byte `0x00` (minimum only) or `0x01` (minimum and maximum),
+//! followed by unsigned LEB32 page counts. The minimum is the initial size and
+//! may be zero, one, or two 64-KiB pages. An explicit maximum must be at least
+//! the minimum and at most the Core memory32 limit of 65,536 pages. The runtime
+//! cap is two pages (128 KiB) or the declared maximum if smaller. Allocation
+//! depends on the initial or requested new size, never the declared maximum.
+//! Loads, stores, `memory.size`, and `memory.grow` require a defined
 //! memory, even in dead code; a zero-page memory qualifies. Loads and stores
 //! take an unsigned LEB32 alignment exponent and an unsigned LEB32 byte offset.
 //! Valid padding is accepted for both fields. The exponent must not exceed the
@@ -318,13 +320,13 @@
 //! Loads consume an i32 base address and push a value of the opcode's type
 //! (i32, i64, f32, or f64). Stores consume an i32 base address and a value of the
 //! opcode's type (value on top) and produce no result. `memory.size`
-//! takes no operands and pushes the instance's actual page count (0 or 1).
+//! takes no operands and pushes the instance's actual page count (0, 1, or 2).
 //! `memory.grow` consumes an i32 page delta as unsigned and pushes the old
-//! page count on success or `-1` on failure. A zero delta always succeeds
-//! without allocating; the only permitted positive growth is from zero to
-//! one page if the maximum allows it. That transition fallibly reserves a
-//! single 64-KiB page and initializes it to zero. An excessive delta or a
-//! failed reserve leaves memory unchanged and does not trap.
+//! page count on success or `-1` on failure. Zero succeeds without allocating.
+//! A positive delta beyond the runtime cap fails without allocating. Eligible
+//! growth fallibly reserves the new size in a fresh buffer, preserves all old
+//! bytes, and zeroes only the added bytes before publishing the replacement.
+//! Failed reserves leave both the size and bytes unchanged and do not trap.
 //! `if` pops an i32 condition in the enclosing frame and saves the remaining
 //! depth as the floor for both arms. `block` and `loop`
 //! save the current depth as their floor without consuming any operands.
@@ -412,11 +414,14 @@
 //! no numeric coercion.
 //! Any preflight error returns before executing a guest instruction
 //! or changing guest state. Execution does not recurse in Rust. The only guest
-//! execution allocation is the fallible single-page
-//! reserve for an eligible `memory.grow`, during start or invocation. After a
-//! page is installed, it is never resized or reallocated. A failed reserve can
-//! be retried by a later dispatch within the same execution limits. Zero selects the else arm (or skips straight to the join if
-//! no `else` is present); every nonzero i32 selects the then arm.
+//! execution allocation is the fallible exact reserve for an eligible
+//! `memory.grow`, during start or invocation. The reserve and the drop of the
+//! old buffer happen outside any memory borrow. The private `RefCell<Vec<u8>>`
+//! only lends bytes within one operation, never across guest dispatch or host
+//! reentry. Capacity is checked before copy or zero-fill. Byte pushes cannot
+//! allocate while capacity suffices, as guaranteed by `Vec`.
+//! Zero selects the else arm (or skips straight to the join if no `else` is
+//! present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of operand types and a fixed stack of control
 //! frames with declared result types (if any).
 //! Each `block` and `if` label keeps a linked chain of incoming branch edges in
@@ -527,7 +532,9 @@
 //! into a caller-provided slice, without exposing a borrow of guest memory or a
 //! way to write it. It checks the exact name and export kind before checking the
 //! full range against the instance's current size. It does not dispatch guest
-//! instructions or use guest fuel, allocate, or retain the destination.
+//! instructions or use guest fuel, allocate, or retain the destination. An
+//! unaligned guest access or a host copy may cross the internal page seam;
+//! only the full range relative to the current size matters.
 //! [`Instance::read_global`] returns an owned snapshot of an explicitly named
 //! global's current value, preserving its exact type and bits. Both immutable
 //! and mutable globals can be read, but neither can be written or borrowed by
@@ -538,6 +545,20 @@
 //! tables across instances. Hosts cannot read entries, mutate the table, or
 //! invoke its entries directly.
 //! [`prepare`] remains a stub.
+//!
+//! ## Linear-memory resource bounds
+//!
+//! A memory can grow successfully at most twice in an instance's lifetime.
+//! The maximum simultaneous **requested** linear-memory backing is 192 KiB
+//! (64 KiB old plus 128 KiB fresh during a one-to-two-page grow), not a bound
+//! on RSS, allocator overhead, or other allocations. Initial zero-fill plus
+//! successful growth zero-fill touches at most 128 KiB in total because only
+//! newly exposed bytes are zeroed. Growth copies old bytes at most once,
+//! at most 64 KiB, separate from active data, guest accesses, and host copies.
+//! Failed reserves may be retried, but each eligible dispatched grow makes
+//! one attempt, so there are at most 1024 such attempts per invocation or
+//! start, separate from the one possible initial reserve during instantiation.
+//! These are work and request bounds, not allocator latency bounds.
 //!
 //! # Evidence and gaps
 //!
@@ -757,9 +778,15 @@
 //! absent and zero-page memory, exact-end and overflowing addresses, no partial
 //! stores, concrete types above live and dead floors, and the exact dispatch
 //! boundary for each opcode.
-//! Growth tests check optional maxima, unsigned deltas, reserve bounds and
-//! failure, stack and dispatch limits, and persistence through exports, calls,
-//! start, and traps. Start growth cannot bypass initial data preflight.
+//! Layout probes with Rust 1.99.1 on arm64 macOS in debug and release measured
+//! `LinearMemory` at 32 → 40 bytes and `Instance` at 432 → 440 bytes; `Module`
+//! remained 272 bytes. These measurements exclude heap backing and do not
+//! guarantee the same layout on other targets.
+//! Growth tests check optional and padded declared maxima, unsigned deltas,
+//! reserve bounds and injected failure/retry, stack and dispatch limits, and
+//! persistence through exports, calls, start, and traps. Start growth cannot
+//! bypass initial data preflight. Seam tests cover all access widths, exact
+//! float bits, overlapping active data, and detached host snapshots.
 //! Data tests cover section order and framing, index and offset encodings, the
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap
@@ -903,7 +930,7 @@ impl Module {
     ///
     /// Check active segment ranges in source order within each kind: elements
     /// before data, using only the initial sizes. Neither table nor memory is
-    /// initialized until all checks pass. An initial page is allocated fallibly
+    /// initialized until all checks pass. Any initial pages are reserved fallibly
     /// and zeroed; an absent or initially zero-page memory allocates nothing at
     /// this step. A defined table uses fixed storage and starts all null.
     /// Segments of each kind are applied in source order.
@@ -1169,7 +1196,7 @@ impl Instance<'_> {
     /// fresh frames and execution budgets but observe completed memory and
     /// global stores and memory growth, even before a trap or limit. The only
     /// allocation during execution is an eligible `memory.grow` attempting to
-    /// reserve the single 64-KiB page of an initially empty memory.
+    /// reserve replacement backing for up to two 64-KiB pages.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         // Preflight checked the same signature that chooses the result.
         match self.invoke(name, args.iter().copied().map(Value::I32), ResultKind::I32)? {

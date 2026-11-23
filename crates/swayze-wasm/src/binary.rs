@@ -1,7 +1,8 @@
 use crate::{
     ExecutionLimit, Export, ExportTarget, Instance, InvokeError, Module, ResultKind, Trap,
     memory::{
-        AccessWidth, DataSegment, LoadKind, MAX_MEMORY_PAGES, MEMORY_PAGE_BYTES, MemoryLimits,
+        AccessWidth, DataSegment, LoadKind, MAX_INSTANCE_MEMORY_PAGES, MEMORY_PAGE_BYTES,
+        MEMORY32_MAX_PAGES, MemoryLimits,
     },
     table::{ElementSegment, MAX_TABLE_ENTRIES},
 };
@@ -784,10 +785,10 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Err
             kind: ErrorKind::UnsupportedMemoryLimitsFlags { flags },
         });
     }
-    let minimum = section.count(IntegerField::MemoryMinimum, 0..=MAX_MEMORY_PAGES)?;
+    let minimum = section.count(IntegerField::MemoryMinimum, 0..=MAX_INSTANCE_MEMORY_PAGES)?;
     let maximum = if flags == 0x01 {
         let offset = section.position();
-        let maximum = section.count(IntegerField::MemoryMaximum, 0..=MAX_MEMORY_PAGES)?;
+        let maximum = section.count(IntegerField::MemoryMaximum, 0..=MEMORY32_MAX_PAGES)?;
         if maximum < minimum {
             return Err(Error {
                 offset,

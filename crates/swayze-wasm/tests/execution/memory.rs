@@ -10,8 +10,9 @@ mod grow;
 mod i64_memory;
 
 const PAGE: i32 = 64 * 1024;
-const ONE_PAGE: &[u8] = &[1, 0, 1];
-const TWO_BOUNDS: &[u8] = &[1, 1, 1, 1];
+const ONE_PAGE: &[u8] = &[1, 1, 1, 1];
+const TWO_PAGES: &[u8] = &[1, 0, 2];
+const CORE_MAX: &[u8] = &[1, 1, 0, 0x80, 0x80, 0x04];
 const LOAD: u8 = 0x28;
 const STORE: u8 = 0x36;
 const LOAD8_S: u8 = 0x2c;
@@ -88,10 +89,17 @@ fn accepts_memory_only_and_empty_memory_sections_and_enforces_order() {
     for payload in [
         &[0][..],
         &[1, 0, 0],
+        &[1, 0, 1],
         ONE_PAGE,
+        TWO_PAGES,
         &[1, 1, 0, 0],
         &[1, 1, 0, 1],
-        TWO_BOUNDS,
+        &[1, 1, 2, 2],
+        &[1, 1, 2, 3],
+        &[1, 1, 2, 0xff, 0xff, 0x03], // 65,535
+        CORE_MAX,
+        // Padded engine-cap minimum and Core-cap maximum.
+        &[1, 1, 0x82, 0x80, 0x80, 0x80, 0, 0x80, 0x80, 0x84, 0x80, 0],
         // Count 1, minimum 0, maximum 1 with legal five-byte uLEB32 padding.
         &[
             0x81, 0x80, 0x80, 0x80, 0, 1, 0x80, 0x80, 0x80, 0x80, 0, 0x81, 0x80, 0x80, 0x80, 0,
@@ -180,13 +188,38 @@ fn rejects_bad_limits_and_checks_the_entire_memory_section() {
             },
         );
     }
+    for payload in [&[1, 0, 3][..], &[1, 1, 0x83, 0x80, 0x80, 0x80, 0]] {
+        bad_payload(
+            5,
+            payload,
+            2,
+            ErrorKind::UnsupportedCount {
+                field: MemoryMinimum,
+                count: 3,
+            },
+        );
+    }
+    for payload in [
+        &[1, 1, 0, 0x81, 0x80, 0x04][..],
+        &[1, 1, 0, 0x81, 0x80, 0x84, 0x80, 0],
+    ] {
+        bad_payload(
+            5,
+            payload,
+            3,
+            ErrorKind::UnsupportedCount {
+                field: MemoryMaximum,
+                count: 65_537,
+            },
+        );
+    }
     bad_payload(
         5,
-        &[1, 1, 0, 2],
-        3,
-        ErrorKind::UnsupportedCount {
-            field: MemoryMaximum,
-            count: 2,
+        &[1, 1, 0x82, 0, 0x81, 0x80, 0x80, 0x80, 0],
+        4,
+        ErrorKind::InvalidMemoryLimits {
+            minimum: 2,
+            maximum: 1,
         },
     );
     bad_payload(
@@ -401,7 +434,10 @@ fn memory_size_pushes_the_actual_page_count_not_the_maximum() {
         (&[1, 1, 0, 0][..], 0),
         (&[1, 1, 0, 1][..], 0),
         (ONE_PAGE, 1),
-        (TWO_BOUNDS, 1),
+        (&[1, 0, 1], 1),
+        (CORE_MAX, 0),
+        (TWO_PAGES, 2),
+        (&[1, 1, 2, 0x80, 0x80, 0x04], 2),
     ] {
         let module = memory_functions(limits, &[0], &[0], &[(b"size", 0)], &[&[0, SIZE, 0, 0x0b]]);
         assert_eq!(
@@ -518,7 +554,7 @@ fn memory_is_zeroed_and_access_is_unaligned_little_endian_with_offsets() {
     ];
     let write_offset = &[0, 0x20, 0, 0x20, 1, STORE, 0, 1, 0x41, 42, 0x0b];
     let module = memory_functions(
-        TWO_BOUNDS,
+        ONE_PAGE,
         &[1, 2],
         &[0, 1, 0, 1],
         &[

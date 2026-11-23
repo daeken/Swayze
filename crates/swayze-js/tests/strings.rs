@@ -400,10 +400,6 @@ fn unsupported_operations_fail_only_when_dispatched() {
         "'a' + 'b'",
         "1 + '2'",
         "'2' - 1",
-        "1 * ''",
-        "'' / 1",
-        "'' % 1",
-        "1 ** ''",
         "'2' & 1",
         "1 ^ ''",
         "'' | 1",
@@ -435,9 +431,7 @@ fn unsupported_operations_fail_only_when_dispatched() {
             );
         }
     }
-    for op in [
-        "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
-    ] {
+    for op in ["+=", "-=", "&=", "|=", "^=", "<<=", ">>=", ">>>="] {
         for source in [
             format!("let x = '2'; x {op} 1; 0"),
             format!("let x = 1; (x {op} '2')"),
@@ -453,7 +447,7 @@ fn unsupported_operations_fail_only_when_dispatched() {
         Value::Number(42.0),
     );
     assert_scalar(
-        "let x = ''; for (; ''; ++x) { x *= 2; } 42",
+        "let x = ''; for (; ''; ++x) { x -= 2; } 42",
         Value::Number(42.0),
     );
     assert!(parse_script(r"true || '\x00' + '\u{}'").is_err());

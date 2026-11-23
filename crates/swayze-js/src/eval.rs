@@ -170,7 +170,7 @@ pub enum EvalError {
     UnsupportedStringOperation,
     /// A String comparison would exceed the evaluation's 65,536-pair budget.
     StringComparisonLimitExceeded,
-    /// A String conversion by `+`, `-`, or `~` would exceed the 262,144-credit evaluation budget.
+    /// An operator's String-to-Number conversion would exceed the 262,144-credit evaluation budget.
     StringNumericConversionLimitExceeded,
 }
 
@@ -233,13 +233,17 @@ impl Script {
     /// return a Boolean, always `false` if either operand is NaN. Two Strings
     /// are ordered lexicographically by UTF-16 code units, with a proper prefix
     /// sorting before the longer String.
-    /// The numeric unary operators (`+`, `-`, `~`) also convert Strings to
-    /// Numbers using ECMAScript's whitespace, signed decimal and `Infinity`
+    /// Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, and `**` (including
+    /// their eager compound forms) convert Strings to Numbers using
+    /// ECMAScript's whitespace, signed decimal and `Infinity`
     /// forms, and unsigned `0x`, `0o`, and `0b` integer forms. Empty or
     /// whitespace-only Strings become `+0`; invalid numeric text becomes NaN.
     /// Unary `+` returns the Number and unary `-` negates it, including signed
     /// zero. Unary `~` applies bitwise NOT after converting the rounded Number
-    /// to a signed 32-bit integer. Other numeric operators do not coerce Strings.
+    /// to a signed 32-bit integer. The four supported binary operators convert
+    /// the left operand and then the right, after evaluating both operand
+    /// expressions. Their compounds use the value loaded before the RHS runs
+    /// and store the Number only after the operation succeeds.
     /// `**` and `**=` handle the ECMAScript Number special cases explicitly;
     /// ordinary finite powers use a platform-dependent approximation.
     /// Bitwise operators truncate and wrap the coerced Number to 32 bits
@@ -256,9 +260,9 @@ impl Script {
     /// other Strings; mixed strict equality and String/nullish loose equality
     /// are false. `!==` and `!=` negate their corresponding equality results.
     /// String/Number and String/Boolean loose equality, mixed String/scalar
-    /// relational comparison, and binary arithmetic (including concatenation)
-    /// and bitwise operations on Strings are unsupported, as is Number coercion
-    /// of Strings in updates and eager compound assignments.
+    /// relational comparison, binary `+` (including concatenation), binary `-`,
+    /// and binary bitwise operations on Strings remain unsupported, including
+    /// the corresponding eager compounds and all name updates on Strings.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -272,7 +276,7 @@ impl Script {
     /// They leave no result, and their RHS is still checked during parsing.
     /// Consuming `++` and `--` updates (alone or followed by a comma suffix
     /// in a statement or `for` clause) load one initialized `let`, convert
-    /// its value to Number as above, and store the result of adding or
+    /// its scalar value to Number as above, and store the result of adding or
     /// subtracting `1`. Neither form leaves a result for the update itself.
     /// An update used as an expression operand, such as in `x++ + 1`,
     /// performs the same write and yields a Number: the new Number for
@@ -313,8 +317,10 @@ impl Script {
     /// before comparison, even for aliases or an early mismatch; skipped
     /// comparisons cost nothing.
     /// String-to-Number conversion has a separate 262,144-credit budget per
-    /// call, shared by `+`, `-`, and `~`. After dispatch and range validation,
-    /// a conversion charges `1 +` the original UTF-16 length. Trimmed-empty
+    /// call, shared by unary `+`, `-`, and `~` and binary `*`, `/`, `%`, and
+    /// `**` (including their eager compound forms). After dispatch, operand
+    /// arity checks, and validation of the operand's String range, each
+    /// conversion charges `1 +` the original UTF-16 length. Trimmed-empty
     /// text, exact optionally signed `Infinity`, and recognized unsigned radix
     /// prefixes only pay this base charge. All other candidates additionally pay
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
@@ -331,8 +337,8 @@ impl Script {
     /// Returns [`EvalError::UnsupportedStringOperation`] if execution reaches an
     /// unsupported String operator, or [`EvalError::StringComparisonLimitExceeded`]
     /// if a comparison would exceed its pair budget. Returns
-    /// [`EvalError::StringNumericConversionLimitExceeded`] if a numeric unary
-    /// operator's String conversion would exceed its credit budget.
+    /// [`EvalError::StringNumericConversionLimitExceeded`] if an operator's
+    /// String-to-Number conversion would exceed its credit budget.
     pub fn evaluate_primitive(&self) -> Result<PrimitiveValue<'_>, EvalError> {
         evaluate(
             self.instructions(),
@@ -474,13 +480,34 @@ fn evaluate<'script>(
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
             }
-            Instruction::Add => apply_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
-            Instruction::Subtract => apply_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
-            Instruction::Multiply => apply_arithmetic(&mut stack, |lhs, rhs| lhs * rhs)?,
-            Instruction::Divide => apply_arithmetic(&mut stack, |lhs, rhs| lhs / rhs)?,
+            // Add and Subtract also serve consuming ++/--; keep them scalar-only.
+            Instruction::Add => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
+            Instruction::Subtract => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
+            Instruction::Multiply => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| lhs * rhs,
+            )?,
+            Instruction::Divide => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| lhs / rhs,
+            )?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
-            Instruction::Remainder => apply_arithmetic(&mut stack, |lhs, rhs| lhs % rhs)?,
-            Instruction::Exponentiate => apply_arithmetic(&mut stack, exponentiate)?,
+            Instruction::Remainder => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                |lhs, rhs| lhs % rhs,
+            )?,
+            Instruction::Exponentiate => apply_numeric_binary(
+                &mut stack,
+                string_units,
+                &mut string_conversion_credits_left,
+                exponentiate,
+            )?,
             Instruction::BitwiseAnd => apply_bitwise(&mut stack, |lhs, rhs| lhs & rhs)?,
             Instruction::BitwiseXor => apply_bitwise(&mut stack, |lhs, rhs| lhs ^ rhs)?,
             Instruction::BitwiseOr => apply_bitwise(&mut stack, |lhs, rhs| lhs | rhs)?,
@@ -731,12 +758,26 @@ fn apply_scalar_binary(
     })
 }
 
-fn apply_arithmetic(
+fn apply_scalar_arithmetic(
     stack: &mut Vec<Operand>,
     op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<(), EvalError> {
     apply_scalar_binary(stack, |lhs, rhs| {
         Value::Number(op(lhs.to_number(), rhs.to_number()))
+    })
+}
+
+fn apply_numeric_binary(
+    stack: &mut Vec<Operand>,
+    string_units: &[u16],
+    credits_left: &mut usize,
+    op: impl FnOnce(f64, f64) -> f64,
+) -> Result<(), EvalError> {
+    // Both expressions have run; apply_binary checks arity before coercion.
+    apply_binary(stack, |lhs, rhs| {
+        let lhs = lhs.to_number(string_units, credits_left)?;
+        let rhs = rhs.to_number(string_units, credits_left)?;
+        Ok(Value::Number(op(lhs, rhs)))
     })
 }
 
@@ -865,6 +906,48 @@ mod tests {
                 ),
                 Ok(Value::Number(42.0)),
             );
+        }
+    }
+
+    #[test]
+    fn numeric_binary_checks_arity_before_left_to_right_conversion() {
+        let script = crate::parse_script("'1' * '2'").unwrap();
+        let [
+            Instruction::String(lhs),
+            Instruction::String(rhs),
+            Instruction::Multiply,
+        ] = script.instructions()
+        else {
+            panic!("expected two String instructions and a multiply");
+        };
+        // A malformed operand cannot pass literal dispatch. Inject it here to
+        // distinguish which conversion ran first when both would fail.
+        let pool = &script.string_units()[..1];
+        let valid = Operand::String(*lhs);
+        let invalid = Operand::String(*rhs);
+        let no_math = |_, _| panic!("numeric operation ran after a failed check");
+        for mut stack in [vec![], vec![valid]] {
+            let mut credits = 261;
+            assert_eq!(
+                apply_numeric_binary(&mut stack, pool, &mut credits, no_math),
+                Err(EvalError::InvalidScript)
+            );
+            assert_eq!(credits, 261);
+        }
+        for (mut stack, expected, remaining) in [
+            (
+                vec![valid, invalid],
+                EvalError::StringNumericConversionLimitExceeded,
+                258,
+            ),
+            (vec![invalid, valid], EvalError::InvalidScript, 260),
+        ] {
+            let mut credits = 260;
+            assert_eq!(
+                apply_numeric_binary(&mut stack, pool, &mut credits, no_math),
+                Err(expected)
+            );
+            assert_eq!(credits, remaining);
         }
     }
 

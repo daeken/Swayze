@@ -27,9 +27,10 @@ fn assert_rounding_cases(
     let ty = types(&[(&[ty], Some(ty))]);
     let one_and_half = one + min_normal / 2;
     let two_and_half = two + min_normal / 4;
+    let three_and_half = three + min_normal / 4;
     // Fixed bit vectors, ordered ceil/floor/trunc/nearest. Immediately below
-    // `integral` the representable spacing is 1/2, and above it all values
-    // are already integral. `four - 1` exercises a carry into the exponent.
+    // `integral` the representable spacing is 1/2: `integral - 1` is the last
+    // half-integer. Rounding 3.5 to even carries into the next exponent (4).
     let cases = [
         (0, [0; 4]),
         (1, [one, 0, 0, 0]),
@@ -50,6 +51,9 @@ fn assert_rounding_cases(
         (two_and_half - 1, [three, two, two, two]),
         (two_and_half, [three, two, two, two]),
         (two_and_half + 1, [three, two, two, three]),
+        (three_and_half - 1, [four, three, three, three]),
+        (three_and_half, [four, three, three, four]),
+        (three_and_half + 1, [four, three, three, four]),
         (four - 1, [four, three, three, four]),
         (
             integral - 3,

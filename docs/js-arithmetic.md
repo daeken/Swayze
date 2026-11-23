@@ -43,10 +43,12 @@ are still checked during parsing, and `const` targets are rejected even when
 no store would run. Prefix and postfix `++` and `--` convert an initialized
 `let` value to Number, add or subtract one, and store the result. Postfix
 forms cannot cross a line terminator between the name and operator, including
-a line terminator in a comment. An update can also occupy its own expression
-group, as in `(++x)` or `(x++)`. Prefix returns the new Number; postfix
-returns the old coerced Number, including signed zero. Use `((x++) + 1)`
-to combine it with another operator. Assignments
+a line terminator in a comment. Updates can be operands in expressions such
+as `1 + ++x`, declaration initializers such as `let y = x++;`, or control
+tests such as `if (x++)`. Prefix returns the new Number; postfix returns
+the old coerced Number, including signed zero. An update at the start of a
+statement or in a standalone `for` initializer or updater still uses the
+statement form, which does not yield a value. Assignments
 can also appear as explicitly grouped expressions, such as `(x = a)`,
 `(x += a)`, and `(x ??= a)`. Simple assignment stores and returns its
 right-hand value. An eager compound reads the target before evaluating the

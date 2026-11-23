@@ -410,8 +410,7 @@ pub(crate) enum UpdateResult {
     Old,
 }
 
-const GROUPED_UPDATE_REQUIRED: &str =
-    "increment and decrement expressions require an explicit group containing only the update";
+const UPDATE_TARGET_REQUIRED: &str = "increment and decrement require a single identifier target";
 
 fn check_postfix_line_break(operator: Span, after_line_break: bool) -> Result<(), Error> {
     // The lexer records LineTerminator trivia, including inside comments.
@@ -1166,9 +1165,8 @@ struct BlockFrame {
 
 struct Parser<'s> {
     lexer: Lexer<'s>,
-    // Cache the next lexer result (including EOF) when disambiguating a
-    // name at the start of a statement, for clause or expression group,
-    // a root semicolon, or an if's then-arm.
+    // Cache the next lexer result (including EOF) while disambiguating a
+    // name, a root semicolon, or an if's then-arm.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -2063,12 +2061,7 @@ impl Parser<'_> {
         self.next_token()?
             .filter(|t| matches!(t.kind, TokenKind::Identifier))
             .map(|t| t.span)
-            .ok_or_else(|| {
-                Error::unsupported(
-                    operator,
-                    "increment and decrement require a single identifier target",
-                )
-            })
+            .ok_or_else(|| Error::unsupported(operator, UPDATE_TARGET_REQUIRED))
     }
 
     fn parse_update(
@@ -2117,7 +2110,7 @@ impl Parser<'_> {
             _ => {
                 return Err(Error::unsupported(
                     operator,
-                    "increment and decrement expressions are outside the subset",
+                    "increment and decrement expressions are outside the subset at the start of a statement or for clause",
                 ));
             }
         }
@@ -2134,24 +2127,15 @@ impl Parser<'_> {
         Ok(span)
     }
 
-    // The caller has already charged the name's emission work, as for an
-    // ordinary identifier at group start. An update must consume this group's
-    // close directly, so no infix operator can take it as an ungrouped operand.
-    fn finish_group_update(
+    // The caller has already charged the name's emission work, just as for a
+    // read. A completed update is one operand, not a pending unary operator.
+    fn emit_expression_update(
         &mut self,
         name: Span,
         operator: Span,
         op: Update,
         result: UpdateResult,
     ) -> Result<(), Error> {
-        let close = self.require_token("expected a closing parenthesis before end of source")?;
-        if !matches!(close.kind, TokenKind::Close) {
-            return Err(Error::unsupported(operator, GROUPED_UPDATE_REQUIRED));
-        }
-        if !matches!(self.pending.pop(), Some((Pending::Group, _))) {
-            return Err(Error::malformed(close.span, "expected an update group"));
-        }
-        self.nesting_depth -= 1;
         self.begin_write(name, operator, false)?;
         self.emit_charged(
             Instruction::UpdateBinding {
@@ -2441,17 +2425,17 @@ impl Parser<'_> {
                 after_line_break,
             } = token;
             // The mandatory statement-test parentheses are delimiters, not an
-            // expression group. A nested '(' can introduce a write there.
+            // expression group. A nested '(' can introduce an assignment there.
             let group_start = after_open && !(statement_test && self.pending.len() == 1);
             match (needs_operand, kind) {
-                (true, TokenKind::Update(op)) if group_start => {
+                (true, TokenKind::Update(op)) => {
                     let name = self.parse_update_target(span)?;
                     self.lexer.charge(1, name)?;
-                    self.finish_group_update(name, span, op, UpdateResult::New)?;
+                    self.emit_expression_update(name, span, op, UpdateResult::New)?;
                     needs_operand = false;
                 }
-                (_, TokenKind::Update(_)) => {
-                    return Err(Error::unsupported(span, GROUPED_UPDATE_REQUIRED));
+                (false, TokenKind::Update(_)) => {
+                    return Err(Error::unsupported(span, UPDATE_TARGET_REQUIRED));
                 }
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
@@ -2519,42 +2503,33 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Identifier) => {
-                    if group_start {
-                        // Charge for the load, assignment marker or update
-                        // before looking ahead, preserving the old read's work order.
-                        self.lexer.charge(1, span)?;
-                        match self.next_token()? {
-                            Some(Token {
-                                kind: TokenKind::Assignment(op),
-                                span: operator,
-                                ..
-                            }) => {
-                                self.begin_group_assignment(span, op, operator)?;
-                                after_open = false;
-                                next = self.next_token()?;
-                                continue;
-                            }
-                            Some(Token {
-                                kind: TokenKind::Update(op),
-                                span: operator,
-                                after_line_break,
-                            }) => {
-                                check_postfix_line_break(operator, after_line_break)?;
-                                self.finish_group_update(span, operator, op, UpdateResult::Old)?;
-                                needs_operand = false;
-                                after_open = false;
-                                next = self.next_token()?;
-                                continue;
-                            }
-                            following => self.lookahead = Some(following),
+                    // Charge the load, assignment marker or update at the name
+                    // before looking ahead, preserving the read's work order.
+                    self.lexer.charge(1, span)?;
+                    match self.next_token()? {
+                        Some(Token {
+                            kind: TokenKind::Assignment(op),
+                            span: operator,
+                            ..
+                        }) if group_start => {
+                            self.begin_group_assignment(span, op, operator)?;
+                            after_open = false;
+                            next = self.next_token()?;
+                            continue;
                         }
-                    }
-                    self.record_access(span, None)?;
-                    let load = Instruction::LoadBinding(UNPATCHED);
-                    if group_start {
-                        self.emit_charged(load, span)?;
-                    } else {
-                        self.emit(load, span)?;
+                        Some(Token {
+                            kind: TokenKind::Update(op),
+                            span: operator,
+                            after_line_break,
+                        }) => {
+                            check_postfix_line_break(operator, after_line_break)?;
+                            self.emit_expression_update(span, operator, op, UpdateResult::Old)?;
+                        }
+                        following => {
+                            self.lookahead = Some(following);
+                            self.record_access(span, None)?;
+                            self.emit_charged(Instruction::LoadBinding(UNPATCHED), span)?;
+                        }
                     }
                     needs_operand = false;
                 }

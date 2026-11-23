@@ -178,12 +178,37 @@ fn grouping_controls_unary_bases_without_leaking_across_conditional_or_sequence_
 }
 
 #[test]
+fn updates_are_valid_power_bases_but_unary_expressions_still_need_groups() {
+    for (source, expected) in [
+        ("let x=2; let y=x++**x--; y*10+x", 82.0),
+        ("let x=1; 2**++x**x++", 16.0),
+        ("let x=2; (x--**2)", 4.0),
+        ("let x=2; let y=--x**3; y", 1.0),
+        ("let x=2; 2**-x++", 0.25),
+        ("let x=2; 2**-++x", 0.125),
+        ("let x=2; (-++x)**3", -27.0),
+        ("let x=2; -(++x**2)", -9.0),
+    ] {
+        assert_number(source, expected);
+    }
+    for source in [
+        "let x=2; -x++@**@2",
+        "let x=2; -++x@**@2",
+        "let x=2; 2**-x++@**@2",
+        "let x=2; false && void ++x@**@2",
+    ] {
+        assert_diagnostic(source, ErrorKind::Malformed, "unary base");
+    }
+}
+
+#[test]
 fn longest_match_is_local_to_contiguous_punctuators() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, expected) in [
         ("2/*💡*/**// line\u{2028}-2", 0.25),
         ("2\n**2", 4.0),
         ("2**/*💡*/+2", 4.0),
+        ("let x=2;x**++x", 8.0),
     ] {
         assert_number(source, expected);
     }
@@ -201,11 +226,6 @@ fn longest_match_is_local_to_contiguous_punctuators() {
             "let x=2;x**/*💡*/@=@2;x",
             Unsupported,
             "assignment expressions",
-        ),
-        (
-            "let x=2;x**@++@x",
-            Unsupported,
-            "increment and decrement expressions",
         ),
     ] {
         assert_diagnostic(source, kind, message);

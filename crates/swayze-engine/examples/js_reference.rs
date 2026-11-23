@@ -536,6 +536,15 @@ fn fixtures() -> Vec<String> {
             "'broken' < 5 || 5 >= 'broken'",
             "'broken' != 5",
             "let n=0; ((n = 1), '2') >= ((n = n+2), 2) && n === 3",
+            "let x='-0'; (x++)",
+            "let x='broken'; (x--)",
+            "let x='0x2a'; (++x)",
+            "let x='0b11'; (--x)",
+            "let x='0x2a'; x++; x",
+            "let x='0b11'; --x; x",
+            "let x='3', y=0; x--, y=x*10; y",
+            "let x='2'; false && ++x; x",
+            "let x='3', i=0; for (; i<3; --x, i++) { continue; } x",
         ]
         .map(str::to_owned),
     );

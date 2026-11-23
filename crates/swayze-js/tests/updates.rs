@@ -4,6 +4,104 @@ use swayze_js::{
 
 const FORMS: [(&str, f64); 4] = [("++x", 1.0), ("x++", 1.0), ("--x", -1.0), ("x--", -1.0)];
 
+#[test]
+fn string_updates_work_in_consuming_statements_and_classic_for_clauses() {
+    for (form, step) in FORMS {
+        for tail in [
+            format!("{form}; x"),
+            format!("{{{form};}} x"),
+            format!("{form}, y=x; y"),
+            format!("{{{form}, y=x;}} y"),
+        ] {
+            let source = format!("let x='0x2A', y; {tail}");
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Ok(42.0 + step),
+                "{source}"
+            );
+        }
+        // The suffix sees the stored Number, continue reaches the updater,
+        // and break leaves the String reset in the second body untouched.
+        let source = format!(
+            "let x='42', i=0, trace; for ({form}, trace=x; ; {form}, trace=trace*100+x) {{
+                x='7'; if (i++) {{ break; }} continue;
+            }} trace === {} && x === '7'",
+            (42.0 + step) * 100.0 + 7.0 + step,
+        );
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate_value(),
+            Ok(Value::Boolean(true)),
+            "{source}"
+        );
+
+        let source = format!("let x='42'; for ({form}; false; {form}) {{}} x");
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate(),
+            Ok(42.0 + step),
+            "{source}"
+        );
+        let source = format!("let x='42'; for (; x === '42'; {form}) {{continue;}} x");
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate(),
+            Ok(42.0 + step),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn string_updates_work_in_expression_positions_and_keep_evaluation_order() {
+    for (source, expected) in [
+        ("let x='2'; x++ + 1;", 3.0),
+        ("let x='2'; ++x ** 2", 9.0),
+        ("let x='2'; { x++ + 1; } x", 3.0),
+        ("let x='2'; x++ + 1; x", 3.0),
+        ("let x='1', old=x++, next=++x; old*100+next*10+x", 133.0),
+        ("let x='2', y; y = false ? 0 : --x; 0, y*10+x--", 11.0),
+        ("let x='2.5'; (x++*100 + ++x*10 + x)", 299.5),
+        (
+            "let x='0', y=0; if (x++) { y=5; } else if (++x) { y=x; } y",
+            2.0,
+        ),
+        ("let x='1'; while (--x) {} x", 0.0),
+        ("let x='0'; do {} while (x--); x", -1.0),
+        ("let x='2'; for (; --x;) {continue;} x", 0.0),
+        (
+            "let x='2', y; for (x++ + 1; x < 4; ++x ? y=x : 0) {x='3'; continue;} y",
+            4.0,
+        ),
+        ("let x='8', y; for (--x ? y=x : 0; false;) {} y", 7.0),
+        ("let x='2'; ++/*\u{2028}*/x; x++/*\u{2028}*/+ 0", 3.0),
+    ] {
+        let script = parse_script(source).unwrap_or_else(|err| panic!("{source:?}: {err}"));
+        assert_eq!(
+            script.evaluate_value(),
+            Ok(Value::Number(expected)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn string_updates_keep_source_target_and_completion_checks() {
+    use ErrorKind::Unsupported;
+    for (source, message) in [
+        ("const x='2'; x@++@; 0", "assignment to const"),
+        ("const x='2'; false && @--@x", "assignment to const"),
+        ("if (false) { ++@x@; let x='2'; } 0", "initialization"),
+        (
+            "let x='2'; { true || @x@--; let x='3'; } x",
+            "initialization",
+        ),
+        ("let x='2'; (++x@.@name)", "token"),
+        ("let x='2'; if (false) { @++@(x); } x", "single identifier"),
+        ("let x='2'; x/*\u{2028}*/@++@; x", "line terminator"),
+        ("let x='2'; x++, x;@@", "final expression"),
+    ] {
+        assert_error(source, Unsupported, message);
+    }
+}
+
 fn assert_error_at(marked: &str, kind: ErrorKind) -> Error {
     let (prefix, rest) = marked.split_once('@').unwrap();
     let (token, suffix) = rest.split_once('@').unwrap();
@@ -740,6 +838,27 @@ fn grouped_updates_yield_and_store_numbers_without_losing_old_number_bits() {
             9007199254740992.0,
             9007199254740991.0,
         ),
+        ("=''", 0.0, 1.0, -1.0),
+        ("='-0'", -0.0, 1.0, -1.0),
+        ("='-1e-999'", -0.0, 1.0, -1.0),
+        ("='-1.0'", -1.0, 0.0, -2.0),
+        ("='1.0'", 1.0, 2.0, 0.0),
+        ("='0b100'", 4.0, 5.0, 3.0),
+        ("='Infinity'", f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        (
+            "='-Infinity'",
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        (
+            "='9007199254740993'",
+            9007199254740992.0,
+            9007199254740992.0,
+            9007199254740991.0,
+        ),
+        ("='1_0'", f64::NAN, f64::NAN, f64::NAN),
+        (r"='\uD800'", f64::NAN, f64::NAN, f64::NAN),
     ] {
         for (form, new, result) in [
             ("++x", incremented, incremented),
@@ -776,6 +895,22 @@ fn postfix_preserves_the_old_coerced_number_and_stores_the_new_number() {
             Ok(Value::Boolean(true)),
             "{source}"
         );
+    }
+}
+
+#[test]
+fn string_postfix_preserves_the_converted_nan_without_arithmetic() {
+    for text in ["'nonnumeric'", "'-nonnumeric'"] {
+        let old = parse_script(&format!("+{text}"))
+            .unwrap()
+            .evaluate()
+            .unwrap();
+        assert!(old.is_nan());
+        for form in ["x++", "x--"] {
+            let source = format!("let x={text}; const old={form}; old");
+            let actual = parse_script(&source).unwrap().evaluate().unwrap();
+            assert_eq!(actual.to_bits(), old.to_bits(), "{source}");
+        }
     }
 }
 

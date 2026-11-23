@@ -214,13 +214,13 @@ Mixed loose equality with Numbers or Booleans and mixed String/scalar ordering
 compare numerically instead. For example, `'10' < '2'` is true, but `'10' < 2`
 is false. Mixed ordering treats `null` as `+0` and `undefined` as NaN; a NaN
 operand makes all four relations false. Mixed comparisons spend no code-unit
-pairs. String concatenation, binary subtraction on Strings, and String updates
-are unsupported. An unsupported String operation is an evaluation error only
+pairs. String concatenation and binary subtraction on Strings are unsupported. An unsupported String operation is an evaluation error only
 when it executes.
 
 Unary `+`, `-`, and `~` and binary `*`, `/`, `%`, `**`, `&`, `^`, `|`, `<<`,
 `>>`, and `>>>` (including their compound assignments) convert Strings to
-Numbers, as do the mixed numeric comparisons above. Conversion trims
+Numbers, as do the mixed numeric comparisons above and name updates with
+`++` and `--`. Conversion trims
 ECMAScript whitespace and line terminators, then accepts signed decimal and
 `Infinity` forms and unsigned `0x`, `0o`, and `0b` integers. Empty text becomes
 `+0`, negative zero is preserved, and invalid numeric text produces NaN rather
@@ -232,8 +232,11 @@ shift operators use the same 32-bit reduction rules as for Numbers, with shift
 counts masked to their low five bits. The supported binary
 operators evaluate both expressions before converting operands left to right.
 Their compound forms read the old left-hand value before the right-hand side
-runs and store the result only if the operation succeeds. Other binary operators
-and updates do not perform this String-to-Number conversion yet.
+runs and store the result only if the operation succeeds. Name updates convert
+once before adding or subtracting one. Prefix expressions return the new Number;
+postfix expressions return the old converted Number, including signed zero or
+NaN. Consuming updates store the result without yielding it. Binary `+` and `-`
+and their compound forms still reject String operands.
 
 Each evaluation has 262,144 conversion credits, separate from comparison
 and dispatch limits. A reached String conversion charges `1 + original

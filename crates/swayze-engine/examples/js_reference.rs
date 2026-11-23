@@ -420,7 +420,10 @@ fn fixtures() -> Vec<String> {
             "let x=2; ++x\n**2",
             "let x=-0; x++/*\n*/ * 1",
             "let x=1,y=0; { x++ ? (y = x) : (y = 99); } y",
-            "let x=2,y=0; x++ + 4, y = x, x + y"
+            "let x=2,y=0; x++ + 4, y = x, x + y",
+            "let seen=0; for (let i=0; i<2; i++/*\n*/ + (seen = seen*10 + i), seen += 1) { continue; } seen",
+            "let x=2,y=0; for (++x ** 2 === 9 ? y = 4 : y = 99; y < 5; x++ + 1, y++) {} x*10+y",
+            "let x=2,y=0; for (x-- * (y=x); y>0; --x ** 2, y++) { break; } x*10+y"
         ]
         .map(str::to_owned),
     );

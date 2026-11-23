@@ -63,6 +63,70 @@ fn non_store_clauses_work_at_root_and_in_nested_loops() {
 }
 
 #[test]
+fn all_leading_update_forms_supply_their_value_in_both_expression_clauses() {
+    for (lead, initial, expected) in [
+        ("++x", 0, 71.0),
+        ("--x", 1, 30.0),
+        ("x++", 0, 31.0),
+        ("x--", 1, 70.0),
+    ] {
+        let clause = format!("{lead} ? seen=7 : seen=3, after=seen*10+x");
+        for header in [format!("{clause};false;"), format!(";!after;{clause}")] {
+            let source = format!("let x={initial},seen=0,after=0;for({header}){{continue;}}after");
+            assert_eq!(
+                parse_script(&source).unwrap().evaluate(),
+                Ok(expected),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn leading_update_power_conditionals_and_sequences_run_on_the_right_loop_edges() {
+    let source = "let x=1,y=0,seen=0;
+        outer: for (++x ** 2 ** 3 === 256 ? seen=1 : seen=99; y<4;
+                    x++ ** 2 === 4 ? seen=seen*10+2 : seen=seen*10+3, ++y) {
+            if (y===0) {continue outer;}
+            if (y===2) {break outer;}
+        }
+        seen*100+x*10+y";
+    let script = parse_script(source).unwrap();
+    // The initializer sets seen to 1. Continue and fallthrough append 2 and 3
+    // and increment y; break skips both operands of the updater.
+    assert_eq!(script.evaluate(), Ok(12342.0));
+    assert_eq!(script.evaluate(), Ok(12342.0));
+
+    let source = "let seen=0; for(let x=0; x<2; ++x && (seen += x)) {let x=9;} seen";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(3.0));
+}
+
+#[test]
+fn declaration_header_continue_runs_entire_seeded_updater_in_order() {
+    let source = "let seen=0;
+        for (let i=0; i<2; i++ + (seen = seen*10 + i), seen += 1) {continue;}
+        seen";
+    let script = parse_script(source).unwrap();
+    // The postfix store runs before the RHS sees i; the comma operand runs last.
+    assert_eq!(script.evaluate(), Ok(23.0));
+}
+
+#[test]
+fn comment_newline_may_follow_but_not_precede_the_postfix_operator_in_a_seed() {
+    let source = "let seen=0;
+        for (let i=0; i<2; i++/*\n*/ + (seen = seen*10 + i), seen += 1) {continue;}
+        seen";
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(23.0));
+
+    let source = source.replace("i++/*\n*/", "i/*\n*/++");
+    let error = assert_error_at(&source, ErrorKind::Unsupported, "++");
+    assert_eq!(
+        error.message(),
+        "a line terminator cannot precede a postfix update"
+    );
+}
+
+#[test]
 fn assignment_sequences_run_left_to_right_on_entry_fallthrough_and_continue() {
     let script = parse_script(
         "let x=99,y=99,trace=0;
@@ -514,38 +578,95 @@ fn skipped_non_store_clauses_still_resolve_all_names_in_their_own_scope() {
 }
 
 #[test]
-fn no_comma_stores_and_leading_update_restrictions_remain_unchanged() {
+fn no_comma_stores_and_assignment_restrictions_remain_unchanged() {
     let source = "let i;for(i??=(null,0);i<3;i+=(true?1:2,1)){}i";
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(3.0));
     let source = "let i=2;for(--i;i<3;i/**/++){if(i===2){break;}continue;}i";
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(2.0));
 
     let assignment_expr = "assignment expressions require a simple name followed by an assignment operator at the start of an expression group";
-    let standalone_update = "increment and decrement expressions are outside the subset at the start of a statement or for clause";
-    for (source, marked, message) in [
-        ("let i;for(i, -i+=1;false;){}0", "+=", assignment_expr),
-        ("let i;for(;false;((i)=1)){}0", "=", assignment_expr),
-        (
-            "let i=0,j=0;for(i++ + j,j++;false;){}0",
-            "i|++",
-            standalone_update,
-        ),
-        (
-            "let i=0,j=0;for(;false;++i ** 2,j--){}0",
-            "++",
-            standalone_update,
-        ),
-        (
-            "let i;for(;false;i/*\n*/++){}0",
-            "++",
-            "a line terminator cannot precede a postfix update",
-        ),
+    for (source, marked) in [
+        ("let i;for(i, -i+=1;false;){}0", "+="),
+        ("let i;for(;false;((i)=1)){}0", "="),
+        ("let i=0;for(++i + i=1;false;){}0", "i|="),
+        ("let i=0;for(;false;i--+1=2){}0", "1|="),
     ] {
         assert_eq!(
             assert_error_at(source, ErrorKind::Unsupported, marked).message(),
-            message,
+            assignment_expr,
             "{source}"
         );
+    }
+}
+
+#[test]
+fn seeded_updates_require_complete_expressions_and_classic_clause_delimiters() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, marked, message) in [
+        (
+            "let x;for(x++ + 1){}0",
+            Malformed,
+            ")",
+            "expected ';' between for clauses",
+        ),
+        (
+            "let x;for(;false;--x ** 2;){}0",
+            Malformed,
+            "2|;",
+            "expected ')' after the for update",
+        ),
+        (
+            "let x;for(;false;--x ** 2",
+            Malformed,
+            "",
+            "expected ')' after the for update",
+        ),
+        (
+            "let x;for(++x + ;false;){}0",
+            Malformed,
+            "+ |;",
+            "expected an operand",
+        ),
+        (
+            "let x;for(;false;x-- + 1,){}0",
+            Malformed,
+            ",|)",
+            "expected an operand",
+        ),
+        (
+            "let x;for(++x ? 1,2 : 3;false;){}0",
+            Malformed,
+            ",",
+            "expected ':' before ','",
+        ),
+        ("let x;for(++x + 1 in x){}0", Unsupported, "in", "outside"),
+        (
+            "let x;for(x-- ? 1 : 2 of x){}0",
+            Unsupported,
+            "of",
+            "outside",
+        ),
+        (
+            "let x;for(let i=x++ + 1,null;false;){}0",
+            Unsupported,
+            "null",
+            "cannot be used as a binding name",
+        ),
+        (
+            "for(const x=1;false;x++ + missing){}0",
+            Unsupported,
+            "++",
+            "assignment to const",
+        ),
+        (
+            "for(;false;++x ? 1 : 2){let x=0;}0",
+            Unsupported,
+            "++|x",
+            "unbound name",
+        ),
+    ] {
+        let error = assert_error_at(source, kind, marked);
+        assert!(error.message().contains(message), "{source}: {error}");
     }
 }
 
@@ -1115,6 +1236,20 @@ fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
             2,
             Value::Number(1.0),
         ),
+        (
+            "let x=true;for(x--;false;--x){}x",
+            18,
+            16,
+            2,
+            Value::Number(0.0),
+        ),
+        (
+            "let x=true;for(x++,false;false;--x,null){}x",
+            22,
+            20,
+            2,
+            Value::Number(2.0),
+        ),
     ] {
         // Besides scanned bytes and emissions: one header and one frame,
         // and three two-unit lookups (one each for the init, update and exit).
@@ -1161,6 +1296,64 @@ fn leading_stores_with_and_without_commas_have_exact_parse_costs() {
                 }
             );
         }
+    }
+}
+
+#[test]
+fn for_leading_expression_updates_meter_one_seed_and_its_continuation() {
+    let source = "let x=false;for(++x/*é*/ + true;false;x-- - false){}x";
+    // Source bytes, 16 emissions, two binary operators pushed, one header
+    // and one frame charge, and three two-unit lookups.
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 22,
+        max_nesting_depth: 1,
+        max_work: source.len() + 26,
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 16);
+    assert_eq!(script.max_stack_depth(), 2);
+    assert_eq!(script.evaluate(), Ok(1.0));
+
+    let final_name = source.len() - 1;
+    let init_name = source.find("++x").unwrap() + 2;
+    let init_operator = source.find("+ true").unwrap();
+    for (limits, limit, start) in [
+        (
+            Limits {
+                max_tokens: 21,
+                ..limits
+            },
+            Limit::Tokens,
+            final_name,
+        ),
+        (
+            Limits {
+                max_work: limits.max_work - 1,
+                ..limits
+            },
+            Limit::Work,
+            final_name,
+        ),
+        // After reading '+', the seed charges its name before emitting it.
+        (
+            Limits {
+                max_work: init_operator + 1 + 3,
+                ..limits
+            },
+            Limit::Work,
+            init_name,
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            }
+        );
     }
 }
 

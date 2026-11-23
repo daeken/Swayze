@@ -101,9 +101,9 @@ fn inner_frames_and_alternate_arms_start_reachable() {
 fn dead_code_still_checks_syntax_immediates_and_indices() {
     for (tail, offset, kind) in [
         (
-            &[0x0f, 0x0b][..],
+            &[0x0e, 0x0b][..],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x0f },
+            ErrorKind::UnsupportedOpcode { opcode: 0x0e },
         ),
         (
             &[0x41, 0x80],
@@ -145,11 +145,11 @@ fn dead_code_still_checks_syntax_immediates_and_indices() {
             },
         ),
         (
-            &[0x0d, 0, 0x0b],
+            &[0x0d, 1, 0x0b],
             1,
             ErrorKind::InvalidIndex {
                 field: IntegerField::LabelIndex,
-                index: 0,
+                index: 1,
             },
         ),
         (&[0x04, 0x7f, 0x00, 0x0b, 0x0b], 3, ErrorKind::MissingElse),

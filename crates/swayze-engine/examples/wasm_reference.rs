@@ -489,6 +489,15 @@ fn fixtures() -> Vec<Fixture> {
     for input in [0, 4] {
         cases.push(Fixture::new(0, &[input], &countdown_with_exit));
     }
+    // A taken branch crosses the if to return from the function. On
+    // fallthrough the candidate is dropped and the ordinary result is 7.
+    let function_label = [
+        0x20, 0, 0x04, 0x40, 0x41, 42, 0x20, 1, 0x0d, 1, 0x1a, 0x0b, 0x41, 7,
+    ];
+    for (args, expected) in [([0, 1], 7), ([1, 0], 7), ([1, -1], 42)] {
+        cases.push(Fixture::new(expected, &args, &function_label));
+    }
+    cases.push(Fixture::new(42, &[], &[0x41, 7, 0x41, 42, 0x0f, 0x00]));
     cases
 }
 

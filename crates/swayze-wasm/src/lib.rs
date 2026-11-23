@@ -79,12 +79,14 @@
 //!
 //! The optional global section (ID 6) follows any type, function, table, and
 //! memory sections and precedes any export, start, element, and code sections.
-//! It may contain zero to eight defined `i32` globals, indexed from zero in declaration
-//! order. Each declaration uses value type byte `0x7f`, literal mutability byte
-//! `0x00` (immutable) or `0x01` (mutable), and exactly `i32.const <signed LEB32> end`.
-//! Every body can read either kind and can set only mutable globals, including
-//! globals at later indices. Global imports, exports, and initializer reads
-//! are unsupported.
+//! It may contain zero to eight private globals total, indexed from zero in
+//! declaration order. Each declaration uses value type byte `0x7f` (i32) or
+//! `0x7e` (i64), literal mutability byte `0x00` (immutable) or `0x01` (mutable),
+//! and exactly the matching `i32.const <signed LEB32> end` or
+//! `i64.const <signed LEB64> end`. Valid LEB padding is accepted; the
+//! initializer cannot read past the global section frame. Every body can read
+//! any declared global and can set only mutable globals. Global imports,
+//! exports, and initializer reads are unsupported.
 //!
 //! The optional start section (ID 8) comes after any exports and before any
 //! elements, code, and data. Its entire payload is one unsigned LEB32 index
@@ -127,7 +129,8 @@
 //! stack and checks each stack effect: `local.get` pushes the indexed slot's
 //! declared type (`i32` for parameters); `local.set` consumes a value of that
 //! type, and `local.tee` writes and leaves a value of that type on the stack.
-//! `global.get` and `i32.const` push one i32; `global.set` consumes one i32.
+//! `global.get` pushes the declared type; `global.set` consumes that type.
+//! Both are checked even in dead code. `i32.const` pushes one i32.
 //! `i64.const` pushes one i64 and accepts valid padding within ten signed LEB128
 //! bytes. In a ten-byte encoding the terminal byte must be `0x00` or `0x7f` to
 //! match the sign bit. The immediate cannot read beyond its body frame.
@@ -137,8 +140,8 @@
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
-//! i64 is limited to internal operands and declared locals: signatures, globals,
-//! control labels, and memory instructions do not accept i64.
+//! i64 is limited to internal operands, declared locals, and private globals:
+//! signatures, control labels, and memory instructions do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
 //! i64) and an i32 condition, pushed in first-candidate, second-candidate,
@@ -477,10 +480,11 @@
 //! parameter order, matching duplicate type declarations, void and i32 results,
 //! target traps and their ordering against both budgets, and shared memory and
 //! globals through indirect calls.
-//! Global tests cover section order, declaration counts and encodings, exact
-//! initializer expressions, index decoding and bounds, mutability and operand
-//! floors in all bodies, and unsupported imports, exports, and global offsets.
-//! They exercise shared state across exports and calls, fresh instances, and
+//! Global tests cover section order, the shared declaration cap, exact typed
+//! initializer expressions and framing, index decoding and bounds, mutability
+//! and type-check precedence, operand floors and caps, and unsupported imports,
+//! exports, and global offsets. They exercise full-width reads and writes,
+//! shared state across start, exports and calls, fresh instances, and
 //! suppression of later writes after a trap or exhausted dispatch budget.
 //! Start tests cover section order, exact framing, padded and invalid indices,
 //! signature errors and validation precedence, private and exported targets,
@@ -524,7 +528,7 @@ use table::{ElementSegment, FunctionTable};
 /// let forged = Module {
 ///     functions: Vec::new(), exports: Vec::new(), start_function: None,
 ///     memory_limits: None, data_segments: Vec::new(),
-///     global_initial_values: [0; 8],
+///     global_initial_values: std::array::from_fn(|_| unreachable!()),
 ///     table_entries: None, element_segments: Vec::new(),
 /// };
 /// ```
@@ -535,7 +539,7 @@ pub struct Module {
     start_function: Option<usize>,
     // None means absent; Some may have a minimum of zero and no declared maximum.
     memory_limits: Option<MemoryLimits>,
-    global_initial_values: [i32; binary::MAX_GLOBALS as usize],
+    global_initial_values: [binary::Value; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
     // None means absent; Some(0) means a declared zero-entry table.
     table_entries: Option<usize>,
@@ -557,7 +561,7 @@ impl Module {
     /// and zeroed; an absent or initially zero-page memory allocates nothing at
     /// this step. A defined table uses fixed storage and starts all null.
     /// Segments of each kind are applied in source order.
-    /// Global initial values are copied into fixed, independent instance slots.
+    /// Typed global initial values are copied into fixed, independent instance slots.
     /// Once initialization succeeds, start (if specified) runs once with fresh
     /// execution budgets. Its stores and memory growth are visible on the
     /// returned instance.
@@ -659,7 +663,8 @@ impl std::error::Error for InstantiationError {
 pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
-    globals: [Cell<i32>; binary::MAX_GLOBALS as usize],
+    // Validation allows stores only to mutable slots and with the initial value's type.
+    globals: [Cell<binary::Value>; binary::MAX_GLOBALS as usize],
     table: Option<FunctionTable>,
 }
 

@@ -719,6 +719,24 @@ fn fixtures() -> Vec<Fixture> {
             ],
         ),
     ]);
+    // Compare all 64 bits in the initialized global and after a write.
+    let i64_global = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7f\x03\x02\x01\0\
+                       \x06\x06\x01\x7e\x01\x42\x2a\x0b\x07\x05\x01\x01x\0\0";
+    for body in [
+        &b"\0\x23\0\x42\x2a\x51\x0b"[..],
+        &b"\0\x42\xaa\x80\x80\x80\x10\x24\0\x23\0\x42\x2a\x52\x0b"[..],
+    ] {
+        let mut bytes = i64_global.to_vec();
+        let body_len = u8::try_from(body.len()).unwrap();
+        bytes.extend([10, body_len + 2, 1, body_len]);
+        bytes.extend_from_slice(body);
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(1)),
+            bytes,
+            export: "x",
+            args: vec![],
+        });
+    }
     cases
 }
 

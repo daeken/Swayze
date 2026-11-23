@@ -27,6 +27,8 @@ mod float_rounding;
 mod float_signatures;
 #[path = "execution/float_sqrt.rs"]
 mod float_sqrt;
+#[path = "execution/float_to_int.rs"]
+mod float_to_int;
 #[path = "execution/function_exit.rs"]
 mod function_exit;
 #[path = "execution/globals.rs"]
@@ -2270,14 +2272,13 @@ fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1a,
-            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40, 0xac, 0xad,
+            0x1b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x3f, 0x40,
         ]
         .contains(&opcode)
             && !(0x28..=0x3e).contains(&opcode)
             && !(0x41..=0x91).contains(&opcode)
             && !(0x96..=0x9f).contains(&opcode)
-            && !(0xa4..=0xa7).contains(&opcode)
-            && !(0xb2..=0xbf).contains(&opcode)
+            && !(0xa4..=0xbf).contains(&opcode)
         {
             bad_body(
                 &[0, 0x41, 3, opcode, 0x0b],

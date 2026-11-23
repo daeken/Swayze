@@ -1250,6 +1250,65 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![input],
         });
     }
+    // Integer conversions truncate first, including for negative unsigned fractions.
+    let overflow = Err(WasmTrap::IntegerOverflow);
+    for (op, arg, expected) in [
+        (0xa8, WasmValue::F32((-3.75_f32).to_bits()), Ok(-3)),
+        (0xa9, WasmValue::F32((-0.75_f32).to_bits()), Ok(0)),
+        (
+            0xaa,
+            WasmValue::F64((-2_147_483_648.5_f64).to_bits()),
+            Ok(i32::MIN),
+        ),
+        (0xab, WasmValue::F64(4_294_967_295.75_f64.to_bits()), Ok(-1)),
+        (
+            0xaa,
+            WasmValue::F64((-2_147_483_649.0_f64).to_bits()),
+            overflow,
+        ),
+        (0xa9, WasmValue::F32((-1.0_f32).to_bits()), overflow),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(expected),
+            bytes: modules(if op < 0xaa { 0x7d } else { 0x7c }, 0x7f, op),
+            export: "x",
+            args: vec![arg],
+        });
+    }
+    for (op, arg, expected) in [
+        (
+            0xae,
+            WasmValue::F32((-9_223_372_036_854_775_808.0_f32).to_bits()),
+            Ok(i64::MIN),
+        ),
+        (0xaf, WasmValue::F32(0x5f7f_ffff), Ok(-(1_i64 << 40))),
+        (0xb0, WasmValue::F64((-42.75_f64).to_bits()), Ok(-42)),
+        (0xb1, WasmValue::F64(0x43ef_ffff_ffff_ffff), Ok(-2048)),
+        (
+            0xb1,
+            WasmValue::F64(0x43f0_0000_0000_0000),
+            Err(WasmTrap::IntegerOverflow),
+        ),
+        (
+            0xb0,
+            WasmValue::F64(f64::NEG_INFINITY.to_bits()),
+            Err(WasmTrap::IntegerOverflow),
+        ),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::I64Invocation(expected),
+            bytes: modules(if op < 0xb0 { 0x7d } else { 0x7c }, 0x7e, op),
+            export: "x",
+            args: vec![arg],
+        });
+    }
+    // Reinterpret an integer to keep signaling NaN bits inside the guest.
+    cases.push(Fixture {
+        expected: Outcome::Invocation(Err(WasmTrap::InvalidConversionToInteger)),
+        bytes: b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x08\x01\x06\0\x20\0\xbe\xa8\x0b".to_vec(),
+        export: "x",
+        args: vec![WasmValue::I32(0x7f80_0001)],
+    });
     // Widening preserves the source value even for f32 subnormals.
     for bits in [1, 0x007f_ffff, 0x8000_0000, 0x7f80_0000] {
         cases.push(Fixture {

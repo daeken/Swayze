@@ -21,6 +21,8 @@
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
 //! `f32.convert_i32_s`, `f32.convert_i32_u`, `f32.convert_i64_s`, `f32.convert_i64_u`,
 //! `f64.convert_i32_s`, `f64.convert_i32_u`, `f64.convert_i64_s`, `f64.convert_i64_u`,
+//! `i32.trunc_f32_s`, `i32.trunc_f32_u`, `i32.trunc_f64_s`, `i32.trunc_f64_u`,
+//! `i64.trunc_f32_s`, `i64.trunc_f32_u`, `i64.trunc_f64_s`, `i64.trunc_f64_u`,
 //! `f32.demote_f64`, `f64.promote_f32`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
@@ -173,7 +175,19 @@
 //! unsigned integer. Conversion rounds directly to the nearest value of the
 //! destination width, with ties to even, using only integer arithmetic. Zero
 //! produces positive zero and all results are finite. Each conversion costs
-//! one dispatch. Float-to-integer numeric conversions are unsupported.
+//! one dispatch.
+//! The trapping float-to-integer conversions (`0xa8`–`0xab` for i32 and
+//! `0xae`–`0xb1` for i64, in the order listed above) consume one float of the
+//! specified width. They truncate toward zero using only integer arithmetic
+//! on the raw bits, then check the resulting integer against the destination
+//! range (`_s` signed, `_u` unsigned). Both zero signs, subnormals, and any
+//! other input with magnitude less than one produce integer zero, including
+//! negative inputs for `_u`. A value below the signed minimum is accepted if
+//! it truncates to that minimum. Any NaN traps with
+//! [`Trap::InvalidConversionToInteger`]; either infinity or a truncated value
+//! outside the destination range traps with [`Trap::IntegerOverflow`]. Each
+//! conversion costs one dispatch; exhaustion is checked before it can trap.
+//! Post-Core-1.0 saturating conversions (`trunc_sat`) are unsupported.
 //! For both widths, `abs` clears the sign bit and `neg` flips it;
 //! each consumes one operand and produces one of the same type. `copysign`
 //! consumes two operands of its width, taking the magnitude bits from the first
@@ -538,6 +552,14 @@
 //! cases that would differ if rounded first to f64 and then to f32. They also
 //! check live and dead typing and one dispatch per opcode at the fuel limit.
 //! Direct Rust casts of deterministic samples supplement the fixed bit vectors.
+//! Trapping float-to-integer tests cover all eight opcodes, exact neighbors of
+//! signed and unsigned range boundaries, NaNs, infinities, both zero signs,
+//! subnormals, and negative fractions. They check live and dead typing, fuel
+//! precedence, and preservation of writes that executed before a trap.
+//! Native truncation on fixed in-range inputs supplements the exact vectors.
+//! Before/after probes with pinned Rust on arm64 macOS (debug and release)
+//! measured the conversion enum growing from 2 to 3 bytes, with no change to
+//! the decoded instruction (32), operand (16), call frame (856), or trap (1).
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh
@@ -1096,11 +1118,15 @@ impl ExecutionLimit {
 }
 
 /// The reason a validated guest instruction trapped at runtime.
+///
+/// This enum now includes [`Trap::InvalidConversionToInteger`]; downstream
+/// exhaustive matches must handle the added variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Trap {
     /// An integer division or remainder instruction had a zero divisor.
     IntegerDivideByZero,
-    /// Signed integer division could not represent its quotient.
+    /// Signed integer division could not represent its quotient, or a trapping
+    /// float-to-integer conversion received an infinity or truncated out of range.
     IntegerOverflow,
     /// The full range of a load or store was not within the instance's memory.
     MemoryOutOfBounds,
@@ -1112,6 +1138,8 @@ pub enum Trap {
     IndirectCallTypeMismatch,
     /// An `unreachable` instruction was executed.
     Unreachable,
+    /// A trapping float-to-integer conversion received a NaN.
+    InvalidConversionToInteger,
 }
 
 impl fmt::Display for Trap {
@@ -1120,6 +1148,7 @@ impl fmt::Display for Trap {
             Self::Unreachable => f.write_str("unreachable instruction executed"),
             Self::IntegerDivideByZero => f.write_str("integer divide by zero"),
             Self::IntegerOverflow => f.write_str("integer overflow"),
+            Self::InvalidConversionToInteger => f.write_str("invalid conversion to integer"),
             Self::MemoryOutOfBounds => f.write_str("out of bounds memory access"),
             Self::TableOutOfBounds => f.write_str("out of bounds table access"),
             Self::UninitializedElement => f.write_str("uninitialized table element"),

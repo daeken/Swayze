@@ -507,6 +507,20 @@ fn fixtures() -> Vec<Fixture> {
     for (args, expected) in [([1, 0], 42), ([0, -1], 7), ([0, 0], 11)] {
         cases.push(Fixture::new(expected, &args, &if_end));
     }
+    // Table slots 0 and 2 exit the inner block and preserve its stack prefix.
+    // Slot 1 and the default exit the outer block and discard that prefix.
+    let table = [
+        0x02, 0x7f, 0x41, 3, 0x02, 0x7f, 0x41, 39, 0x20, 0, 0x0e, 3, 0, 1, 0, 1, 0x0b, 0x6a, 0x0b,
+    ];
+    for (input, expected) in [(0, 42), (1, 39), (2, 42), (3, 39), (-1, 39)] {
+        cases.push(Fixture::new(expected, &[input], &table));
+    }
+    // An empty vector still dispatches to its mandatory function-label default.
+    cases.push(Fixture::new(
+        42,
+        &[],
+        &[0x41, 42, 0x41, 0, 0x0e, 0, 0, 0x00],
+    ));
     cases
 }
 

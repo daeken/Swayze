@@ -141,9 +141,9 @@ fn void_floors_and_fallthrough_are_checked_even_on_untaken_paths() {
         ErrorKind::InvalidResultDepth { depth: 1 },
     );
     bad_body(
-        &[block, &[0x0e, 0x0b, 0x0b]].concat(),
+        &[block, &[0x11, 0x0b, 0x0b]].concat(),
         block.len(),
-        ErrorKind::UnsupportedOpcode { opcode: 0x0e },
+        ErrorKind::UnsupportedOpcode { opcode: 0x11 },
     );
     bad_body(
         &[block, &[0x1a, 0x41, 42, 0x0b, 0x0b]].concat(),

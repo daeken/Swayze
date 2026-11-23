@@ -81,9 +81,9 @@ fn if_branches_do_not_relax_dead_tail_or_other_arm_validation() {
     for (tail, offset, kind) in [
         (&[0x0b, 0x0b][..], 0, ErrorKind::MissingElse),
         (
-            &[0x0e, 0x05, 0x41, 7, 0x0b, 0x0b],
+            &[0x11, 0x05, 0x41, 7, 0x0b, 0x0b],
             0,
-            ErrorKind::UnsupportedOpcode { opcode: 0x0e },
+            ErrorKind::UnsupportedOpcode { opcode: 0x11 },
         ),
         (
             &[0x05, 0x1a, 0x41, 7, 0x0b, 0x0b],

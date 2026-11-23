@@ -79,6 +79,18 @@ fn every_loop_alias_breaks_and_continues_to_the_same_edges() {
 }
 
 #[test]
+fn continue_to_a_non_first_for_alias_runs_the_update_before_retesting() {
+    let source = "let i=0; let trace=0;
+         outer: middle: next: for(;i<4;i+=2) {
+             { trace=trace*10+i+1; continue next; }
+             trace=999;
+         }
+         trace*10+i";
+    // The body sees i=0 and i=2, skips its tail, and the last update leaves i=4.
+    assert_eq!(parse_script(source).unwrap().evaluate(), Ok(134.0));
+}
+
+#[test]
 fn aliases_share_neither_bindings_nor_lifetimes_with_other_statements() {
     let source = "let name=0;
          if(false) { name: reuse: { break name; } }
@@ -104,6 +116,30 @@ fn span(start: usize, len: usize) -> Span {
 
 fn last_span(source: &str, needle: &str) -> Span {
     span(source.rfind(needle).unwrap(), needle.len())
+}
+
+#[test]
+fn closing_a_target_releases_every_alias_but_keeps_outer_labels_active() {
+    for statement in [
+        "{break last;}",
+        "while(true){break last;}",
+        "for(;;){break last;}",
+        "do{break last;}while(true);",
+    ] {
+        let prefix = format!("let n=0; keep:{{first:middle:last:{statement}");
+        let reuse = format!("{prefix}last:middle:first:{{n=42;break middle;}}break keep;n=999;}}n");
+        assert_eq!(parse_script(&reuse).unwrap().evaluate(), Ok(42.0));
+
+        for alias in ["first", "middle", "last"] {
+            for jump in ["break", "continue"] {
+                let source = format!("{prefix}{jump} {alias};}}n");
+                let error = parse_script(&source).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Malformed, "{source}: {error}");
+                assert_eq!(error.message(), "jump target is not an active label");
+                assert_eq!(error.span(), last_span(&source, alias));
+            }
+        }
+    }
 }
 
 #[test]
@@ -172,19 +208,41 @@ fn stacked_prefixes_do_not_expand_statement_or_jump_syntax() {
 
 #[test]
 fn many_aliases_use_one_frame_and_no_expression_depth() {
-    let prefix = (0..140).map(|i| format!("l{i}:")).collect::<String>();
+    const LABELS: usize = 140;
+    const OUTER_BLOCKS: usize = 127;
+    let prefix = (0..LABELS).map(|i| format!("l{i}:")).collect::<String>();
     let limits = Limits {
         max_nesting_depth: 0,
         ..Limits::default()
     };
-    let braces = ("{".repeat(127), "}".repeat(127));
+    let braces = ("{".repeat(OUTER_BLOCKS), "}".repeat(OUTER_BLOCKS));
     let source = format!("{}{}{{break l0;}}{}42", braces.0, prefix, braces.1);
+    // Each prefix contributes a name and colon; each block contributes two
+    // braces. The named break adds three tokens and the final expression one.
+    let max_tokens = 2 * LABELS + 2 * (OUTER_BLOCKS + 1) + 3 + 1;
     assert_eq!(
-        parse_script_with_limits(&source, limits)
-            .unwrap()
-            .evaluate(),
+        parse_script_with_limits(
+            &source,
+            Limits {
+                max_tokens,
+                ..limits
+            }
+        )
+        .unwrap()
+        .evaluate(),
         Ok(42.0)
     );
+    let error = parse_script_with_limits(
+        &source,
+        Limits {
+            max_tokens: max_tokens - 1,
+            ..limits
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Tokens));
+    // The lexer stops at the first byte of the final literal before scanning it.
+    assert_eq!(error.span(), last_span(&source, "4"));
     let source = format!(
         "{}{}{{overflow:alias:{{}}}}{}42",
         braces.0, prefix, braces.1

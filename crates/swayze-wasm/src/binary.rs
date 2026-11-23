@@ -801,7 +801,7 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<MemoryLimits>, Err
     };
     Ok(Some(MemoryLimits {
         minimum_pages: minimum,
-        maximum_pages: maximum,
+        declared_maximum_pages: maximum,
     }))
 }
 

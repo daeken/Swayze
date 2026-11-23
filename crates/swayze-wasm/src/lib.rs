@@ -418,8 +418,8 @@
 //! `memory.grow`, during start or invocation. The reserve and the drop of the
 //! old buffer happen outside any memory borrow. The private `RefCell<Vec<u8>>`
 //! only lends bytes within one operation, never across guest dispatch or host
-//! reentry. Capacity is checked before copy or zero-fill: on pinned Rust the
-//! bulk append and resize do not allocate when capacity suffices.
+//! reentry. After checking capacity, growth appends bytes with individual
+//! pushes, not bulk `Vec` methods.
 //! Zero selects the else arm (or skips straight to the join if no `else` is
 //! present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of operand types and a fixed stack of control
@@ -547,6 +547,19 @@
 //! [`prepare`] remains a stub.
 //!
 //! ## Linear-memory resource bounds
+//!
+//! At instantiation, a zero minimum starts with [`Vec::new`] and skips
+//! reserve and zero-fill, even for a declared maximum of 65,536. For positive
+//! initial or new sizes, [`Vec::try_reserve_exact`] guarantees capacity of at
+//! least `len + additional` on success; the vector is empty at reserve, and
+//! `additional` is the checked target byte length. The pinned Rust 1.99.1
+//! [Vec guarantees] say `push` never reallocates with spare capacity, but
+//! bulk insertion methods may. Consequently the old bytes are copied with
+//! one `push` each, from length zero to the old length (less than the target);
+//! initial zero-fill and growth's zero-tail fill push only up to the target.
+//! Before each push, `len < target <= capacity`. Active-data writes, guest
+//! stores, and host copies use slices of existing storage and do not change
+//! vector length or capacity.
 //!
 //! A memory can grow successfully at most twice in an instance's lifetime.
 //! The maximum simultaneous **requested** linear-memory backing is 192 KiB
@@ -782,10 +795,10 @@
 //! `LinearMemory` at 32 → 40 bytes and `Instance` at 432 → 440 bytes; `Module`
 //! remained 272 bytes (sizes exclude heap backing). A local optimized Apple
 //! M4 microprobe (median of seven batches, direct memory operations, no guest
-//! dispatch) measured about 1.3 → 2.1 ns for one unaligned i64 store/load pair,
-//! 0.89 → 0.78 µs for a hot 64 KiB copy-out, and 0.63 → 0.84 µs for fresh
+//! dispatch) measured about 1.3 → 2.2 ns for one unaligned i64 store/load pair,
+//! 0.85 → 0.90 µs for a hot 64 KiB copy-out, and 0.59 → 18 µs for fresh
 //! zero-to-one growth with drop. Fresh one-to-two growth including initial
-//! allocation and drop measured about 2.0 µs. These are local observations,
+//! allocation and drop measured about 69 µs. These are local observations,
 //! not performance or cross-target layout guarantees.
 //! Growth tests check optional and padded declared maxima, unsigned deltas,
 //! reserve bounds and injected failure/retry, stack and dispatch limits, and
@@ -854,6 +867,7 @@
 //! No upstream Wasm spec suite or fuzzing has been run.
 //!
 //! [WebAssembly Core 1.0]: https://www.w3.org/TR/2019/REC-wasm-core-1-20191205/
+//! [Vec guarantees]: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/mod.rs#L371-L376
 
 mod binary;
 mod memory;

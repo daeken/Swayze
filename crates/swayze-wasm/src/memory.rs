@@ -8,7 +8,7 @@ pub(super) const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MemoryLimits {
     pub(super) minimum_pages: u32,
-    pub(super) maximum_pages: Option<u32>,
+    pub(super) declared_maximum_pages: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,11 +93,19 @@ impl LinearMemory {
         limits: Option<MemoryLimits>,
         segments: &[DataSegment],
     ) -> Result<Self, InstantiationError> {
+        Self::new_preflighted_with(limits, segments, Vec::try_reserve_exact)
+    }
+
+    fn new_preflighted_with(
+        limits: Option<MemoryLimits>,
+        segments: &[DataSegment],
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+    ) -> Result<Self, InstantiationError> {
         let (minimum_pages, cap_pages) = limits.map_or((0, 0), |limits| {
             (
                 limits.minimum_pages,
                 limits
-                    .maximum_pages
+                    .declared_maximum_pages
                     .unwrap_or(MAX_INSTANCE_MEMORY_PAGES)
                     .min(MAX_INSTANCE_MEMORY_PAGES),
             )
@@ -105,8 +113,7 @@ impl LinearMemory {
         let byte_len = minimum_pages as usize * MEMORY_PAGE_BYTES;
         let mut bytes = Vec::new();
         if byte_len != 0 {
-            bytes
-                .try_reserve_exact(byte_len)
+            reserve(&mut bytes, byte_len)
                 .map_err(|_| InstantiationError::MemoryAllocationFailed)?;
             Self::zero_tail(&mut bytes, byte_len);
         }
@@ -123,10 +130,12 @@ impl LinearMemory {
     }
 
     fn zero_tail(bytes: &mut Vec<u8>, byte_len: usize) {
-        // Pinned Rust 1.99.1: Vec::resize growth goes through extend_with,
-        // whose reserve only grows if `new_len > capacity`.
+        // The pinned Vec "Guarantees" section rules out reallocation for
+        // push with spare capacity, but not for bulk insertion (see crate docs).
         assert!(bytes.capacity() >= byte_len);
-        bytes.resize(byte_len, 0);
+        for _ in bytes.len()..byte_len {
+            bytes.push(0);
+        }
     }
 
     pub(super) fn size_in_pages(&self) -> i32 {
@@ -157,14 +166,15 @@ impl LinearMemory {
         if reserve(&mut replacement, byte_len).is_err() {
             return -1;
         }
-        // We have reserved the complete new length, from an empty Vec. With
-        // no reentry the old length is strictly smaller. On Rust 1.99.1,
-        // extend_from_slice for u8 reaches append_elements, whose reserve
-        // grows only if `len + additional > capacity`, like resize above.
+        // Push cannot allocate: before each push, len < old.len() < byte_len
+        // <= capacity (the same Vec guarantee as in zero_tail).
         assert!(replacement.is_empty() && replacement.capacity() >= byte_len);
         {
             let old = self.bytes.borrow();
-            replacement.extend_from_slice(&old);
+            assert!(old.len() < byte_len);
+            for &byte in old.iter() {
+                replacement.push(byte);
+            }
         }
         Self::zero_tail(&mut replacement, byte_len);
         let old = self.bytes.replace(replacement);
@@ -249,20 +259,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_minimum_with_core_maximum_never_reserves_at_instantiation() {
+        let module =
+            crate::validate_module(b"\0asm\x01\0\0\0\x05\x06\x01\x01\0\x80\x80\x04").unwrap();
+        let limits = module.memory_limits.unwrap();
+        assert_eq!(limits.minimum_pages, 0);
+        assert_eq!(limits.declared_maximum_pages, Some(65_536));
+        let no_reserve = |_: &mut Vec<u8>, _| panic!("instantiation must not request a reserve");
+        let memory =
+            LinearMemory::new_preflighted_with(Some(limits), &module.data_segments, no_reserve)
+                .unwrap();
+        let instance = module.instantiate().unwrap();
+        for memory in [&memory, &instance.memory] {
+            assert_eq!(memory.size_in_pages(), 0);
+            assert_eq!(memory.bytes.borrow().capacity(), 0);
+            assert_eq!(memory.cap_pages, 2);
+        }
+    }
+
+    #[test]
     fn reserves_only_for_eligible_growth_and_can_retry_after_reserve_failure() {
-        let make_memory = |minimum_pages, maximum_pages| {
+        let make_memory = |minimum_pages, declared_maximum_pages| {
             LinearMemory::new_preflighted(
                 Some(MemoryLimits {
                     minimum_pages,
-                    maximum_pages,
+                    declared_maximum_pages,
                 }),
                 &[],
             )
             .unwrap()
         };
         let no_reserve = |_: &mut Vec<u8>, _| panic!("this delta must never request a reserve");
-        assert_eq!(make_memory(0, Some(0)).grow_with(1, no_reserve), -1);
-        assert_eq!(make_memory(1, Some(1)).grow_with(1, no_reserve), -1);
+        for pages in [0, 1] {
+            let memory = make_memory(pages, Some(pages));
+            assert_eq!(memory.grow_with(0, no_reserve), pages as i32);
+            assert_eq!(memory.grow_with(1, no_reserve), -1);
+        }
 
         let memory = make_memory(0, Some(MEMORY32_MAX_PAGES));
         assert_eq!(memory.bytes.borrow().capacity(), 0);

@@ -248,6 +248,13 @@ fn fixtures() -> Vec<String> {
             "let i = 0; for (i = 1; false; i = 9) { i = 42; } i",
             "let i = 0; let out = 0; for (; i < 2; i = i + 1) { const i = 21; out = out + i; } out",
             "let i = 0; let out = 0; while (i < 3) { for (;;) { out = out + i; break; } i = i + 1; } out",
+            "let x = 10; x += x; x -= 2; x *= 3; x /= 2; x %= 5; x",
+            "let x = false; x += true; x ^= 3; x |= 8; x &= 7; x <<= 33; x >>= 1; x",
+            "let x = -1; x >>>= null; x",
+            "let x = -0; x *= true; x",
+            "let x = 42; x += undefined; x",
+            "let i = -1; let out = 0; for (i += 1; i < 4; i += 1) { if (i === 1) { continue; } out += i; } out",
+            "let x = 1; let out = 0; if (true) { let x = 21; x += x; out = x; } out - x",
         ]
         .map(str::to_owned),
     );

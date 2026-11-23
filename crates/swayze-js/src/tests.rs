@@ -963,7 +963,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const x=1; x; const y=1; y", Unsupported, 14, 19),
         ("const x=1; x=2", Unsupported, 14, 14),
         ("const x=1; x=2; x", Unsupported, 12, 13),
-        ("const x=1; x += 2", Unsupported, 13, 15),
+        ("const x=1; x += 2; x", Unsupported, 13, 15),
         ("const x=1; x(2)", Unsupported, 12, 13),
         ("const x=1; x.y", Unsupported, 12, 13),
         ("(const x=1; x)", Unsupported, 1, 6),
@@ -1092,6 +1092,30 @@ fn lets_and_assignments_compile_to_ordered_slot_operations() {
 }
 
 #[test]
+fn compound_assignment_loads_once_before_the_rhs_and_stores_to_the_same_slot() {
+    use Instruction::{Jump, JumpIfFalse, StoreBinding};
+    assert_postfix(
+        "let x=8;let y=2;x/=y?y:4;x",
+        &[
+            Number(8.0),
+            init_let(0),
+            Number(2.0),
+            init_let(1),
+            LoadBinding(0),
+            LoadBinding(1),
+            JumpIfFalse(9),
+            LoadBinding(1),
+            Jump(10),
+            Number(4.0),
+            Divide,
+            StoreBinding(0),
+            LoadBinding(0),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn mutable_binding_gaps_and_duplicate_declarations() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [
@@ -1120,7 +1144,7 @@ fn mutable_binding_gaps_and_duplicate_declarations() {
 }
 
 #[test]
-fn only_explicit_simple_assignments_before_the_final_expression() {
+fn only_explicit_assignments_before_the_final_expression() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [
         ("let x=1; x=2", Unsupported, 12, 12),
@@ -1135,7 +1159,6 @@ fn only_explicit_simple_assignments_before_the_final_expression() {
         ("let x=1; x + (x=2)", Unsupported, 15, 16),
         ("let x=1; let y=(x=2); y", Unsupported, 17, 18),
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
-        ("let x=1; x+=2; x", Unsupported, 10, 12),
         ("let x=1; x**=2; x", Unsupported, 10, 13),
         ("let x=1; x==2; x", Unsupported, 15, 16),
         ("let x=1; x=>2; x", Unsupported, 10, 12),

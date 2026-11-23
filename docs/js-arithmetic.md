@@ -14,9 +14,13 @@ This path evaluates an expression over decimal literals (including fractions and
 signed exponents) with binary
 `+`, `-`, `*`, `/`, and `%`, plus prefix `+` and `-` and parenthesized grouping.
 The parser determines precedence and associativity. `const` and initialized
-`let` declarations initialize slots in source order, preserving the value type. Simple assignment
-statements update earlier `let` slots. All statements require an explicit
-semicolon; the final expression's semicolon is optional. Unavailable bindings
+`let` declarations initialize slots in source order, preserving the value type.
+Simple assignments and eager arithmetic or bitwise compound assignments
+update earlier `let` slots. A compound assignment reads the target once,
+evaluates the right operand, then applies the corresponding operator and
+stores the result. Assignments do not produce expression values in this subset.
+Declaration and assignment statements require an explicit semicolon; the
+final expression's semicolon is optional. Unavailable bindings
 and writes to `const` are rejected as unsupported rather than modeling global
 lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
 calls or objects.
@@ -50,8 +54,9 @@ It is left-associative, binds between bitwise OR and `?:`, and cannot mix with
 `&&` or `||` without parentheses at the same expression level. All operands
 and arms must use supported syntax and bindings.
 
-Braced `if`, `while`, and `for` statements may precede the final expression. Braced bodies can contain initialized `let` and `const`
-declarations, simple assignments to earlier visible `let` bindings, and nested
+Braced `if`, `while`, and `for` statements may precede the final expression.
+Their bodies can contain initialized `let` and `const` declarations,
+assignments to earlier visible `let` bindings, and nested
 control statements. A block-local declaration shadows enclosing
 bindings throughout its block. The parser resolves every access to the nearest
 lexical declaration after parsing the script. Access before initialization is
@@ -60,7 +65,8 @@ binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. `for (init; test; update)` permits any clause
 to be empty; a missing test is true. The initializer and update, when present,
-must assign to an existing mutable binding in the enclosing scope. `break;`
+must be simple or supported compound assignments to an existing mutable
+binding in the enclosing scope. `break;`
 skips the update. Untaken arms and skipped loop bodies are still checked. The parser
 uses at most 128 active statement frames, separate from the expression nesting
 limit. Unbraced `else if` is unsupported.

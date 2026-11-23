@@ -157,8 +157,8 @@ fn bitwise_operators_do_not_hide_mixing_of_nullish_and_logical_operators() {
 #[test]
 fn recognizes_whole_compounds_and_does_not_join_across_trivia() {
     for op in ["&=", "^=", "|=", "<<=", ">>=", ">>>=", "&&=", "||="] {
-        let prefix = "let x=1;x\u{00a0}";
-        let source = format!("{prefix}{op}2");
+        let prefix = "let x=1;(x\u{00a0}";
+        let source = format!("{prefix}{op}2)");
         let error = parse_script(&source).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{source}");
         assert_eq!(
@@ -233,7 +233,7 @@ fn operators_charge_bytes_one_token_one_push_and_one_instruction() {
         }
     }
 
-    // The fourth byte of `>>>=` costs work before the lexical rejection.
+    // The fourth byte of `>>>=` costs work before rejection in an expression.
     for (max_work, kind, start) in [
         (7, ErrorKind::Unsupported, 1),
         (6, ErrorKind::LimitExceeded(Limit::Work), 4),

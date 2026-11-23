@@ -47,6 +47,9 @@ pub enum ErrorKind {
     TruncatedMemoryLimitsFlags,
     UnsupportedMemoryLimitsFlags { flags: u8 },
     InvalidMemoryLimits { minimum: u32, maximum: u32 },
+    TruncatedGlobalMutability,
+    InvalidGlobalMutability { byte: u8 },
+    ImmutableGlobal { index: u32 },
     MissingMemory,
     InvalidMemoryAlignment { exponent: u32 },
     TruncatedByte { expected: u8 },
@@ -83,6 +86,7 @@ pub enum IntegerField {
     FunctionCount,
     ExportCount,
     MemoryCount,
+    GlobalCount,
     DataCount,
     MemoryIndex,
     MemoryMinimum,
@@ -94,6 +98,7 @@ pub enum IntegerField {
     TypeIndex,
     FunctionIndex,
     LocalIndex,
+    GlobalIndex,
     LabelIndex,
     I32Const,
     /// Number of declared locals in one group.
@@ -198,6 +203,11 @@ impl fmt::Display for Error {
             InvalidMemoryLimits { minimum, maximum } => {
                 write!(f, "memory minimum {minimum} exceeds maximum {maximum}")
             }
+            TruncatedGlobalMutability => f.write_str("missing global mutability byte"),
+            InvalidGlobalMutability { byte } => {
+                write!(f, "invalid global mutability byte {byte:#04x}")
+            }
+            ImmutableGlobal { index } => write!(f, "cannot set immutable global {index}"),
             MissingMemory => {
                 f.write_str("memory instruction or data segment requires a defined memory")
             }
@@ -270,6 +280,11 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
 /// segment's memory index. A data length above the remaining aggregate budget
 /// is reported as [`ErrorKind::LimitExceeded`] at the start of the length field.
+/// Oversized global counts are reported as [`ErrorKind::UnsupportedCount`]
+/// with [`IntegerField::GlobalCount`]. Invalid or missing global mutability
+/// bytes are reported as [`ErrorKind::InvalidGlobalMutability`] or
+/// [`ErrorKind::TruncatedGlobalMutability`]. [`ErrorKind::ImmutableGlobal`]
+/// points to the start of the `global.set` index field.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -292,6 +307,8 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut functions = Vec::new();
     let mut exports = Vec::new();
     let mut memory_bytes = None;
+    let mut globals = [Global::default(); MAX_GLOBALS as usize];
+    let mut global_count = 0;
     let mut data_segments = Vec::new();
     let mut has_function_sections = false;
     let limit = Limit::SectionCount;
@@ -319,7 +336,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3 | 5 | 7 | 10 | 11) {
+        if id <= last_standard && matches!(id, 1 | 3 | 5 | 6 | 7 | 10 | 11) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -340,6 +357,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 function_count = Some(count);
             }
             5 => memory_bytes = validate_memory(&mut section)?,
+            6 => global_count = validate_globals(&mut section, &mut globals)?,
             7 => exports = validate_exports(&mut section, function_count)?,
             10 => {
                 let declarations = function_count.map(|count| &function_arities[..count as usize]);
@@ -348,6 +366,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     declarations,
                     type_arities[0],
                     memory_bytes.is_some(),
+                    &globals[..global_count],
                 )?;
             }
             11 => data_segments = validate_data(&mut section, memory_bytes.is_some())?,
@@ -382,6 +401,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         functions,
         exports,
         memory_bytes,
+        global_initial_values: globals.map(|global| global.initial_value),
         data_segments,
     })
 }
@@ -420,6 +440,7 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
 const MAX_TYPES: u32 = 8;
 const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
+pub(super) const MAX_GLOBALS: u32 = 8;
 const MAX_DATA_SEGMENTS: u32 = 8;
 const MAX_MEMORY_PAGES: u32 = 1;
 const MAX_PARAMETERS: u32 = 4;
@@ -474,6 +495,39 @@ fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
     }
     // No growth: the maximum is validated but only the initial size matters.
     Ok(Some(minimum as usize * MEMORY_PAGE_BYTES))
+}
+
+#[derive(Clone, Copy, Default)]
+struct Global {
+    initial_value: i32,
+    mutable: bool,
+}
+
+fn validate_globals(
+    section: &mut Reader<'_>,
+    globals: &mut [Global; MAX_GLOBALS as usize],
+) -> Result<usize, Error> {
+    let count = section.count(IntegerField::GlobalCount, 0..=MAX_GLOBALS)? as usize;
+    for global in &mut globals[..count] {
+        section.expect_byte(I32)?;
+        let offset = section.position();
+        let mutable = match section.byte() {
+            Some(0) => false,
+            Some(1) => true,
+            Some(byte) => {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::InvalidGlobalMutability { byte },
+                });
+            }
+            None => return Err(section.error(ErrorKind::TruncatedGlobalMutability)),
+        };
+        *global = Global {
+            initial_value: section.i32_const_expr()?,
+            mutable,
+        };
+    }
+    Ok(count)
 }
 
 fn validate_exports(
@@ -536,9 +590,7 @@ fn validate_data(section: &mut Reader<'_>, has_memory: bool) -> Result<Vec<DataS
                 kind: ErrorKind::MissingMemory,
             });
         }
-        section.expect_byte(I32_CONST)?;
-        let offset = section.integer(IntegerField::I32Const)?;
-        section.expect_byte(END)?;
+        let offset = section.i32_const_expr()? as u32;
 
         let length_offset = section.position();
         let declared = section.length(LengthField::DataSize)?;
@@ -583,6 +635,8 @@ enum Instruction {
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
+    GlobalGet(u32),
+    GlobalSet(u32),
     Call(u32),
     Eqz,
     Binary(BinaryOp),
@@ -663,10 +717,11 @@ impl BinaryOp {
     }
 }
 
-/// Only the decoder constructs this, after checking local and function indices,
-/// every stack effect, and the complete body frame. Block and if jump targets
-/// are strictly later decoded instruction indices or the one-past-last index.
-/// Loop continues target an in-body index at or before the branch.
+/// Only the decoder constructs this, after checking all indices, global set
+/// mutability, every stack effect, and the complete body frame. Block and if
+/// jump targets are strictly later decoded instruction indices or the
+/// one-past-last index. Loop continues target an in-body index at or before
+/// the branch.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -758,6 +813,8 @@ pub(super) fn execute(
             Instruction::LocalTee(index) => {
                 frame.locals[index as usize] = frame.operands[frame.depth - 1]
             }
+            Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
+            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
             Instruction::Call(index) => {
                 if active + 1 == ExecutionLimit::CallDepth.maximum() {
                     return Err(InvokeError::LimitExceeded {
@@ -900,6 +957,7 @@ fn decode_plain(
     local_bound: u32,
     function_bound: u32,
     has_memory: bool,
+    globals: &[Global],
 ) -> Result<Instruction, Error> {
     let load = |body: &mut Reader<'_>, kind: LoadKind| {
         let offset = decode_memarg(body, offset, kind.width(), has_memory)?;
@@ -914,6 +972,20 @@ fn decode_plain(
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
+        0x23 => {
+            Instruction::GlobalGet(body.index(IntegerField::GlobalIndex, globals.len() as u32)?)
+        }
+        0x24 => {
+            let offset = body.position();
+            let index = body.index(IntegerField::GlobalIndex, globals.len() as u32)?;
+            if !globals[index as usize].mutable {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::ImmutableGlobal { index },
+                });
+            }
+            Instruction::GlobalSet(index)
+        }
         0x28 => load(body, LoadKind::Full)?,
         0x2c => load(body, LoadKind::ByteSigned)?,
         0x2d => load(body, LoadKind::ByteUnsigned)?,
@@ -961,6 +1033,7 @@ fn validate_code(
     declarations: Option<&[u32]>,
     first_type_arity: u32,
     has_memory: bool,
+    globals: &[Global],
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |arities| {
@@ -985,6 +1058,7 @@ fn validate_code(
             parameter_count,
             function_arities,
             has_memory,
+            globals,
         )?);
     }
     Ok(functions)
@@ -995,6 +1069,7 @@ fn validate_body(
     parameter_count: u32,
     function_arities: &[u32],
     has_memory: bool,
+    globals: &[Global],
 ) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -1161,15 +1236,17 @@ fn validate_body(
                     local_bound,
                     function_arities.len() as u32,
                     has_memory,
+                    globals,
                 )?;
                 depth = match instruction {
-                    Instruction::Const(_) | Instruction::LocalGet(_) | Instruction::MemorySize => {
-                        depth + 1
-                    }
+                    Instruction::Const(_)
+                    | Instruction::LocalGet(_)
+                    | Instruction::GlobalGet(_)
+                    | Instruction::MemorySize => depth + 1,
                     Instruction::Call(index) => {
                         consume(function_arities[index as usize] as usize)? + 1
                     }
-                    Instruction::LocalSet(_) => consume(1)?,
+                    Instruction::LocalSet(_) | Instruction::GlobalSet(_) => consume(1)?,
                     Instruction::LocalTee(_) | Instruction::Eqz | Instruction::LoadI32 { .. } => {
                         consume(1)? + 1
                     }
@@ -1263,6 +1340,13 @@ impl<'a> Reader<'a> {
             }),
             None => Err(self.error(ErrorKind::TruncatedByte { expected })),
         }
+    }
+
+    fn i32_const_expr(&mut self) -> Result<i32, Error> {
+        self.expect_byte(I32_CONST)?;
+        let value = self.integer(IntegerField::I32Const)? as i32;
+        self.expect_byte(END)?;
+        Ok(value)
     }
 
     fn name(&mut self, field: LengthField) -> Result<&'a str, Error> {

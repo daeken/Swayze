@@ -368,6 +368,21 @@ fn fixtures() -> Vec<Fixture> {
         ),
         with_data(&[(-1, &[1])], 0, Outcome::DataSegmentOutOfBounds(0)),
     ]);
+    // The callee adds the argument to mutable global 1 and returns it.
+    // The caller adds immutable global 0. Each fixture starts a fresh instance.
+    let globals = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\
+                    \x03\x03\x02\0\0\x06\x0b\x02\x7f\0\x41\x28\x0b\x7f\x01\x41\x02\x0b\
+                    \x07\x0a\x01\x06answer\0\0\x0a\x17\x02\
+                    \x09\0\x20\0\x10\x01\x23\0\x6a\x0b\
+                    \x0b\0\x20\0\x23\x01\x6a\x24\x01\x23\x01\x0b";
+    for (input, expected) in [(0, 42), (-41, 1), (i32::MAX, i32::MIN + 41)] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(expected)),
+            bytes: globals.to_vec(),
+            export: EXPORT,
+            args: vec![input],
+        });
+    }
     cases
 }
 

@@ -71,7 +71,7 @@ fn both_arms_are_parsed_but_remain_expression_only() {
         "1 ? 2 : missing",
         "0 ? missing : 2",
         "const x = 0 ? x : 1; x",
-        "let x = 1; 0 ? (x = 2) : x",
+        "let x = 1; 0 ? (x += 2) : x",
         "let x = 1; x = 1 ? 2 : x = 3; x",
         "true ? 2 : typeof 0",
     ] {

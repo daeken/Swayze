@@ -300,7 +300,7 @@ fn evaluate(
                     value,
                 });
             }
-            Instruction::StoreBinding(slot) => {
+            Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
                 let Some(Some(Slot {
                     kind: BindingKind::Let,
                     value,
@@ -309,10 +309,14 @@ fn evaluate(
                 else {
                     return Err(EvalError::InvalidScript);
                 };
-                if stack.len() != 1 {
-                    return Err(EvalError::InvalidScript);
-                }
-                *value = stack.pop().ok_or(EvalError::InvalidScript)?;
+                *value = if matches!(op, Instruction::StoreBindingKeep(_)) {
+                    *stack.last().ok_or(EvalError::InvalidScript)?
+                } else {
+                    if stack.len() != 1 {
+                        return Err(EvalError::InvalidScript);
+                    }
+                    stack.pop().ok_or(EvalError::InvalidScript)?
+                };
             }
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
@@ -930,6 +934,36 @@ mod tests {
         assert_eq!(
             evaluate(&[one, INIT_LET, two, store, read], 1, 1),
             Ok(Value::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn store_keep_checks_the_slot_and_preserves_the_operand_stack() {
+        use Instruction::{Add, LoadBinding, Multiply, Number, StoreBindingKeep};
+        let one = Number(1.0);
+        let two = Number(2.0);
+        let store_keep = StoreBindingKeep(0);
+        let read = LoadBinding(0);
+        for ops in [
+            &[one, store_keep, one, INIT_LET, read][..], // before initialization
+            &[one, INIT_CONST, two, store_keep, read][..], // immutable slot
+            &[one, INIT_LET, two, StoreBindingKeep(1)][..], // out of range
+            &[one, INIT_LET, two, StoreBindingKeep(usize::MAX)][..],
+            &[one, INIT_LET, store_keep, read][..], // missing operand
+        ] {
+            assert_eq!(evaluate(ops, 1, 1), Err(EvalError::InvalidScript));
+        }
+        assert_eq!(
+            evaluate(&[one, INIT_LET, two, store_keep], 1, 1),
+            Ok(Value::Number(2.0))
+        );
+        assert_eq!(
+            evaluate(
+                &[one, INIT_LET, one, two, store_keep, read, Multiply, Add],
+                3,
+                1,
+            ),
+            Ok(Value::Number(5.0)),
         );
     }
 

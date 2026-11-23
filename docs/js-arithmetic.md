@@ -43,8 +43,12 @@ are still checked during parsing, and `const` targets are rejected even when
 no store would run. Prefix and postfix `++` and `--` convert an initialized
 `let` value to Number, add or subtract one, and store the result. Postfix
 forms cannot cross a line terminator between the name and operator, including
-a line terminator in a comment. Assignments and updates do not produce
-expression values in this subset.
+a line terminator in a comment. Compound assignments and updates remain
+statement-only. Simple assignments can also appear as explicitly grouped
+expressions, such as `(x = a)`: the right-hand side is evaluated once, and
+its value is stored and returned without coercion. A comma right-hand side
+needs its own group, as in `(x = (a, b))`. The required parentheses around a
+control test are not an expression group: use `if ((x = a))`.
 Declarations, assignments, updates, and nonfinal expression statements require
 explicit semicolons. Expression statements discard their values. The script
 must end in a root-level expression, whose trailing semicolon is optional;

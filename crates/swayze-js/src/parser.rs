@@ -204,6 +204,7 @@ pub(crate) enum Instruction {
         kind: BindingKind,
     },
     StoreBinding(usize),
+    StoreBindingKeep(usize),
     Discard,
     Add,
     Subtract,
@@ -997,6 +998,10 @@ enum Pending {
         join_depth: usize,
     },
     Group,
+    AssignmentGroup {
+        access: usize,
+        base_depth: usize,
+    },
     Consequent {
         branch: usize,
         base_depth: usize,
@@ -1129,8 +1134,8 @@ struct BlockFrame {
 struct Parser<'s> {
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) when disambiguating a
-    // name at the start of a statement or for clause, a root semicolon,
-    // or an if's then-arm.
+    // name at the start of a statement, for clause or expression group,
+    // a root semicolon, or an if's then-arm.
     lookahead: Option<Option<Token>>,
     max_nesting_depth: usize,
     nesting_depth: usize,
@@ -2094,7 +2099,7 @@ impl Parser<'_> {
             },
             operator,
         )?;
-        self.finish_write(access, span)?;
+        self.finish_write(access, span, false)?;
         Ok(span)
     }
 
@@ -2126,7 +2131,7 @@ impl Parser<'_> {
         if let Some(binary) = binary {
             self.emit(binary, operator_span)?;
         }
-        self.finish_write(access, end)?;
+        self.finish_write(access, end, false)?;
         if let Some(skip) = skip {
             self.patch_jump(skip, end)?;
         }
@@ -2146,9 +2151,28 @@ impl Parser<'_> {
         Ok(access)
     }
 
-    fn finish_write(&mut self, access: usize, end: Span) -> Result<(), Error> {
+    fn finish_write(&mut self, access: usize, end: Span, keep: bool) -> Result<(), Error> {
         self.accesses[access].instruction = self.instructions.len();
-        self.emit(Instruction::StoreBinding(UNPATCHED), end)
+        self.emit(
+            if keep {
+                Instruction::StoreBindingKeep(UNPATCHED)
+            } else {
+                Instruction::StoreBinding(UNPATCHED)
+            },
+            end,
+        )
+    }
+
+    fn begin_group_assignment(&mut self, name: Span, operator: Span) -> Result<(), Error> {
+        let access = self.begin_write(name, operator, false)?;
+        let Some((group @ Pending::Group, _)) = self.pending.last_mut() else {
+            return Err(Error::malformed(operator, "expected an assignment group"));
+        };
+        *group = Pending::AssignmentGroup {
+            access,
+            base_depth: self.stack_depth,
+        };
+        Ok(())
     }
 
     fn record_access(&mut self, name: Span, write: Option<WriteAccess>) -> Result<usize, Error> {
@@ -2269,6 +2293,11 @@ impl Parser<'_> {
                         *op = Instruction::LoadBinding(slot);
                     }
                 }
+                (
+                    Some(WriteAccess { load: None, .. }),
+                    Instruction::StoreBinding(slot),
+                    Some(op @ Instruction::StoreBindingKeep(UNPATCHED)),
+                ) => *op = Instruction::StoreBindingKeep(slot),
                 _ => {
                     return Err(Error::malformed(
                         access.name,
@@ -2336,7 +2365,7 @@ impl Parser<'_> {
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
                         span,
-                        "assignment expressions are outside the subset",
+                        "assignment expressions require a simple name and '=' at the start of an expression group",
                     ));
                 }
                 (_, TokenKind::Declaration(_)) => {
@@ -2399,8 +2428,34 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Identifier) => {
+                    // The mandatory statement-test parentheses are delimiters, not
+                    // an expression group. A nested '(' can introduce a write there.
+                    let group_start = after_open && !(statement_test && self.pending.len() == 1);
+                    if group_start {
+                        // Charge for the load or the assignment marker before
+                        // looking ahead, preserving the old read's work order.
+                        self.lexer.charge(1, span)?;
+                        let following = self.next_token()?;
+                        if let Some(Token {
+                            kind: TokenKind::Assignment(None),
+                            span: operator,
+                            ..
+                        }) = following
+                        {
+                            self.begin_group_assignment(span, operator)?;
+                            after_open = false;
+                            next = self.next_token()?;
+                            continue;
+                        }
+                        self.lookahead = Some(following);
+                    }
                     self.record_access(span, None)?;
-                    self.emit(Instruction::LoadBinding(UNPATCHED), span)?;
+                    let load = Instruction::LoadBinding(UNPATCHED);
+                    if group_start {
+                        self.emit_charged(load, span)?;
+                    } else {
+                        self.emit(load, span)?;
+                    }
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {
@@ -2517,6 +2572,16 @@ impl Parser<'_> {
                     self.reduce_expression()?;
                     match self.pending.pop() {
                         Some((Pending::Group, _)) => self.nesting_depth -= 1,
+                        Some((Pending::AssignmentGroup { access, base_depth }, _)) => {
+                            if self.stack_depth.checked_sub(base_depth) != Some(1) {
+                                return Err(Error::malformed(
+                                    span,
+                                    "assignment value must leave one result",
+                                ));
+                            }
+                            self.finish_write(access, span, true)?;
+                            self.nesting_depth -= 1;
+                        }
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(
                                 span,
@@ -2578,8 +2643,12 @@ impl Parser<'_> {
         self.reduce_expression()?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
-                Pending::Group if at_eof => "expected a closing parenthesis before end of source",
-                Pending::Group => "semicolon inside a parenthesized expression",
+                Pending::Group | Pending::AssignmentGroup { .. } if at_eof => {
+                    "expected a closing parenthesis before end of source"
+                }
+                Pending::Group | Pending::AssignmentGroup { .. } => {
+                    "semicolon inside a parenthesized expression"
+                }
                 _ => "expected ':' to complete conditional expression",
             };
             return Err(Error::malformed(end, message));
@@ -2752,6 +2821,10 @@ impl Parser<'_> {
 
     fn emit(&mut self, instruction: Instruction, span: Span) -> Result<(), Error> {
         self.lexer.charge(1, span)?;
+        self.emit_charged(instruction, span)
+    }
+
+    fn emit_charged(&mut self, instruction: Instruction, span: Span) -> Result<(), Error> {
         let (operands, results) = match instruction {
             Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid Number literal value"));
@@ -2791,6 +2864,7 @@ impl Parser<'_> {
                 (0, 0)
             }
             Instruction::Positive
+            | Instruction::StoreBindingKeep(_)
             | Instruction::Negate
             | Instruction::Not
             | Instruction::BitwiseNot

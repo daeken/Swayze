@@ -3,6 +3,9 @@ use swayze_wasm::{
     validate_module,
 };
 
+#[path = "execution/memory.rs"]
+mod memory;
+
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const TYPE: &[u8] = &[1, 0x60, 0, 1, 0x7f];
 const FUNCTION: &[u8] = &[1, 0];
@@ -59,9 +62,12 @@ fn instantiates_and_invokes_only_the_exact_owned_export() {
         push_section(&mut bytes, 0, &[0]);
         validate_module(&bytes).unwrap()
     };
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32("answer"), Ok(42));
-    assert_eq!(validated.instantiate().invoke_i32("answer"), Ok(42));
+    assert_eq!(
+        validated.instantiate().unwrap().invoke_i32("answer"),
+        Ok(42)
+    );
     for name in ["", "Answer", "answe", "answer\0"] {
         assert_eq!(instance.invoke_i32(name), Err(InvokeError::ExportNotFound));
     }
@@ -77,11 +83,11 @@ fn accepts_empty_and_custom_only_modules_and_functions_without_exports() {
     ] {
         let validated = validate_module(&module(sections)).unwrap();
         assert_eq!(
-            validated.instantiate().invoke_i32(""),
+            validated.instantiate().unwrap().invoke_i32(""),
             Err(InvokeError::ExportNotFound)
         );
         assert_eq!(
-            validated.instantiate().invoke_i32("answer"),
+            validated.instantiate().unwrap().invoke_i32("answer"),
             Err(InvokeError::ExportNotFound)
         );
     }
@@ -101,6 +107,7 @@ fn validates_export_name_utf8_and_its_inclusive_limit() {
             validate_module(&bytes)
                 .unwrap()
                 .instantiate()
+                .unwrap()
                 .invoke_i32(&name),
             Ok(42)
         );
@@ -193,7 +200,7 @@ fn exported_typed_functions(
 
 fn assert_body_result(body: &[u8], expected: i32) {
     let validated = exported_function(TYPE, &code_body(body));
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32("answer"), Ok(expected));
     assert_eq!(instance.invoke_i32("answer"), Ok(expected));
 }
@@ -232,7 +239,7 @@ fn dispatches_multiple_bodies_by_exact_owned_names_and_aliases() {
         let bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS), (7, &exports), (10, &code)]);
         validate_module(&bytes).unwrap()
     };
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     for (name, expected) in [
         ("", 42),
         ("é", 19),
@@ -263,7 +270,7 @@ fn shares_arity_and_keeps_traps_and_locals_call_local_across_exports() {
         (10, &code),
     ]);
     let validated = validate_module(&bytes).unwrap();
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     for name in ["accumulate", "divide"] {
         assert_eq!(
             instance.invoke_i32(name),
@@ -316,7 +323,7 @@ fn admits_eight_types_functions_and_exports_with_independent_body_budgets() {
         (10, &code),
     ]))
     .unwrap();
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     for (i, name) in ["a", "b", "c", "d", "e", "f", "g", "h"]
         .into_iter()
         .enumerate()
@@ -341,6 +348,7 @@ fn admits_eight_types_with_one_function_referencing_the_last_type() {
     assert_eq!(
         validated
             .instantiate()
+            .unwrap()
             .invoke_i32_with_args("answer", &[11, 22, 33]),
         Ok(33)
     );
@@ -472,7 +480,7 @@ fn composes_nested_and_repeated_zero_arg_calls_to_forward_and_earlier_targets() 
             b"\0\x10\0\x0b", // 7: f0()
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32("answer"), Ok(24));
 }
 
@@ -491,7 +499,7 @@ fn uses_each_export_arity_and_passes_four_arguments_above_the_caller_arm_floor()
               \x41\x0a\x6c\x20\x03\x6a\x0b",
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32_with_args("answer", &[1, 2]), Ok(1264));
     assert_eq!(instance.invoke_i32_with_args("answer", &[4, 3]), Ok(4364));
     assert_eq!(
@@ -530,7 +538,7 @@ fn keeps_caller_locals_and_operands_and_resets_reused_callee_storage() {
             b"\x01\x02\x7f\x20\0\x20\x01\x6a\x0b",
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32_with_args("answer", &[7]), Ok(80));
     assert_eq!(instance.invoke_i32_with_args("answer", &[-2]), Ok(53));
     assert_eq!(instance.invoke_i32("zero"), Ok(0));
@@ -660,7 +668,10 @@ fn zero_arg_result_obeys_the_operand_cap_without_sharing_caller_stack_space() {
         &[&caller(peak - 1), &callee],
     );
     assert_eq!(
-        validated.instantiate().invoke_i32_with_args("answer", &[7]),
+        validated
+            .instantiate()
+            .unwrap()
+            .invoke_i32_with_args("answer", &[7]),
         Ok(63)
     );
 
@@ -689,7 +700,7 @@ fn propagates_the_first_nested_trap_and_reuses_the_instance() {
             b"\0\x20\0\x20\x01\x20\x02\x6c\x6d\x0b", // a / (b * c)
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(
         instance.invoke_i32_with_args("answer", &[-1]),
         Err(InvokeError::Trap(Trap::IntegerOverflow))
@@ -716,7 +727,7 @@ fn bounds_live_frames_including_the_export_and_resumes_after_finite_self_calls()
             b"\0\x20\0\x04\x7f\x41\x01\x20\0\x41\x01\x6b\x10\x01\x6a\x05\x41\0\x0b\x0b",
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     let limit = ExecutionLimit::CallDepth;
     assert_eq!(limit.maximum(), 16);
     let failure = Err(InvokeError::LimitExceeded { limit });
@@ -754,7 +765,7 @@ fn spends_one_dispatch_budget_across_sequential_calls_and_final_returns_are_free
             &leaf,
         ],
     );
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(instance.invoke_i32("exact"), Ok(1));
     assert_eq!(
         instance.invoke_i32("over"),
@@ -773,7 +784,7 @@ fn dispatch_limit_is_checked_before_attempting_a_call_at_maximum_depth() {
         body
     };
     let module = exported_functions(0, &[(b"both", 0), (b"depth", 1)], &[&recur(62), &recur(61)]);
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     // Each frame spends 64 dispatches through its call. At depth 16 the
     // attempted push on dispatch 1024 is within budget but exceeds depth.
     assert_eq!(
@@ -860,7 +871,7 @@ fn reads_four_parameters_in_declared_order_on_each_invocation() {
         0, 0x20, 2, 0x20, 0, 0x6b, 0x20, 3, 0x6c, 0x20, 1, 0x6a, 0x0b,
     ]);
     let validated = exported_function(&i32_type(4), &code);
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(
         instance.invoke_i32_with_args("answer", &[5, 7, 9, 11]),
         Ok(51)
@@ -890,7 +901,7 @@ fn reads_and_assigns_parameters_before_grouped_declared_locals() {
         0x0b,
     ]);
     let validated = exported_function(&i32_type(2), &code);
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     let args = [9, 4];
     assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(17));
     assert_eq!(args, [9, 4]);
@@ -900,7 +911,7 @@ fn reads_and_assigns_parameters_before_grouped_declared_locals() {
 #[test]
 fn checks_export_name_then_exact_declared_arity_even_for_unused_parameters() {
     let validated = exported_function(&i32_type(2), CODE);
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(
         instance.invoke_i32_with_args("Answer", &[]),
         Err(InvokeError::ExportNotFound)
@@ -925,11 +936,15 @@ fn checks_export_name_then_exact_declared_arity_even_for_unused_parameters() {
 
     let zero = validate_module(&module(&SECTIONS)).unwrap();
     assert_eq!(
-        zero.instantiate().invoke_i32_with_args("answer", &[]),
+        zero.instantiate()
+            .unwrap()
+            .invoke_i32_with_args("answer", &[]),
         Ok(42)
     );
     assert_eq!(
-        zero.instantiate().invoke_i32_with_args("answer", &[1]),
+        zero.instantiate()
+            .unwrap()
+            .invoke_i32_with_args("answer", &[1]),
         Err(InvokeError::ArityMismatch {
             expected: 0,
             actual: 1
@@ -949,6 +964,7 @@ fn parameter_arithmetic_wraps() {
         assert_eq!(
             validated
                 .instantiate()
+                .unwrap()
                 .invoke_i32_with_args("answer", &[lhs, rhs]),
             Ok(expected)
         );
@@ -979,6 +995,7 @@ fn bounds_total_declared_locals_independently_of_parameters() {
     assert_eq!(
         validated
             .instantiate()
+            .unwrap()
             .invoke_i32_with_args("answer", &[1, 2, 3, 4]),
         Ok(4)
     );
@@ -1184,7 +1201,7 @@ fn executes_signed_and_unsigned_division_and_remainder() {
     ] {
         let code = code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]);
         let validated = exported_function(&i32_type(2), &code);
-        let instance = validated.instantiate();
+        let instance = validated.instantiate().unwrap();
         for &(lhs, rhs, expected) in cases {
             assert_eq!(
                 instance.invoke_i32_with_args("answer", &[lhs, rhs]),
@@ -1199,7 +1216,7 @@ fn executes_signed_and_unsigned_division_and_remainder() {
 fn eqz_returns_exactly_one_for_zero_and_zero_otherwise() {
     let code = code_body(&[0, 0x20, 0, 0x45, 0x0b]);
     let module = exported_function(&i32_type(1), &code);
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     for (arg, expected) in [(0, 1), (1, 0), (-1, 0), (i32::MIN, 0), (i32::MAX, 0)] {
         assert_eq!(
             instance.invoke_i32_with_args("answer", &[arg]),
@@ -1222,7 +1239,7 @@ fn compares_signed_and_unsigned_operands_in_stack_order() {
     for (index, opcode) in (0x46..=0x4f).enumerate() {
         let code = code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]);
         let module = exported_function(&i32_type(2), &code);
-        let instance = module.instantiate();
+        let instance = module.instantiate().unwrap();
         for (args, expected) in cases {
             assert_eq!(
                 instance.invoke_i32_with_args("answer", &args),
@@ -1238,7 +1255,7 @@ fn division_and_remainder_by_zero_validate_but_trap_on_invocation() {
     for opcode in 0x6d..=0x70 {
         let code = code_body(&[0, 0x41, 0, 0x41, 0, opcode, 0x0b]);
         let validated = exported_function(TYPE, &code);
-        let instance = validated.instantiate();
+        let instance = validated.instantiate().unwrap();
         assert_eq!(
             instance.invoke_i32("answer"),
             Err(InvokeError::Trap(Trap::IntegerDivideByZero)),
@@ -1268,7 +1285,7 @@ fn stops_at_first_guest_trap_and_can_reuse_the_instance() {
         0x6a, 0x20, 3, 0x6a, 0x0b, // Sum the results and the local.
     ]);
     let validated = exported_function(&i32_type(3), &code);
-    let instance = validated.instantiate();
+    let instance = validated.instantiate().unwrap();
     assert_eq!(
         instance.invoke_i32_with_args("answer", &[i32::MIN, -1, 0]),
         Err(InvokeError::Trap(Trap::IntegerOverflow)),
@@ -1292,7 +1309,7 @@ fn selects_one_arm_using_i32_truthiness_and_preserves_outer_operands() {
         0x6a, 0x20, 1, 0x6a, 0x0b, // Add the preserved value, arm result and local 1.
     ]);
     let module = exported_function(&i32_type(1), &code);
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     for (condition, expected) in [(1, 44), (7, 44), (-1, 44), (i32::MIN, 44), (0, 43)] {
         assert_eq!(
             instance.invoke_i32_with_args("answer", &[condition]),
@@ -1317,7 +1334,7 @@ fn traps_only_when_the_arm_is_taken() {
             .concat(),
         );
         let module = exported_function(&i32_type(1), &code);
-        let instance = module.instantiate();
+        let instance = module.instantiate().unwrap();
         for _ in 0..2 {
             assert_eq!(
                 instance.invoke_i32_with_args("answer", &[1 - trapping_condition]),
@@ -1340,7 +1357,7 @@ fn joins_nested_arms_at_the_enclosing_else_or_function_exit() {
         0x0b, 0x0b, // End of outer if and function, respectively.
     ]);
     let module = exported_function(&i32_type(2), &code);
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     for (args, expected) in [([1, 1], 1), ([1, 0], 2), ([0, 1], 3), ([0, 0], 4)] {
         assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
     }
@@ -1358,7 +1375,7 @@ fn zero_test_and_ordering_comparisons_select_conditional_arms() {
         0x0b, 0x6a, 0x0b,
     ]);
     let module = exported_function(&i32_type(3), &code);
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     for (args, expected) in [
         ([0, -1, 0], 41),
         ([0, 0, -1], 42),
@@ -1587,7 +1604,7 @@ fn counts_control_ops_and_both_arms_together_in_the_instruction_budget() {
     }
     body.extend([0x0b, 0x0b]);
     let module = exported_function(&ty, &code_body(&body));
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     assert_eq!(instance.invoke_i32_with_args("answer", &[1]), Ok(7));
     assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(1));
 
@@ -1630,7 +1647,7 @@ fn branches_join_innermost_blocks_across_mixed_nesting() {
         0x6a, 0x0b, // Both exits preserve 40.
     ];
     let module = exported_function(&i32_type(3), &code_body(&body));
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     for (args, expected) in [
         ([1, 1, 0], 47),
         ([1, 0, 0], 67),
@@ -1652,7 +1669,7 @@ fn patches_multiple_branches_to_function_exit_and_only_fallthrough_traps() {
         0x6a, 0x41, 0, 0x6d, 0x0b, 0x0b, // Divide by zero only on fallthrough.
     ];
     let module = exported_function(&i32_type(2), &code_body(&body));
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     let invoke = |args| instance.invoke_i32_with_args("answer", args);
     assert_eq!(invoke(&[1, 1]), Ok(7));
     assert_eq!(invoke(&[0, 1]), Ok(8));
@@ -1890,7 +1907,7 @@ fn charges_taken_br_if_but_not_its_skipped_tail_or_block_delimiters() {
         &[(b"exact", 0), (b"over", 1)],
         &[&entry(1), &entry(2), &leaf],
     );
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     // 7 * (call + 126 + local.set) + eqz + call + 126 = 1024.
     assert_eq!(instance.invoke_i32("exact"), Ok(0));
     // A second eqz in the caller runs the budget out before the final br_if.
@@ -1913,7 +1930,7 @@ fn loop_continues_preserve_locals_and_prefix_but_not_temporaries() {
         0x0b, 0x20, 1, 0x6a, 0x0b, 0x6a, 0x0b, // Add the two preserved values.
     ];
     let module = exported_function(&i32_type(1), &code_body(&body));
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     // 40 trips would overflow the operand storage if each kept its temporaries.
     // With arg 1, even the first condition is false.
     for (arg, expected) in [(40, 90), (1, 51), (5, 55), (1, 51)] {
@@ -1937,7 +1954,7 @@ fn loops_compose_with_forward_block_exits_and_if_joins() {
         0x0b, 0x20, 1, 0x6a, 0x0b,
     ];
     let module = exported_function(&i32_type(1), &code_body(&body));
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     assert_eq!(instance.invoke_i32_with_args("answer", &[-1]), Ok(43));
     assert_eq!(instance.invoke_i32_with_args("answer", &[0]), Ok(41));
 }
@@ -2103,7 +2120,7 @@ fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
             b"\0\x41\x2a\x03\x40\x41\x01\x0d\0\x0b\x0b", // Always continue.
         ],
     );
-    let instance = module.instantiate();
+    let instance = module.instantiate().unwrap();
     let invoke = |name, arg| instance.invoke_i32_with_args(name, &[arg]);
     // 3 caller dispatches + 1 const + 204 * 5 = 1024. The final false br_if
     // uses the last dispatch; both returns are free. With an extra caller op,
@@ -2122,7 +2139,7 @@ fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
         if ![
-            0x02, 0x03, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x41,
+            0x02, 0x03, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x28, 0x36, 0x41,
         ]
         .contains(&opcode)
             && !(0x45..=0x4f).contains(&opcode)
@@ -2228,7 +2245,10 @@ fn bounds_instruction_count_inclusively() {
     body.push(0x0b);
     let validated = exported_function(&ty, &code_body(&body));
     assert_eq!(
-        validated.instantiate().invoke_i32_with_args("answer", &[1]),
+        validated
+            .instantiate()
+            .unwrap()
+            .invoke_i32_with_args("answer", &[1]),
         Ok(pairs as i32)
     );
 
@@ -2256,7 +2276,10 @@ fn bounds_operand_depth_inclusively() {
     for (opcode, reduced) in [(0x6a, 2), (0x6d, 1), (0x6e, 1), (0x6f, 0), (0x70, 0)] {
         let validated = exported_function(&ty, &code_body(&body_at_depth(limit.maximum(), opcode)));
         assert_eq!(
-            validated.instantiate().invoke_i32_with_args("answer", &[1]),
+            validated
+                .instantiate()
+                .unwrap()
+                .invoke_i32_with_args("answer", &[1]),
             Ok(limit.maximum() as i32 - 2 + reduced),
         );
         bad_typed_body(
@@ -2302,6 +2325,7 @@ fn decodes_signed_boundaries_and_legal_padding() {
             validate_module(&bytes)
                 .unwrap()
                 .instantiate()
+                .unwrap()
                 .invoke_i32("answer"),
             Ok(expected)
         );
@@ -2327,6 +2351,7 @@ fn accepts_legal_padding_in_counts_indices_and_nested_lengths() {
         validate_module(&bytes)
             .unwrap()
             .instantiate()
+            .unwrap()
             .invoke_i32(""),
         Ok(42)
     );
@@ -2605,8 +2630,8 @@ fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
 #[test]
 fn rejects_invalid_suffixes_even_after_a_complete_valid_function() {
     let complete = module(&SECTIONS);
-    for id in [2, 5, 8] {
-        // Imports, memory, and start never reach instantiation.
+    for id in [2, 8] {
+        // Imports and start never reach instantiation.
         let mut bytes = complete.clone();
         push_section(&mut bytes, id, &[0]);
         expect_error(&bytes, complete.len(), ErrorKind::UnsupportedSection { id });

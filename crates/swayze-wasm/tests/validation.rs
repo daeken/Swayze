@@ -80,7 +80,7 @@ fn distinguishes_bad_or_incomplete_magic_from_unsupported_version() {
 
 #[test]
 fn rejects_even_empty_vectors_in_unsupported_sections() {
-    for id in [2, 4, 5, 6, 8, 9, 11, 12, 13] {
+    for id in [2, 4, 6, 8, 9, 11, 12, 13] {
         let bytes = module_with_suffix(&[0, 1, 0, id, 1, 0]);
         expect_error(&bytes, 11, ErrorKind::UnsupportedSection { id });
     }

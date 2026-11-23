@@ -1,4 +1,4 @@
-use crate::{ExecutionLimit, Export, InvokeError, Module, Trap};
+use crate::{ExecutionLimit, Export, Instance, InvokeError, Module, Trap};
 use std::{fmt, ops::RangeInclusive, str};
 
 /// A validation failure with an absolute, zero-based byte offset in the input.
@@ -40,6 +40,11 @@ pub enum ErrorKind {
     DuplicateExportName,
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
+    TruncatedMemoryLimitsFlags,
+    UnsupportedMemoryLimitsFlags { flags: u8 },
+    InvalidMemoryLimits { minimum: u32, maximum: u32 },
+    MissingMemory,
+    InvalidMemoryAlignment { exponent: u32 },
     TruncatedByte { expected: u8 },
     UnexpectedByte { expected: u8, found: u8 },
     TrailingSectionBytes { id: u8 },
@@ -72,6 +77,11 @@ pub enum IntegerField {
     ResultCount,
     FunctionCount,
     ExportCount,
+    MemoryCount,
+    MemoryMinimum,
+    MemoryMaximum,
+    MemoryAlignment,
+    MemoryOffset,
     CodeCount,
     LocalGroupCount,
     TypeIndex,
@@ -164,6 +174,17 @@ impl fmt::Display for Error {
             DuplicateExportName => f.write_str("duplicate export name"),
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
+            TruncatedMemoryLimitsFlags => f.write_str("missing memory limits flags"),
+            UnsupportedMemoryLimitsFlags { flags } => {
+                write!(f, "unsupported memory limits flags {flags:#04x}")
+            }
+            InvalidMemoryLimits { minimum, maximum } => {
+                write!(f, "memory minimum {minimum} exceeds maximum {maximum}")
+            }
+            MissingMemory => f.write_str("memory instruction requires a defined memory"),
+            InvalidMemoryAlignment { exponent } => {
+                write!(f, "i32 memory alignment exponent {exponent} exceeds 2")
+            }
             TruncatedByte { expected } => write!(f, "missing expected byte {expected:#04x}"),
             UnexpectedByte { expected, found } => {
                 write!(f, "expected byte {expected:#04x}, found {found:#04x}")
@@ -201,7 +222,7 @@ impl std::error::Error for Error {}
 /// executing it. Work is at most linear in the input length under the fixed
 /// section and vector caps. Allocations retain up to eight bodies bounded by
 /// [`Limit::BodyInstructions`] and eight export entries with names bounded by
-/// [`Limit::ExportNameBytes`].
+/// [`Limit::ExportNameBytes`]. Linear memory is not allocated during validation.
 ///
 /// The module-byte limit is checked before decoding, and the section-count
 /// limit before reading the next section. Unsupported known IDs are rejected
@@ -216,6 +237,11 @@ impl std::error::Error for Error {}
 /// A repeated export name is reported at the start of its length field.
 /// A `br_if` label outside the supported target set is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`].
+/// Oversized memory counts or page bounds are reported as
+/// [`ErrorKind::UnsupportedCount`], and a reversed pair as
+/// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
+/// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent;
+/// [`ErrorKind::MissingMemory`] points to the instruction opcode.
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -237,6 +263,8 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
+    let mut memory_bytes = None;
+    let mut has_function_sections = false;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -262,7 +290,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3 | 7 | 10) {
+        if id <= last_standard && matches!(id, 1 | 3 | 5 | 7 | 10) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -282,10 +310,16 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 }
                 function_count = Some(count);
             }
+            5 => memory_bytes = validate_memory(&mut section)?,
             7 => exports = validate_exports(&mut section, function_count)?,
             10 => {
                 let declarations = function_count.map(|count| &function_arities[..count as usize]);
-                functions = validate_code(&mut section, declarations, type_arities[0])?;
+                functions = validate_code(
+                    &mut section,
+                    declarations,
+                    type_arities[0],
+                    memory_bytes.is_some(),
+                )?;
             }
             _ => {
                 return Err(Error {
@@ -296,11 +330,12 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         section.finish(ErrorKind::TrailingSectionBytes { id })?;
         last_standard = id;
+        has_function_sections |= id != 5;
     }
     if !module.remaining.is_empty() {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
     }
-    if last_standard != 0 {
+    if has_function_sections {
         // The presence of all three sections makes the count and index checks
         // above sufficient to associate each export and call with a validated body.
         for (id, present) in [
@@ -313,7 +348,11 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
         }
     }
-    Ok(Module { functions, exports })
+    Ok(Module {
+        functions,
+        exports,
+        memory_bytes,
+    })
 }
 
 fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
@@ -350,6 +389,8 @@ fn read_header(module: &mut Reader<'_>) -> Result<(), Error> {
 const MAX_TYPES: u32 = 8;
 const MAX_FUNCTIONS: u32 = 8;
 const MAX_EXPORTS: u32 = 8;
+const MAX_MEMORY_PAGES: u32 = 1;
+const MEMORY_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
@@ -371,6 +412,37 @@ fn validate_types(
         *arity = parameter_count;
     }
     Ok(count)
+}
+
+fn validate_memory(section: &mut Reader<'_>) -> Result<Option<usize>, Error> {
+    if section.count(IntegerField::MemoryCount, 0..=1)? == 0 {
+        return Ok(None);
+    }
+    // Core 1.0 limits use a literal discriminant byte followed by uLEB32
+    // page counts. Other flags, including shared and memory64, are unsupported.
+    let offset = section.position();
+    let flags = section
+        .byte()
+        .ok_or_else(|| section.error(ErrorKind::TruncatedMemoryLimitsFlags))?;
+    if !matches!(flags, 0x00 | 0x01) {
+        return Err(Error {
+            offset,
+            kind: ErrorKind::UnsupportedMemoryLimitsFlags { flags },
+        });
+    }
+    let minimum = section.count(IntegerField::MemoryMinimum, 0..=MAX_MEMORY_PAGES)?;
+    if flags == 0x01 {
+        let offset = section.position();
+        let maximum = section.count(IntegerField::MemoryMaximum, 0..=MAX_MEMORY_PAGES)?;
+        if maximum < minimum {
+            return Err(Error {
+                offset,
+                kind: ErrorKind::InvalidMemoryLimits { minimum, maximum },
+            });
+        }
+    }
+    // No growth: the maximum is validated but only the initial size matters.
+    Ok(Some(minimum as usize * MEMORY_PAGE_BYTES))
 }
 
 fn validate_exports(
@@ -421,6 +493,8 @@ const IF: u8 = 0x04;
 const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR_IF: u8 = 0x0d;
+const I32_LOAD: u8 = 0x28;
+const I32_STORE: u8 = 0x36;
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
@@ -431,6 +505,8 @@ enum Instruction {
     Call(u32),
     Eqz,
     Binary(BinaryOp),
+    LoadI32 { offset: u32 },
+    StoreI32 { offset: u32 },
     JumpIfZero { target: usize },
     Jump { target: usize },
     BranchIfNonzero { target: usize, floor: usize },
@@ -553,10 +629,11 @@ impl CallFrame {
 }
 
 pub(super) fn execute(
-    module: &Module,
+    instance: &Instance<'_>,
     function_index: usize,
     args: &[i32],
 ) -> Result<i32, InvokeError> {
+    let module = instance.module;
     let parameter_count = module.functions[function_index].parameter_count;
     if args.len() != parameter_count {
         return Err(InvokeError::ArityMismatch {
@@ -622,6 +699,21 @@ pub(super) fn execute(
                 let rhs = frame.pop();
                 let lhs = &mut frame.operands[frame.depth - 1];
                 *lhs = op.apply(*lhs, rhs).map_err(InvokeError::Trap)?;
+            }
+            Instruction::LoadI32 { offset } => {
+                let address_and_result = &mut frame.operands[frame.depth - 1];
+                *address_and_result = instance
+                    .memory
+                    .load_i32(*address_and_result, offset)
+                    .map_err(InvokeError::Trap)?;
+            }
+            Instruction::StoreI32 { offset } => {
+                let value = frame.pop();
+                let address = frame.pop();
+                instance
+                    .memory
+                    .store_i32(address, offset, value)
+                    .map_err(InvokeError::Trap)?;
             }
             Instruction::JumpIfZero { target } => {
                 if frame.pop() == 0 {
@@ -694,12 +786,39 @@ fn decode_plain(
     offset: usize,
     local_bound: u32,
     function_bound: u32,
+    has_memory: bool,
 ) -> Result<Instruction, Error> {
     Ok(match opcode {
         0x10 => Instruction::Call(body.index(IntegerField::FunctionIndex, function_bound)?),
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
+        I32_LOAD | I32_STORE => {
+            let alignment_offset = body.position();
+            let exponent = body.integer(IntegerField::MemoryAlignment)?;
+            let memory_offset = body.integer(IntegerField::MemoryOffset)?;
+            if exponent > 2 {
+                return Err(Error {
+                    offset: alignment_offset,
+                    kind: ErrorKind::InvalidMemoryAlignment { exponent },
+                });
+            }
+            if !has_memory {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::MissingMemory,
+                });
+            }
+            if opcode == I32_LOAD {
+                Instruction::LoadI32 {
+                    offset: memory_offset,
+                }
+            } else {
+                Instruction::StoreI32 {
+                    offset: memory_offset,
+                }
+            }
+        }
         0x41 => Instruction::Const(body.integer(IntegerField::I32Const)? as i32),
         0x45 => Instruction::Eqz,
         0x46 => Instruction::Binary(BinaryOp::Eq),
@@ -732,6 +851,7 @@ fn validate_code(
     section: &mut Reader<'_>,
     declarations: Option<&[u32]>,
     first_type_arity: u32,
+    has_memory: bool,
 ) -> Result<Vec<ValidatedCode>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let allowed_counts = declarations.map_or(1..=MAX_FUNCTIONS, |arities| {
@@ -751,7 +871,12 @@ fn validate_code(
             // gives the placeholder arity until the final required-section check.
             None => (first_type_arity, &[][..]),
         };
-        functions.push(validate_body(section, parameter_count, function_arities)?);
+        functions.push(validate_body(
+            section,
+            parameter_count,
+            function_arities,
+            has_memory,
+        )?);
     }
     Ok(functions)
 }
@@ -760,6 +885,7 @@ fn validate_body(
     section: &mut Reader<'_>,
     parameter_count: u32,
     function_arities: &[u32],
+    has_memory: bool,
 ) -> Result<ValidatedCode, Error> {
     let declared = section.length(LengthField::CodeBodySize)?;
     let available = section.remaining.len();
@@ -925,6 +1051,7 @@ fn validate_body(
                     offset,
                     local_bound,
                     function_arities.len() as u32,
+                    has_memory,
                 )?;
                 depth = match instruction {
                     Instruction::Const(_) | Instruction::LocalGet(_) => depth + 1,
@@ -932,7 +1059,10 @@ fn validate_body(
                         consume(function_arities[index as usize] as usize)? + 1
                     }
                     Instruction::LocalSet(_) => consume(1)?,
-                    Instruction::LocalTee(_) | Instruction::Eqz => consume(1)? + 1,
+                    Instruction::LocalTee(_) | Instruction::Eqz | Instruction::LoadI32 { .. } => {
+                        consume(1)? + 1
+                    }
+                    Instruction::StoreI32 { .. } => consume(2)?,
                     Instruction::Binary(_) => consume(2)? + 1,
                     Instruction::JumpIfZero { .. }
                     | Instruction::Jump { .. }

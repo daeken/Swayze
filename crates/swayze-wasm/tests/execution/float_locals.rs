@@ -50,6 +50,55 @@ fn interleaved_float_and_integer_locals_move_exact_bits_after_integer_parameters
 }
 
 #[test]
+fn tee_preserves_signaling_nan_bits_and_the_next_invocation_reads_positive_zero() {
+    for (float, int, to_float, to_int, ne, result, snan, zero) in [
+        (
+            F32,
+            0x7f,
+            I32_TO_F32,
+            F32_TO_I32,
+            0x47,
+            ResultKind::I32,
+            Value::I32(0xff80_0b12_u32 as i32),
+            Value::I32(0),
+        ),
+        (
+            F64,
+            0x7e,
+            I64_TO_F64,
+            F64_TO_I64,
+            0x52,
+            ResultKind::I64,
+            Value::I64(0x7ff0_000b_89ab_cdef),
+            Value::I64(0),
+        ),
+    ] {
+        let ty = types(&[(&[int, 0x7f], Some(int))]);
+        #[rustfmt::skip]
+        let body = [
+            1, 1, float, // Float local 2 after two integer parameters.
+            0x20, 1, 0x04, int, // if write (result int)
+                0x20, 0, to_float, 0x22, 2, to_int, // Return the value left by tee as raw bits.
+                0x20, 2, to_int, 0x20, 0, ne, // Check the saved bits independently.
+                0x04, 0x40, 0x00, 0x0b, // Trap if the stored bits changed.
+            0x05, // else
+                0x20, 2, to_int, // Read the same slot without writing.
+            0x0b, 0x0b,
+        ];
+        let module = exported_function(&ty, &code_body(&body));
+        let instance = module.instantiate().unwrap();
+        assert_eq!(
+            instance.invoke_with_values("answer", &[snan, Value::I32(1)], result),
+            Ok(Some(snan)),
+        );
+        assert_eq!(
+            instance.invoke_with_values("answer", &[snan, Value::I32(0)], result),
+            Ok(Some(zero)),
+        );
+    }
+}
+
+#[test]
 fn recursive_calls_preserve_caller_locals_and_clear_reused_frames() {
     for (ty, to_float, to_int, eqz, eq, extend) in [
         (F32, I32_TO_F32, F32_TO_I32, 0x45, 0x46, &[][..]),

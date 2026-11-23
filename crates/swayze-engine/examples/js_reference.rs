@@ -242,6 +242,12 @@ fn fixtures() -> Vec<String> {
             "null == (undefined ?? false)",
             "0 == false ? 42 : 2",
             "2 & 1 == true && 42",
+            "let i = 99; let out = 0; for (i = 0; i < 4; i = i + 1) { out = out + i; } out * 10 + i",
+            "let i = 0; let out = 0; for (; i < 4; i = i + 1) { if (i < 2) { continue; } out = out + i; } out",
+            "let i = 0; for (;; i = i + 1) { if (i === 3) { break; } } i",
+            "let i = 0; for (i = 1; false; i = 9) { i = 42; } i",
+            "let i = 0; let out = 0; for (; i < 2; i = i + 1) { const i = 21; out = out + i; } out",
+            "let i = 0; let out = 0; while (i < 3) { for (;;) { out = out + i; break; } i = i + 1; } out",
         ]
         .map(str::to_owned),
     );

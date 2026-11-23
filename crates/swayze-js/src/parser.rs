@@ -29,7 +29,7 @@ pub struct Limits {
     pub max_source_bytes: usize,
     /// Maximum number of tokens, including punctuation but excluding trivia.
     pub max_tokens: usize,
-    /// Maximum combined depth of open parentheses (including statement tests)
+    /// Maximum combined depth of open parentheses (including control headers)
     /// and pending conditional expressions. Statement frames have a separate fixed cap.
     pub max_nesting_depth: usize,
     /// Maximum work units (see the crate's slice notes for accounting).
@@ -238,7 +238,7 @@ pub(crate) enum Instruction {
     Jump(usize),
     // Unconditional statement transfers require an empty operand stack.
     JumpStatement(usize),
-    // The only backward edge; re-enter the test with an empty operand stack.
+    // The only backward edge; enter a loop test or update with an empty stack.
     LoopBack(usize),
 }
 
@@ -382,6 +382,7 @@ enum TokenKind {
     If,
     Else,
     While,
+    For,
     Break,
     Continue,
     Equals,
@@ -432,7 +433,7 @@ fn is_excluded_name(name: &str) -> bool {
         // Other keywords, reserved literals, future/strict reserved words, and `await`.
         "case" | "catch" | "class" | "debugger" | "default"
             | "delete" | "do" | "enum" | "export" | "extends"
-            | "finally" | "for" | "function" | "import" | "in" | "instanceof"
+            | "finally" | "function" | "import" | "in" | "instanceof"
             | "new" | "return" | "super" | "switch" | "this" | "throw"
             | "try" | "typeof" | "var" | "void" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
@@ -597,6 +598,7 @@ impl Lexer<'_> {
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
+            "for" => Ok(TokenKind::For),
             "break" => Ok(TokenKind::Break),
             "continue" => Ok(TokenKind::Continue),
             "true" => Ok(TokenKind::Boolean(true)),
@@ -888,6 +890,8 @@ enum ExpressionEnd {
     Script,
     Semicolon(&'static str),
     StatementTest,
+    ForSemicolon,
+    ForClose,
 }
 
 // One frame per active statement, including across both arms of an if.
@@ -900,8 +904,8 @@ enum StatementFrame {
     IfElse {
         join: usize,
     },
-    While {
-        test: usize,
+    Loop {
+        continue_target: usize,
         exit: usize,
         enclosing_loop: Option<usize>,
         // Head of a list threaded through unpatched break instructions.
@@ -958,7 +962,7 @@ impl Parser<'_> {
                     self.parse_declaration(kind)?;
                     continue;
                 }
-                TokenKind::If | TokenKind::While => {
+                TokenKind::If | TokenKind::While | TokenKind::For => {
                     self.open_statement(first)?;
                     continue;
                 }
@@ -974,7 +978,7 @@ impl Parser<'_> {
                         ..
                     }) = next
                     {
-                        self.parse_assignment(first.span, span)?;
+                        self.parse_assignment_statement(first.span, span)?;
                         continue;
                     }
                     self.lookahead = Some(next);
@@ -1060,15 +1064,14 @@ impl Parser<'_> {
                 let test = self.instructions.len();
                 let exit = self.parse_statement_test("expected '(' after 'while'")?;
                 (
-                    StatementFrame::While {
-                        test,
-                        exit,
-                        enclosing_loop: self.innermost_loop,
-                        break_head: UNPATCHED,
-                    },
+                    self.loop_frame(test, exit),
                     "expected '{' to open the while body",
                 )
             }
+            TokenKind::For => (
+                self.parse_for_header()?,
+                "expected '{' to open the for body",
+            ),
             _ => unreachable!("not a control statement keyword"),
         };
         let brace = self.require_block_open(missing_brace)?;
@@ -1083,7 +1086,7 @@ impl Parser<'_> {
             },
             brace,
         )?;
-        if matches!(frame, StatementFrame::While { .. }) {
+        if matches!(frame, StatementFrame::Loop { .. }) {
             self.innermost_loop = Some(index);
         }
         Ok(())
@@ -1123,13 +1126,13 @@ impl Parser<'_> {
                 self.patch_jump(branch, close)?;
             }
             StatementFrame::IfElse { join } => self.patch_jump(join, close)?,
-            StatementFrame::While {
-                test,
+            StatementFrame::Loop {
+                continue_target,
                 exit,
                 enclosing_loop,
                 break_head,
             } => {
-                self.emit(Instruction::LoopBack(test), close)?;
+                self.emit(Instruction::LoopBack(continue_target), close)?;
                 self.patch_jump(exit, close)?;
                 self.patch_breaks(break_head, close)?;
                 self.innermost_loop = enclosing_loop;
@@ -1139,12 +1142,95 @@ impl Parser<'_> {
         Ok(())
     }
 
+    fn loop_frame(&self, continue_target: usize, exit: usize) -> StatementFrame {
+        StatementFrame::Loop {
+            continue_target,
+            exit,
+            enclosing_loop: self.innermost_loop,
+            break_head: UNPATCHED,
+        }
+    }
+
+    fn parse_for_header(&mut self) -> Result<StatementFrame, Error> {
+        let missing_open = "expected '(' after 'for'";
+        let open = self.require_token(missing_open)?;
+        if !matches!(open.kind, TokenKind::Open) {
+            return Err(Error::malformed(open.span, missing_open));
+        }
+        // The header parentheses count toward nesting but do not group a single
+        // expression. Each clause runs the same iterative expression parser.
+        self.enter_nesting(open.span)?;
+        self.lexer.charge(1, open.span)?;
+
+        let init = self.require_token("expected a for initializer or ';'")?;
+        if matches!(init.kind, TokenKind::Close) {
+            return Err(Error::malformed(
+                init.span,
+                "expected ';' between for clauses",
+            ));
+        }
+        if !matches!(init.kind, TokenKind::Semicolon) {
+            self.parse_for_assignment(init, ExpressionEnd::ForSemicolon)?;
+        }
+
+        let test = self.instructions.len();
+        let first = self.require_token("expected a for test or ';'")?;
+        let end = if matches!(first.kind, TokenKind::Semicolon) {
+            self.emit(Instruction::Boolean(true), first.span)?;
+            first.span
+        } else {
+            self.parse_expression(first, ExpressionEnd::ForSemicolon)?
+        };
+        let exit = self.emit_statement_test(end)?;
+
+        let first = self.require_token("expected a for update or ')'")?;
+        if matches!(first.kind, TokenKind::Semicolon) {
+            return Err(Error::malformed(
+                first.span,
+                "unexpected third ';' in for header",
+            ));
+        }
+        let (continue_target, close) = if matches!(first.kind, TokenKind::Close) {
+            (test, first.span)
+        } else {
+            // A truthy test skips over the update to the body. Fallthrough at
+            // the end of the body and continue both jump back to the update,
+            // whose own back edge leads to the test. Break skips both.
+            let skip_update = self.instructions.len();
+            self.emit(Instruction::JumpStatement(UNPATCHED), first.span)?;
+            let update = self.instructions.len();
+            let close = self.parse_for_assignment(first, ExpressionEnd::ForClose)?;
+            self.emit(Instruction::LoopBack(test), close)?;
+            self.patch_jump(skip_update, close)?;
+            (update, close)
+        };
+        self.nesting_depth -= 1;
+        self.check_statement_boundary(close)?;
+        Ok(self.loop_frame(continue_target, exit))
+    }
+
+    fn parse_for_assignment(&mut self, first: Token, end: ExpressionEnd) -> Result<Span, Error> {
+        let unsupported = "for initializers and updates must be simple assignments";
+        if !matches!(first.kind, TokenKind::Identifier) {
+            return Err(Error::unsupported(first.span, unsupported));
+        }
+        let equals = self.require_token("expected '=' after the assignment name")?;
+        if !matches!(equals.kind, TokenKind::Equals) {
+            return Err(Error::unsupported(equals.span, unsupported));
+        }
+        self.parse_assignment(first.span, equals.span, end)
+    }
+
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
         let open = self.require_token(missing_open)?;
         if !matches!(open.kind, TokenKind::Open) {
             return Err(Error::malformed(open.span, missing_open));
         }
         let end = self.parse_expression(open, ExpressionEnd::StatementTest)?;
+        self.emit_statement_test(end)
+    }
+
+    fn emit_statement_test(&mut self, end: Span) -> Result<usize, Error> {
         let branch = self.instructions.len();
         // The test leaves one value, which the jump consumes on both paths.
         self.emit(Instruction::JumpIfFalseStatement(UNPATCHED), end)?;
@@ -1157,7 +1243,7 @@ impl Parser<'_> {
             TokenKind::OpenBrace => Ok(open.span),
             TokenKind::If => Err(Error::unsupported(
                 open.span,
-                "if branches and while bodies require braces; else if is outside the subset",
+                "if branches and loop bodies require braces; else if is outside the subset",
             )),
             _ => Err(Error::malformed(open.span, missing_open)),
         }
@@ -1169,7 +1255,7 @@ impl Parser<'_> {
         match first.kind {
             TokenKind::CloseBrace => self.close_block(first.span),
             TokenKind::Declaration(kind) => self.parse_declaration(kind),
-            TokenKind::If | TokenKind::While => self.open_statement(first),
+            TokenKind::If | TokenKind::While | TokenKind::For => self.open_statement(first),
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
             TokenKind::Identifier => {
                 let equals = self.require_token("expected '=' after the assignment name")?;
@@ -1179,7 +1265,7 @@ impl Parser<'_> {
                         "only simple assignments are supported in these blocks",
                     ));
                 }
-                self.parse_assignment(first.span, equals.span)
+                self.parse_assignment_statement(first.span, equals.span)
             }
             _ => Err(Error::unsupported(
                 first.span,
@@ -1203,10 +1289,7 @@ impl Parser<'_> {
         }
         // The stored frame index bypasses any intervening if frames.
         let index = self.innermost_loop.ok_or_else(|| {
-            Error::malformed(
-                keyword.span,
-                "break and continue require an enclosing while",
-            )
+            Error::malformed(keyword.span, "break and continue require an enclosing loop")
         })?;
         let missing = "loop jumps require explicit semicolons";
         let Some(next) = next else {
@@ -1222,14 +1305,16 @@ impl Parser<'_> {
                 },
             );
         }
-        let StatementFrame::While {
-            test, break_head, ..
+        let StatementFrame::Loop {
+            continue_target,
+            break_head,
+            ..
         } = &mut self.statement_frames[index].statement
         else {
-            unreachable!("innermost loop index must refer to a while frame");
+            unreachable!("innermost loop index must refer to a loop frame");
         };
         let instruction = if matches!(keyword.kind, TokenKind::Continue) {
-            Instruction::LoopBack(*test)
+            Instruction::LoopBack(*continue_target)
         } else {
             let previous = std::mem::replace(break_head, self.instructions.len());
             Instruction::JumpStatement(previous)
@@ -1279,6 +1364,7 @@ impl Parser<'_> {
             TokenKind::If
             | TokenKind::Else
             | TokenKind::While
+            | TokenKind::For
             | TokenKind::Break
             | TokenKind::Continue => {
                 return Err(Error::unsupported(
@@ -1332,16 +1418,25 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_assignment(&mut self, name: Span, equals: Span) -> Result<(), Error> {
+    fn parse_assignment_statement(&mut self, name: Span, equals: Span) -> Result<(), Error> {
+        let end = ExpressionEnd::Semicolon("assignments require explicit semicolons");
+        self.parse_assignment(name, equals, end)?;
+        Ok(())
+    }
+
+    fn parse_assignment(
+        &mut self,
+        name: Span,
+        equals: Span,
+        end: ExpressionEnd,
+    ) -> Result<Span, Error> {
         // Record the target before the RHS reads to preserve diagnostic order.
         let access = self.record_access(name, Some(equals))?;
         let first = self.require_token("expected an assignment value")?;
-        let end = self.parse_expression(
-            first,
-            ExpressionEnd::Semicolon("assignments require explicit semicolons"),
-        )?;
+        let end = self.parse_expression(first, end)?;
         self.accesses[access].instruction = self.instructions.len();
-        self.emit(Instruction::StoreBinding(UNPATCHED), end)
+        self.emit(Instruction::StoreBinding(UNPATCHED), end)?;
+        Ok(end)
     }
 
     fn record_access(&mut self, name: Span, equals: Option<Span>) -> Result<usize, Error> {
@@ -1451,6 +1546,11 @@ impl Parser<'_> {
 
     fn parse_expression(&mut self, first: Token, end_kind: ExpressionEnd) -> Result<Span, Error> {
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
+        let for_delimiter = match end_kind {
+            ExpressionEnd::ForSemicolon => Some("expected ';' between for clauses"),
+            ExpressionEnd::ForClose => Some("expected ')' after the for update"),
+            _ => None,
+        };
         let missing_semicolon = match end_kind {
             ExpressionEnd::Semicolon(message) => Some(message),
             _ => None,
@@ -1501,6 +1601,7 @@ impl Parser<'_> {
                     TokenKind::If
                     | TokenKind::Else
                     | TokenKind::While
+                    | TokenKind::For
                     | TokenKind::Break
                     | TokenKind::Continue,
                 ) => {
@@ -1518,10 +1619,15 @@ impl Parser<'_> {
                         "expected ')' after the statement test",
                     ));
                 }
+                (false, TokenKind::OpenBrace | TokenKind::CloseBrace)
+                    if let Some(message) = for_delimiter =>
+                {
+                    return Err(Error::malformed(span, message));
+                }
                 (_, TokenKind::OpenBrace | TokenKind::CloseBrace) => {
                     return Err(Error::unsupported(
                         span,
-                        "braces are only supported around if branches and while bodies",
+                        "braces are only supported around if branches and loop bodies",
                     ));
                 }
                 (true, TokenKind::Number(value)) => {
@@ -1562,7 +1668,9 @@ impl Parser<'_> {
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Pending::Op(prefix), span)?;
                 }
-                (true, TokenKind::Semicolon) if missing_semicolon.is_none() && !seen_token => {
+                (true, TokenKind::Semicolon)
+                    if matches!(end_kind, ExpressionEnd::Script) && !seen_token =>
+                {
                     return Err(Error::unsupported(
                         span,
                         "empty statements are outside the arithmetic subset",
@@ -1641,6 +1749,10 @@ impl Parser<'_> {
                                 "expected ':' before closing parenthesis",
                             ));
                         }
+                        None if matches!(end_kind, ExpressionEnd::ForClose) => break (span, false),
+                        None if let Some(message) = for_delimiter => {
+                            return Err(Error::malformed(span, message));
+                        }
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
                     // The statement test starts with its required '(' as the first group.
@@ -1662,7 +1774,7 @@ impl Parser<'_> {
                     | TokenKind::Null
                     | TokenKind::Identifier,
                 ) => {
-                    if after_line_break {
+                    if after_line_break && for_delimiter.is_none() {
                         self.reduce_expression()?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(
@@ -1673,6 +1785,9 @@ impl Parser<'_> {
                         }
                     }
                     return Err(Error::malformed(span, "expected a binary operator"));
+                }
+                (false, TokenKind::Semicolon) if matches!(end_kind, ExpressionEnd::ForClose) => {
+                    return Err(Error::malformed(span, "expected ')' after the for update"));
                 }
                 (false, TokenKind::Semicolon) => break (span, false),
             }
@@ -1690,6 +1805,9 @@ impl Parser<'_> {
         }
         if at_eof && let Some(message) = missing_semicolon {
             return Err(Error::unsupported(end, message));
+        }
+        if at_eof && let Some(message) = for_delimiter {
+            return Err(Error::malformed(end, message));
         }
         if self.stack_depth != 1 {
             return Err(Error::malformed(
@@ -1734,11 +1852,16 @@ impl Parser<'_> {
     }
 
     fn open_pending(&mut self, marker: Pending, span: Span) -> Result<(), Error> {
+        self.enter_nesting(span)?;
+        self.push_pending(marker, span)
+    }
+
+    fn enter_nesting(&mut self, span: Span) -> Result<(), Error> {
         if self.nesting_depth == self.max_nesting_depth {
             return Err(Error::limit(span, Limit::NestingDepth));
         }
         self.nesting_depth += 1;
-        self.push_pending(marker, span)
+        Ok(())
     }
 
     fn push_pending(&mut self, entry: Pending, span: Span) -> Result<(), Error> {

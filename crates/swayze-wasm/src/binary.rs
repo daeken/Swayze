@@ -72,6 +72,7 @@ pub enum ErrorKind {
     TruncatedGlobalMutability,
     InvalidGlobalMutability { byte: u8 },
     ImmutableGlobal { index: u32 },
+    MutableGlobalInSegmentOffset { index: u32 },
     MissingMemory,
     InvalidMemoryAlignment { exponent: u32 },
     TruncatedByte { expected: u8 },
@@ -304,6 +305,9 @@ impl fmt::Display for Error {
                 write!(f, "invalid global mutability byte {byte:#04x}")
             }
             ImmutableGlobal { index } => write!(f, "cannot set immutable global {index}"),
+            MutableGlobalInSegmentOffset { index } => {
+                write!(f, "cannot use mutable global {index} in a segment offset")
+            }
             MissingMemory => {
                 f.write_str("memory instruction, export, or data segment requires a defined memory")
             }
@@ -427,6 +431,13 @@ impl std::error::Error for Error {}
 /// of a memory export or data segment's memory index. A data length above the
 /// remaining aggregate budget is reported as [`ErrorKind::LimitExceeded`] at
 /// the start of the length field.
+/// In either segment kind, the table or memory index and presence checks precede
+/// the offset expression. An unrecognized or missing offset opcode still reports
+/// `i32.const` (`0x41`) as the expected byte. For an offset using `global.get`,
+/// validation decodes and bounds-checks the global index, checks mutability,
+/// checks the operand type, and then requires `end`. A mutable global reports
+/// [`ErrorKind::MutableGlobalInSegmentOffset`] at the start of the index;
+/// a non-i32 immutable global reports [`ErrorKind::TypeMismatch`] at the opcode.
 /// Oversized global counts are reported as [`ErrorKind::UnsupportedCount`]
 /// with [`IntegerField::GlobalCount`]. Invalid or missing global mutability
 /// bytes are reported as [`ErrorKind::InvalidGlobalMutability`] or
@@ -536,6 +547,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                     &mut section,
                     table_entries.is_some(),
                     function_count.unwrap_or(0),
+                    &globals[..global_count],
                 )?;
             }
             10 => {
@@ -548,7 +560,13 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 };
                 functions = validate_code(&mut section, &environment, function_count)?;
             }
-            11 => data_segments = validate_data(&mut section, memory_limits.is_some())?,
+            11 => {
+                data_segments = validate_data(
+                    &mut section,
+                    memory_limits.is_some(),
+                    &globals[..global_count],
+                )?;
+            }
             _ => {
                 return Err(Error {
                     offset: id_offset,
@@ -911,6 +929,7 @@ fn validate_elements(
     section: &mut Reader<'_>,
     has_table: bool,
     function_count: u32,
+    globals: &[Global],
 ) -> Result<Vec<ElementSegment>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ElementCount, 0..=MAX_ELEMENT_SEGMENTS)?;
@@ -930,7 +949,7 @@ fn validate_elements(
                 kind: ErrorKind::MissingTable,
             });
         }
-        let offset = section.i32_const_expr()? as u32;
+        let offset = section.segment_offset(globals)?;
         let count_offset = section.position();
         let count = section.integer(IntegerField::ElementFunctionCount)?;
         if count > budget {
@@ -959,7 +978,11 @@ fn validate_elements(
     Ok(segments)
 }
 
-fn validate_data(section: &mut Reader<'_>, has_memory: bool) -> Result<Vec<DataSegment>, Error> {
+fn validate_data(
+    section: &mut Reader<'_>,
+    has_memory: bool,
+    globals: &[Global],
+) -> Result<Vec<DataSegment>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::DataCount, 0..=MAX_DATA_SEGMENTS)?;
     let mut segments = Vec::new();
@@ -978,7 +1001,7 @@ fn validate_data(section: &mut Reader<'_>, has_memory: bool) -> Result<Vec<DataS
                 kind: ErrorKind::MissingMemory,
             });
         }
-        let offset = section.i32_const_expr()? as u32;
+        let offset = section.segment_offset(globals)?;
 
         let length_offset = section.position();
         let declared = section.length(LengthField::DataSize)?;
@@ -1018,6 +1041,7 @@ const BR: u8 = 0x0c;
 const BR_IF: u8 = 0x0d;
 const BR_TABLE: u8 = 0x0e;
 const RETURN: u8 = 0x0f;
+const GLOBAL_GET: u8 = 0x23;
 const I32_CONST: u8 = 0x41;
 const I64_CONST: u8 = 0x42;
 const F32_CONST: u8 = 0x43;
@@ -3013,7 +3037,7 @@ fn decode_plain(
         0x20 => Instruction::LocalGet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x21 => Instruction::LocalSet(body.index(IntegerField::LocalIndex, local_bound)?),
         0x22 => Instruction::LocalTee(body.index(IntegerField::LocalIndex, local_bound)?),
-        0x23 => {
+        GLOBAL_GET => {
             Instruction::GlobalGet(body.index(IntegerField::GlobalIndex, globals.len() as u32)?)
         }
         0x24 => {
@@ -3589,13 +3613,55 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn i32_const_expr(&mut self) -> Result<i32, Error> {
-        self.expect_byte(I32_CONST)?;
-        let value = self.integer(IntegerField::I32Const)? as i32;
+    fn segment_offset(&mut self, globals: &[Global]) -> Result<u32, Error> {
+        let opcode_offset = self.position();
+        let value = match self.byte() {
+            Some(I32_CONST) => self.integer(IntegerField::I32Const)?,
+            Some(GLOBAL_GET) => {
+                let index_offset = self.position();
+                let index = self.index(IntegerField::GlobalIndex, globals.len() as u32)?;
+                let global = globals[index as usize];
+                if global.mutable {
+                    return Err(Error {
+                        offset: index_offset,
+                        kind: ErrorKind::MutableGlobalInSegmentOffset { index },
+                    });
+                }
+                // Segment offsets see all validated globals. Without imports,
+                // each immutable global already has its literal initial value.
+                let Operand::I32(value) = global.initial_value else {
+                    return Err(Error {
+                        offset: opcode_offset,
+                        kind: ErrorKind::TypeMismatch {
+                            expected: ValType::I32,
+                            actual: global.operand_type(),
+                        },
+                    });
+                };
+                value as u32
+            }
+            // Preserve the old expected byte for missing or unsupported opcodes.
+            Some(found) => {
+                return Err(Error {
+                    offset: opcode_offset,
+                    kind: ErrorKind::UnexpectedByte {
+                        expected: I32_CONST,
+                        found,
+                    },
+                });
+            }
+            None => {
+                return Err(self.error(ErrorKind::TruncatedByte {
+                    expected: I32_CONST,
+                }));
+            }
+        };
         self.expect_byte(END)?;
         Ok(value)
     }
 
+    // Core 1.0 validates defined initializers with only imported globals in
+    // scope, unlike segment offsets. There are no imports in this slice.
     fn global_initializer(&mut self, ty: ValType) -> Result<Operand, Error> {
         self.expect_byte(match ty {
             ValType::I32 => I32_CONST,

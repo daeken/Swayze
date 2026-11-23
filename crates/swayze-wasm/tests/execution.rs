@@ -65,6 +65,8 @@ mod memory;
 mod memory_exports;
 #[path = "execution/result_loop.rs"]
 mod result_loop;
+#[path = "execution/segment_offsets.rs"]
+mod segment_offsets;
 #[path = "execution/stack.rs"]
 mod stack;
 #[path = "execution/start.rs"]

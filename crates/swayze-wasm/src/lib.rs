@@ -127,21 +127,27 @@
 //! export, and start sections and precedes any code and data sections. It may
 //! contain zero to eight active segments, retaining at most 64 function indices total,
 //! counting repeats and overlaps. Each segment requires a defined table and
-//! encodes the Core 1.0 table index zero as unsigned LEB32, exactly
-//! `i32.const <signed LEB32> end`, and an unsigned LEB32 count followed by that
-//! many unsigned LEB32 indices into the defined function declarations. Padded
-//! LEB32 encodings are accepted if valid. Functions of any supported signature
-//! can be referenced. An element section with no segments does not require a table;
+//! encodes the Core 1.0 table index zero as unsigned LEB32, an offset expression,
+//! and an unsigned LEB32 count followed by that many unsigned LEB32 indices into
+//! the defined function declarations. Functions of any supported signature can
+//! be referenced. An element section with no segments does not require a table;
 //! a segment with no function indices still does. Passive and declarative
-//! segments, element expressions, and global offsets are unsupported.
+//! segments and element expressions are unsupported.
 //!
 //! The optional data section (ID 11) follows any memory, global, export, start,
 //! and code sections. It may contain zero to eight active segments with at most
 //! 64 KiB of payload bytes total, counting overlaps. Each segment requires a defined
-//! memory and encodes the Core 1.0 memory index zero as unsigned LEB32, exactly
-//! `i32.const <signed LEB32> end`, and a length-prefixed vector of raw bytes.
-//! An empty segment vector does not require memory. Passive segments, bulk
-//! memory, and global offsets are unsupported.
+//! memory and encodes the Core 1.0 memory index zero as unsigned LEB32, an
+//! offset expression, and a length-prefixed vector of raw bytes. An empty
+//! segment vector does not require memory. Passive segments and bulk memory
+//! are unsupported.
+//!
+//! Active element and data offsets are exactly `i32.const <signed LEB32> end`
+//! or `global.get <unsigned LEB32> end`, with valid padding accepted in all
+//! LEB32 fields. The global must be defined, immutable, and i32. Validation
+//! resolves it to its literal initializer value. Both forms use the unsigned
+//! interpretation of the i32 bits as the offset. Bounds are checked against
+//! the initial table or memory size at instantiation.
 //!
 //! An optional export section after any table, memory, and globals and before
 //! any start, elements, code, and data may contain zero to eight names total

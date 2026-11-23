@@ -246,7 +246,7 @@ fn float_initializers_check_mutability_opcode_width_and_end_in_order() {
 }
 
 #[test]
-fn float_global_imports_and_non_i32_const_data_offsets_stay_unsupported() {
+fn float_global_imports_and_float_const_data_offsets_stay_unsupported() {
     let globals = [&[1][..], F32_SNAN].concat();
     bad_payload(
         2,
@@ -257,7 +257,7 @@ fn float_global_imports_and_non_i32_const_data_offsets_stay_unsupported() {
             count: 1,
         },
     );
-    for opcode in [0x23, 0x43, 0x44] {
+    for opcode in [0x43, 0x44] {
         let mut bytes = module(&[(5, &[1, 0, 1]), (6, &globals)]);
         let start = push_section(&mut bytes, 11, &[1, 0, opcode]);
         expect_error(

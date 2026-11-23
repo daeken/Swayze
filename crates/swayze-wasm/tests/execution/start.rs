@@ -192,32 +192,24 @@ fn preflight_errors_take_precedence_over_a_start_trap() {
             InstantiationError::StartTrap(Trap::Unreachable),
         ),
     ] {
-        let bytes = module(&[
-            (1, VOID),
-            (3, ONE_FUNCTION),
-            (4, &[1, 0x70, 0, 0]), // Zero-entry table.
-            (5, &[1, 0, 0]),       // Zero-page memory.
-            (8, &[0]),
-            (
-                9,
-                if elements {
-                    &[1, 0, 0x41, 0, 0x0b, 1, 0]
-                } else {
-                    &[0]
-                },
-            ),
-            (10, &code),
-            (
-                11,
-                if data {
-                    &[1, 0, 0x41, 0, 0x0b, 1, 1]
-                } else {
-                    &[0]
-                },
-            ),
-        ]);
-        let validated = validate_module(&bytes).unwrap();
-        assert_eq!(validated.instantiate().unwrap_err(), error);
+        for opcode in [0x41, 0x23] {
+            // i32.const and global.get must preflight identically.
+            let element_segment = [1, 0, opcode, 0, 0x0b, 1, 0];
+            let data_segment = [1, 0, opcode, 0, 0x0b, 1, 1];
+            let bytes = module(&[
+                (1, VOID),
+                (3, ONE_FUNCTION),
+                (4, &[1, 0x70, 0, 0]), // Zero-entry table.
+                (5, &[1, 0, 0]),       // Zero-page memory.
+                (6, &[1, 0x7f, 0, 0x41, 0, 0x0b]),
+                (8, &[0]),
+                (9, if elements { &element_segment } else { &[0] }),
+                (10, &code),
+                (11, if data { &data_segment } else { &[0] }),
+            ]);
+            let validated = validate_module(&bytes).unwrap();
+            assert_eq!(validated.instantiate().unwrap_err(), error);
+        }
     }
 }
 

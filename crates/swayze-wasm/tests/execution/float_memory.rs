@@ -137,7 +137,7 @@ fn float_accesses_preserve_raw_bits_and_alias_integer_bytes() {
             assert_eq!(word(0, 0x4444_4455), Ok(42));
             assert_eq!(word(1 + f.width() as i32, 0x66), Ok(42));
             for (index, bits) in patterns.into_iter().enumerate() {
-                // Integer writes produce the bytes, independently of float stores.
+                // Integer stores → float load → guest reinterpretation.
                 let bytes = bits.to_le_bytes();
                 let (words, []) = bytes[..f.width()].as_chunks::<4>() else {
                     unreachable!("full words for both formats");
@@ -147,8 +147,8 @@ fn float_accesses_preserve_raw_bits_and_alias_integer_bytes() {
                 }
                 assert_eq!(f.read(&instance, 0), Ok(Some(f.integer(bits))));
 
-                // The stored pattern differs from both this and the next
-                // iteration's integer writes. Inspect all bytes and both neighbors.
+                // Float store → integer byte loads. The stored pattern differs
+                // from both this and the next iteration's integer writes.
                 let next = patterns[(index + 2) % patterns.len()];
                 assert_eq!(f.write(&instance, 0, next), Ok(Some(Value::I32(42))));
                 for (i, &expected) in next.to_le_bytes()[..f.width()].iter().enumerate() {
@@ -174,13 +174,22 @@ fn float_accesses_check_the_whole_range_without_wrapping_or_partial_stores() {
         let load = |addr| f.read(&instance, addr);
         let store = |addr, bits| f.write(&instance, addr, bits);
         let last = PAGE - f.width() as i32 - 1; // Offset 1 lands exactly at the exclusive end.
+        let byte = |addr| instance.invoke_i32_with_args("byte", &[addr]);
         assert_eq!(store(last, f.snan), Ok(Some(Value::I32(42))));
-        for invalid in [last + 1, -1] {
-            assert_eq!(load(invalid), Err(OOB));
-            assert_eq!(store(invalid, u64::MAX), Err(OOB));
-            assert_eq!(load(last), Ok(Some(f.integer(f.snan))));
-            assert_eq!(instance.invoke_i32_with_args("byte", &[0]), Ok(0));
+        assert_eq!(load(last), Ok(Some(f.integer(f.snan))));
+        // Check every start whose access straddles the end. Read the sentinel
+        // independently with integer loads so the float load cannot mask a write.
+        for shift in 1..f.width() as i32 {
+            let straddle = last + shift;
+            assert_eq!(load(straddle), Err(OOB));
+            assert_eq!(store(straddle, u64::MAX), Err(OOB));
+            for (i, &expected) in f.snan.to_le_bytes()[..f.width()].iter().enumerate() {
+                assert_eq!(byte(last + 1 + i as i32), Ok(i32::from(expected)));
+            }
         }
+        assert_eq!(load(-1), Err(OOB));
+        assert_eq!(store(-1, u64::MAX), Err(OOB));
+        assert_eq!(byte(0), Ok(0));
 
         // Positive base + UINT32_MAX must neither wrap nor treat the offset as signed.
         let max_offset = f.module(ONE_PAGE, &[f.align, 0xff, 0xff, 0xff, 0xff, 0x0f]);

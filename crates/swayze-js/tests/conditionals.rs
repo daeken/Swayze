@@ -73,7 +73,6 @@ fn both_arms_are_parsed_but_remain_expression_only() {
         "const x = 0 ? x : 1; x",
         "let x = 1; 0 ? x + 1 += 2 : x",
         "let x = 1; x = 1 ? 2 : true && x ||= 3; x",
-        "true ? 2 : typeof 0",
     ] {
         assert_eq!(
             parse_script(source).unwrap_err().kind(),

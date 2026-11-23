@@ -6,9 +6,9 @@ Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?` produces `14.0`.
 `Script::evaluate_primitive()` returns `PrimitiveValue::Scalar(Value)` or
 `PrimitiveValue::String(&[u16])` (facade: `JsPrimitiveValue`). The String
-slice borrows immutable Script storage. A final runtime String (even empty)
-returns `RuntimeStringResultRequiresScratch` from that API. To accept either
-kind of String, use `Script::evaluate_primitive_with_scratch(&mut scratch)`
+slice borrows immutable Script storage or a static `typeof` spelling. A final
+concatenated String (even empty) returns `RuntimeStringResultRequiresScratch`
+from that API. To accept all kinds of String, use `Script::evaluate_primitive_with_scratch(&mut scratch)`
 with `EvalScratch` (facade: `JsEvalScratch`); the result borrows both inputs.
 Each call clears the scratch's logical length without zeroizing its storage
 and can reuse retained capacity. `evaluate_value()` still returns
@@ -17,6 +17,16 @@ coercion; a String result yields `NonScalarResult`. `evaluate()` returns
 `NonNumericResult` for any non-Number. An unbound read of `undefined` returns
 the default value, but a block-local declaration of that name takes precedence.
 A top-level declaration of `undefined` is malformed in a classic script.
+
+Unary `typeof` evaluates its operand once and returns `"number"`, `"boolean"`,
+`"string"`, `"object"` for `null`, or `"undefined"`. The spelling itself does
+not allocate or consume literal or concatenation storage. Only a direct
+unbound name, optionally wrapped in pure parentheses, gets the unbound-name
+exception. For example, `typeof (missing)` yields `"undefined"`, but
+`typeof (0, missing)` still rejects the ordinary unbound read. A lexical binding
+wins over the exception, including a later declaration whose access is rejected
+before initialization. This is the closed primitive environment, not a full
+JavaScript Realm or implementation of runtime TDZ errors.
 
 Number literals include decimal fractions and signed exponents, plus binary
 (`0b`), octal (`0o`), and hexadecimal (`0x`) integers with either case of prefix.
@@ -209,7 +219,7 @@ literal does not allocate runtime String storage.
 
 A primary (including a parenthesized expression) may take one read-only
 `.length` suffix. It returns the exact UTF-16 code-unit count as a Number from
-a literal or runtime String in one dispatch, without scanning or allocating.
+a literal, static, or concatenated String in one dispatch, without scanning or allocating.
 Trivia, including line breaks, is allowed around the dot but the name must
 be raw ASCII `length`. A reached non-String receiver produces
 `UnsupportedPropertyReceiver`, a Swayze subset error, not JavaScript

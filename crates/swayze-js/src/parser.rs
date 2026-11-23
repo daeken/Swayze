@@ -247,6 +247,7 @@ pub(crate) enum Instruction {
     Not,
     BitwiseNot,
     Void,
+    Typeof,
     BitwiseAnd,
     BitwiseXor,
     BitwiseOr,
@@ -364,13 +365,19 @@ enum Operator {
     Not,
     BitwiseNot,
     Void,
+    Typeof,
 }
 
 impl Operator {
     fn is_binary(self) -> bool {
         !matches!(
             self,
-            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void
+            Self::Positive
+                | Self::Negate
+                | Self::Not
+                | Self::BitwiseNot
+                | Self::Void
+                | Self::Typeof
         )
     }
 
@@ -391,7 +398,12 @@ impl Operator {
             Self::Add | Self::Subtract => 9,
             Self::Multiply | Self::Divide | Self::Remainder => 10,
             Self::Exponentiate => 11,
-            Self::Positive | Self::Negate | Self::Not | Self::BitwiseNot | Self::Void => 12,
+            Self::Positive
+            | Self::Negate
+            | Self::Not
+            | Self::BitwiseNot
+            | Self::Void
+            | Self::Typeof => 12,
         }
     }
 
@@ -430,6 +442,7 @@ impl Operator {
             Self::Not => Instruction::Not,
             Self::BitwiseNot => Instruction::BitwiseNot,
             Self::Void => Instruction::Void,
+            Self::Typeof => Instruction::Typeof,
         }
     }
 }
@@ -540,7 +553,7 @@ fn is_excluded_name(name: &str) -> bool {
             | "delete" | "enum" | "export" | "extends"
             | "finally" | "function" | "import" | "in" | "instanceof"
             | "new" | "return" | "super" | "switch" | "this" | "throw"
-            | "try" | "typeof" | "var" | "with" | "await" | "yield"
+            | "try" | "var" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
             // Contextual syntax, strict-mode restricted names, and selected globals.
@@ -743,6 +756,7 @@ impl Lexer<'_> {
             "false" => Ok(TokenKind::Boolean(false)),
             "null" => Ok(TokenKind::Null),
             "void" => Ok(TokenKind::Operator(Operator::Void)),
+            "typeof" => Ok(TokenKind::Operator(Operator::Typeof)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
@@ -1049,7 +1063,9 @@ enum Pending {
         join_depth: usize,
     },
     StatementTest,
-    Group,
+    Group {
+        preserves_reference: bool,
+    },
     AssignmentGroup(ExpressionAssignment),
     Assignment(ExpressionAssignment),
     Consequent {
@@ -1097,7 +1113,14 @@ struct Access {
     name: Span,
     scope: usize,
     instruction: usize,
-    write: Option<WriteAccess>,
+    kind: AccessKind,
+}
+
+#[derive(Clone, Copy)]
+enum AccessKind {
+    Read,
+    TypeofRead,
+    Write(WriteAccess),
 }
 
 #[derive(Clone, Copy)]
@@ -2078,6 +2101,12 @@ impl Parser<'_> {
                     "void cannot be used as a binding name",
                 ));
             }
+            TokenKind::Operator(Operator::Typeof) => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "reserved or excluded name is outside the subset",
+                ));
+            }
             TokenKind::If
             | TokenKind::Else
             | TokenKind::While
@@ -2342,7 +2371,7 @@ impl Parser<'_> {
             operator_span,
             load: load.then_some(self.instructions.len()),
         };
-        let access = self.record_access(name, Some(write))?;
+        let access = self.record_access(name, AccessKind::Write(write))?;
         if load {
             self.emit(Instruction::LoadBinding(UNPATCHED), name)?;
         }
@@ -2389,7 +2418,7 @@ impl Parser<'_> {
             rhs_base_depth: self.stack_depth,
         };
         if grouped {
-            let Some(group @ (Pending::Group, _)) = self.pending.last_mut() else {
+            let Some(group @ (Pending::Group { .. }, _)) = self.pending.last_mut() else {
                 return Err(Error::malformed(operator, "expected an assignment group"));
             };
             *group = (Pending::AssignmentGroup(assignment), operator);
@@ -2405,7 +2434,9 @@ impl Parser<'_> {
         {
             // The assignment ends here, but only ')' can close the group.
             // Reuse the marker and its nesting slot for the rest of the sequence.
-            *pending = Pending::Group;
+            *pending = Pending::Group {
+                preserves_reference: false,
+            };
             let operator = *operator;
             self.finish_expression_assignment(assignment, operator, end)?;
         }
@@ -2441,7 +2472,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn record_access(&mut self, name: Span, write: Option<WriteAccess>) -> Result<usize, Error> {
+    fn record_access(&mut self, name: Span, kind: AccessKind) -> Result<usize, Error> {
         let index = self.accesses.len();
         let scope = self.current_scope();
         try_push(
@@ -2450,7 +2481,7 @@ impl Parser<'_> {
                 name,
                 scope,
                 instruction: self.instructions.len(),
-                write,
+                kind,
             },
             name,
         )?;
@@ -2498,7 +2529,7 @@ impl Parser<'_> {
                         "access before lexical binding initialization is outside the subset",
                     ));
                 }
-                if let Some(write) = access.write
+                if let AccessKind::Write(write) = access.kind
                     && binding.kind == BindingKind::Const
                 {
                     return Err(Error::unsupported(
@@ -2509,10 +2540,13 @@ impl Parser<'_> {
                 return Ok(Some(slot));
             }
             let Some(parent) = self.scopes[scope].parent else {
-                // Only an unbound read gets the immutable default. A declaration
-                // in any visible scope, even in its TDZ, wins over this fallback.
-                if access.write.is_none() && self.is_undefined_name(access.name) {
-                    return Ok(None);
+                // Only an unbound read gets the immutable `undefined` default.
+                // Both that default and the direct typeof exception come after
+                // lexical resolution, including the pre-initialization check.
+                match access.kind {
+                    AccessKind::Read if self.is_undefined_name(access.name) => return Ok(None),
+                    AccessKind::TypeofRead => return Ok(None),
+                    _ => {}
                 }
                 return Err(Error::unsupported(
                     access.name,
@@ -2530,15 +2564,19 @@ impl Parser<'_> {
             let access = self.accesses[index];
             let slot = self.resolve_access(access)?;
             match (
-                access.write,
+                access.kind,
                 slot,
                 self.instructions.get_mut(access.instruction),
             ) {
-                (None, _, Some(op @ Instruction::LoadBinding(UNPATCHED))) => {
+                (
+                    AccessKind::Read | AccessKind::TypeofRead,
+                    _,
+                    Some(op @ Instruction::LoadBinding(UNPATCHED)),
+                ) => {
                     *op = slot.map_or(Instruction::Undefined, Instruction::LoadBinding);
                 }
                 (
-                    Some(WriteAccess { load: None, .. }),
+                    AccessKind::Write(WriteAccess { load: None, .. }),
                     Some(slot),
                     Some(Instruction::UpdateBinding {
                         slot: binding @ UNPATCHED,
@@ -2546,7 +2584,7 @@ impl Parser<'_> {
                     }),
                 ) => *binding = slot,
                 (
-                    Some(write),
+                    AccessKind::Write(write),
                     Some(slot),
                     Some(
                         Instruction::StoreBinding(binding @ UNPATCHED)
@@ -2640,6 +2678,9 @@ impl Parser<'_> {
                     | ExpressionEnd::ForStore(_)
                     | ExpressionEnd::ForClause(_)
             );
+        // Only the most recent operand can be the direct argument of a pending
+        // prefix. Track its read-access index, not the shape of emitted code.
+        let mut direct_read = None;
         let (end, delimiter) = loop {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
@@ -2657,7 +2698,10 @@ impl Parser<'_> {
                 after_line_break,
             } = token;
             let group_start =
-                after_open && matches!(self.pending.last(), Some((Pending::Group, _)));
+                after_open && matches!(self.pending.last(), Some((Pending::Group { .. }, _)));
+            if needs_operand {
+                direct_read = None;
+            }
             // Operand completeness is not sufficient: a name update or a
             // read that already took a suffix cannot take another dot.
             let mut allow_dot = false;
@@ -2682,7 +2726,7 @@ impl Parser<'_> {
                         && after_line_break
                         && let Some(message) = missing_semicolon
                     {
-                        self.reduce_expression(span)?;
+                        self.reduce_expression(span, &mut direct_read)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(span, message));
                         }
@@ -2725,6 +2769,7 @@ impl Parser<'_> {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
                 (false, TokenKind::LengthSuffix) => {
+                    direct_read = None;
                     self.emit(Instruction::StringLength, span)?;
                 }
                 (true, TokenKind::String(range)) => {
@@ -2773,7 +2818,7 @@ impl Parser<'_> {
                         }
                         following => {
                             self.lookahead = Some(following);
-                            self.record_access(span, None)?;
+                            direct_read = Some(self.record_access(span, AccessKind::Read)?);
                             self.emit_charged(Instruction::LoadBinding(UNPATCHED), span)?;
                             allow_dot = true;
                         }
@@ -2781,7 +2826,12 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Open) => {
-                    self.open_pending(Pending::Group, span)?;
+                    self.open_pending(
+                        Pending::Group {
+                            preserves_reference: true,
+                        },
+                        span,
+                    )?;
                 }
                 (true, TokenKind::Operator(op)) => {
                     let prefix = match op {
@@ -2790,6 +2840,7 @@ impl Parser<'_> {
                         Operator::Not => Operator::Not,
                         Operator::BitwiseNot => Operator::BitwiseNot,
                         Operator::Void => Operator::Void,
+                        Operator::Typeof => Operator::Typeof,
                         Operator::Divide => {
                             // In operand position a slash could begin a regexp, not division.
                             return Err(Error::unsupported(
@@ -2830,7 +2881,7 @@ impl Parser<'_> {
                 (false, TokenKind::Comma) => {
                     // Comma is looser than ?: and =. Finish pending subexpressions
                     // before deciding which surrounding production owns the comma.
-                    self.reduce_expression(span)?;
+                    self.reduce_expression(span, &mut direct_read)?;
                     self.finish_group_assignment(span)?;
                     match self.pending.last() {
                         Some((Pending::Consequent { .. }, _)) => {
@@ -2845,7 +2896,7 @@ impl Parser<'_> {
                         {
                             break (span, Some(kind));
                         }
-                        Some((Pending::Group | Pending::StatementTest, _)) => {}
+                        Some((Pending::Group { .. } | Pending::StatementTest, _)) => {}
                         None if matches!(
                             end_kind,
                             ExpressionEnd::Script
@@ -2860,6 +2911,15 @@ impl Parser<'_> {
                                 "a sequence in an assignment RHS requires parentheses",
                             ));
                         }
+                    }
+                    if let Some((
+                        Pending::Group {
+                            preserves_reference,
+                        },
+                        _,
+                    )) = self.pending.last_mut()
+                    {
+                        *preserves_reference = false;
                     }
                     // Discard the left result before the next operand, with no pending
                     // operator or additional nesting for a flat sequence.
@@ -2882,7 +2942,7 @@ impl Parser<'_> {
                 (false, TokenKind::Question) => {
                     // Lower precedence than every operator here, but do not close an
                     // enclosing conditional: this one starts within that arm.
-                    self.reduce_operators(0)?;
+                    self.reduce_operators(0, &mut direct_read)?;
                     let branch = self.instructions.len();
                     self.emit(Instruction::JumpIfFalse(UNPATCHED), span)?;
                     self.open_pending(
@@ -2895,11 +2955,11 @@ impl Parser<'_> {
                     needs_operand = true;
                 }
                 (false, TokenKind::Colon) => {
-                    self.start_alternate(span)?;
+                    self.start_alternate(span, &mut direct_read)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Close) => {
-                    self.reduce_expression(span)?;
+                    self.reduce_expression(span, &mut direct_read)?;
                     self.finish_group_assignment(span)?;
                     match self.pending.pop() {
                         Some((Pending::StatementTest, _)) => {
@@ -2907,7 +2967,15 @@ impl Parser<'_> {
                             // Do not consume the opening brace or do-while semicolon.
                             break (span, Some(kind));
                         }
-                        Some((Pending::Group, _)) => {
+                        Some((
+                            Pending::Group {
+                                preserves_reference,
+                            },
+                            _,
+                        )) => {
+                            if !preserves_reference {
+                                direct_read = None;
+                            }
                             self.nesting_depth -= 1;
                             allow_dot = true;
                         }
@@ -2939,10 +3007,10 @@ impl Parser<'_> {
                     | TokenKind::Boolean(_)
                     | TokenKind::Null
                     | TokenKind::Identifier
-                    | TokenKind::Operator(Operator::Void),
+                    | TokenKind::Operator(Operator::Void | Operator::Typeof),
                 ) => {
                     if after_line_break && for_delimiter.is_none() {
-                        self.reduce_expression(span)?;
+                        self.reduce_expression(span, &mut direct_read)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(
                                 span,
@@ -2953,7 +3021,7 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "expected a binary operator"));
                 }
                 (false, TokenKind::Operator(op)) => {
-                    self.push_infix(op, span)?;
+                    self.push_infix(op, span, &mut direct_read)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Semicolon) if for_update => {
@@ -2971,13 +3039,15 @@ impl Parser<'_> {
             next = self.next_token_with_dot(allow_dot)?;
         };
         let at_eof = delimiter.is_none();
-        self.reduce_expression(end)?;
+        self.reduce_expression(end, &mut direct_read)?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
-                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup(_) if at_eof => {
+                Pending::Group { .. } | Pending::StatementTest | Pending::AssignmentGroup(_)
+                    if at_eof =>
+                {
                     "expected a closing parenthesis before end of source"
                 }
-                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup(_) => {
+                Pending::Group { .. } | Pending::StatementTest | Pending::AssignmentGroup(_) => {
                     "semicolon inside a parenthesized expression"
                 }
                 _ => "expected ':' to complete conditional expression",
@@ -2999,13 +3069,18 @@ impl Parser<'_> {
         Ok((end, delimiter))
     }
 
-    fn push_infix(&mut self, op: Operator, span: Span) -> Result<(), Error> {
+    fn push_infix(
+        &mut self,
+        op: Operator,
+        span: Span,
+        direct_read: &mut Option<usize>,
+    ) -> Result<(), Error> {
         let pending = if let branch @ Instruction::ShortCircuit { .. } = op.instruction() {
             // Reduce the tighter operators (starting at bitwise OR precedence)
             // to expose the closest pending short circuit without reducing it.
             // All earlier short circuits in this region have already agreed on
             // the family. A Group or conditional arm marker ends the region.
-            self.reduce_operators(Operator::BitwiseOr.precedence())?;
+            self.reduce_operators(Operator::BitwiseOr.precedence(), direct_read)?;
             if let Some((Pending::ShortCircuit { op: previous, .. }, _)) = self.pending.last()
                 && matches!(previous, Operator::Coalesce) != matches!(op, Operator::Coalesce)
             {
@@ -3016,7 +3091,7 @@ impl Parser<'_> {
             }
             // Equal precedence reduces first; a preceding branch joins before
             // this operator consumes its left operand.
-            self.reduce_operators(op.precedence())?;
+            self.reduce_operators(op.precedence(), direct_read)?;
             let jump = self.instructions.len();
             let join_depth = self.stack_depth; // LHS stays on the taken path.
             self.emit(branch, span)?; // Track the fallthrough path, which pops the LHS.
@@ -3039,7 +3114,7 @@ impl Parser<'_> {
             // Keep equal precedence pending: `**` associates to the right.
             Pending::Op(op)
         } else {
-            self.reduce_operators(op.precedence())?;
+            self.reduce_operators(op.precedence(), direct_read)?;
             Pending::Op(op)
         };
         self.push_pending(pending, span)
@@ -3063,11 +3138,20 @@ impl Parser<'_> {
         try_push(&mut self.pending, (entry, span), span)
     }
 
-    fn reduce_operators(&mut self, min_precedence: u8) -> Result<(), Error> {
+    fn reduce_operators(
+        &mut self,
+        min_precedence: u8,
+        direct_read: &mut Option<usize>,
+    ) -> Result<(), Error> {
         while let Some(&(pending, span)) = self.pending.last() {
             match pending {
                 Pending::Op(op) if op.precedence() >= min_precedence => {
                     self.emit(op.instruction(), span)?;
+                    if matches!(op, Operator::Typeof)
+                        && let Some(index) = *direct_read
+                    {
+                        self.accesses[index].kind = AccessKind::TypeofRead;
+                    }
                 }
                 Pending::ShortCircuit {
                     op,
@@ -3084,6 +3168,7 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
+            *direct_read = None; // Any reduction here produces a value, not a reference.
             self.pending.pop();
         }
         Ok(())
@@ -3096,8 +3181,12 @@ impl Parser<'_> {
     // its conditional joins; an assignment whose RHS is that conditional
     // finishes after the join. Groups, the statement test's outer delimiter,
     // and consequents still awaiting ':' stop reduction.
-    fn reduce_expression(&mut self, end: Span) -> Result<(), Error> {
-        self.reduce_operators(0)?;
+    fn reduce_expression(
+        &mut self,
+        end: Span,
+        direct_read: &mut Option<usize>,
+    ) -> Result<(), Error> {
+        self.reduce_operators(0, direct_read)?;
         while let Some(&(pending, span)) = self.pending.last() {
             match pending {
                 Pending::Alternate { jump, join_depth } => {
@@ -3116,13 +3205,18 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
+            *direct_read = None; // Any reduction here produces a value, not a reference.
             self.pending.pop();
         }
         Ok(())
     }
 
-    fn start_alternate(&mut self, span: Span) -> Result<(), Error> {
-        self.reduce_expression(span)?;
+    fn start_alternate(
+        &mut self,
+        span: Span,
+        direct_read: &mut Option<usize>,
+    ) -> Result<(), Error> {
+        self.reduce_expression(span, direct_read)?;
         let Some((Pending::Consequent { branch, base_depth }, _)) = self.pending.pop() else {
             return Err(Error::malformed(span, "':' without a matching '?'"));
         };
@@ -3214,6 +3308,7 @@ impl Parser<'_> {
             | Instruction::Not
             | Instruction::BitwiseNot
             | Instruction::Void
+            | Instruction::Typeof
             | Instruction::StringLength => (1, 1),
             Instruction::UpdateNumber(_)
             | Instruction::Add

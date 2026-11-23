@@ -587,6 +587,16 @@ fn fixtures() -> Vec<String> {
             "false && null.length",
             "'use strict'\n. /*\u{2028}*/ length",
             "let s='x'; for (; s.length < 4; s += 'y') {} s.length",
+            "typeof x",
+            "typeof (((notBound)))",
+            "typeof true",
+            "typeof null",
+            "typeof (0/0)",
+            "typeof ('a' + 'b')",
+            "{ const undefined = 2; typeof undefined; } typeof undefined",
+            "let n=0; typeof n++ === 'number' && n===1",
+            "(typeof x).length",
+            "(typeof 2) + ':' + typeof (void 3)",
         ]
         .map(str::to_owned),
     );

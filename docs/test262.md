@@ -49,12 +49,11 @@ are reported as not run, never as passes. No negative, module or harness-heavy
 cases are credited.
 
 The first cohort covers numeric separators, U+2028 in a String, and unary
-positive and negative zero. These are required adapted sloppy-mode passes.
-The `typeof x` unresolvable-reference test is a frontier case: the runner
-attempts it and reports its current unsupported result. A required variant
-becoming unsupported, a wrong result, or no required passes exits 1;
-infrastructure errors exit 2. Frontier unsupported alone does not fail the
-run. Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
+positive and negative zero. The unresolvable-reference test (`typeof x`)
+was first reproduced as unsupported and is now a required regression. All
+five are adapted sloppy-mode cases. A required variant becoming unsupported,
+a wrong result, or no required passes exits 1; infrastructure errors exit 2.
+An unsupported frontier case alone does not fail the run. Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
 against the full pinned blob. Reproduce a frontier result before changing the
 engine, rerun the same blob after the fix, then promote the case to required.
 This is regression evidence for a small subset, not a Test262 conformance score.

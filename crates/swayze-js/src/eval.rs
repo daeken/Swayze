@@ -14,7 +14,7 @@ mod string_concat;
 mod string_number;
 
 pub use string_concat::EvalScratch;
-use string_concat::{StringOperand, StringPools};
+use string_concat::{StringOperand, StringPools, TypeName};
 
 /// A scalar value in the supported JavaScript subset.
 ///
@@ -34,7 +34,8 @@ pub enum Value {
 }
 
 /// A supported primitive result. Strings borrow immutable UTF-16 units from
-/// the prepared Script or the caller's evaluation scratch.
+/// the prepared Script, the caller's evaluation scratch, or private static
+/// storage. The return type still ties the borrow to the inputs of the API.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PrimitiveValue<'a> {
     /// Number, Boolean, `null`, or `undefined`.
@@ -169,7 +170,7 @@ pub enum EvalError {
     StringConcatenationLengthLimitExceeded,
     /// A concatenation would exceed the evaluation's 32,768 appended-unit budget.
     StringConcatenationBudgetExceeded,
-    /// The primitive convenience API received a runtime String, not a literal.
+    /// The primitive convenience API received a concatenation result.
     RuntimeStringResultRequiresScratch,
     /// A reached `.length` receiver is not a primitive String.
     /// This is a subset error, not JavaScript `undefined` or a `TypeError`.
@@ -232,7 +233,7 @@ impl Script {
     /// # Errors
     ///
     /// Returns execution errors, or [`EvalError::NonScalarResult`] if the final
-    /// value is a String (literal or runtime).
+    /// value is a String (literal, `typeof` spelling, or concatenation result).
     pub fn evaluate_value(&self) -> Result<Value, EvalError> {
         match self.run(&mut EvalScratch::new())? {
             Operand::Scalar(value) => Ok(value),
@@ -376,15 +377,19 @@ impl Script {
                 .get(self.string_units())
                 .map(PrimitiveValue::String)
                 .ok_or(EvalError::InvalidScript),
+            Operand::String(StringOperand::TypeName(name)) => {
+                Ok(PrimitiveValue::String(name.units()))
+            }
             Operand::String(StringOperand::Runtime(_)) => {
                 Err(EvalError::RuntimeStringResultRequiresScratch)
             }
         }
     }
 
-    /// Evaluate the Script, accepting literal and runtime String results.
+    /// Evaluate the Script, accepting literal, static, and runtime String results.
     ///
-    /// The result borrows from the Script and scratch for its lifetime. Each
+    /// Even for static `typeof` spellings, the signature ties the result to
+    /// the Script and scratch for its lifetime. Each
     /// call resets scratch's logical length while retaining its capacity; it
     /// does not zeroize the allocation. The execution semantics and errors are
     /// those of [`Script::evaluate_primitive`], except that runtime String
@@ -722,6 +727,17 @@ fn evaluate(
                 })?;
             }
             Instruction::Void => apply_unary(&mut stack, |_| Ok(Value::Undefined))?,
+            Instruction::Typeof => {
+                let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
+                let name = match *value {
+                    Operand::Scalar(Value::Number(_)) => TypeName::Number,
+                    Operand::Scalar(Value::Boolean(_)) => TypeName::Boolean,
+                    Operand::Scalar(Value::Null) => TypeName::Object,
+                    Operand::Scalar(Value::Undefined) => TypeName::Undefined,
+                    Operand::String(_) => TypeName::String,
+                };
+                *value = Operand::String(StringOperand::TypeName(name));
+            }
             Instruction::StringLength => {
                 apply_unary(&mut stack, |value| {
                     string_length(value, scratch.pools(string_units))
@@ -785,7 +801,8 @@ fn string_length(value: Operand, pools: StringPools<'_>) -> Result<Value, EvalEr
         return Err(EvalError::UnsupportedPropertyReceiver);
     };
     let units = string.get(pools).ok_or(EvalError::InvalidScript)?;
-    // Use the checked slice length. Both endpoints are u16, so this is exact.
+    // Use the checked slice length. Range endpoints are u16 and the static
+    // spellings are shorter still, so the Number is exact.
     Ok(Value::Number(units.len() as f64))
 }
 
@@ -1035,6 +1052,23 @@ mod tests {
         slot: 0,
         kind: BindingKind::Let,
     };
+
+    #[test]
+    fn typeof_checks_its_operand_only_when_reached() {
+        use Instruction::{Discard, JumpStatement, Number, Typeof};
+        assert_eq!(
+            evaluate(&[Typeof, Number(1.0)], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[Number(1.0), Discard, Typeof, Number(2.0)], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[JumpStatement(2), Typeof, Number(42.0)], 1, 0),
+            Ok(Value::Number(42.0))
+        );
+    }
 
     #[test]
     fn compound_add_failure_stops_before_the_store() {

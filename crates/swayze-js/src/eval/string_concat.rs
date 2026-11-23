@@ -15,6 +15,45 @@ const _: () = assert!(MAX_APPENDED_UNITS.is_multiple_of(CHUNK_UNITS));
 const _: () = assert!((MAX_APPENDED_UNITS / CHUNK_UNITS).is_power_of_two());
 type Chunk = [u16; CHUNK_UNITS];
 
+// Frozen UTF-16 spellings: no per-Script or scratch allocation. The only
+// way to refer to one in an operand is by the private, payload-free tag.
+#[derive(Clone, Copy)]
+pub(super) enum TypeName {
+    Number,
+    Boolean,
+    String,
+    Object,
+    Undefined,
+}
+
+impl TypeName {
+    pub(super) fn units(self) -> &'static [u16] {
+        static NUMBER: [u16; 6] = ascii_units(b"number");
+        static BOOLEAN: [u16; 7] = ascii_units(b"boolean");
+        static STRING: [u16; 6] = ascii_units(b"string");
+        static OBJECT: [u16; 6] = ascii_units(b"object");
+        static UNDEFINED: [u16; 9] = ascii_units(b"undefined");
+        match self {
+            Self::Number => &NUMBER,
+            Self::Boolean => &BOOLEAN,
+            Self::String => &STRING,
+            Self::Object => &OBJECT,
+            Self::Undefined => &UNDEFINED,
+        }
+    }
+}
+
+const fn ascii_units<const N: usize>(bytes: &[u8; N]) -> [u16; N] {
+    assert!(N > 0 && N <= 9 && N <= MAX_CONCAT_UNITS && bytes.is_ascii());
+    let mut units = [0; N];
+    let mut i = 0;
+    while i < N {
+        units[i] = bytes[i] as u16;
+        i += 1;
+    }
+    units
+}
+
 /// Reusable storage for runtime Strings produced by Script evaluation.
 ///
 /// The arena starts unallocated and grows only for nonempty concatenations.
@@ -75,7 +114,7 @@ impl EvalScratch {
             Value::Boolean(true) => &[116, 114, 117, 101], // true
             Value::Boolean(false) => &[102, 97, 108, 115, 101], // false
             Value::Null => &[110, 117, 108, 108],          // null
-            Value::Undefined => &[117, 110, 100, 101, 102, 105, 110, 101, 100], // undefined
+            Value::Undefined => TypeName::Undefined.units(),
             Value::Number(number) => return self.concatenate_number(string, number, scalar_first),
         };
         self.append_scalar(string, units, scalar_first)
@@ -194,6 +233,7 @@ impl RuntimeRange {
 pub(super) enum StringOperand {
     Literal(StringRange),
     Runtime(RuntimeRange),
+    TypeName(TypeName),
 }
 
 impl StringOperand {
@@ -201,6 +241,7 @@ impl StringOperand {
         match self {
             Self::Literal(range) => range.get(pools.literals),
             Self::Runtime(range) => pools.runtime.get(range.indices()),
+            Self::TypeName(name) => Some(name.units()),
         }
     }
 
@@ -208,6 +249,7 @@ impl StringOperand {
         match self {
             Self::Literal(range) => range.is_empty(),
             Self::Runtime(range) => range.start == range.end,
+            Self::TypeName(_) => false,
         }
     }
 }
@@ -240,6 +282,7 @@ impl<'a> AppendSource<'a> {
                 .get(literals)
                 .map(Self::Borrowed)
                 .ok_or(EvalError::InvalidScript),
+            StringOperand::TypeName(name) => Ok(Self::Borrowed(name.units())),
             StringOperand::Runtime(range) => {
                 let indices = range.indices();
                 if indices.start > indices.end || indices.end > used {
@@ -270,6 +313,39 @@ impl<'a> AppendSource<'a> {
 mod tests {
     use super::*;
     use crate::{PrimitiveValue, Value, parse_script, parser::Instruction};
+
+    #[test]
+    fn typeof_spellings_do_not_use_the_script_pool_or_append_arena() {
+        let script = parse_script("typeof x").unwrap();
+        assert_eq!(
+            script.instructions(),
+            &[Instruction::Undefined, Instruction::Typeof]
+        );
+        assert!(script.string_units().is_empty());
+
+        let mut scratch = EvalScratch::new();
+        assert_eq!(
+            script.evaluate_primitive_with_scratch(&mut scratch),
+            Ok(PrimitiveValue::String(TypeName::Undefined.units()))
+        );
+        assert_eq!(scratch.used, 0);
+        assert_eq!(scratch.chunks.capacity(), 0);
+
+        let warm = parse_script("typeof ('a' + 'b')").unwrap();
+        assert_eq!(
+            warm.evaluate_primitive_with_scratch(&mut scratch),
+            Ok(PrimitiveValue::String(TypeName::String.units()))
+        );
+        assert_eq!(scratch.used, 2); // Only the operand's concatenation appends.
+        let chunks = scratch.chunks.capacity();
+        assert!(chunks > 0);
+        assert_eq!(
+            script.evaluate_primitive_with_scratch(&mut scratch),
+            Ok(PrimitiveValue::String(TypeName::Undefined.units()))
+        );
+        assert_eq!(scratch.used, 0);
+        assert_eq!(scratch.chunks.capacity(), chunks);
+    }
 
     #[test]
     fn string_length_checks_full_ranges_against_warm_logical_prefix() {

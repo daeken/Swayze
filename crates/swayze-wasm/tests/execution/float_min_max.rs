@@ -6,6 +6,85 @@ const F64_OPS: [u8; 2] = [0xa4, 0xa5];
 const F32_ZERO: &[u8] = b"\x43\0\0\0\0";
 const F64_ZERO: &[u8] = b"\x44\0\0\0\0\0\0\0\0";
 
+fn float_binary_module(float: u8, opcode: u8) -> Module {
+    let ty = types(&[(&[float, float], Some(float))]);
+    exported_function(&ty, &code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]))
+}
+
+#[test]
+fn min_max_pin_all_signed_zero_pairs() {
+    for (ops, float, result, pos, neg) in [
+        (
+            F32_OPS,
+            0x7d,
+            ResultKind::F32,
+            Value::F32(0),
+            Value::F32(0x8000_0000),
+        ),
+        (
+            F64_OPS,
+            0x7c,
+            ResultKind::F64,
+            Value::F64(0),
+            Value::F64(0x8000_0000_0000_0000),
+        ),
+    ] {
+        for (opcode, mixed) in ops.into_iter().zip([neg, pos]) {
+            let module = float_binary_module(float, opcode);
+            let instance = module.instantiate().unwrap();
+            for (args, expected) in [
+                ([pos, neg], mixed),
+                ([neg, pos], mixed),
+                ([neg, neg], neg),
+                ([pos, pos], pos),
+            ] {
+                assert_eq!(
+                    instance.invoke_with_values("answer", &args, result),
+                    Ok(Some(expected)),
+                    "opcode {opcode:#x}, operands {args:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn copysign_flips_a_signaling_nan_without_quieting_or_losing_payload() {
+    for (opcode, float, result, positive_nan, negative_nan, positive_zero, negative_zero) in [
+        (
+            0x98,
+            0x7d,
+            ResultKind::F32,
+            Value::F32(0x7f85_4321),
+            Value::F32(0xff85_4321),
+            Value::F32(0),
+            Value::F32(0x8000_0000),
+        ),
+        (
+            0xa6,
+            0x7c,
+            ResultKind::F64,
+            Value::F64(0x7ff0_1234_5678_9abc),
+            Value::F64(0xfff0_1234_5678_9abc),
+            Value::F64(0),
+            Value::F64(0x8000_0000_0000_0000),
+        ),
+    ] {
+        let module = float_binary_module(float, opcode);
+        let instance = module.instantiate().unwrap();
+        for (args, expected) in [
+            ([positive_nan, negative_zero], negative_nan),
+            ([negative_nan, positive_zero], positive_nan),
+        ] {
+            assert_eq!(
+                instance.invoke_with_values("answer", &args, result),
+                Ok(Some(expected)),
+                "opcode {opcode:#x}, operands {args:?}"
+            );
+        }
+    }
+}
+
 fn check_bits(
     ops: [u8; 2],
     float: u8,
@@ -13,7 +92,6 @@ fn check_bits(
     value: impl Fn(u64) -> Value,
     [sign, min_normal, one, infinity, canonical]: [u64; 5],
 ) {
-    let ty = types(&[(&[float, float], Some(float))]);
     // Numeric order, with -0 placed before +0 to encode the tie rule. Cross
     // every value with every other value (including itself) in both orders.
     let ordered = [
@@ -37,7 +115,7 @@ fn check_bits(
     let nan_bits = [infinity + 1, canonical, canonical | 0x1234];
     let nans = [0, sign].into_iter().flat_map(|s| nan_bits.map(|n| s | n));
     for (op_index, opcode) in ops.into_iter().enumerate() {
-        let module = exported_function(&ty, &code_body(&[0, 0x20, 0, 0x20, 1, opcode, 0x0b]));
+        let module = float_binary_module(float, opcode);
         let instance = module.instantiate().unwrap();
         let check = |lhs, rhs, expected| {
             assert_eq!(

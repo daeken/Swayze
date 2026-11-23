@@ -439,7 +439,7 @@ fn expression_updates_require_one_bare_name_and_do_not_relax_assignment_grammar(
         ("(null@++@)", "single identifier"),
         ("let x=0;let y=x++@=@2;y", "assignment expressions"),
         ("let x=0;let y=++x@+=@2;y", "assignment expressions"),
-        ("let x=0;if(x@=@++x){}0", "assignment expressions"),
+        ("let x=0;if(0,x@=@++x){}0", "assignment expressions"),
         ("let x=0;(0, x@=@++x)", "assignment expressions"),
         ("let x=0;(x = x++@,@0)", "sequence in an assignment RHS"),
     ] {

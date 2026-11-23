@@ -216,7 +216,7 @@ fn only_direct_names_at_admitted_rhs_starts_can_begin_a_chain() {
         "let a; true ? 0 : +a @=@ 1",
         "let a; true ? 0 : a=1, a @=@ 2",
         "let a; let x = (0, a @=@ 1); x",
-        "let a; if (a @=@ 1) {} a",
+        "let a; if (+a @=@ 1) {} a",
         "let a; let x = (a) @=@ 1; x",
         "let a; let x = a @||=@ 1; x",
         "let a; let x = a = a++ @=@ 1; x",

@@ -186,9 +186,10 @@ impl Script {
     /// from left to right, discarding each but the last without coercion.
     /// A standalone expression statement also discards its result without coercion.
     /// Only the required final root expression supplies the Script's result.
-    /// An `if` statement uses the same
-    /// truthiness but executes only the selected branch, leaving no operand
-    /// stack result. A falsy test with no `else` performs no writes.
+    /// Statement tests use the same truthiness. A simple assignment chain at
+    /// the start of a test stores the RHS value before truthiness is checked
+    /// (or before the next comma operand is evaluated). An `if` statement
+    /// executes only the selected branch, leaving no operand stack result.
     /// A `while` statement evaluates its test before each iteration and runs its
     /// body only when the test is truthy. A `for` statement first runs its
     /// optional initializer and then tests (an omitted test is truthy). Each

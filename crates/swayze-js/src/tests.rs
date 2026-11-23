@@ -149,6 +149,41 @@ fn arm_stores_precede_the_join_and_the_outer_store_follows_it() {
 }
 
 #[test]
+fn control_test_stores_follow_the_rhs_join_and_precede_comma_and_test() {
+    use Instruction::{
+        Boolean, Discard, Jump, JumpIfFalse, JumpIfFalseStatement, StoreBindingKeep, StrictEqual,
+        Undefined,
+    };
+    assert_postfix(
+        "let x,y,z; if (x=y=false ? z=1 : z=2, x===2) {} y",
+        &[
+            Undefined,
+            init_let(0),
+            Undefined,
+            init_let(1),
+            Undefined,
+            init_let(2),
+            Boolean(false),
+            JumpIfFalse(11),
+            Number(1.0),
+            StoreBindingKeep(2),
+            Jump(13),
+            Number(2.0),
+            StoreBindingKeep(2),
+            StoreBindingKeep(1),
+            StoreBindingKeep(0),
+            Discard,
+            LoadBinding(0),
+            Number(2.0),
+            StrictEqual,
+            JumpIfFalseStatement(20),
+            LoadBinding(1),
+        ],
+        2,
+    );
+}
+
+#[test]
 fn updates_load_and_store_the_same_slot_once_with_no_result() {
     use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
     assert_postfix(

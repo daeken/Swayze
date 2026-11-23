@@ -262,6 +262,9 @@ pub(crate) enum Instruction {
 /// A root expression at EOF yields the result, with or without a trailing
 /// semicolon. If another token follows its semicolon, it is a statement and
 /// its value is discarded. A final root expression is still required.
+///
+/// A control test may begin with a simple name assignment chain. Any comma
+/// at test level follows the chain and starts the next sequence operand.
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
@@ -1022,6 +1025,7 @@ enum Pending {
         jump: usize,
         join_depth: usize,
     },
+    StatementTest,
     Group,
     AssignmentGroup {
         access: usize,
@@ -2438,14 +2442,25 @@ impl Parser<'_> {
             _ => None,
         };
         let mut needs_operand = true;
-        let mut after_open = false;
-        // An ungrouped simple assignment can start an RHS or a ternary arm,
-        // but not an operator operand, a comma operand, or a bare test.
-        let mut rhs_start = matches!(
-            end_kind,
-            ExpressionEnd::Declarator(_) | ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(_)
-        );
-        let mut next = Some(first);
+        // Statement tests receive their already checked opening parenthesis.
+        // Meter it like a group, but let it own the test's close and comma
+        // sequence without admitting a grouped (possibly compound) assignment.
+        let (mut next, mut after_open) = if statement_test {
+            self.open_pending(Pending::StatementTest, first.span)?;
+            (self.next_token()?, true)
+        } else {
+            (Some(first), false)
+        };
+        // Bare simple prefixes are allowed at the start of a test, RHS or
+        // ternary arm, but not at the start of an operator or comma operand.
+        let mut allow_simple_assignment = statement_test
+            || matches!(
+                end_kind,
+                ExpressionEnd::ForTest
+                    | ExpressionEnd::Declarator(_)
+                    | ExpressionEnd::Semicolon(_)
+                    | ExpressionEnd::ForStore(_)
+            );
         let (end, delimiter) = loop {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
@@ -2462,9 +2477,8 @@ impl Parser<'_> {
                 span,
                 after_line_break,
             } = token;
-            // The mandatory statement-test parentheses are delimiters, not an
-            // expression group. A nested '(' can introduce an assignment there.
-            let group_start = after_open && !(statement_test && self.pending.len() == 1);
+            let group_start =
+                after_open && matches!(self.pending.last(), Some((Pending::Group, _)));
             match (needs_operand, kind) {
                 (true, TokenKind::Update(op)) => {
                     let name = self.parse_update_target(span)?;
@@ -2549,7 +2563,7 @@ impl Parser<'_> {
                             kind: TokenKind::Assignment(op),
                             span: operator,
                             ..
-                        }) if group_start || (rhs_start && op.is_none()) => {
+                        }) if group_start || (allow_simple_assignment && op.is_none()) => {
                             if group_start {
                                 self.begin_group_assignment(span, op, operator)?;
                             } else {
@@ -2563,7 +2577,7 @@ impl Parser<'_> {
                                 )?;
                             }
                             after_open = false;
-                            rhs_start = true;
+                            allow_simple_assignment = true;
                             next = self.next_token()?;
                             continue;
                         }
@@ -2606,7 +2620,7 @@ impl Parser<'_> {
                     self.push_pending(Pending::Op(prefix), span)?;
                 }
                 (true, TokenKind::Close) if after_open => {
-                    if statement_test && self.pending.len() == 1 {
+                    if matches!(self.pending.last(), Some((Pending::StatementTest, _))) {
                         return Err(Error::malformed(
                             span,
                             "expected a statement test expression",
@@ -2641,7 +2655,7 @@ impl Parser<'_> {
                         None if matches!(end_kind, ExpressionEnd::Declarator(_)) => {
                             break (span, Some(kind));
                         }
-                        Some((Pending::Group, _)) => {}
+                        Some((Pending::Group | Pending::StatementTest, _)) => {}
                         None if matches!(
                             end_kind,
                             ExpressionEnd::Script
@@ -2696,6 +2710,11 @@ impl Parser<'_> {
                 (false, TokenKind::Close) => {
                     self.reduce_expression(span)?;
                     match self.pending.pop() {
+                        Some((Pending::StatementTest, _)) => {
+                            self.nesting_depth -= 1;
+                            // Do not consume the opening brace or do-while semicolon.
+                            break (span, Some(kind));
+                        }
                         Some((Pending::Group, _)) => self.nesting_depth -= 1,
                         Some((
                             Pending::AssignmentGroup {
@@ -2726,11 +2745,6 @@ impl Parser<'_> {
                             return Err(Error::malformed(span, message));
                         }
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
-                    }
-                    // The statement test starts with its required '(' as the first group.
-                    // Stop at that group's close without consuming the next token.
-                    if statement_test && self.pending.is_empty() {
-                        break (span, Some(kind));
                     }
                 }
                 (false, TokenKind::Open) => {
@@ -2768,17 +2782,19 @@ impl Parser<'_> {
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
             after_open = matches!(kind, TokenKind::Open);
-            rhs_start = matches!(kind, TokenKind::Question | TokenKind::Colon);
+            allow_simple_assignment = matches!(kind, TokenKind::Question | TokenKind::Colon);
             next = self.next_token()?;
         };
         let at_eof = delimiter.is_none();
         self.reduce_expression(end)?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
-                Pending::Group | Pending::AssignmentGroup { .. } if at_eof => {
+                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup { .. }
+                    if at_eof =>
+                {
                     "expected a closing parenthesis before end of source"
                 }
-                Pending::Group | Pending::AssignmentGroup { .. } => {
+                Pending::Group | Pending::StatementTest | Pending::AssignmentGroup { .. } => {
                     "semicolon inside a parenthesized expression"
                 }
                 _ => "expected ':' to complete conditional expression",
@@ -2892,10 +2908,11 @@ impl Parser<'_> {
 
     // At a delimiter, finish conditionals and ungrouped assignments inside out.
     // '?' drained operators at its level, and a simple assignment began at an
-    // RHS or arm prefix, so neither marker has operators immediately beneath it.
-    // An arm's assignments finish before its conditional joins; an assignment
-    // whose RHS is that conditional finishes after the join. Groups and
-    // consequents still awaiting ':' stop reduction.
+    // test, RHS or arm prefix, so neither marker has operators immediately
+    // beneath it. An arm's assignments finish before its conditional joins;
+    // an assignment whose RHS is that conditional finishes after the join.
+    // Groups, the statement test's outer delimiter, and consequents still
+    // awaiting ':' stop reduction.
     fn reduce_expression(&mut self, end: Span) -> Result<(), Error> {
         self.reduce_operators(0)?;
         while let Some(&(pending, span)) = self.pending.last() {

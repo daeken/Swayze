@@ -1088,12 +1088,15 @@ struct WriteAccess {
 enum ExpressionEnd {
     Script,
     ExpressionStatement,
-    Semicolon(&'static str),
+    // A bare assignment RHS ends at the first outer comma or semicolon.
+    StatementStore,
+    // Subsequent comma operands use expression rules but still require ';'.
+    StatementStoreSuffix,
     Declarator(DeclaratorEnd),
     StatementTest,
     ForTest,
     ForClause(ForClauseEnd),
-    // An outer comma ends an assignment RHS, but is not an update delimiter.
+    // An outer comma ends the first assignment RHS or name update.
     ForStore(ForClauseEnd),
 }
 
@@ -1112,9 +1115,7 @@ enum DeclaratorEnd {
 const FOR_SEMICOLON: &str = "expected ';' between for clauses";
 const FOR_UPDATE_CLOSE: &str = "expected ')' after the for update";
 const EXPRESSION_STATEMENT_SEMICOLON: &str = "expression statements require explicit semicolons";
-
-const STORE_STATEMENT_END: ExpressionEnd =
-    ExpressionEnd::Semicolon("assignments require explicit semicolons");
+const ASSIGNMENT_STATEMENT_SEMICOLON: &str = "assignments require explicit semicolons";
 
 // One frame per active standalone block or control statement, reused for `else {}`.
 // Every test starts and every block enters and joins at operand depth zero.
@@ -1728,7 +1729,7 @@ impl Parser<'_> {
             | TokenKind::Do => self.open_statement(first, self.labels.len())?,
             TokenKind::Break | TokenKind::Continue => self.parse_statement_jump(&first)?,
             TokenKind::Update(op) => {
-                self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
+                self.parse_prefix_update(op, first.span, ExpressionEnd::StatementStore)?;
             }
             TokenKind::Identifier => {
                 let next = self.next_token()?;
@@ -1738,7 +1739,7 @@ impl Parser<'_> {
                 ) {
                     self.open_labeled_statement(first.span)?;
                 } else if self
-                    .parse_name_store(first.span, next, STORE_STATEMENT_END)?
+                    .parse_name_store(first.span, next, ExpressionEnd::StatementStore)?
                     .is_none()
                 {
                     return Ok(Some(first));
@@ -2089,20 +2090,21 @@ impl Parser<'_> {
             .map_or(Span::at(self.lexer.offset), |t| t.span);
         let kind = next.as_ref().map(|t| t.kind);
         // Only a complete, explicitly delimited update is a supported write.
+        // Unlike an assignment statement, a statement-leading update owns no comma.
         match (end, kind) {
             (
-                ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(ForClauseEnd::Init),
+                ExpressionEnd::StatementStore | ExpressionEnd::ForStore(ForClauseEnd::Init),
                 Some(TokenKind::Semicolon),
             )
             | (ExpressionEnd::ForStore(ForClauseEnd::Update), Some(TokenKind::Close))
             | (ExpressionEnd::ForStore(_), Some(TokenKind::Comma)) => {}
-            (ExpressionEnd::Semicolon(_), None | Some(TokenKind::CloseBrace)) => {
+            (ExpressionEnd::StatementStore, None | Some(TokenKind::CloseBrace)) => {
                 return Err(Error::unsupported(
                     span,
                     "increments and decrements require explicit semicolons",
                 ));
             }
-            (ExpressionEnd::Semicolon(_), _) if next.is_some_and(|t| t.after_line_break) => {
+            (ExpressionEnd::StatementStore, _) if next.is_some_and(|t| t.after_line_break) => {
                 return Err(Error::unsupported(
                     span,
                     "increments and decrements require explicit semicolons",
@@ -2137,7 +2139,7 @@ impl Parser<'_> {
             operator,
         )?;
         self.finish_write(access, span, false)?;
-        self.finish_store_clause(end, span, kind)
+        self.parse_store_suffix(end, span, kind)
     }
 
     // The caller has already charged the name's emission work, just as for a
@@ -2192,22 +2194,28 @@ impl Parser<'_> {
         if let Some(skip) = skip {
             self.patch_jump(skip, rhs_end)?;
         }
-        self.finish_store_clause(end, rhs_end, delimiter)
+        self.parse_store_suffix(end, rhs_end, delimiter)
     }
 
-    fn finish_store_clause(
+    fn parse_store_suffix(
         &mut self,
         end: ExpressionEnd,
         span: Span,
         delimiter: Option<TokenKind>,
     ) -> Result<Span, Error> {
-        if let (ExpressionEnd::ForStore(clause), Some(TokenKind::Comma)) = (end, delimiter) {
-            // The comma was already consumed, and the store (or its skip edge)
-            // leaves no value to discard. Parse just the remaining operands.
-            let first = self.require_token("expected an operand before end of source")?;
-            return self.parse_discarded_expression(first, ExpressionEnd::ForClause(clause));
-        }
-        Ok(span)
+        let suffix_end = match (end, delimiter) {
+            (ExpressionEnd::StatementStore, Some(TokenKind::Comma)) => {
+                ExpressionEnd::StatementStoreSuffix
+            }
+            (ExpressionEnd::ForStore(clause), Some(TokenKind::Comma)) => {
+                ExpressionEnd::ForClause(clause)
+            }
+            _ => return Ok(span),
+        };
+        // The comma was already consumed, and the store (or its skip edge)
+        // leaves no value to discard. Parse just the remaining operands.
+        let first = self.require_token("expected an operand before end of source")?;
+        self.parse_discarded_expression(first, suffix_end)
     }
 
     fn begin_write(&mut self, name: Span, operator_span: Span, load: bool) -> Result<usize, Error> {
@@ -2474,8 +2482,10 @@ impl Parser<'_> {
         };
         let missing_semicolon = match end_kind {
             ExpressionEnd::ExpressionStatement => Some(EXPRESSION_STATEMENT_SEMICOLON),
-            ExpressionEnd::Semicolon(message)
-            | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
+            ExpressionEnd::StatementStore | ExpressionEnd::StatementStoreSuffix => {
+                Some(ASSIGNMENT_STATEMENT_SEMICOLON)
+            }
+            ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
             _ => None,
         };
         let mut needs_operand = true;
@@ -2489,15 +2499,16 @@ impl Parser<'_> {
             (Some(first), false)
         };
         // Bare assignment prefixes can start a test, RHS, ternary arm, or
-        // noninitial sequence operand, but not an operator operand. ForClause
-        // starts at the first operand after a leading store's comma, or at a
-        // clause start where parse_for_clause has ruled out a leading store.
+        // noninitial sequence operand, but not an operator operand. Store
+        // suffixes start after the first comma. ForClause may also start where
+        // parse_for_clause has ruled out a leading store.
         let mut allow_assignment = statement_test
             || matches!(
                 end_kind,
                 ExpressionEnd::ForTest
                     | ExpressionEnd::Declarator(_)
-                    | ExpressionEnd::Semicolon(_)
+                    | ExpressionEnd::StatementStore
+                    | ExpressionEnd::StatementStoreSuffix
                     | ExpressionEnd::ForStore(_)
                     | ExpressionEnd::ForClause(_)
             );
@@ -2684,7 +2695,9 @@ impl Parser<'_> {
                         }
                         None if matches!(
                             end_kind,
-                            ExpressionEnd::Declarator(_) | ExpressionEnd::ForStore(_)
+                            ExpressionEnd::Declarator(_)
+                                | ExpressionEnd::StatementStore
+                                | ExpressionEnd::ForStore(_)
                         ) =>
                         {
                             break (span, Some(kind));
@@ -2694,6 +2707,7 @@ impl Parser<'_> {
                             end_kind,
                             ExpressionEnd::Script
                                 | ExpressionEnd::ExpressionStatement
+                                | ExpressionEnd::StatementStoreSuffix
                                 | ExpressionEnd::ForTest
                                 | ExpressionEnd::ForClause(_)
                         ) => {}

@@ -114,7 +114,6 @@ fn commas_only_separate_complete_single_name_declarators() {
         ("|var x=1,y=2; y", 3, Unsupported),
         ("for(;false;|const x=1,y=2){} 0", 5, Unsupported),
         ("for(let x=1,y|+=2;;){} 0", 2, Unsupported),
-        ("let x,y; x=1|,y=2; y", 1, Unsupported),
         ("let x=true ? 1|,y=2 : 0; y", 1, Malformed),
     ] {
         error_at(source, len, kind);

@@ -233,14 +233,9 @@ fn only_direct_names_at_admitted_rhs_starts_can_begin_a_chain() {
         assert_marked_error(source, ErrorKind::Unsupported, "assignment expressions");
     }
     for (source, message) in [
-        ("let x,y; x=y=1@,@x; x", "sequence in an assignment RHS"),
         (
             "let x,y; x=y=1@@",
             "assignments require explicit semicolons",
-        ),
-        (
-            "let x; x=true ? x=1 : x=2@,@ x; x",
-            "sequence in an assignment RHS",
         ),
         (
             "let x; x=true ? x=1 : x=2@@",

@@ -330,8 +330,6 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
         ("true ? (1, 2) : |,3", 1, Malformed),
         ("for (;true,|;){} 0", 1, Malformed),
         ("const x=1, |2; x", 1, Malformed),
-        ("let x; x=true ? 1 : 2|, 3; x", 1, Unsupported),
-        ("let x; x ??= 1|, 2; x", 1, Unsupported),
         ("{1,2|} 0", 1, Unsupported),
         ("1, 2; 3,|", 0, Malformed),
         ("let x; x=(1,2)\n|x", 1, Unsupported),
@@ -360,20 +358,12 @@ fn rejects_incomplete_sequences_and_leaves_other_grammar_restrictions_in_place()
 }
 
 #[test]
-fn ungrouped_sequences_in_a_consequent_or_assignment_rhs_error_at_the_comma() {
-    use ErrorKind::{Malformed, Unsupported};
+fn ungrouped_sequences_in_a_consequent_error_at_the_comma() {
+    use ErrorKind::Malformed;
     assert_error_at("(true ? 1|, 2 : 3)", Malformed, 1);
     assert_error_at("let x; (true ? 1|, x=2 : 3)", Malformed, 1);
     assert_error_at("let x,y; (x=true ? y=1|, 2 : 3)", Malformed, 1);
     assert_error_at("let x,y; (x=0,y=true ? 1|,2 : 3)", Malformed, 1);
-    for source in [
-        "let x; x=1|, 2; x",
-        "let x; x=1|, x=2; x",
-        "let x; {x=1|,x=2;} x",
-        "let x; for (;false;) {x=1|,x=2;} x",
-    ] {
-        assert_error_at(source, Unsupported, 1);
-    }
     assert_error_at("let x=0, |x=1; x", Malformed, 1);
 }
 

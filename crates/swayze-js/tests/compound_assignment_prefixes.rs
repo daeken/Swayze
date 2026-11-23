@@ -204,18 +204,6 @@ fn skipped_targets_and_rhs_are_resolved_in_source_order() {
 
 #[test]
 fn delimiters_and_leading_standalone_dispatch_keep_their_existing_roles() {
-    for source in [
-        "let x=0,y=2; x=y+=1@,@x; x",
-        "let x=0; x ||= 1@,@2; x",
-        "let x=0; {x+=1@,@true;} x",
-        "let x=0; x=1@,@x",
-    ] {
-        assert_marked_error(
-            source,
-            ErrorKind::Unsupported,
-            "sequence in an assignment RHS",
-        );
-    }
     assert_marked_error(
         "let x=0; x+=1@@",
         ErrorKind::Unsupported,

@@ -357,15 +357,16 @@ fn memory_exports_do_not_change_legacy_function_section_precedence() {
         }
     }
     for sections in [
-        &[(7, &[0][..])][..], // Legacy empty export vector.
-        &[(5, ONE_PAGE), (7, b"\x02\x03mem\x02\0\x01f\0\x7f")], // Unbound function index.
-        &[(3, FUNCTION), (5, ONE_PAGE), (7, MEM)], // Explicit function section still opts in.
+        &[(5, ONE_PAGE), (7, b"\x02\x03mem\x02\0\x01f\0\x7f")][..], // Unbound function index.
+        &[(3, FUNCTION), (5, ONE_PAGE), (7, MEM)], // Nonempty declarations still need types.
     ] {
         let bytes = module(sections);
         expect_error(&bytes, bytes.len(), ErrorKind::MissingSection { id: 1 });
     }
-    let bytes = module(&[(1, TYPE), (5, ONE_PAGE), (7, MEM)]);
-    expect_error(&bytes, bytes.len(), ErrorKind::MissingSection { id: 3 });
+    for names in [MEM, &[0]] {
+        let bytes = module(&[(1, TYPE), (5, ONE_PAGE), (7, names)]);
+        validate_module(&bytes).unwrap().instantiate().unwrap();
+    }
     let mut bytes = module(&[(1, TYPE), (5, ONE_PAGE)]);
     let start = push_section(&mut bytes, 7, b"\x02\x03mem\x02\0\x01f\0\x80");
     push_section(&mut bytes, 0, &[0]);

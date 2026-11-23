@@ -120,12 +120,7 @@ fn accepts_memory_only_and_empty_memory_sections_and_enforces_order() {
     push_section(&mut bytes, 3, FUNCTION);
     expect_error(&bytes, id_offset, ErrorKind::SectionOutOfOrder { id: 3 });
 
-    let incomplete = module(&[(1, TYPE), (5, ONE_PAGE)]);
-    expect_error(
-        &incomplete,
-        incomplete.len(),
-        ErrorKind::MissingSection { id: 3 },
-    );
+    validate_module(&module(&[(1, TYPE), (5, ONE_PAGE)])).unwrap();
 }
 
 #[test]

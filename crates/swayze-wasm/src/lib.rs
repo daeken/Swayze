@@ -4,11 +4,13 @@
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
 //! custom sections within [`Limit`], and optional table, memory, global,
-//! start, element, and data sections. Modules with functions must have one to eight
-//! types, one to eight function declarations, and exactly as many code bodies
-//! as function declarations, in that section order. Each type must have zero
-//! to four parameters in any order and either no result (void) or one result,
-//! even if unused. Each parameter and result can be `i32`, `i64`, `f32`, or `f64`.
+//! start, element, and data sections. The type, function, and code sections
+//! are optional and may each contain zero to eight entries. An omitted section
+//! contributes no entries; the number of function declarations must equal the
+//! number of code bodies. When present, the three sections keep that order.
+//! Each type must have zero to four parameters in any order and either no result
+//! (void) or one result, even if unused. Each parameter and result can be `i32`,
+//! `i64`, `f32`, or `f64`.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 locals in total, in addition
 //! to its parameters. The number of groups and each group's local count are
@@ -141,9 +143,8 @@
 //! descriptor is `0x00` followed by a defined function index, `0x02` followed by
 //! the defined memory index zero, or `0x03` followed by a defined global index.
 //! All indices are unsigned LEB32 and accept valid padding. Distinct names may
-//! refer to the same target. A nonempty list with no function exports does not
-//! require type, function, or code sections unless one is explicitly present;
-//! a present empty export section retains their existing requirement. Tables
+//! refer to the same target. An omitted or empty export section contributes no
+//! exports. Memory and global exports do not require any functions. Tables
 //! cannot be exported. Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)

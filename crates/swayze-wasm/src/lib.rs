@@ -74,13 +74,13 @@
 //!
 //! The optional table section (ID 4) follows any function section and precedes
 //! any memory, global, export, start, element, and code sections. It may be
-//! empty (a zero-length vector) or declare one private `funcref` table, using
+//! empty (a zero-length vector) or declare one `funcref` table, using
 //! literal element type byte `0x70`. Its limits use flag byte `0x00` (minimum only) or
 //! `0x01` (minimum and maximum), followed by unsigned LEB32 entry counts. The
 //! minimum and any explicit maximum are at most 16, and the maximum must not
 //! be less than the minimum. The minimum is the fixed instance size, which may
-//! be zero. The table cannot be imported, exported, or mutated after
-//! instantiation. Guest code can only use it as the target of `call_indirect`.
+//! be zero. The table can be exported by name but cannot be imported or mutated
+//! after instantiation. Guest code can only use it as the target of `call_indirect`.
 //!
 //! If present, the memory section follows any function and table sections and
 //! precedes any global, export, start, element, and code sections. It may be
@@ -138,14 +138,15 @@
 //!
 //! An optional export section after any table, memory, and globals and before
 //! any start, elements, code, and data may contain zero to eight names total
-//! across function, memory, and global exports. Matching is exact (no Unicode
-//! normalization), and duplicate names are rejected across all kinds. An export
-//! descriptor is `0x00` followed by a defined function index, `0x02` followed by
-//! the defined memory index zero, or `0x03` followed by a defined global index.
-//! All indices are unsigned LEB32 and accept valid padding. Distinct names may
-//! refer to the same target. An omitted or empty export section contributes no
-//! exports. Memory and global exports do not require any functions. Tables
-//! cannot be exported. Both export and custom names must be UTF-8.
+//! across function, table, memory, and global exports. Matching is exact (no
+//! Unicode normalization), and duplicate names are rejected across all kinds.
+//! An export descriptor is `0x00` followed by a defined function index, `0x01`
+//! followed by the defined table index zero, `0x02` followed by the defined
+//! memory index zero, or `0x03` followed by a defined global index. All indices
+//! are unsigned LEB32 and accept valid padding. Distinct names may refer to the
+//! same target. An omitted or empty export section contributes no exports.
+//! Table, memory, and global exports do not require any functions. Both export
+//! and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
 //! are rejected, even when empty.
@@ -378,7 +379,7 @@
 //! segments are reported by zero-based source index as
 //! [`InstantiationError::ElementSegmentOutOfBounds`] or
 //! [`InstantiationError::DataSegmentOutOfBounds`], not validation errors or
-//! invocation traps. The fixed private table starts with all entries null;
+//! invocation traps. The fixed-size table starts with all entries null;
 //! fresh linear memory starts with all bytes zero. Segments of each kind are
 //! applied in source order; the last write to an entry or byte wins. Global
 //! initial values are copied into fixed private slots with no allocation.
@@ -518,6 +519,11 @@
 //! global's current value, preserving its exact type and bits. Both immutable
 //! and mutable globals can be read, but neither can be written or borrowed by
 //! the host. Like a memory copy, a global snapshot does not run guest code.
+//! [`Instance::table_size`] returns only the logical slot count of an explicitly
+//! named table export, including null slots. Accepting table export declarations
+//! does not provide a JavaScript `WebAssembly.Table` object or support linking
+//! tables across instances. Hosts cannot read entries, mutate the table, or
+//! invoke its entries directly.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -755,6 +761,9 @@
 //! malformed and unsupported encodings, validation of every referenced function,
 //! absent versus zero-entry tables, null slots, overlap order, fresh instances,
 //! full-range preflight, and coexistence and failure precedence with data.
+//! Table export tests cover framed index diagnostics, the shared name budget,
+//! wrong-kind lookups, fixed slot counts, and indirect calls from a guest
+//! wrapper without exposing its private callee to the host.
 //! Indirect-call tests cover exact immediate encoding, operand floors and caps,
 //! parameter order, matching duplicate type declarations, void and i32 results,
 //! target traps and their ordering against both budgets, and shared memory and
@@ -849,6 +858,7 @@ struct Export {
 #[derive(Clone, Copy)]
 enum ExportTarget {
     Function(usize),
+    Table,
     Memory,
     Global(usize),
 }
@@ -1015,7 +1025,7 @@ impl Instance<'_> {
     /// # Errors
     ///
     /// Returns [`ReadMemoryError::ExportNotFound`] for a missing name,
-    /// [`ReadMemoryError::ExportNotMemory`] for a function or global export, or
+    /// [`ReadMemoryError::ExportNotMemory`] for any other export kind, or
     /// [`ReadMemoryError::OutOfBounds`] for an invalid range.
     ///
     /// # Examples
@@ -1039,7 +1049,7 @@ impl Instance<'_> {
     ) -> Result<(), ReadMemoryError> {
         match self.module.find_export(name) {
             None => Err(ReadMemoryError::ExportNotFound),
-            Some(ExportTarget::Function(_) | ExportTarget::Global(_)) => {
+            Some(ExportTarget::Function(_) | ExportTarget::Table | ExportTarget::Global(_)) => {
                 Err(ReadMemoryError::ExportNotMemory)
             }
             Some(ExportTarget::Memory) => self.memory.copy_out(offset, dest),
@@ -1059,7 +1069,7 @@ impl Instance<'_> {
     /// # Errors
     ///
     /// Returns [`ReadGlobalError::ExportNotFound`] for a missing name or
-    /// [`ReadGlobalError::ExportNotGlobal`] for a function or memory export.
+    /// [`ReadGlobalError::ExportNotGlobal`] for any other export kind.
     ///
     /// # Examples
     ///
@@ -1074,10 +1084,45 @@ impl Instance<'_> {
     pub fn read_global(&self, name: &str) -> Result<Value, ReadGlobalError> {
         match self.module.find_export(name) {
             None => Err(ReadGlobalError::ExportNotFound),
-            Some(ExportTarget::Function(_) | ExportTarget::Memory) => {
+            Some(ExportTarget::Function(_) | ExportTarget::Table | ExportTarget::Memory) => {
                 Err(ReadGlobalError::ExportNotGlobal)
             }
             Some(ExportTarget::Global(index)) => Ok(self.globals[index].get().into()),
+        }
+    }
+
+    /// Return the logical slot count of an exact named table export.
+    ///
+    /// This is the fixed size of the instance's table (0 through 16), counting
+    /// both initialized and null slots. It is not the declared maximum. This
+    /// operation does not allocate, execute guest code, or consume guest fuel,
+    /// and exposes no entries, table handle, or way to mutate the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableSizeError::ExportNotFound`] for a missing name or
+    /// [`TableSizeError::ExportNotTable`] for any other export kind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use swayze_wasm::validate_module;
+    /// // (module (table (export "t") 2 4 funcref))
+    /// let bytes = b"\0asm\x01\0\0\0\x04\x05\x01\x70\x01\x02\x04\x07\x05\x01\x01t\x01\0";
+    /// let module = validate_module(bytes)?;
+    /// assert_eq!(module.instantiate()?.table_size("t")?, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn table_size(&self, name: &str) -> Result<u32, TableSizeError> {
+        match self.module.find_export(name) {
+            None => Err(TableSizeError::ExportNotFound),
+            Some(ExportTarget::Function(_) | ExportTarget::Memory | ExportTarget::Global(_)) => {
+                Err(TableSizeError::ExportNotTable)
+            }
+            Some(ExportTarget::Table) => {
+                let table = self.table.as_ref().expect("validated table presence");
+                Ok(table.size())
+            }
         }
     }
 
@@ -1190,7 +1235,7 @@ impl Instance<'_> {
     ) -> Result<Option<Value>, InvokeError> {
         match self.module.find_export(name) {
             None => Err(InvokeError::ExportNotFound),
-            Some(ExportTarget::Memory | ExportTarget::Global(_)) => {
+            Some(ExportTarget::Table | ExportTarget::Memory | ExportTarget::Global(_)) => {
                 Err(InvokeError::ExportNotFunction)
             }
             Some(ExportTarget::Function(index)) => {
@@ -1242,6 +1287,26 @@ impl fmt::Display for ReadGlobalError {
 }
 
 impl std::error::Error for ReadGlobalError {}
+
+/// Why a host query of an explicitly named table export failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableSizeError {
+    /// This module has no export with the requested name.
+    ExportNotFound,
+    /// The named export exists but is not a table.
+    ExportNotTable,
+}
+
+impl fmt::Display for TableSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ExportNotFound => "WebAssembly export not found",
+            Self::ExportNotTable => "WebAssembly export is not a table",
+        })
+    }
+}
+
+impl std::error::Error for TableSizeError {}
 
 /// A result kind supported by a typed invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

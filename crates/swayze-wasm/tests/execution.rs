@@ -69,6 +69,8 @@ mod result_loop;
 mod stack;
 #[path = "execution/start.rs"]
 mod start;
+#[path = "execution/table_exports.rs"]
+mod table_exports;
 #[path = "execution/unreachable.rs"]
 mod unreachable;
 #[path = "execution/void_control.rs"]
@@ -2591,7 +2593,7 @@ fn bounds_type_function_code_and_export_counts() {
     for (id, payload, index, expected) in [
         (1, &[1, 0x61, 0, 1, 0x7f][..], 1, 0x60),
         (1, &[1, 0x60, 0, 1, 0x70], 4, 0x7f),
-        (7, &[1, 0, 1, 0], 2, 0),
+        (7, &[1, 0, 4, 0], 2, 0),
     ] {
         bad_payload(
             id,

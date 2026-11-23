@@ -17,6 +17,6 @@ pub use swayze_wasm::{
     IntegerField as WasmIntegerField, InvokeError as WasmInvokeError,
     LengthField as WasmLengthField, Limit as WasmLimit, Module as WasmModule,
     ReadGlobalError as WasmReadGlobalError, ReadMemoryError as WasmReadMemoryError,
-    ResultKind as WasmResultKind, Trap as WasmTrap, ValType as WasmValType, Value as WasmValue,
-    validate_module,
+    ResultKind as WasmResultKind, TableSizeError as WasmTableSizeError, Trap as WasmTrap,
+    ValType as WasmValType, Value as WasmValue, validate_module,
 };

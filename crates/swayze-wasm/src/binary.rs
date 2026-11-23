@@ -384,9 +384,10 @@ impl std::error::Error for Error {}
 /// checked provisionally before reporting a missing section.
 /// A repeated export name (regardless of kind) is reported at the start of its
 /// length field, before checking the descriptor. An export index is decoded
-/// within the section frame. In a memory export, a nonzero index reports
-/// [`ErrorKind::InvalidIndex`] with [`IntegerField::MemoryIndex`] at the start
-/// of that field, even if the module has no memory.
+/// within the section frame. In a table or memory export, a nonzero index reports
+/// [`ErrorKind::InvalidIndex`] with [`IntegerField::TableIndex`] or
+/// [`IntegerField::MemoryIndex`] at the start of that field, even if the target
+/// is absent.
 /// In a global export, an index outside the defined globals (including when
 /// there are none) reports [`ErrorKind::InvalidIndex`] with
 /// [`IntegerField::GlobalIndex`] at the start of the index field.
@@ -407,9 +408,9 @@ impl std::error::Error for Error {}
 /// as [`ErrorKind::UnsupportedCount`], and a reversed table bounds pair as
 /// [`ErrorKind::InvalidTableLimits`] at the start of the maximum field.
 /// [`ErrorKind::MissingTable`] points to the `call_indirect` opcode or the start
-/// of an active segment's table index. An element function-index vector above
-/// the remaining aggregate budget reports [`ErrorKind::LimitExceeded`] at the
-/// start of its count field.
+/// of a table export's or active element segment's table index.
+/// An element function-index vector above the remaining aggregate budget
+/// reports [`ErrorKind::LimitExceeded`] at the start of its count field.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -510,6 +511,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
                 exports = validate_exports(
                     &mut section,
                     function_count,
+                    table_entries.is_some(),
                     memory_limits.is_some(),
                     global_count as u32,
                 )?;
@@ -822,6 +824,7 @@ fn validate_globals(
 fn validate_exports(
     section: &mut Reader<'_>,
     function_count: Option<u32>,
+    has_table: bool,
     has_memory: bool,
     global_count: u32,
 ) -> Result<Vec<Export>, Error> {
@@ -851,6 +854,17 @@ fn validate_exports(
                     section.integer(IntegerField::FunctionIndex)?
                 };
                 ExportTarget::Function(index as usize)
+            }
+            Some(0x01) => {
+                let index_offset = section.position();
+                section.index(IntegerField::TableIndex, 1)?;
+                if !has_table {
+                    return Err(Error {
+                        offset: index_offset,
+                        kind: ErrorKind::MissingTable,
+                    });
+                }
+                ExportTarget::Table
             }
             Some(0x02) => {
                 let index_offset = section.position();

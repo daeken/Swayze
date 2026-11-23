@@ -49,6 +49,11 @@ for (const fixture of fixtures) {
         continue;
     }
     const exported = instance.exports[name];
+    if (result === 'table-size') {
+        if (!(exported instanceof WebAssembly.Table)) throw new Error('expected a table export');
+        console.log(`table-size=${exported.length}`);
+        continue;
+    }
     if (result === 'memory') {
         if (!(exported instanceof WebAssembly.Memory)) throw new Error('expected a memory export');
         const [offset, length] = args.map(Number);
@@ -137,6 +142,7 @@ enum Outcome {
     VoidInvocation(Result<(), WasmTrap>),
     MemoryRead { offset: u32, bytes: [u8; 4] },
     GlobalRead(WasmValue),
+    TableSize(u32),
     Instantiated,
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
@@ -214,6 +220,13 @@ impl Fixture<WasmValue> {
         }
         if self.expected == Outcome::Instantiated {
             return format!("{}::instantiate", hex(&self.bytes));
+        }
+        if let Outcome::TableSize(_) = self.expected {
+            return format!(
+                "{}:{}:table-size",
+                hex(&self.bytes),
+                hex(self.export.as_bytes())
+            );
         }
         let result = match self.expected.result_kind() {
             WasmResultKind::Void => "void",
@@ -1621,6 +1634,35 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     cases.into_iter()
 }
 
+fn table_export_fixtures() -> [Fixture<WasmValue>; 3] {
+    [
+        Fixture {
+            // Defined, empty, and exported; no function sections.
+            bytes: b"\0asm\x01\0\0\0\x04\x04\x01\x70\0\0\x07\x05\x01\x01t\x01\0".to_vec(),
+            export: "t",
+            expected: Outcome::TableSize(0),
+            args: vec![],
+        },
+        Fixture {
+            // Padded table export index, two logical slots, maximum four.
+            bytes: b"\0asm\x01\0\0\0\x04\x05\x01\x70\x01\x02\x04\x07\x06\x01\x01t\x01\x80\0"
+                .to_vec(),
+            export: "t",
+            expected: Outcome::TableSize(2),
+            args: vec![],
+        },
+        Fixture {
+            // Table and memory exports share a name vector, not an index space.
+            bytes: b"\0asm\x01\0\0\0\x04\x04\x01\x70\0\x10\x05\x03\x01\0\0\
+                     \x07\x09\x02\x01m\x02\0\x01t\x01\0"
+                .to_vec(),
+            export: "t",
+            expected: Outcome::TableSize(16),
+            args: vec![],
+        },
+    ]
+}
+
 fn empty_section_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     // Independently omit or encode each empty section. Test the canonical
     // count and the longest permitted unsigned LEB32 encoding of zero.
@@ -1777,6 +1819,9 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
     if fixture.expected == Outcome::Instantiated {
         return Ok(Outcome::Instantiated);
     }
+    if let Outcome::TableSize(_) = fixture.expected {
+        return Ok(Outcome::TableSize(instance.table_size(fixture.export)?));
+    }
     let expected_kind = fixture.expected.result_kind();
     match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
         Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
@@ -1803,6 +1848,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .chain(memory_export_fixtures())
         .chain(global_export_fixtures())
         .chain(empty_section_fixtures())
+        .chain(table_export_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
@@ -1850,6 +1896,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     == Some(bits)
             }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
+            Outcome::TableSize(size) => {
+                reference
+                    .strip_prefix("table-size=")
+                    .and_then(|text| text.parse().ok())
+                    == Some(size)
+            }
             Outcome::Instantiated => reference == "instantiated",
             Outcome::GlobalRead(value) => {
                 reference
@@ -1880,7 +1932,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, global snapshots, invocation traps, or instantiation outcomes)"
+        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, global snapshots, table sizes, invocation traps, or instantiation outcomes)"
     );
     Ok(())
 }

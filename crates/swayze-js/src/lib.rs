@@ -13,6 +13,9 @@ pub use parser::{
 };
 
 #[cfg(test)]
+mod number_format;
+
+#[cfg(test)]
 mod tests;
 
 use std::{convert::Infallible, fmt};

@@ -62,8 +62,9 @@ fn all_aliases_release_at_the_final_arm_and_arm_local_labels_release_earlier() {
          a:b:if(false) { sibling: if(false) {} }
          else if(false) { sibling: { break sibling; } }
          else { sibling: while(false) {} n++; break b; }
-         b:a:if(true) { n++; break a; } else if(false) { break b; }
-         a:{ b:do { n+=40; break a; } while(true); }
+         b:a:if(true) { n++; break a; }
+         a:b:if(false) {} else if(true) { n++; break b; }
+         a:{ b:do { n+=39; break a; } while(true); }
          n";
     assert_eq!(parse_script(source).unwrap().evaluate(), Ok(42.0));
 }
@@ -119,6 +120,11 @@ fn invalid_targets_and_cross_kind_duplicates_point_at_the_name() {
             "done:if(true){}else{break done;continue done;}42",
             "done",
             "continue target must label a loop",
+        ),
+        (
+            "done:alias:if(true){break done;}break alias;42",
+            "alias",
+            "jump target is not an active label",
         ),
         (
             "done:if(true){}else if(false){}break done;42",

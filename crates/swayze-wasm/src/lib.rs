@@ -20,20 +20,19 @@
 //! `i32.and`, `i32.or`, `i32.xor`, `i32.shl`, `i32.shr_s`, `i32.shr_u`, `i32.rotl`,
 //! `i32.rotr`, `i32.load`, `i32.load8_s`, `i32.load8_u`, `i32.load16_s`,
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`, `memory.size`,
-//! `nop`, `drop`, untyped `select`, `call`, `if (result i32) ... else ... end`,
-//! `block (result i32) ... end`, `loop ... end`, and `br_if <depth>`. Local indices
-//! start at zero and address parameters first, then locals in declaration order.
-//! Both can be assigned.
+//! `nop`, `drop`, untyped `select`, `call`, `if`, `block`, `loop`, and
+//! `br_if <depth>`. Local indices start at zero and address parameters first,
+//! then locals in declaration order. Both can be assigned.
 //! `call` takes an unsigned LEB32 index into the exact function declarations,
 //! including forward and self references. The control constructs may nest
-//! together. `if` and `block` accept only block type byte `0x7f` (one i32 result,
-//! no block parameters), and `if` requires both arms. `loop` accepts only `0x40`
-//! (no block parameters or results). `br_if` takes an unsigned LEB32 label
-//! depth: zero names the innermost frame, and each enclosing frame, including
-//! `if`, adds one to the depth. A branch may cross any of these frames but may
-//! target only a `block` or `loop`. Branches to `if` or the implicit function
-//! label, other block types, typed `select`, `br`, `return`, `unreachable`, and
-//! indirect calls are unsupported.
+//! together. `if` and `block` accept block type byte `0x40` (void) or `0x7f`
+//! (one i32 result), with no block parameters. A void `if` may omit `else`;
+//! an i32-result `if` requires it. `loop` accepts only `0x40`.
+//! `br_if` takes an unsigned LEB32 label depth: zero names the innermost frame,
+//! and each enclosing frame, including `if`, adds one to the depth. A branch may
+//! cross any of these frames but may target only a `block` or `loop`. Branches to
+//! `if` or the implicit function label, other block types, typed `select`, `br`,
+//! `return`, `unreachable`, and indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
 //! any global, export, and code sections. It may be empty (a zero-length vector) or
@@ -94,22 +93,23 @@
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
 //! `if` consumes an i32 condition from above the enclosing frame's operand floor
-//! and saves the remaining depth as the floor for both arms. `else` checks for
-//! exactly one new result and resets validation to the saved depth, and the
-//! matching `end` checks that the else arm also leaves exactly one new result.
+//! and saves the remaining depth as the floor for both arms. `else` checks the
+//! then arm's result depth and resets validation to the saved floor. `end` checks
+//! the final arm's result depth, including the then arm of an `if` without `else`.
 //! `block` and `loop` save the current depth as their floor without consuming
-//! any operands. A `block` must leave exactly one new i32 at its normal exit;
-//! a `loop` must leave none. Every operand access must stay above the active
-//! floor. `br_if` requires an i32 condition and, for a block target, an i32
-//! result immediately below it. Both must be above the active innermost frame's
-//! floor, even when targeting an outer frame. With a zero condition, execution
-//! pops only the condition and continues. With a nonzero condition, a block
-//! branch keeps the result, truncates to the target block's floor, pushes the
-//! result back, and resumes after that block's `end`. A taken loop branch
-//! truncates to the target loop's floor and resumes at its body start. Both
-//! taken edges preserve the target's operand prefix and locals. Both `if` arms
-//! and the entire `br_if` fallthrough path are validated regardless of the
-//! condition; no unreachable typing is used.
+//! any operands. Normal exits from void blocks, void arms, and loops must leave
+//! no values above their floor; i32-result blocks and arms must leave exactly one.
+//! Every operand access must stay above the active floor. `br_if` requires an i32
+//! condition and, only for an i32-result block target, an i32 result immediately
+//! below it. Both operands must be above the active innermost frame's floor,
+//! even when targeting an outer frame. With a zero condition, execution pops
+//! only the condition and continues. With a nonzero condition, a block branch
+//! truncates to the target block's floor, keeps the result if required, and
+//! resumes after that block's `end`. A taken loop branch truncates to the target
+//! loop's floor and resumes at its body start. Both taken edges preserve the
+//! target's operand prefix and locals. Both `if` arms and the entire `br_if`
+//! fallthrough path are validated regardless of the condition; no unreachable
+//! typing is used.
 //! The function has a floor of zero; its own `end` must be the final byte of
 //! the body frame and leave exactly one result. The inclusive limits are 256
 //! body bytes (including the locals vector and all delimiters), 127 decoded
@@ -135,14 +135,16 @@
 //! [`Instance::invoke_i32_with_args`] method
 //! scans at most eight export names for an exact match, then checks the selected
 //! function's arity and begins execution without allocating or recursing
-//! in Rust. Zero selects the else arm; every nonzero i32 selects the then arm.
-//! Validation uses a fixed stack of control frames. Each target block keeps
-//! a linked chain of incoming branch slots in fixed scratch storage. Validation
-//! backpatches `if` and `block` targets at matching delimiters to strictly later
-//! decoded instruction indices or the one-past-last index in the same body.
-//! Loop continues have a separate target at or before the branch, resolved
-//! from the target loop's saved body start. Each decoded `br_if` also stores
-//! its target's operand floor.
+//! in Rust. Zero selects the else arm (or skips straight to the join if no
+//! `else` is present); every nonzero i32 selects the then arm.
+//! Validation uses a fixed stack of control frames with explicit result arities.
+//! Each target block keeps a linked chain of incoming branch slots in fixed
+//! scratch storage. Validation backpatches `if` and `block` targets at matching
+//! delimiters to strictly later decoded instruction indices or the one-past-last
+//! index in the same body. Loop continues have a separate target at or before
+//! the branch, resolved from the target loop's saved body start. Each decoded
+//! `br_if` stores its target's operand floor; a block exit also carries the
+//! block's result arity.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
@@ -184,8 +186,9 @@
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
 //! including `nop`, `drop`, `select`, memory and global instructions, a `call`,
 //! an `if` test, an executed `else` jump, or a `br_if` with either outcome.
-//! Skipped instructions, `block`, `loop`, and `end` delimiters, and returning
-//! from frames cost nothing. A continue does not reset the budget: all loop
+//! An omitted `else` introduces no dispatch. Skipped instructions, `block`,
+//! `loop`, and `end` delimiters, and returning from frames cost nothing.
+//! A continue does not reset the budget: all loop
 //! iterations and calls share it, including recursive guest calls.
 //! An invocation can return just after its last allowed dispatch. If the next
 //! instruction would exceed the dispatch budget, that limit takes precedence
@@ -245,6 +248,11 @@
 //! validation, shared caps, and the exact dispatch boundary in a called nested
 //! loop and instance reuse after hitting the limit. Both target kinds check
 //! operand underflow against the innermost floor even on an untaken path.
+//! Void-control tests cover omitted, empty, and nonempty `else` arms, joins at
+//! enclosing delimiters and function exit, unchanged result-`if` diagnostics,
+//! zero-result branch exits across mixed frames and preserved operand prefixes,
+//! floor and depth errors even in skipped code, shared inclusive caps, exact
+//! dispatch charging across calls and loops, and instance reuse.
 //! Memory tests cover exact limits, width-specific alignment and framed memarg
 //! decoding, actual page counts and the reserved `memory.size` byte, absent and
 //! zero-page memory, ordering and unsupported features, operand floors and

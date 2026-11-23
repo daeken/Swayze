@@ -11,6 +11,8 @@ mod globals;
 mod memory;
 #[path = "execution/stack.rs"]
 mod stack;
+#[path = "execution/void_control.rs"]
+mod void_control;
 
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const TYPE: &[u8] = &[1, 0x60, 0, 1, 0x7f];
@@ -1394,7 +1396,7 @@ fn zero_test_and_ordering_comparisons_select_conditional_arms() {
 
 #[test]
 fn rejects_bad_if_block_type_and_missing_condition() {
-    for found in [0x40, 0x7e, 0, 0xff] {
+    for found in [0x7e, 0, 0xff] {
         bad_body(
             &[0, 0x41, 1, 0x04, found],
             4,
@@ -1798,7 +1800,7 @@ fn block_floors_protect_enclosing_arm_operands_even_on_untaken_paths() {
 
 #[test]
 fn validates_block_type_and_delimiters_at_the_body_boundary() {
-    for found in [0x40, 0x7e, 0, 0xff] {
+    for found in [0x7e, 0, 0xff] {
         bad_body(
             &[0, 0x02, found],
             2,

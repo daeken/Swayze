@@ -17,11 +17,10 @@ pub struct Error {
 /// Why the input was not accepted. Unsupported does not imply valid Wasm.
 ///
 /// `UnexpectedElse` indicates a stray or duplicate `else`; `MissingElse`
-/// indicates an `if` closed by `end` without an `else`. The depth in
+/// indicates an i32-result `if` closed by `end` without an `else`. The depth in
 /// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
-/// active frame's entry stack floor. The latter is reported at a delimiter
-/// when a loop leaves any new operands or a block, arm, or function fails to
-/// produce exactly one result.
+/// active frame's entry stack floor. The latter is reported at a delimiter if
+/// the depth differs from the frame's result arity (zero for void, one for i32).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -630,6 +629,21 @@ const END: u8 = 0x0b;
 const BR_IF: u8 = 0x0d;
 const I32_CONST: u8 = 0x41;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultArity {
+    Void,
+    I32,
+}
+
+impl ResultArity {
+    fn count(self) -> usize {
+        match self {
+            Self::Void => 0,
+            Self::I32 => 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
     Nop,
@@ -644,13 +658,30 @@ enum Instruction {
     Call(u32),
     Unary(UnaryOp),
     Binary(BinaryOp),
-    LoadI32 { kind: LoadKind, offset: u32 },
-    StoreI32 { width: AccessWidth, offset: u32 },
+    LoadI32 {
+        kind: LoadKind,
+        offset: u32,
+    },
+    StoreI32 {
+        width: AccessWidth,
+        offset: u32,
+    },
     MemorySize,
-    JumpIfZero { target: usize },
-    Jump { target: usize },
-    BranchIfNonzero { target: usize, floor: usize },
-    ContinueIfNonzero { target: LoopTarget, floor: usize },
+    JumpIfZero {
+        target: usize,
+    },
+    Jump {
+        target: usize,
+    },
+    BranchIfNonzero {
+        target: usize,
+        floor: usize,
+        result: ResultArity,
+    },
+    ContinueIfNonzero {
+        target: LoopTarget,
+        floor: usize,
+    },
 }
 
 /// The first decoded slot of the target loop body, no later than the
@@ -762,8 +793,8 @@ impl BinaryOp {
 /// Only the decoder constructs this, after checking all indices, global set
 /// mutability, every stack effect, and the complete body frame. Block and if
 /// jump targets are strictly later decoded instruction indices or the
-/// one-past-last index. Loop continues target an in-body index at or before
-/// the branch.
+/// one-past-last index. Block exits carry their target floor and result arity.
+/// Loop continues target an in-body index at or before the branch.
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     parameter_count: usize,
@@ -913,12 +944,21 @@ pub(super) fn execute(
                 }
             }
             Instruction::Jump { target } => frame.pc = target,
-            Instruction::BranchIfNonzero { target, floor } => {
+            Instruction::BranchIfNonzero {
+                target,
+                floor,
+                result,
+            } => {
                 if frame.pop() != 0 {
-                    let result = frame.pop();
+                    let value = match result {
+                        ResultArity::Void => None,
+                        ResultArity::I32 => Some(frame.pop()),
+                    };
                     // Match the depth of a normal block exit, preserving its prefix.
                     frame.depth = floor;
-                    frame.push(result);
+                    if let Some(value) = value {
+                        frame.push(value);
+                    }
                     frame.pc = target;
                 }
             }
@@ -950,6 +990,7 @@ fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
 #[derive(Clone, Copy)]
 struct ControlFrame {
     base: usize,
+    result: ResultArity,
     kind: ControlKind,
 }
 
@@ -1157,6 +1198,7 @@ fn validate_body(
     let mut depth = 0usize;
     let mut frames = [ControlFrame {
         base: 0,
+        result: ResultArity::Void,
         kind: ControlKind::Block { last_branch: None },
     }; Limit::ControlDepth.maximum()];
     let mut nesting = 0;
@@ -1164,25 +1206,23 @@ fn validate_body(
         let offset = body.position();
         let frame = frames[..nesting].last().copied();
         let base = frame.map_or(0, |frame| frame.base);
+        let result = frame.map_or(ResultArity::I32, |frame| frame.result);
         let kind = frame.map(|frame| frame.kind);
         let available = depth - base;
+        let requires_else =
+            result == ResultArity::I32 && matches!(kind, Some(ControlKind::Then { .. }));
         let opcode = body.byte().ok_or_else(|| {
-            let expected = if matches!(kind, Some(ControlKind::Then { .. })) {
-                ELSE
-            } else {
-                END
-            };
+            let expected = if requires_else { ELSE } else { END };
             body.error(ErrorKind::TruncatedByte { expected })
         })?;
         if opcode == END {
-            if matches!(kind, Some(ControlKind::Then { .. })) {
+            if requires_else {
                 return Err(Error {
                     offset,
                     kind: ErrorKind::MissingElse,
                 });
             }
-            let expected = usize::from(!matches!(kind, Some(ControlKind::Loop { .. })));
-            check_result_depth(available, expected, offset)?;
+            check_result_depth(available, result.count(), offset)?;
             // Forward edges target the next decoded slot, possibly the final
             // one-past-last index. All sources are in the decoded prefix.
             match kind {
@@ -1192,6 +1232,7 @@ fn validate_body(
                         decoded[..count][pc] = Instruction::BranchIfNonzero {
                             target: count,
                             floor: base,
+                            result,
                         };
                         last_branch = previous_branch[pc];
                     }
@@ -1203,7 +1244,10 @@ fn validate_body(
                     body.finish(ErrorKind::TrailingBodyBytes)?;
                     break offset;
                 }
-                Some(ControlKind::Then { .. }) => unreachable!("checked for missing else"),
+                Some(ControlKind::Then { if_pc }) => {
+                    // The implicit empty else skips straight to the join.
+                    decoded[..count][if_pc] = Instruction::JumpIfZero { target: count };
+                }
             }
             nesting -= 1;
             continue;
@@ -1231,11 +1275,12 @@ fn validate_body(
         };
         match opcode {
             BLOCK | LOOP | IF => {
-                body.expect_byte(if opcode == LOOP {
-                    EMPTY_BLOCK_TYPE
+                let result = if opcode == LOOP {
+                    body.expect_byte(EMPTY_BLOCK_TYPE)?;
+                    ResultArity::Void
                 } else {
-                    I32
-                })?;
+                    body.block_result()?
+                };
                 let next = frames.get_mut(nesting).ok_or(Error {
                     offset,
                     kind: ErrorKind::LimitExceeded {
@@ -1251,7 +1296,11 @@ fn validate_body(
                     }
                     _ => unreachable!("only control openers"),
                 };
-                *next = ControlFrame { base: depth, kind };
+                *next = ControlFrame {
+                    base: depth,
+                    result,
+                    kind,
+                };
                 nesting += 1;
             }
             ELSE => {
@@ -1261,7 +1310,7 @@ fn validate_body(
                         kind: ErrorKind::UnexpectedElse,
                     });
                 };
-                check_result_depth(available, 1, offset)?;
+                check_result_depth(available, result.count(), offset)?;
                 // Skip the then arm and its else jump on a zero condition.
                 decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
                 frames[nesting - 1].kind = ControlKind::Else { else_pc: pc };
@@ -1277,7 +1326,8 @@ fn validate_body(
                 // the target floor. Fallthrough pops just the condition.
                 match &mut target.kind {
                     ControlKind::Block { last_branch } => {
-                        depth = consume(2)? + 1;
+                        let results = target.result.count();
+                        depth = consume(1 + results)? + results;
                         previous_branch[pc] = *last_branch;
                         *last_branch = Some(pc);
                     }
@@ -1414,6 +1464,23 @@ impl<'a> Reader<'a> {
                 kind: ErrorKind::UnexpectedByte { expected, found },
             }),
             None => Err(self.error(ErrorKind::TruncatedByte { expected })),
+        }
+    }
+
+    fn block_result(&mut self) -> Result<ResultArity, Error> {
+        let offset = self.position();
+        // Preserve the original expected byte in errors for block and if.
+        match self.byte() {
+            Some(EMPTY_BLOCK_TYPE) => Ok(ResultArity::Void),
+            Some(I32) => Ok(ResultArity::I32),
+            Some(found) => Err(Error {
+                offset,
+                kind: ErrorKind::UnexpectedByte {
+                    expected: I32,
+                    found,
+                },
+            }),
+            None => Err(self.error(ErrorKind::TruncatedByte { expected: I32 })),
         }
     }
 

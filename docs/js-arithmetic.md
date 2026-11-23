@@ -4,8 +4,11 @@
 Call `Script::evaluate(&self) -> Result<f64, EvalError>` on the resulting
 `Script` if a Number result is required. For example,
 `swayze_js::parse_script("2 + 3 * 4")?.evaluate()?` produces `14.0`.
-`Script::evaluate_value()` returns a tagged `Value::Number` or `Value::Boolean`;
-`evaluate()` returns `NonNumericResult` for a Boolean instead of converting it.
+`Script::evaluate_value()` returns `Value::Number`, `Value::Boolean`,
+`Value::Null`, or `Value::Undefined` without coercion. `evaluate()` returns
+`NonNumericResult` for any non-Number. An unbound read of `undefined` returns
+the default value, but a block-local declaration of that name takes precedence.
+A top-level declaration of `undefined` is malformed in a classic script.
 
 This path evaluates an expression over decimal literals (including fractions and
 signed exponents) with binary
@@ -19,8 +22,8 @@ lookup, temporal dead zone behavior or a runtime `TypeError`. There are no
 calls or objects.
 
 Arithmetic and relational comparisons (`<`, `<=`, `>`, `>=`) convert `true`
-to `1` and `false` to `+0`. Every relational comparison involving NaN is
-false. Strict equality (`===`, `!==`) compares types without coercion: signed
+to `1`, `false` and `null` to `+0`, and `undefined` to NaN. Every relational
+comparison involving NaN is false. Strict equality (`===`, `!==`) compares types without coercion: signed
 zeros compare equal, while NaN is unequal to itself. Comparisons return
 Booleans. Arithmetic binds more tightly than relational comparisons, which
 bind more tightly than equality.
@@ -28,10 +31,14 @@ bind more tightly than equality.
 Conditional expressions (`test ? consequent : alternate`) evaluate only the
 selected arm, preserving its value type. Boolean tests use their own value.
 For numeric tests, either signed zero and NaN are false; other numbers are
-true. The same truthiness drives `!`, `&&`, and `||`. `!` returns a Boolean;
+true. `null` and `undefined` are also false in tests. The same truthiness drives
+`!`, `&&`, and `||`. `!` returns a Boolean;
 `&&` and `||` short-circuit and return the selected operand without coercion.
 Equality binds tighter than `&&`, then `||`, then the right-associative `?:`.
-All operands and arms must use supported syntax and bindings.
+`??` evaluates its right operand only when the left is `null` or `undefined`.
+It is left-associative, binds between equality and `?:`, and cannot mix with
+`&&` or `||` without parentheses at the same expression level. All operands
+and arms must use supported syntax and bindings.
 
 `if (test) { ... }` and `while (test) { ... }` statements may precede the final
 expression. Braced bodies can contain initialized `let` and `const`

@@ -141,7 +141,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A validated Script in the Number and Boolean subset. Only the parser constructs it.
+/// A validated Script in the supported primitive-value subset. Only the parser constructs it.
 pub struct Script {
     instructions: Vec<Instruction>,
     max_stack_depth: usize,
@@ -185,12 +185,24 @@ pub(crate) enum BindingKind {
     Let,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShortCircuitCondition {
+    Falsy,
+    Truthy,
+    NonNullish,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
     Boolean(bool),
+    Null,
+    Undefined,
     LoadBinding(usize),
-    InitBinding { slot: usize, kind: BindingKind },
+    InitBinding {
+        slot: usize,
+        kind: BindingKind,
+    },
     StoreBinding(usize),
     Add,
     Subtract,
@@ -210,7 +222,10 @@ pub(crate) enum Instruction {
     // A statement test must be the only operand when the jump consumes it.
     JumpIfFalseStatement(usize),
     // Keep the test value when jumping; otherwise pop it before evaluating the RHS.
-    ShortCircuit { target: usize, when_truthy: bool },
+    ShortCircuit {
+        target: usize,
+        condition: ShortCircuitCondition,
+    },
     Jump(usize),
     // Unconditional statement transfers require an empty operand stack.
     JumpStatement(usize),
@@ -218,12 +233,12 @@ pub(crate) enum Instruction {
     LoopBack(usize),
 }
 
-/// Parse a complete Script in the Number and Boolean subset with default [`Limits`].
+/// Parse a complete Script in the supported subset with default [`Limits`].
 pub fn parse_script(source: &str) -> Result<Script, Error> {
     parse_script_with_limits(source, Limits::default())
 }
 
-/// Parse a complete Script in the Number and Boolean subset with caller-supplied limits.
+/// Parse a complete Script in the supported subset with caller-supplied limits.
 pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, Error> {
     if source.len() > limits.max_source_bytes {
         // Starting within the source, back up at most three continuation bytes.
@@ -262,6 +277,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
 
 #[derive(Clone, Copy, Debug)]
 enum Operator {
+    Coalesce,
     LogicalOr,
     LogicalAnd,
     StrictEqual,
@@ -283,7 +299,8 @@ enum Operator {
 impl Operator {
     fn precedence(self) -> u8 {
         match self {
-            Self::LogicalOr => 1,
+            // Mixing `??` with either logical operator at this level is forbidden.
+            Self::Coalesce | Self::LogicalOr => 1,
             Self::LogicalAnd => 2,
             Self::StrictEqual | Self::StrictNotEqual => 3,
             Self::LessThan
@@ -298,9 +315,13 @@ impl Operator {
 
     fn instruction(self) -> Instruction {
         match self {
-            Self::LogicalOr | Self::LogicalAnd => Instruction::ShortCircuit {
+            Self::Coalesce | Self::LogicalOr | Self::LogicalAnd => Instruction::ShortCircuit {
                 target: UNPATCHED,
-                when_truthy: matches!(self, Self::LogicalOr),
+                condition: match self {
+                    Self::LogicalAnd => ShortCircuitCondition::Falsy,
+                    Self::LogicalOr => ShortCircuitCondition::Truthy,
+                    _ => ShortCircuitCondition::NonNullish,
+                },
             },
             Self::StrictEqual => Instruction::StrictEqual,
             Self::StrictNotEqual => Instruction::StrictNotEqual,
@@ -324,6 +345,7 @@ impl Operator {
 enum TokenKind {
     Number(f64),
     Boolean(bool),
+    Null,
     Identifier,
     Declaration(BindingKind),
     If,
@@ -380,13 +402,13 @@ fn is_excluded_name(name: &str) -> bool {
         "case" | "catch" | "class" | "debugger" | "default"
             | "delete" | "do" | "enum" | "export" | "extends"
             | "finally" | "for" | "function" | "import" | "in" | "instanceof"
-            | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
+            | "new" | "return" | "super" | "switch" | "this" | "throw"
             | "try" | "typeof" | "var" | "void" | "with" | "await" | "yield"
             | "implements" | "interface" | "package" | "private" | "protected"
             | "public" | "static"
             // Contextual syntax, strict-mode restricted names, and selected globals.
             | "as" | "async" | "from" | "get" | "of" | "set" | "using" | "eval"
-            | "arguments" | "undefined" | "Infinity" | "NaN" | "globalThis"
+            | "arguments" | "Infinity" | "NaN" | "globalThis"
     )
 }
 
@@ -547,6 +569,7 @@ impl Lexer<'_> {
             "continue" => Ok(TokenKind::Continue),
             "true" => Ok(TokenKind::Boolean(true)),
             "false" => Ok(TokenKind::Boolean(false)),
+            "null" => Ok(TokenKind::Null),
             _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
@@ -645,6 +668,8 @@ impl Lexer<'_> {
             self.consume('?')?;
             if self.peek() == Some('=') {
                 self.consume('=')?;
+            } else {
+                return Ok(TokenKind::Operator(Operator::Coalesce));
             }
         } else if self.rest().strip_prefix('.').is_some_and(|rest| {
             // `?.` is not optional chaining when followed by a decimal digit.
@@ -1202,6 +1227,12 @@ impl Parser<'_> {
                     "Boolean literals cannot be used as binding names",
                 ));
             }
+            TokenKind::Null => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "null cannot be used as a binding name",
+                ));
+            }
             TokenKind::If
             | TokenKind::Else
             | TokenKind::While
@@ -1221,6 +1252,14 @@ impl Parser<'_> {
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         let scope = self.current_scope();
+        // The classic Script global scope cannot lexically redeclare its
+        // non-configurable `undefined` property. Block scopes can shadow it.
+        if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
+            return Err(Error::malformed(
+                name.span,
+                "undefined cannot be declared in the Script scope",
+            ));
+        }
         if self.find_in_scope(scope, name.span)?.is_some() {
             return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
@@ -1297,7 +1336,11 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    fn resolve_access(&mut self, access: Access) -> Result<usize, Error> {
+    fn is_undefined_name(&self, name: Span) -> bool {
+        &self.lexer.source[name.start..name.end] == "undefined"
+    }
+
+    fn resolve_access(&mut self, access: Access) -> Result<Instruction, Error> {
         let mut scope = access.scope;
         loop {
             // Resolve by lexical proximity before checking initialization or mutability.
@@ -1318,9 +1361,18 @@ impl Parser<'_> {
                         "assignment to const is outside the subset",
                     ));
                 }
-                return Ok(slot);
+                return Ok(if access.equals.is_some() {
+                    Instruction::StoreBinding(slot)
+                } else {
+                    Instruction::LoadBinding(slot)
+                });
             }
             let Some(parent) = self.scopes[scope].parent else {
+                // Only an unbound read gets the immutable default. A declaration
+                // in any visible scope, even in its TDZ, wins over this fallback.
+                if access.equals.is_none() && self.is_undefined_name(access.name) {
+                    return Ok(Instruction::Undefined);
+                }
                 return Err(Error::unsupported(
                     access.name,
                     "unbound name is outside the subset",
@@ -1335,13 +1387,13 @@ impl Parser<'_> {
         // One site per emitted load or store. The search alone takes extra work.
         for index in 0..self.accesses.len() {
             let access = self.accesses[index];
-            let slot = self.resolve_access(access)?;
+            let resolved = self.resolve_access(access)?;
             match self.instructions.get_mut(access.instruction) {
-                Some(Instruction::LoadBinding(operand @ UNPATCHED)) if access.equals.is_none() => {
-                    *operand = slot;
+                Some(op @ Instruction::LoadBinding(UNPATCHED)) if access.equals.is_none() => {
+                    *op = resolved;
                 }
-                Some(Instruction::StoreBinding(operand @ UNPATCHED)) if access.equals.is_some() => {
-                    *operand = slot;
+                Some(op @ Instruction::StoreBinding(UNPATCHED)) if access.equals.is_some() => {
+                    *op = resolved;
                 }
                 _ => {
                     return Err(Error::malformed(
@@ -1437,6 +1489,10 @@ impl Parser<'_> {
                     self.emit(Instruction::Boolean(value), span)?;
                     needs_operand = false;
                 }
+                (true, TokenKind::Null) => {
+                    self.emit(Instruction::Null, span)?;
+                    needs_operand = false;
+                }
                 (true, TokenKind::Identifier) => {
                     self.record_access(span, None)?;
                     self.emit(Instruction::LoadBinding(UNPATCHED), span)?;
@@ -1503,23 +1559,7 @@ impl Parser<'_> {
                     ));
                 }
                 (false, TokenKind::Operator(op)) => {
-                    // Equal precedence reduces first, so a preceding short circuit
-                    // joins before this operator consumes its left operand.
-                    self.reduce_operators(op.precedence())?;
-                    let pending = match op.instruction() {
-                        branch @ Instruction::ShortCircuit { .. } => {
-                            let jump = self.instructions.len();
-                            let join_depth = self.stack_depth; // LHS stays on the taken path.
-                            self.emit(branch, span)?; // Track the fallthrough path, which pops it.
-                            Pending::ShortCircuit {
-                                op,
-                                jump,
-                                join_depth,
-                            }
-                        }
-                        _ => Pending::Op(op),
-                    };
-                    self.push_pending(pending, span)?;
+                    self.push_infix(op, span)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Question) => {
@@ -1565,7 +1605,13 @@ impl Parser<'_> {
                         "call expressions are outside the arithmetic subset",
                     ));
                 }
-                (false, TokenKind::Number(_) | TokenKind::Boolean(_) | TokenKind::Identifier) => {
+                (
+                    false,
+                    TokenKind::Number(_)
+                    | TokenKind::Boolean(_)
+                    | TokenKind::Null
+                    | TokenKind::Identifier,
+                ) => {
                     if after_line_break {
                         self.reduce_expression()?;
                         if self.pending.is_empty() {
@@ -1604,6 +1650,38 @@ impl Parser<'_> {
         Ok(end)
     }
 
+    fn push_infix(&mut self, op: Operator, span: Span) -> Result<(), Error> {
+        let pending = if let branch @ Instruction::ShortCircuit { .. } = op.instruction() {
+            // First expose the closest pending short circuit without reducing it.
+            // All earlier short circuits in this region have already agreed on
+            // the family. A Group or conditional arm marker ends the region.
+            self.reduce_operators(Operator::StrictEqual.precedence())?;
+            if let Some((Pending::ShortCircuit { op: previous, .. }, _)) = self.pending.last()
+                && matches!(previous, Operator::Coalesce) != matches!(op, Operator::Coalesce)
+            {
+                return Err(Error::malformed(
+                    span,
+                    "'??' cannot be mixed with '&&' or '||' without parentheses",
+                ));
+            }
+            // Equal precedence reduces first; a preceding branch joins before
+            // this operator consumes its left operand.
+            self.reduce_operators(op.precedence())?;
+            let jump = self.instructions.len();
+            let join_depth = self.stack_depth; // LHS stays on the taken path.
+            self.emit(branch, span)?; // Track the fallthrough path, which pops the LHS.
+            Pending::ShortCircuit {
+                op,
+                jump,
+                join_depth,
+            }
+        } else {
+            self.reduce_operators(op.precedence())?;
+            Pending::Op(op)
+        };
+        self.push_pending(pending, span)
+    }
+
     fn open_pending(&mut self, marker: Pending, span: Span) -> Result<(), Error> {
         if self.nesting_depth == self.max_nesting_depth {
             return Err(Error::limit(span, Limit::NestingDepth));
@@ -1631,7 +1709,7 @@ impl Parser<'_> {
                     if self.stack_depth != join_depth {
                         return Err(Error::malformed(
                             span,
-                            "logical operands must each leave one result",
+                            "short-circuit operands must each leave one result",
                         ));
                     }
                     self.patch_jump(jump, span)?;
@@ -1707,9 +1785,11 @@ impl Parser<'_> {
             Instruction::Number(value) if value.is_sign_negative() || value.is_nan() => {
                 return Err(Error::malformed(span, "invalid decimal Number value"));
             }
-            Instruction::Number(_) | Instruction::Boolean(_) | Instruction::LoadBinding(_) => {
-                (0, 1)
-            }
+            Instruction::Number(_)
+            | Instruction::Boolean(_)
+            | Instruction::Null
+            | Instruction::Undefined
+            | Instruction::LoadBinding(_) => (0, 1),
             Instruction::JumpIfFalseStatement(_) if self.stack_depth != 1 => {
                 return Err(Error::malformed(
                     span,

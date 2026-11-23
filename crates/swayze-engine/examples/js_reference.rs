@@ -11,7 +11,11 @@ const bytes = Buffer.alloc(8);
 console.log(process.version);
 for (const [i, source] of process.argv.slice(1).entries()) {
     const value = runInNewContext(source, {}, { filename: `fixture-${i + 1}` });
-    if (typeof value === 'boolean') {
+    if (value === null) {
+        console.log('null');
+    } else if (value === undefined) {
+        console.log('undefined');
+    } else if (typeof value === 'boolean') {
         console.log(`boolean:${value}`);
     } else if (typeof value === 'number') {
         bytes.writeDoubleBE(value);
@@ -188,6 +192,24 @@ fn fixtures() -> Vec<String> {
             "let x = 3; let out = 0; if (x) { let x = 40; x = x + 2; out = x; } out + x",
             "let out = 0; if (true) { if (true) { const x = 42; out = x; } const x = 3; out = out + x; } out",
             "let i = 2; let out = 0; while (i) { i = i - 1; if (true) { const i = 21; out = out + i; } } out",
+            "null",
+            "undefined",
+            "null ?? undefined",
+            "undefined ?? null",
+            "null ?? undefined ?? 42",
+            "false ?? true",
+            "-0 ?? 42",
+            "(0 / 0) ?? 42",
+            "null + false",
+            "undefined + 42",
+            "null === undefined",
+            "null <= false",
+            "undefined >= undefined",
+            "(false || null) ?? 42",
+            "(undefined ?? true) && null",
+            "null ?? false ? 1 : undefined",
+            "let out = 0; if (true) { let undefined = 21; out = undefined ?? 42; } out",
+            "let out = undefined; if (true) { const undefined = null; out = undefined; } out",
         ]
         .map(str::to_owned),
     );
@@ -251,6 +273,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             JsValue::Number(value) if value.is_nan() => "number:nan".to_owned(),
             JsValue::Number(value) => format!("number:{:016x}", value.to_bits()),
             JsValue::Boolean(value) => format!("boolean:{value}"),
+            JsValue::Null => "null".to_owned(),
+            JsValue::Undefined => "undefined".to_owned(),
         };
         if actual != reference {
             return Err(format!(
@@ -261,7 +285,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (Boolean values and f64 bits or NaN)"
+        "Matched all {count} fixtures against Node {version} (exact value tags and payloads, ignoring NaN payload bits)"
     );
     Ok(())
 }

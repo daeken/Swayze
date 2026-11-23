@@ -5,6 +5,8 @@ fn typed_results_and_numeric_compatibility() {
     for (source, expected) in [
         ("true", Value::Boolean(true)),
         ("(false);", Value::Boolean(false)),
+        ("null", Value::Null),
+        ("undefined", Value::Undefined),
         ("2+3", Value::Number(5.0)),
         ("1/0", Value::Number(f64::INFINITY)),
     ] {
@@ -12,7 +14,7 @@ fn typed_results_and_numeric_compatibility() {
         assert_eq!(script.evaluate_value(), Ok(expected), "{source}");
         let numeric_result = match expected {
             Value::Number(value) => Ok(value),
-            Value::Boolean(_) => Err(EvalError::NonNumericResult),
+            Value::Boolean(_) | Value::Null | Value::Undefined => Err(EvalError::NonNumericResult),
         };
         assert_eq!(script.evaluate(), numeric_result, "{source}");
     }
@@ -41,6 +43,13 @@ fn arithmetic_converts_both_operands_and_returns_numbers() {
         ("-1 % true", -0.0),
         ("true ? -false : +false", -0.0),
         ("const z=-false; z", -0.0),
+        ("+null", 0.0),
+        ("-null", -0.0),
+        ("null + 3", 3.0),
+        ("4 - null", 4.0),
+        ("null * -2", -0.0),
+        ("2 / null", f64::INFINITY),
+        ("null % 2", 0.0),
     ] {
         let script = parse_script(source).unwrap();
         let Value::Number(actual) = script.evaluate_value().unwrap() else {
@@ -53,7 +62,17 @@ fn arithmetic_converts_both_operands_and_returns_numbers() {
             "{source}"
         );
     }
-    for source in ["false / false", "true % false"] {
+    for source in [
+        "false / false",
+        "true % false",
+        "+undefined",
+        "-undefined",
+        "undefined + 1",
+        "1 - undefined",
+        "undefined * 0",
+        "1 / undefined",
+        "undefined % 2",
+    ] {
         let script = parse_script(source).unwrap();
         assert!(matches!(script.evaluate_value(), Ok(Value::Number(n)) if n.is_nan()));
         assert!(script.evaluate().unwrap().is_nan());
@@ -68,6 +87,9 @@ fn lexical_slots_preserve_values_and_can_change_type_between_assignments() {
         ("const x=7; let y=x; y", Value::Number(7.0)),
         ("let x=1; x=false; x", Value::Boolean(false)),
         ("let x=true; x=x?0:true; x", Value::Number(0.0)),
+        ("const x=undefined; x", Value::Undefined),
+        ("let x=0; x=null; x", Value::Null),
+        ("let x=null; x=undefined; x", Value::Undefined),
         (
             "let x=7; const before=x; x=true; const middle=x; x=2; middle ? before+x : false",
             Value::Number(9.0),

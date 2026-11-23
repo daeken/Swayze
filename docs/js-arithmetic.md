@@ -19,8 +19,10 @@ for decimal fractions and exponents. Decimal conversion strips separators
 with a metered, fallible pass; explicit-radix conversion skips them while
 scanning. Legacy octal and BigInt remain outside the subset. Arithmetic includes binary `+`, `-`, `*`, `/`, and `%`, plus prefix
 `+` and `-` and parenthesized grouping.
-The parser determines precedence and associativity. `const` and initialized
-`let` declarations initialize slots in source order, preserving the value type.
+The parser determines precedence and associativity. `const` and `let`
+declarations initialize slots in source order, preserving the value type.
+`const` requires an initializer. `let name;` initializes to `undefined` each
+time the declaration executes, without reading any binding named `undefined`.
 Simple and compound assignments update earlier `let` slots. Arithmetic and
 bitwise compound assignments read the target once, evaluate the right operand,
 apply the corresponding operator, and store the result. Logical assignments
@@ -69,7 +71,7 @@ and arms must use supported syntax and bindings.
 
 Standalone blocks, empty statements (`;`), and braced `if`, `while`,
 `do…while`, and `for` statements may precede the required final expression.
-Braced bodies can contain initialized `let` and `const` declarations,
+Braced bodies can contain `let` and `const` declarations,
 assignments and updates to earlier visible `let` bindings, and other supported
 statements. Empty statements and standalone braces emit no instructions. A block-local declaration shadows enclosing
 bindings throughout its block. The parser resolves every access to the nearest

@@ -1663,28 +1663,35 @@ impl Parser<'_> {
         if self.find_in_scope(scope, name.span)?.is_some() {
             return Err(Error::malformed(name.span, "duplicate binding declaration"));
         }
-        let equals = self.require_token("expected '=' after the binding name")?;
-        match equals.kind {
-            TokenKind::Assignment(None) => {}
+        let expected_delimiter = match kind {
+            BindingKind::Const => "expected '=' after the binding name",
+            BindingKind::Let => "expected '=' or ';' after the binding name",
+        };
+        let delimiter = self.require_token(expected_delimiter)?;
+        let end = match delimiter.kind {
+            TokenKind::Semicolon if kind == BindingKind::Let => {
+                // A metered primitive push, not a name read or a prefilled slot.
+                self.emit(Instruction::Undefined, delimiter.span)?;
+                delimiter.span
+            }
+            TokenKind::Assignment(None) => {
+                let first = self.require_token("expected a binding initializer")?;
+                let missing_semicolon = match kind {
+                    BindingKind::Const => "const declarations require explicit semicolons",
+                    BindingKind::Let => "let declarations require explicit semicolons",
+                };
+                self.parse_expression(first, ExpressionEnd::Semicolon(missing_semicolon))?
+            }
             TokenKind::Assignment(Some(_)) => {
                 return Err(Error::unsupported(
-                    equals.span,
+                    delimiter.span,
                     "compound assignments cannot initialize declarations",
                 ));
             }
             _ => {
-                return Err(Error::malformed(
-                    equals.span,
-                    "expected '=' after the binding name",
-                ));
+                return Err(Error::malformed(delimiter.span, expected_delimiter));
             }
-        }
-        let first = self.require_token("expected a binding initializer")?;
-        let missing_semicolon = match kind {
-            BindingKind::Const => "const declarations require explicit semicolons",
-            BindingKind::Let => "let declarations require explicit semicolons",
         };
-        let end = self.parse_expression(first, ExpressionEnd::Semicolon(missing_semicolon))?;
         let slot = self.bindings.len();
         self.emit(Instruction::InitBinding { slot, kind }, end)?;
         let binding = Binding {

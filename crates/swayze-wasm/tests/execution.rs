@@ -1666,6 +1666,59 @@ fn branches_join_innermost_blocks_across_mixed_nesting() {
 }
 
 #[test]
+fn exits_an_enclosing_block_across_loop_if_and_block_frames() {
+    let body = [
+        0, 0x41, 40, 0x02, 0x7f, // Target block preserves 40.
+        0x41, 10, 0x03, 0x40, // Loop freezes 10.
+        0x41, 20, 0x20, 0, 0x04, 0x7f, // If freezes 20.
+        0x41, 8, 0x02, 0x7f, // Inner block freezes 8.
+        0x41, 9, 0x41, 2, 0x20, 1, 0x0d, 0x83, 0x80, 0x80, 0x80, 0,
+        // Padded depth 3: take only 2 (drop 10, 20, 8 and 9).
+        0x20, 2, 0x0d, 0, 0x6a, 0x0b, // Inner fixup: take 2 or add 9 + 2.
+        0x6a, 0x05, // Then adds 8 to the inner block result.
+        0x41, 3, 0x20, 1, 0x0d, 2, // Second outer fixup, through the else arm.
+        0x0b, 0x6a, 0x21, 0, 0x0b, // Add 20 and save the result before leaving the loop.
+        0x20, 0, 0x6a, 0x0b, // Normal block exit adds 10 to the saved result.
+        0x6a, 0x0b, // Both branch and normal exits add 40.
+    ];
+    let module = exported_function(&i32_type(3), &code_body(&body));
+    let instance = module.instantiate().unwrap();
+    for (args, expected) in [
+        ([1, -1, 1], 42), // Taken nonzero-depth branch skips the inner fixup.
+        ([0, 1, 0], 43),
+        ([1, 0, 1], 80), // Outer fallthrough, inner taken.
+        ([1, 0, 0], 89), // Both fall through.
+        ([0, 0, 0], 73),
+    ] {
+        assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
+    }
+}
+
+#[test]
+fn nonlocal_branches_cannot_take_operands_from_below_the_active_floor() {
+    for (target, operands, depth) in [
+        ([0x02, 0x7f], &[][..], 0),
+        ([0x02, 0x7f], &[0x41, 1][..], 1),
+        ([0x03, 0x40], &[][..], 0),
+    ] {
+        // Both 7 and 8 are above the target's floor but frozen in the if.
+        // Validate its else branch even though the literal selects then.
+        let prefix = [
+            &[0][..],
+            &target,
+            &[0x41, 7, 0x41, 8, 0x41, 1, 0x04, 0x7f, 0x41, 9, 0x05],
+            operands,
+        ]
+        .concat();
+        bad_body(
+            &[&prefix[..], &[0x0d, 1, 0x0b, 0x0b, 0x0b]].concat(),
+            prefix.len(),
+            ErrorKind::StackUnderflow { depth },
+        );
+    }
+}
+
+#[test]
 fn patches_multiple_branches_to_function_exit_and_only_fallthrough_traps() {
     let body = [
         0, 0x02, 0x7f, 0x41, 7, 0x20, 0, 0x0d, 0, // First exit returns 7.
@@ -1774,11 +1827,15 @@ fn validates_block_type_and_delimiters_at_the_body_boundary() {
 }
 
 #[test]
-fn validates_branch_label_leb_and_only_accepts_zero_in_a_block_or_loop() {
+fn validates_branch_label_leb_and_rejects_unsupported_destinations() {
     let field = IntegerField::LabelIndex;
     for opener in [[0x02, 0x7f], [0x03, 0x40]] {
         let prefix = [&[0][..], &opener, &opener, &[0x41, 7, 0x41, 1, 0x0d]].concat();
-        for (label, index) in [(&[1][..], 1), (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX)] {
+        for (label, index) in [
+            (&[0x82, 0][..], 2), // Implicit function label, padded.
+            (&[3][..], 3),       // Beyond the function label.
+            (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX),
+        ] {
             let body = [&prefix[..], label, &[0x0b, 0x0b, 0x0b]].concat();
             bad_body(
                 &body,
@@ -1815,6 +1872,20 @@ fn validates_branch_label_leb_and_only_accepts_zero_in_a_block_or_loop() {
         );
         bad_body(&branch, branch.len(), ErrorKind::TruncatedInteger { field });
     }
+    // An enclosing if still occupies a depth and may not be the target.
+    for arm in [&[][..], &[0x41, 7, 0x05]] {
+        let branch = [
+            &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f][..],
+            arm,
+            &[0x03, 0x40, 0x41, 7, 0x41, 1, 0x0d],
+        ]
+        .concat();
+        bad_body(
+            &[&branch[..], &[1, 0x0b, 0x0b, 0x0b, 0x0b]].concat(),
+            branch.len(),
+            ErrorKind::InvalidIndex { field, index: 1 },
+        );
+    }
 }
 
 #[test]
@@ -1832,7 +1903,8 @@ fn bounds_blocks_and_ifs_on_the_same_control_stack() {
                 last_open = body.len();
                 body.extend([if is_if(level) { 0x04 } else { 0x02 }, 0x7f]);
             }
-            body.extend([0x41, 9]);
+            // Take the largest supported depth at the control cap.
+            body.extend([0x41, 9, 0x41, 1, 0x0d, (depth - 1) as u8]);
             for level in (0..depth).rev() {
                 if is_if(level) {
                     body.extend([0x05, 0x41, 8]);
@@ -1851,11 +1923,11 @@ fn bounds_blocks_and_ifs_on_the_same_control_stack() {
 #[test]
 fn counts_br_if_but_not_block_or_end_as_body_instructions() {
     let limit = Limit::BodyInstructions;
-    let mut body = vec![0, 0x02, 0x7f, 0x41, 1];
+    let mut body = vec![0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 1];
     body.extend(std::iter::repeat_n(0x45, limit.maximum() - 3));
-    body.extend([0x41, 1, 0x0d, 0, 0x0b, 0x0b]); // Branch is instruction 127.
+    let branch = body.len() + 2;
+    body.extend([0x41, 1, 0x0d, 1, 0x0b, 0x0b, 0x0b]); // Branch is instruction 127.
     assert_body_result(&body, 1);
-    let branch = body.len() - 4;
     body.insert(branch, 0x45); // Now the branch itself exceeds the cap.
     bad_body(&body, branch + 1, ErrorKind::LimitExceeded { limit });
 }
@@ -1863,14 +1935,16 @@ fn counts_br_if_but_not_block_or_end_as_body_instructions() {
 #[test]
 fn counts_block_encoding_and_branch_immediate_in_body_bytes() {
     let limit = Limit::CodeBodyBytes;
-    let ops = [0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d, 0x80, 0, 0x0b, 0x0b];
+    let ops = [
+        0x02, 0x7f, 0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d, 0x81, 0x80, 0, 0x0b, 0x0b, 0x0b,
+    ];
     let groups = (limit.maximum() - 1 - ops.len()) / 2;
     let mut body = vec![u8::try_from(groups).unwrap()];
     body.extend([0, 0x7f].repeat(groups));
     body.extend(ops);
     assert_eq!(body.len(), limit.maximum());
     assert_body_result(&body, 7);
-    body.insert(body.len() - 3, 0x80); // One more LEB padding byte for label zero.
+    body.insert(body.len() - 4, 0x80); // One more LEB padding byte for depth one.
     bad_code(&code_body(&body), 1, ErrorKind::LimitExceeded { limit });
 }
 
@@ -1880,8 +1954,9 @@ fn counts_frozen_operands_toward_the_branch_stack_limit() {
     let floor = limit.maximum() - 2;
     let mut body = vec![0];
     body.extend([0x41, 1].repeat(floor));
-    body.extend([0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d, 0, 0x0b]);
-    let condition = body.len() - 5;
+    body.extend([0x02, 0x7f, 0x02, 0x7f, 0x41, 7]);
+    let condition = body.len();
+    body.extend([0x41, 1, 0x0d, 1, 0x0b, 0x0b]);
     body.extend(std::iter::repeat_n(0x6a, floor));
     body.push(0x0b);
     assert_body_result(&body, floor as i32 + 7);
@@ -1894,9 +1969,9 @@ fn charges_taken_br_if_but_not_its_skipped_tail_or_block_delimiters() {
     let limit = ExecutionLimit::InstructionDispatches;
     assert_eq!(limit.maximum(), 1024);
     // Leaf: 126 dispatches (result, 123 eqz, condition, br_if), skipping its tail.
-    let mut leaf = vec![0, 0x02, 0x7f, 0x41, 1];
+    let mut leaf = vec![0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 1];
     leaf.extend(std::iter::repeat_n(0x45, 123));
-    leaf.extend([0x41, 1, 0x0d, 0, 0x45, 0x0b, 0x0b]);
+    leaf.extend([0x41, 1, 0x0d, 1, 0x45, 0x0b, 0x0b, 0x0b]);
     let entry = |extra| {
         let mut body = vec![1, 1, 0x7f];
         body.extend([0x10, 2]);
@@ -1922,22 +1997,26 @@ fn charges_taken_br_if_but_not_its_skipped_tail_or_block_delimiters() {
 }
 
 #[test]
-fn loop_continues_preserve_locals_and_prefix_but_not_temporaries() {
+fn continues_an_enclosing_loop_across_loop_if_and_block_frames() {
     let body = [
         1, 1, 0x7f, 0x41, 39, 0x02, 0x7f, // Keep 39 below the block floor.
         0x41, 1, 0x03, 0x40, // Keep a second value below the loop floor.
         0x20, 1, 0x41, 1, 0x6a, 0x21, 1, // Count trips in the declared local.
-        0x41, 7, 0x41, 3, // Temporary operands, discarded only on a taken edge.
-        0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x41, 0, 0x4a, // --param > 0
-        0x0d, 0x80, 0, // Padded label zero resumes at the first local.get.
-        0x6a, 0x20, 1, 0x6a, 0x21, 1, // On fallthrough add 7 + 3 to the trip count.
-        0x0b, 0x20, 1, 0x6a, 0x0b, 0x6a, 0x0b, // Add the two preserved values.
+        0x41, 7, 0x03, 0x40, // Inner loop freezes 7.
+        0x41, 3, 0x41, 1, 0x04, 0x7f, // If freezes 3.
+        0x41, 4, 0x02, 0x7f, // Inner block freezes 4.
+        0x41, 2, 0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x41, 0, 0x4a, // --param > 0
+        0x0d, 0x83, 0, // Padded depth 3 resumes at the trip counter update.
+        0x0b, 0x6a, 0x05, 0x41, 0, 0x0b, // On fallthrough the then arm yields 4 + 2.
+        0x6a, 0x20, 1, 0x6a, 0x21, 1, 0x0b, // Add 3 and the if result into the counter.
+        0x20, 1, 0x6a, 0x21, 1, 0x0b, // Add 7 into the counter.
+        0x20, 1, 0x6a, 0x0b, 0x6a, 0x0b, // Add the two preserved values.
     ];
     let module = exported_function(&i32_type(1), &code_body(&body));
     let instance = module.instantiate().unwrap();
     // 40 trips would overflow the operand storage if each kept its temporaries.
     // With arg 1, even the first condition is false.
-    for (arg, expected) in [(40, 90), (1, 51), (5, 55), (1, 51)] {
+    for (arg, expected) in [(40, 96), (1, 57), (5, 61), (1, 57)] {
         assert_eq!(
             instance.invoke_i32_with_args("answer", &[arg]),
             Ok(expected)
@@ -2119,9 +2198,10 @@ fn loop_dispatches_share_the_budget_with_callers_and_reset_on_reuse() {
         &[
             b"\0\x20\0\x22\0\x10\x02\x0b",       // local.get, local.tee, call
             b"\0\x20\0\x22\0\x22\0\x10\x02\x0b", // Same, with one extra local.tee.
-            // Preserve 42 and repeat (get, const, sub, tee, br_if) until --param == 0.
-            b"\0\x41\x2a\x03\x40\x20\0\x41\x01\x6b\x22\0\x0d\0\x0b\x0b",
-            b"\0\x41\x2a\x03\x40\x41\x01\x0d\0\x0b\x0b", // Always continue.
+            // Preserve 42; repeat (get, const, sub, tee, br_if 1) until --param == 0.
+            b"\0\x41\x2a\x03\x40\x03\x40\x20\0\x41\x01\x6b\x22\0\x0d\x01\x0b\x0b\x0b",
+            // Always continue to the outer loop.
+            b"\0\x41\x2a\x03\x40\x03\x40\x41\x01\x0d\x01\x0b\x0b\x0b",
         ],
     );
     let instance = module.instantiate().unwrap();

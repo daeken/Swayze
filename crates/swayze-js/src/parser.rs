@@ -233,6 +233,8 @@ pub(crate) enum Instruction {
         result: UpdateResult,
     },
     Discard,
+    // Consuming updates keep their two operands and separate binding store.
+    UpdateNumber(Update),
     Add,
     Subtract,
     Multiply,
@@ -2201,13 +2203,7 @@ impl Parser<'_> {
         }
         let access = self.begin_write(name, operator, true)?;
         self.emit(Instruction::Number(1.0), operator)?;
-        self.emit(
-            match op {
-                Update::Increment => Instruction::Add,
-                Update::Decrement => Instruction::Subtract,
-            },
-            operator,
-        )?;
+        self.emit(Instruction::UpdateNumber(op), operator)?;
         self.finish_write(access, span, false)?;
         self.parse_store_suffix(end, span, kind, UPDATE_STATEMENT_SEMICOLON)
     }
@@ -3153,7 +3149,8 @@ impl Parser<'_> {
             | Instruction::Not
             | Instruction::BitwiseNot
             | Instruction::Void => (1, 1),
-            Instruction::Add
+            Instruction::UpdateNumber(_)
+            | Instruction::Add
             | Instruction::Subtract
             | Instruction::Multiply
             | Instruction::Divide

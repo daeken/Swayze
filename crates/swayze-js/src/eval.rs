@@ -256,7 +256,7 @@ impl Script {
     /// equality are false without conversion. `!==` and `!=` negate their
     /// corresponding equality results. Binary `+` (including concatenation)
     /// and binary `-` remain unsupported on Strings, as do the corresponding
-    /// compounds and all name updates on Strings.
+    /// compounds.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -270,8 +270,8 @@ impl Script {
     /// They leave no result, and their RHS is still checked during parsing.
     /// Consuming `++` and `--` updates (alone or followed by a comma suffix
     /// in a statement or `for` clause) load one initialized `let`, convert
-    /// its scalar value to Number as above, and store the result of adding or
-    /// subtracting `1`. Neither form leaves a result for the update itself.
+    /// its value (including Strings) to Number once, and store the result of
+    /// adding or subtracting `1`. Neither form leaves a result for the update itself.
     /// An update used as an expression operand, such as in `x++ + 1`,
     /// performs the same write and yields a Number: the new Number for
     /// prefix, or the old coerced Number (including signed zero or NaN)
@@ -313,11 +313,11 @@ impl Script {
     /// String-to-Number conversion has a separate 262,144-credit budget per
     /// call, shared by unary `+`, `-`, and `~`, binary `*`, `/`, `%`, `**`,
     /// `&`, `^`, `|`, `<<`, `>>`, and `>>>` (including their eager compound
-    /// forms), and comparisons that coerce Strings. After dispatch, operand
-    /// arity checks, and validation of the operand's String range, each
-    /// conversion charges `1 +` the original UTF-16 length. Trimmed-empty
-    /// text, exact optionally signed `Infinity`,
-    /// and recognized unsigned radix prefixes only pay this base charge.
+    /// forms), name `++` and `--` updates, and comparisons that coerce Strings.
+    /// After dispatch, operand arity checks, and validation of the operand's
+    /// String range, each conversion charges `1 +` the original UTF-16 length.
+    /// Trimmed-empty text, exact optionally signed `Infinity`, and recognized
+    /// unsigned radix prefixes only pay this base charge.
     /// All other candidates additionally pay
     /// `256 + 3 *` the trimmed magnitude length (excluding a leading sign),
     /// before validating decimal syntax. Skipped instructions, scalar operands,
@@ -457,11 +457,8 @@ fn evaluate<'script>(
             }
             Instruction::UpdateBinding { slot, op, result } => {
                 let value = writable_binding(&mut bindings, slot)?;
-                let old = value.require_scalar()?.to_number();
-                let new = match op {
-                    Update::Increment => old + 1.0,
-                    Update::Decrement => old - 1.0,
-                };
+                let old = value.to_number(string_units, &mut string_conversion_credits_left)?;
+                let new = update_number(op, old);
                 let result = match result {
                     UpdateResult::New => new,
                     UpdateResult::Old => old,
@@ -476,7 +473,13 @@ fn evaluate<'script>(
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
             }
-            // Add and Subtract also serve consuming ++/--; keep them scalar-only.
+            Instruction::UpdateNumber(op) => apply_binary(&mut stack, |lhs, rhs| {
+                if !matches!(rhs, Operand::Scalar(Value::Number(1.0))) {
+                    return Err(EvalError::InvalidScript);
+                }
+                let old = lhs.to_number(string_units, &mut string_conversion_credits_left)?;
+                Ok(Value::Number(update_number(op, old)))
+            })?,
             Instruction::Add => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs + rhs)?,
             Instruction::Subtract => apply_scalar_arithmetic(&mut stack, |lhs, rhs| lhs - rhs)?,
             Instruction::Multiply => apply_numeric_binary(
@@ -786,6 +789,13 @@ fn apply_binary(
     Ok(())
 }
 
+fn update_number(op: Update, old: f64) -> f64 {
+    match op {
+        Update::Increment => old + 1.0,
+        Update::Decrement => old - 1.0,
+    }
+}
+
 fn apply_scalar_arithmetic(
     stack: &mut Vec<Operand>,
     op: impl FnOnce(f64, f64) -> f64,
@@ -973,6 +983,64 @@ mod tests {
                 Err(expected)
             );
             assert_eq!(credits, remaining);
+        }
+    }
+
+    #[test]
+    fn update_instructions_check_operands_and_slots_before_conversion() {
+        use Instruction::{Boolean, Discard, LoadBinding, Number, UpdateBinding, UpdateNumber};
+        let prefix = format!(
+            "const ws = '{}'; let i = 0; while (i++ < 64) {{ +ws; }} +'{}'; ",
+            " ".repeat(4094),
+            " ".repeat(63),
+        );
+        let script = crate::parse_script(&format!("{prefix}let x = ''; ++x; x")).unwrap();
+        let mut ops = script.instructions().to_vec();
+        let rhs_index = ops.len() - 4;
+        let slot = script.binding_slots() - 1;
+        assert_eq!(ops[rhs_index], Number(1.0));
+        let run = |ops: &[Instruction]| {
+            super::evaluate(
+                ops,
+                script.max_stack_depth(),
+                script.binding_slots(),
+                script.string_units(),
+            )
+        };
+        assert_eq!(
+            run(&ops),
+            Err(EvalError::StringNumericConversionLimitExceeded)
+        );
+        for rhs in [
+            Number(2.0),
+            Boolean(true),
+            LoadBinding(slot),
+            Discard,
+            UpdateNumber(Update::Increment),
+        ] {
+            // A malformed RHS or too few operands fails before converting even
+            // though evaluating the original LHS would exhaust String credits.
+            ops[rhs_index] = rhs;
+            assert_eq!(run(&ops), Err(EvalError::InvalidScript), "{rhs:?}");
+        }
+
+        let script = crate::parse_script(&format!("{prefix}const x = ''; x")).unwrap();
+        let mut ops = script.instructions().to_vec();
+        for slot in [slot, usize::MAX] {
+            *ops.last_mut().unwrap() = UpdateBinding {
+                slot,
+                op: Update::Increment,
+                result: UpdateResult::Old,
+            };
+            assert_eq!(
+                super::evaluate(
+                    &ops,
+                    script.max_stack_depth(),
+                    script.binding_slots(),
+                    script.string_units()
+                ),
+                Err(EvalError::InvalidScript),
+            );
         }
     }
 

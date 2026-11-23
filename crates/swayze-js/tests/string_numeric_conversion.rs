@@ -540,6 +540,112 @@ fn unary_budget_prefix(padding: usize) -> String {
 }
 
 #[test]
+fn name_updates_charge_once_and_share_credits_with_other_operators() {
+    let credit_error = EvalError::StringNumericConversionLimitExceeded;
+    for (form, new, result) in [
+        ("++x", 1.0, 1.0),
+        ("--x", -1.0, -1.0),
+        ("x++", 1.0, 0.0),
+        ("x--", -1.0, 0.0),
+    ] {
+        for (update, exact) in [(format!("{form}; x"), new), (format!("({form})"), result)] {
+            for padding in [60, 61] {
+                // Unary conversions leave three or two credits, then division
+                // spends one. The update's one UTF-16 unit costs two credits.
+                let prefix = format!(
+                    "{}'' / true; let x = '\\uFEFF'; ",
+                    unary_budget_prefix(padding)
+                );
+                let script = parse_script(&format!("{prefix}{update}")).unwrap();
+                let expected = if padding == 60 {
+                    Ok(exact)
+                } else {
+                    Err(credit_error)
+                };
+                assert_eq!(script.evaluate(), expected, "{update}");
+                assert_eq!(script.evaluate(), expected, "{update}");
+                if padding == 60 {
+                    let over = parse_script(&format!("{prefix}{update}, '' == 0")).unwrap();
+                    assert_eq!(over.evaluate_value(), Err(credit_error), "{update}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn skipped_string_updates_do_not_convert_or_store_even_with_no_credits() {
+    let source = format!(
+        "{}let x = ''; false && x++; true || --x; 'keep' ?? ++x; true ? 0 : x--; \
+         if (false) {{ x++; }} for (; false; ++x) {{}} for (;; x--) {{break;}} \
+         x === ''",
+        unary_budget_prefix(63),
+    );
+    assert_eq!(
+        parse_script(&source).unwrap().evaluate_value(),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn string_update_dispatch_boundaries_are_exact_and_dispatch_precedes_conversion() {
+    let credit_error = EvalError::StringNumericConversionLimitExceeded;
+    let dispatch_error = EvalError::DispatchLimitExceeded;
+    for padding in [62, 63] {
+        let prefix = format!(
+            "{}let x = ''; let k = 0; while (k++ < 3169) {{}} ",
+            unary_budget_prefix(padding),
+        );
+        // 525 dispatches for the credit prelude and x declaration, then
+        // 6 + 5 * 3169 for the empty scalar loop, leaving eight dispatches.
+        let cases = [
+            // Padding costs seven, then the expression update is dispatch 16,384.
+            (
+                "+ + + + +0; (x++)",
+                if padding == 62 {
+                    Ok(0.0)
+                } else {
+                    Err(credit_error)
+                },
+            ),
+            ("+ + + + + +0; (x++)", Err(dispatch_error)),
+            // Padding costs three; four consuming dispatches plus the final load fit.
+            (
+                "+0; --x; x",
+                if padding == 62 {
+                    Ok(-1.0)
+                } else {
+                    Err(credit_error)
+                },
+            ),
+            (
+                "+ +0; --x; x",
+                if padding == 62 {
+                    Err(dispatch_error)
+                } else {
+                    Err(credit_error)
+                },
+            ),
+            // Padding costs five or six. Conversion is the third consuming
+            // dispatch and must run at 16,384, but not at 16,385.
+            (
+                "+ + +0; --x; x",
+                if padding == 62 {
+                    Err(dispatch_error)
+                } else {
+                    Err(credit_error)
+                },
+            ),
+            ("+ + + +0; --x; x", Err(dispatch_error)),
+        ];
+        for (tail, expected) in cases {
+            let script = parse_script(&format!("{prefix}{tail}")).unwrap();
+            assert_eq!(script.evaluate(), expected, "padding {padding}; {tail}");
+        }
+    }
+}
+
+#[test]
 fn unary_arithmetic_and_bitwise_share_credits_and_charge_both_strings_once() {
     // After unary conversions and one credit for division, two credits are
     // enough for two empty Strings, but one is not. Use the same range twice

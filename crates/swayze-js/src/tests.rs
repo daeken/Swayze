@@ -220,7 +220,8 @@ fn sequence_stores_finish_inside_out_before_discard_and_the_next_operand() {
 
 #[test]
 fn updates_load_and_store_the_same_slot_once_with_no_result() {
-    use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding};
+    use crate::parser::Update;
+    use Instruction::{Boolean, JumpIfFalseStatement, StoreBinding, UpdateNumber};
     assert_postfix(
         "let x=0;++x;if(true){let x=0;x--;--x;}x++;x",
         &[
@@ -228,7 +229,7 @@ fn updates_load_and_store_the_same_slot_once_with_no_result() {
             init_let(0),
             LoadBinding(0),
             Number(1.0),
-            Add,
+            UpdateNumber(Update::Increment),
             StoreBinding(0),
             Boolean(true),
             JumpIfFalseStatement(18),
@@ -236,15 +237,15 @@ fn updates_load_and_store_the_same_slot_once_with_no_result() {
             init_let(1),
             LoadBinding(1),
             Number(1.0),
-            Subtract,
+            UpdateNumber(Update::Decrement),
             StoreBinding(1),
             LoadBinding(1),
             Number(1.0),
-            Subtract,
+            UpdateNumber(Update::Decrement),
             StoreBinding(1),
             LoadBinding(0),
             Number(1.0),
-            Add,
+            UpdateNumber(Update::Increment),
             StoreBinding(0),
             LoadBinding(0),
         ],
@@ -455,9 +456,10 @@ fn for_emits_checked_statement_edges_between_test_update_body_and_exit() {
 
 #[test]
 fn for_no_comma_logical_store_and_leading_update_keep_their_instructions() {
-    use crate::parser::ShortCircuitCondition;
+    use crate::parser::{ShortCircuitCondition, Update};
     use Instruction::{
-        Boolean, JumpIfFalseStatement, JumpStatement, LoopBack, ShortCircuitStatement, StoreBinding,
+        Boolean, JumpIfFalseStatement, JumpStatement, LoopBack, ShortCircuitStatement,
+        StoreBinding, UpdateNumber,
     };
 
     assert_postfix(
@@ -477,7 +479,7 @@ fn for_no_comma_logical_store_and_leading_update_keep_their_instructions() {
             JumpStatement(14),
             LoadBinding(0), // 9: update
             Number(1.0),
-            Add,
+            UpdateNumber(Update::Increment),
             StoreBinding(0),
             LoopBack(6),
             LoopBack(9),    // 14: continue
@@ -531,9 +533,10 @@ fn for_assignment_sequences_store_first_and_join_with_an_empty_stack() {
 
 #[test]
 fn for_update_sequences_discard_only_the_suffix_values() {
+    use crate::parser::Update;
     use Instruction::{
         Boolean, Discard, JumpIfFalseStatement, JumpStatement, LoopBack, Null, StoreBinding,
-        StoreBindingKeep, Subtract,
+        StoreBindingKeep, UpdateNumber,
     };
 
     assert_postfix(
@@ -543,7 +546,7 @@ fn for_update_sequences_discard_only_the_suffix_values() {
             init_let(0),
             LoadBinding(0),
             Number(1.0),
-            Add,
+            UpdateNumber(Update::Increment),
             StoreBinding(0), // leading prefix update leaves no operand
             Boolean(true),
             StoreBindingKeep(0),
@@ -553,7 +556,7 @@ fn for_update_sequences_discard_only_the_suffix_values() {
             JumpStatement(19),
             LoadBinding(0), // 12: update
             Number(1.0),
-            Subtract,
+            UpdateNumber(Update::Decrement),
             StoreBinding(0), // leading postfix update leaves no operand
             Null,
             Discard,
@@ -2068,13 +2071,13 @@ fn assignment_statement_sequence_joins_at_the_suffix_and_discards_only_suffix_va
 #[test]
 fn update_statements_use_the_same_consuming_store_with_or_without_a_suffix() {
     use crate::parser::{Update, UpdateResult};
-    use Instruction::{Discard, StoreBinding, StoreBindingKeep, UpdateBinding};
+    use Instruction::{Discard, StoreBinding, StoreBindingKeep, UpdateBinding, UpdateNumber};
 
     for (leading, operation) in [
-        ("++x", Add),
-        ("x++", Add),
-        ("--x", Subtract),
-        ("x--", Subtract),
+        ("++x", UpdateNumber(Update::Increment)),
+        ("x++", UpdateNumber(Update::Increment)),
+        ("--x", UpdateNumber(Update::Decrement)),
+        ("x--", UpdateNumber(Update::Decrement)),
     ] {
         assert_postfix(
             &format!("let x=0;{leading};x"),

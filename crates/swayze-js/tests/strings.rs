@@ -472,7 +472,14 @@ fn skipped_mixed_comparisons_still_validate_literals_and_bindings() {
 
 #[test]
 fn unsupported_operations_fail_only_when_dispatched() {
-    for expr in ["'a' + 'b'", "1 + '2'", "'2' - 1", "void ('' + '')"] {
+    for expr in [
+        "'a' + 'b'",
+        "'2' + 1",
+        "1 + '2'",
+        "'2' - 1",
+        "1 - '2'",
+        "void ('' + '')",
+    ] {
         let script = parse_script(expr).unwrap();
         assert_eq!(
             script.evaluate_primitive(),
@@ -480,17 +487,6 @@ fn unsupported_operations_fail_only_when_dispatched() {
             "{expr}"
         );
         assert_scalar(&format!("false && ({expr})"), Value::Boolean(false));
-    }
-    for update in ["x++", "++x", "x--", "--x"] {
-        for source in [
-            format!("let x = '2'; {update}; 0"),
-            format!("let x = '2'; ({update})"),
-        ] {
-            assert_eq!(
-                parse_script(&source).unwrap().evaluate(),
-                Err(EvalError::UnsupportedStringOperation)
-            );
-        }
     }
     for op in ["+=", "-="] {
         for source in [

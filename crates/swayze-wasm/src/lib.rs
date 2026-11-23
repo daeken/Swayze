@@ -3,18 +3,18 @@
 //! # Supported slice
 //!
 //! [`validate_module`] accepts the [WebAssembly Core 1.0] header, any number of
-//! custom sections within [`Limit`], and optional memory and data sections. Modules
-//! with functions must have one to eight types, one to eight function
-//! declarations, and exactly as many code bodies as function declarations,
-//! in that section order. Each type must have zero to four `i32` parameters
-//! and exactly one `i32` result, even if unused.
+//! custom sections within [`Limit`], and optional memory, global, and data
+//! sections. Modules with functions must have one to eight types, one to eight
+//! function declarations, and exactly as many code bodies as function
+//! declarations, in that section order. Each type must have zero to four `i32`
+//! parameters and exactly one `i32` result, even if unused.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 `i32` locals in total. The
 //! number of groups and each group's local count are unsigned LEB32; zero-count
 //! groups are allowed but must still specify `i32`.
-//! Supported instructions are `local.get`, `local.set`, `local.tee` (each with
-//! an unsigned LEB32 index), `i32.const <signed LEB32>`, `i32.eqz`, `i32.eq`,
-//! `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
+//! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
+//! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
+//! `i32.eqz`, `i32.eq`, `i32.ne`, `i32.lt_s`, `i32.lt_u`, `i32.gt_s`, `i32.gt_u`, `i32.le_s`,
 //! `i32.le_u`, `i32.ge_s`, `i32.ge_u`, `i32.add`, `i32.sub`, `i32.mul`,
 //! `i32.div_s`, `i32.div_u`, `i32.rem_s`, `i32.rem_u`, `i32.load`, `i32.load8_s`,
 //! `i32.load8_u`, `i32.load16_s`, `i32.load16_u`, `i32.store`, `i32.store8`,
@@ -32,7 +32,7 @@
 //! types, `br`, `return`, `unreachable`, and indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
-//! any export and code sections. It may be empty (a zero-length vector) or
+//! any global, export, and code sections. It may be empty (a zero-length vector) or
 //! declare one private, unshared memory32. The limits use flag byte `0x00`
 //! (minimum only) or `0x01` (minimum and maximum), followed by unsigned LEB32
 //! page counts. The minimum and any explicit maximum must be zero or one
@@ -45,27 +45,38 @@
 //! `memory.size` takes a literal reserved byte `0x00`, not a general LEB32 index.
 //! Other memory instructions, including `memory.grow`, are unsupported.
 //!
-//! The optional data section (ID 11) follows code, if present, and any memory
-//! section. It may contain zero to eight active segments with at most 64 KiB of
+//! The optional global section (ID 6) follows any type, function, and memory
+//! sections and precedes any export and code sections. It may contain zero to
+//! eight defined `i32` globals, indexed from zero in declaration order. Each
+//! declaration uses value type byte `0x7f`, literal mutability byte `0x00`
+//! (immutable) or `0x01` (mutable), and exactly `i32.const <signed LEB32> end`.
+//! Every body can read either kind and can set only mutable globals, including
+//! globals at later indices. Global imports, exports, and initializer reads
+//! are unsupported.
+//!
+//! The optional data section (ID 11) follows any memory, global, export, and
+//! code sections. It may contain zero to eight active segments with at most 64 KiB of
 //! payload bytes total, counting overlaps. Each segment requires a defined
 //! memory and encodes the Core 1.0 memory index zero as unsigned LEB32, exactly
 //! `i32.const <signed LEB32> end`, and a length-prefixed vector of raw bytes.
 //! An empty segment vector does not require memory. Passive segments, bulk
 //! memory, and global offsets are unsupported.
 //!
-//! An optional export section between function and code (after memory, if
-//! present) may contain zero to eight function exports. Memory cannot be
-//! exported. Name matching is exact (no Unicode normalization), and duplicate
-//! export names are rejected. Each export refers to a defined function by its
-//! zero-based declaration index. Distinct names may refer to the same function.
+//! An optional export section between function and code (after memory and
+//! globals, if present) may contain zero to eight function exports. Memory and
+//! globals cannot be exported. Name matching is exact (no Unicode normalization),
+//! and duplicate export names are rejected. Each export refers to a defined
+//! function by its zero-based declaration index. Distinct names may refer to
+//! the same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import, start, and data count)
 //! are rejected, even when empty.
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
-//! stack and checks each stack effect: `local.get` and `i32.const` push one i32,
-//! `local.set` pops one, `local.tee` requires and leaves the top operand,
+//! stack and checks each stack effect: `local.get`, `global.get`, and `i32.const`
+//! push one i32; `local.set` and `global.set` pop one, and `local.tee` requires
+//! and leaves the top operand.
 //! `i32.eqz` consumes one and pushes one, and the binary operators consume two
 //! and push one. `call` consumes as many i32s as the target function's type has
 //! parameters (the top operand is the last parameter) and pushes one result.
@@ -96,18 +107,20 @@
 //! simultaneously open `block`, `loop`, and `if` frames combined, excluding
 //! the function frame.
 //!
-//! Validation resolves every function's type index before decoding any body,
-//! and checks the entire input, including every body even if unexported. It
-//! returns an immutable, owned [`Module`] with private decoded bodies, their
-//! arities, named export entries, the memory size (if defined), and the active
-//! data segments. It does not allocate linear memory. A separate fallible
-//! [`Module::instantiate`] step checks all segment ranges before allocating and
-//! zeroing fresh private linear memory. It then applies the segments in source
-//! order; the last segment to write a byte wins. Offsets are interpreted as
-//! `u32` bits and widened before adding the payload length. An empty segment may
+//! Validation resolves every function's type index and validates all global
+//! declarations before decoding any body. It checks the entire input, even
+//! unexported bodies and untaken arms. It returns an immutable, owned [`Module`]
+//! with private decoded bodies, their arities, named export entries, the memory
+//! size (if defined), global initial values, and the active data segments. It
+//! does not allocate linear memory. A separate fallible [`Module::instantiate`]
+//! step checks all segment ranges before allocating and zeroing fresh private
+//! linear memory. It then applies the segments in source order; the last
+//! segment to write a byte wins. Data offsets are interpreted as `u32` bits
+//! and widened before adding the payload length. An empty segment may
 //! start at the end of memory, but not beyond it. An out-of-bounds segment is an
 //! [`InstantiationError::DataSegmentOutOfBounds`], not a validation error or an
-//! invocation trap. Failed instantiation exposes no instance. The typed
+//! invocation trap. Global initial values are copied into fixed private slots
+//! with no allocation. Failed instantiation exposes no instance. The typed
 //! [`Instance::invoke_i32_with_args`] method
 //! scans at most eight export names for an exact match, then checks the selected
 //! function's arity and begins execution without allocating or recursing
@@ -148,8 +161,8 @@
 //! [`InvokeError::LimitExceeded`] stops the entire invocation before it would
 //! exceed either 16 live frames (including the exported function) or 1024 total
 //! instruction dispatches. Every executed decoded instruction costs one dispatch,
-//! including a memory instruction, a `call`, an `if` test, an executed `else`
-//! jump, or a `br_if` with either outcome. Skipped instructions, `block`,
+//! including memory and global instructions, a `call`, an `if` test, an executed
+//! `else` jump, or a `br_if` with either outcome. Skipped instructions, `block`,
 //! `loop`, and `end` delimiters, and returning from frames cost nothing. A
 //! continue does not reset the budget: all loop iterations and calls share it,
 //! including recursive guest calls.
@@ -157,10 +170,10 @@
 //! instruction would exceed the dispatch budget, that limit takes precedence
 //! over executing it.
 //! The same instance can be invoked again with fresh call-local state and budgets.
-//! All functions in an instance share its memory. Stores persist across calls,
-//! exports, traps, and host limits: completed stores are not rolled back. Separate
-//! instances have independent memory. Empty, custom-only, memory-only, and
-//! unexported modules have no callable exports.
+//! All functions in an instance share its memory and globals. Completed memory
+//! and global stores persist across calls, exports, traps, and host limits.
+//! Separate instances have independent memory and globals. Empty, custom-only,
+//! memory-only, globals-only, and other unexported modules have no callable exports.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -212,10 +225,15 @@
 //! count and aggregate byte limits, absent and zero-page memories, full-range
 //! preflight (including wrapping offsets and empty segments at the end), overlap
 //! order, and reinitialization from the same module into independent instances.
-//! Parsing uses fixed scratch tables for up to eight type arities and eight
-//! resolved function arities. It checks local group counts against the remaining
-//! local budget without expanding groups, uses bounded borrowed frames, and
-//! decodes instructions into a fixed-size scratch array. After checking `end`
+//! Global tests cover section order, declaration counts and encodings, exact
+//! initializer expressions, index decoding and bounds, mutability and operand
+//! floors in all bodies, and unsupported imports, exports, and global offsets.
+//! They exercise shared state across exports and calls, fresh instances, and
+//! suppression of later writes after a trap or exhausted dispatch budget.
+//! Parsing uses fixed scratch tables for up to eight type arities, eight resolved
+//! function arities, and eight global declarations. It checks local group counts
+//! against the remaining local budget without expanding groups, uses bounded
+//! borrowed frames, and decodes instructions into a fixed-size scratch array. After checking `end`
 //! and the complete body frame, it calls `Vec::try_reserve_exact` for the count and
 //! copies those instructions. The body, export, and data segment vectors are
 //! reserved fallibly after checking their counts. Each name and segment payload
@@ -234,7 +252,7 @@ mod memory;
 pub use binary::{Error, ErrorKind, IntegerField, LengthField, Limit, validate_module};
 
 use memory::{DataSegment, LinearMemory};
-use std::{convert::Infallible, fmt};
+use std::{cell::Cell, convert::Infallible, fmt};
 
 /// An owned, opaque module produced only by successful [`validate_module`].
 ///
@@ -242,6 +260,7 @@ use std::{convert::Infallible, fmt};
 /// use swayze_wasm::Module;
 /// let forged = Module {
 ///     functions: Vec::new(), exports: Vec::new(), memory_bytes: None, data_segments: Vec::new(),
+///     global_initial_values: [0; 8],
 /// };
 /// ```
 #[derive(Debug)]
@@ -250,6 +269,7 @@ pub struct Module {
     exports: Vec<Export>,
     // None means absent; Some is a validated byte length (zero or one page).
     memory_bytes: Option<usize>,
+    global_initial_values: [i32; binary::MAX_GLOBALS as usize],
     data_segments: Vec<DataSegment>,
 }
 
@@ -266,11 +286,13 @@ impl Module {
     /// allocating or writing any linear memory. A one-page memory is allocated
     /// fallibly, zeroed, then initialized by the segments in source order.
     /// No linear memory is allocated for an absent or zero-page memory.
+    /// Global initial values are copied into fixed, independent instance slots.
     pub fn instantiate(&self) -> Result<Instance<'_>, InstantiationError> {
         let memory = LinearMemory::new(self.memory_bytes.unwrap_or(0), &self.data_segments)?;
         Ok(Instance {
             module: self,
             memory,
+            globals: self.global_initial_values.map(Cell::new),
         })
     }
 }
@@ -305,9 +327,9 @@ impl fmt::Display for InstantiationError {
 
 impl std::error::Error for InstantiationError {}
 
-/// An instance of a validated module, with private, persistent linear memory.
+/// An instance of a validated module, with private, persistent memory and globals.
 ///
-/// Invocation through `&self` can change this memory. An instance is `Send`
+/// Invocation through `&self` can change this state. An instance is `Send`
 /// (it can move to another thread when its module borrow permits), but not
 /// `Sync`: sharing one instance between threads requires synchronization.
 /// The immutable module can be shared to create independent instances.
@@ -315,6 +337,7 @@ impl std::error::Error for InstantiationError {}
 pub struct Instance<'module> {
     module: &'module Module,
     memory: LinearMemory,
+    globals: [Cell<i32>; binary::MAX_GLOBALS as usize],
 }
 
 impl Instance<'_> {
@@ -344,8 +367,8 @@ impl Instance<'_> {
     /// locals are initialized to zero on each invocation. A guest trap stops
     /// execution and returns [`InvokeError::Trap`]; exceeding a host execution
     /// limit returns [`InvokeError::LimitExceeded`]. Later calls start with
-    /// fresh frames and execution budgets but observe any completed stores,
-    /// including those made before a trap or limit.
+    /// fresh frames and execution budgets but observe any completed memory and
+    /// global stores, including those made before a trap or limit.
     pub fn invoke_i32_with_args(&self, name: &str, args: &[i32]) -> Result<i32, InvokeError> {
         let export = self
             .module

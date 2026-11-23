@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "data.rs"]
 mod data;
+#[path = "float_memory.rs"]
+mod float_memory;
 #[path = "memory_grow.rs"]
 mod grow;
 #[path = "i64_memory.rs"]
@@ -235,14 +237,12 @@ fn rejects_memory_exports_and_other_memory_features() {
         }
         expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id });
     }
-    for opcode in [0x2a, 0x2b, 0x38, 0x39, 0xfc] {
-        bad_memory_body(
-            ONE_PAGE,
-            &[0, 0x41, 0, opcode, 0, 0x0b],
-            3,
-            ErrorKind::UnsupportedOpcode { opcode },
-        );
-    }
+    bad_memory_body(
+        ONE_PAGE,
+        &[0, 0x41, 0, 0xfc, 0, 0x0b],
+        3,
+        ErrorKind::UnsupportedOpcode { opcode: 0xfc },
+    );
 }
 
 #[test]
@@ -261,6 +261,7 @@ fn checks_memory_presence_and_framed_memarg_immediates() {
     ]
     .into_iter()
     .chain(i64_memory::ops().map(|(opcode, natural, _)| (opcode, natural)))
+    .chain(float_memory::ops())
     {
         let body = [0, 0x41, 0, 0x41, 0, opcode, 0, 0, 0x0b];
         bad_body(&body, 5, ErrorKind::MissingMemory);
@@ -312,6 +313,22 @@ fn checks_memory_presence_and_framed_memarg_immediates() {
         bad_alignment[6] = natural + 1;
         bad_memory_body(
             ONE_PAGE,
+            &bad_alignment,
+            6,
+            ErrorKind::InvalidMemoryAlignment {
+                exponent: u32::from(natural + 1),
+            },
+        );
+        // Read both immediates before checking the exponent, and reject a
+        // too-large exponent before checking for a defined memory.
+        bad_body(
+            &bad_alignment[..7],
+            7,
+            ErrorKind::TruncatedInteger {
+                field: MemoryOffset,
+            },
+        );
+        bad_body(
             &bad_alignment,
             6,
             ErrorKind::InvalidMemoryAlignment {

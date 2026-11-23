@@ -35,7 +35,7 @@
 //! `i32.load16_u`, `i32.store`, `i32.store8`, `i32.store16`,
 //! `i64.load`, `i64.load8_s`, `i64.load8_u`, `i64.load16_s`, `i64.load16_u`,
 //! `i64.load32_s`, `i64.load32_u`, `i64.store`, `i64.store8`, `i64.store16`,
-//! `i64.store32`, `memory.size`,
+//! `i64.store32`, `f32.load`, `f64.load`, `f32.store`, `f64.store`, `memory.size`,
 //! `memory.grow` (`0x40`), `unreachable` (`0x00`), `nop`, `drop`, untyped `select`, `call`,
 //! `call_indirect` (`0x11`), `if`, `block`, `loop`, `br <depth>` (`0x0c`),
 //! `br_if <depth>`, `br_table` (`0x0e`), and `return` (`0x0f`). Local indices
@@ -196,8 +196,8 @@
 //! arity and each positional type above the active frame's entry floor, and
 //! any result is concrete even when the floor supplied implicit arguments.
 //! Loads consume an i32 base address and push a value of the opcode's type
-//! (i32 or i64). Stores consume an i32 base address and a value of the opcode's
-//! type (value on top) and produce no result. `memory.size`
+//! (i32, i64, f32, or f64). Stores consume an i32 base address and a value of the
+//! opcode's type (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
 //! `memory.grow` consumes an i32 page delta as unsigned and pushes the old
 //! page count on success or `-1` on failure. A zero delta always succeeds
@@ -362,7 +362,10 @@
 //! be unaligned; validated alignment annotations do not constrain addresses.
 //! Narrow loads sign-extend (`_s`) or zero-extend (`_u`) to the opcode's
 //! result type. Narrow stores write only the low 8, 16, or (for `i64.store32`)
-//! 32 bits of the value. Each load or store uses one dispatch.
+//! 32 bits of the value. Float loads and stores move the full 32- or 64-bit
+//! encoding without floating-point arithmetic or conversion, preserving signed
+//! zeros and signaling NaN payloads. They share the same bytes as integer
+//! accesses. Each load or store uses one dispatch.
 //!
 //! A zero right operand raises [`Trap::IntegerDivideByZero`] for all division
 //! and remainder instructions at either width. Signed division of the minimum
@@ -551,6 +554,12 @@
 //! i64 memory tests compare all 64 result bits, check i64 and i32 accesses to
 //! overlapping bytes, and cover typed stack effects and all four access widths
 //! before and after growth and at the exact instruction and dispatch caps.
+//! Float memory tests check both zero signs and signaling NaN payloads against
+//! independent integer accesses, including little-endian bytes at unaligned
+//! addresses with natural or smaller hints. They cover framed memarg errors,
+//! absent and zero-page memory, exact-end and overflowing addresses, no partial
+//! stores, concrete types above live and dead floors, and the exact dispatch
+//! boundary for each opcode.
 //! Growth tests check optional maxima, unsigned deltas, reserve bounds and
 //! failure, stack and dispatch limits, and persistence through exports, calls,
 //! start, and traps. Start growth cannot bypass initial data preflight.

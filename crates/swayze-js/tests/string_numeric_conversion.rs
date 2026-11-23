@@ -1,5 +1,5 @@
 use swayze_js::{
-    ErrorKind, EvalError, Limit, Limits, PrimitiveValue, Value, parse_script,
+    ErrorKind, EvalError, EvalScratch, Limit, Limits, PrimitiveValue, Value, parse_script,
     parse_script_with_limits,
 };
 
@@ -130,7 +130,7 @@ fn unary_conversions_evaluate_operands_once_in_source_order() {
     assert_eq!(script.evaluate(), Ok(-7.0));
 }
 
-const BINARY_OPS: [&str; 4] = ["*", "/", "%", "**"];
+const BINARY_OPS: [&str; 5] = ["-", "*", "/", "%", "**"];
 // The expected results for the snapshotted operands '9' and '2'.
 const BITWISE_OPS: [(&str, f64); 6] = [
     ("&", 0.0),
@@ -151,6 +151,47 @@ fn assert_number(source: &str, expected: f64) {
     } else {
         assert_eq!(result.to_bits(), expected.to_bits(), "{source}");
     }
+}
+
+#[test]
+fn subtraction_coerces_strings_and_preserves_number_special_cases() {
+    for (lhs, rhs, expected) in [
+        (r"'\uFEFF0x10\u2029'", "'2.5'", 13.5),
+        ("'2.5'", "'0x10'", -13.5),
+        ("'6'", "true", 5.0),
+        ("true", "'6'", -5.0),
+        ("'-1e-9999'", "null", -0.0),
+        ("''", "'-0'", 0.0),
+        ("'-0'", "'-0'", 0.0),
+        ("'Infinity'", "'-Infinity'", f64::INFINITY),
+        ("2", "'Infinity'", f64::NEG_INFINITY),
+        ("'Infinity'", "'Infinity'", f64::NAN),
+        ("'7'", "undefined", f64::NAN),
+        (r"'\uD800'", "'2'", f64::NAN),
+        ("'2'", "'1_0'", f64::NAN),
+    ] {
+        assert_number(&format!("{lhs} - {rhs}"), expected);
+        assert_number(&format!("let x = {lhs}; x -= {rhs}; x"), expected);
+    }
+}
+
+#[test]
+fn subtraction_handles_runtime_strings_and_keeps_updates_numeric() {
+    assert_number("('0x' + '10') - ('2' + '.5')", 13.5);
+    assert_number("'2.5' - ('0x' + '10')", -13.5);
+    assert_number("('-' + '0') - ''", -0.0);
+    assert_number("('Infin' + 'ity') - 'Infinity'", f64::NAN);
+    assert_number(
+        "let x = '0x' + 'a', n = 0; const y = (x -= (n++, x = '2' + '.5')); \
+         n === 1 && x === y ? y : -1",
+        7.5,
+    );
+    assert_number(
+        "let s = '4'; s += '2'; let x = '4' + '3'; \
+         const old = x--; --x; x -= '1'; \
+         old === 43 && x === 40 && s === '42' ? s - '' + 1 : -1",
+        43.0,
+    );
 }
 
 #[test]
@@ -249,7 +290,7 @@ fn binary_bitwise_coerces_strings_before_applying_32_bit_kernels() {
 fn binary_expressions_run_once_left_to_right_and_compounds_snapshot_before_rhs() {
     for (op, expected) in BINARY_OPS
         .into_iter()
-        .zip([18.0, 4.5, 1.0, 81.0])
+        .zip([7.0, 18.0, 4.5, 1.0, 81.0])
         .chain(BITWISE_OPS)
     {
         assert_number(
@@ -655,7 +696,7 @@ fn unary_arithmetic_and_bitwise_share_credits_and_charge_both_strings_once() {
     let error = EvalError::StringNumericConversionLimitExceeded;
     for (op, expected) in BINARY_OPS
         .into_iter()
-        .zip([0.0, f64::NAN, f64::NAN, 1.0])
+        .zip([0.0, 0.0, f64::NAN, f64::NAN, 1.0])
         .chain(BITWISE_OPS.map(|(op, _)| (op, 0.0)))
     {
         for expr in [format!("empty {op} empty"), format!("(empty {op}= empty)")] {
@@ -668,6 +709,51 @@ fn unary_arithmetic_and_bitwise_share_credits_and_charge_both_strings_once() {
             assert_eq!(over.evaluate_primitive(), Err(error), "{suffix}");
         }
     }
+}
+
+#[test]
+fn runtime_subtraction_charges_both_aliases_and_shares_credits() {
+    let error = EvalError::StringNumericConversionLimitExceeded;
+    // Unary conversions and an update leave eight or seven credits. Each
+    // conversion of the same runtime '0x9' range costs four.
+    let prefix = |padding| {
+        format!(
+            "{}let empty = ''; empty++; let x = '0x' + '9'; ",
+            unary_budget_prefix(padding)
+        )
+    };
+    let mut scratch = EvalScratch::new();
+    for tail in ["x - x", "(x -= x)", "x -= x; x"] {
+        let exact = parse_script(&format!("{}{tail}", prefix(54))).unwrap();
+        let short = parse_script(&format!("{}{tail}", prefix(55))).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                short.evaluate_primitive_with_scratch(&mut scratch),
+                Err(error),
+                "{tail}"
+            );
+            assert_eq!(
+                exact.evaluate_primitive_with_scratch(&mut scratch),
+                Ok(PrimitiveValue::Scalar(Value::Number(0.0))),
+                "{tail}"
+            );
+        }
+        // Even an empty String in a following comparison needs one more credit.
+        assert_eq!(
+            parse_script(&format!("{}{tail}, '' == 0", prefix(54)))
+                .unwrap()
+                .evaluate_value(),
+            Err(error)
+        );
+    }
+    assert_number(
+        &format!(
+            "{}x - x; true || x - x; false && (x -= x); \
+                  x += '!'; x === '0x9!' ? 42 - 0 : -1",
+            prefix(54)
+        ),
+        42.0,
+    );
 }
 
 #[test]
@@ -722,7 +808,7 @@ fn binary_dispatch_precedes_conversion_at_the_exact_boundary() {
         );
         // One literal statement then a binary expression use the last five
         // dispatches; only the extra unary `+` puts the binary op over the limit.
-        for (op, expected) in [("**", 1.0)]
+        for (op, expected) in [("-", 0.0), ("**", 1.0)]
             .into_iter()
             .chain(BITWISE_OPS.map(|(op, _)| (op, 0.0)))
         {

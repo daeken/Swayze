@@ -205,6 +205,11 @@ pub(crate) enum Instruction {
     },
     StoreBinding(usize),
     StoreBindingKeep(usize),
+    UpdateBinding {
+        slot: usize,
+        op: Update,
+        result: UpdateResult,
+    },
     Discard,
     Add,
     Subtract,
@@ -393,10 +398,30 @@ impl Operator {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Update {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Update {
     Increment,
     Decrement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum UpdateResult {
+    New,
+    Old,
+}
+
+const GROUPED_UPDATE_REQUIRED: &str =
+    "increment and decrement expressions require an explicit group containing only the update";
+
+fn check_postfix_line_break(operator: Span, after_line_break: bool) -> Result<(), Error> {
+    // The lexer records LineTerminator trivia, including inside comments.
+    if after_line_break {
+        return Err(Error::unsupported(
+            operator,
+            "a line terminator cannot precede a postfix update",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1617,13 +1642,7 @@ impl Parser<'_> {
                 span,
                 after_line_break,
             }) => {
-                // The lexer records LineTerminator trivia, including inside comments.
-                if after_line_break {
-                    return Err(Error::unsupported(
-                        span,
-                        "a line terminator cannot precede a postfix update",
-                    ));
-                }
+                check_postfix_line_break(span, after_line_break)?;
                 self.parse_update(name, op, span, end).map(Some)
             }
             _ => {
@@ -2036,16 +2055,20 @@ impl Parser<'_> {
         operator: Span,
         end: ExpressionEnd,
     ) -> Result<Span, Error> {
-        let Some(name) = self
-            .next_token()?
+        let name = self.parse_update_target(operator)?;
+        self.parse_update(name, op, operator, end)
+    }
+
+    fn parse_update_target(&mut self, operator: Span) -> Result<Span, Error> {
+        self.next_token()?
             .filter(|t| matches!(t.kind, TokenKind::Identifier))
-        else {
-            return Err(Error::unsupported(
-                operator,
-                "increment and decrement require a single identifier target",
-            ));
-        };
-        self.parse_update(name.span, op, operator, end)
+            .map(|t| t.span)
+            .ok_or_else(|| {
+                Error::unsupported(
+                    operator,
+                    "increment and decrement require a single identifier target",
+                )
+            })
     }
 
     fn parse_update(
@@ -2109,6 +2132,35 @@ impl Parser<'_> {
         )?;
         self.finish_write(access, span, false)?;
         Ok(span)
+    }
+
+    // The caller has already charged the name's emission work, as for an
+    // ordinary identifier at group start. An update must consume this group's
+    // close directly, so no infix operator can take it as an ungrouped operand.
+    fn finish_group_update(
+        &mut self,
+        name: Span,
+        operator: Span,
+        op: Update,
+        result: UpdateResult,
+    ) -> Result<(), Error> {
+        let close = self.require_token("expected a closing parenthesis before end of source")?;
+        if !matches!(close.kind, TokenKind::Close) {
+            return Err(Error::unsupported(operator, GROUPED_UPDATE_REQUIRED));
+        }
+        if !matches!(self.pending.pop(), Some((Pending::Group, _))) {
+            return Err(Error::malformed(close.span, "expected an update group"));
+        }
+        self.nesting_depth -= 1;
+        self.begin_write(name, operator, false)?;
+        self.emit_charged(
+            Instruction::UpdateBinding {
+                slot: UNPATCHED,
+                op,
+                result,
+            },
+            name,
+        )
     }
 
     fn parse_assignment(
@@ -2250,7 +2302,7 @@ impl Parser<'_> {
         &self.lexer.source[name.start..name.end] == "undefined"
     }
 
-    fn resolve_access(&mut self, access: Access) -> Result<Instruction, Error> {
+    fn resolve_access(&mut self, access: Access) -> Result<Option<usize>, Error> {
         let mut scope = access.scope;
         loop {
             // Resolve by lexical proximity before checking initialization or mutability.
@@ -2271,17 +2323,13 @@ impl Parser<'_> {
                         "assignment to const is outside the subset",
                     ));
                 }
-                return Ok(if access.write.is_some() {
-                    Instruction::StoreBinding(slot)
-                } else {
-                    Instruction::LoadBinding(slot)
-                });
+                return Ok(Some(slot));
             }
             let Some(parent) = self.scopes[scope].parent else {
                 // Only an unbound read gets the immutable default. A declaration
                 // in any visible scope, even in its TDZ, wins over this fallback.
                 if access.write.is_none() && self.is_undefined_name(access.name) {
-                    return Ok(Instruction::Undefined);
+                    return Ok(None);
                 }
                 return Err(Error::unsupported(
                     access.name,
@@ -2297,28 +2345,32 @@ impl Parser<'_> {
         // Resolve each name site once, even when it emits both a load and a store.
         for index in 0..self.accesses.len() {
             let access = self.accesses[index];
-            let resolved = self.resolve_access(access)?;
+            let slot = self.resolve_access(access)?;
             match (
                 access.write,
-                resolved,
+                slot,
                 self.instructions.get_mut(access.instruction),
             ) {
                 (None, _, Some(op @ Instruction::LoadBinding(UNPATCHED))) => {
-                    *op = resolved;
+                    *op = slot.map_or(Instruction::Undefined, Instruction::LoadBinding);
                 }
                 (
+                    Some(WriteAccess { load: None, .. }),
+                    Some(slot),
+                    Some(Instruction::UpdateBinding {
+                        slot: binding @ UNPATCHED,
+                        ..
+                    }),
+                ) => *binding = slot,
+                (
                     Some(write),
-                    Instruction::StoreBinding(slot),
+                    Some(slot),
                     Some(
-                        op @ (Instruction::StoreBinding(UNPATCHED)
-                        | Instruction::StoreBindingKeep(UNPATCHED)),
+                        Instruction::StoreBinding(binding @ UNPATCHED)
+                        | Instruction::StoreBindingKeep(binding @ UNPATCHED),
                     ),
                 ) => {
-                    *op = if matches!(op, Instruction::StoreBindingKeep(_)) {
-                        Instruction::StoreBindingKeep(slot)
-                    } else {
-                        resolved
-                    };
+                    *binding = slot;
                     if let Some(load) = write.load {
                         let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
                             self.instructions.get_mut(load)
@@ -2388,12 +2440,18 @@ impl Parser<'_> {
                 span,
                 after_line_break,
             } = token;
+            // The mandatory statement-test parentheses are delimiters, not an
+            // expression group. A nested '(' can introduce a write there.
+            let group_start = after_open && !(statement_test && self.pending.len() == 1);
             match (needs_operand, kind) {
+                (true, TokenKind::Update(op)) if group_start => {
+                    let name = self.parse_update_target(span)?;
+                    self.lexer.charge(1, name)?;
+                    self.finish_group_update(name, span, op, UpdateResult::New)?;
+                    needs_operand = false;
+                }
                 (_, TokenKind::Update(_)) => {
-                    return Err(Error::unsupported(
-                        span,
-                        "increment and decrement expressions are outside the subset",
-                    ));
+                    return Err(Error::unsupported(span, GROUPED_UPDATE_REQUIRED));
                 }
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
@@ -2461,26 +2519,35 @@ impl Parser<'_> {
                     needs_operand = false;
                 }
                 (true, TokenKind::Identifier) => {
-                    // The mandatory statement-test parentheses are delimiters, not
-                    // an expression group. A nested '(' can introduce a write there.
-                    let group_start = after_open && !(statement_test && self.pending.len() == 1);
                     if group_start {
-                        // Charge for the load or the assignment marker before
-                        // looking ahead, preserving the old read's work order.
+                        // Charge for the load, assignment marker or update
+                        // before looking ahead, preserving the old read's work order.
                         self.lexer.charge(1, span)?;
-                        let following = self.next_token()?;
-                        if let Some(Token {
-                            kind: TokenKind::Assignment(op),
-                            span: operator,
-                            ..
-                        }) = following
-                        {
-                            self.begin_group_assignment(span, op, operator)?;
-                            after_open = false;
-                            next = self.next_token()?;
-                            continue;
+                        match self.next_token()? {
+                            Some(Token {
+                                kind: TokenKind::Assignment(op),
+                                span: operator,
+                                ..
+                            }) => {
+                                self.begin_group_assignment(span, op, operator)?;
+                                after_open = false;
+                                next = self.next_token()?;
+                                continue;
+                            }
+                            Some(Token {
+                                kind: TokenKind::Update(op),
+                                span: operator,
+                                after_line_break,
+                            }) => {
+                                check_postfix_line_break(operator, after_line_break)?;
+                                self.finish_group_update(span, operator, op, UpdateResult::Old)?;
+                                needs_operand = false;
+                                after_open = false;
+                                next = self.next_token()?;
+                                continue;
+                            }
+                            following => self.lookahead = Some(following),
                         }
-                        self.lookahead = Some(following);
                     }
                     self.record_access(span, None)?;
                     let load = Instruction::LoadBinding(UNPATCHED);
@@ -2881,7 +2948,8 @@ impl Parser<'_> {
             | Instruction::Boolean(_)
             | Instruction::Null
             | Instruction::Undefined
-            | Instruction::LoadBinding(_) => (0, 1),
+            | Instruction::LoadBinding(_)
+            | Instruction::UpdateBinding { .. } => (0, 1),
             Instruction::JumpIfFalseStatement(_) | Instruction::ShortCircuitStatement { .. }
                 if self.stack_depth != 1 =>
             {

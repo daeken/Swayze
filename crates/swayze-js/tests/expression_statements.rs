@@ -100,7 +100,7 @@ fn statement_expressions_do_not_enable_other_syntax() {
             "increment and decrement expressions",
         ),
         (
-            "let x=1; {(x@++);} x",
+            "let x=1; {(x@++ + 1);} x",
             2,
             "increment and decrement expressions",
         ),

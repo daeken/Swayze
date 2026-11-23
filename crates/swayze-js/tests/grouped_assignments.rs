@@ -434,11 +434,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             Unsupported,
             "sequence in an assignment RHS",
         ),
-        (
-            "let x;(@--@x)",
-            Unsupported,
-            "increment and decrement expressions",
-        ),
         ("let x,y;(x+=y@*=@2)", Unsupported, "assignment expressions"),
         (
             "let x;false && (0,x@>>>=@1)",
@@ -475,11 +470,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             "let x;true || (x**=1@@",
             Malformed,
             "expected a closing parenthesis",
-        ),
-        (
-            "let x;(x@++@)",
-            Unsupported,
-            "increment and decrement expressions",
         ),
         ("let x,y;(x=y@=@42)", Unsupported, "assignment expressions"),
         ("let x;(0,x@=@42)", Unsupported, "assignment expressions"),

@@ -78,7 +78,9 @@ report breaks selections down by `adapted`/`raw` and `required`/`frontier`. It
 fails on malformed path rows, duplicate paths, or membership in fixtures,
 unknowns, or paths missing from the pin. It does not validate assertion spans
 or predict runner eligibility. Even for a narrow prefix, it reconciles the
-whole committed manifest before reporting that subtree's counts.
+whole committed manifest before reporting that subtree's counts. On a manifest
+error, the tree inventory and requested audit are still shown, all selection
+counts are withheld, and the tool exits 2.
 
 At `6aeb41f` the manifest selects 15 paths (11 required adapted, three adapted
 frontier, one raw frontier); 53,787 standalone paths are not selected. The

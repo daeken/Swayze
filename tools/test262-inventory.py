@@ -116,7 +116,7 @@ def manifest_paths(text, paths):
     return selected
 
 
-def load(root):
+def load_inventory(root):
     commit = git(root, 'rev-parse', '--verify', 'HEAD').strip().decode('ascii')
     entries = list(tree_entries(git(root, 'ls-tree', '-z', commit, '--', SUBMODULE)))
     if len(entries) != 1 or entries[0][:2] != ('160000', 'commit'):
@@ -128,8 +128,12 @@ def load(root):
     paths = inventory(git(repo, 'ls-tree', '-rz', pin, '--', 'test/',
                           max_bytes=TREE_OUTPUT_LIMIT),
                       REVIEWED_TESTS.get(pin, set()))
+    return commit, pin, paths
+
+
+def load_manifest(root, commit, paths):
     manifest = git(root, 'cat-file', 'blob', f'{commit}:{MANIFEST}').decode('utf-8')
-    return commit, pin, paths, manifest_paths(manifest, paths)
+    return manifest_paths(manifest, paths)
 
 
 def summarize(paths, selected, prefix):
@@ -157,29 +161,33 @@ def test_count(counts):
 
 
 def report(paths, selected, prefix, audit):
-    counts, selections, groups = summarize(paths, selected, prefix)
+    counts, selections, groups = summarize(paths, selected or {}, prefix)
     tests = test_count(counts)
-    chosen = sum(selections.values())
     yield f'Directory: {ascii(prefix)}'
     yield (f'Inventory: {sum(counts.values())} tree entries, {tests} standalone test paths '
            f'({counts["js-test"]} .js, {counts["reviewed-test"]} reviewed filename exceptions)')
     yield (f'Other entries: {counts["js-fixture"] + counts["other-fixture"]} fixtures '
            f'({counts["js-fixture"]} .js, {counts["other-fixture"]} other), '
            f'{counts["unknown"]} unknown')
-    yield f'Manifest: {chosen} selected test paths, {tests - chosen} not selected (not runtime outcomes)'
-    for mode in MODES:
-        required, frontier = (selections[role, mode] for role in ROLES)
-        yield f'  {mode}: {required + frontier} selected ({required} required, {frontier} frontier)'
+    if selected is None:
+        yield 'Manifest: unavailable; selection counts withheld'
+    else:
+        chosen = sum(selections.values())
+        yield f'Manifest: {chosen} selected test paths, {tests - chosen} not selected (not runtime outcomes)'
+        for mode in MODES:
+            required, frontier = (selections[role, mode] for role in ROLES)
+            yield f'  {mode}: {required + frontier} selected ({required} required, {frontier} frontier)'
 
     yield 'Next-level groups (largest by test-path count; use --prefix to drill down):'
-    yield '  tests  selected  not-selected  fixtures  unknown  group'
+    columns = '  selected  not-selected' if selected is not None else ''
+    yield f'  tests{columns}  fixtures  unknown  group'
     ranked = sorted(groups.items(), key=lambda pair: (-test_count(pair[1]), pair[0]))
 
     def row(name, group):
         tests = test_count(group)
         fixtures = group['js-fixture'] + group['other-fixture']
-        return (f'{tests:7}  {group["selected"]:8}  {tests - group["selected"]:12}  '
-                f'{fixtures:8}  {group["unknown"]:7}  {name}')
+        columns = '' if selected is None else f'  {group["selected"]:8}  {tests - group["selected"]:12}'
+        return f'{tests:7}{columns}  {fixtures:8}  {group["unknown"]:7}  {name}'
 
     for name, group in ranked[:GROUP_LIMIT]:
         yield row(ascii(name) if name else '(direct files)', group)
@@ -222,6 +230,11 @@ def self_test():
     assert '3 standalone test paths (2 .js, 1 reviewed filename exceptions)' in output
     assert '1 selected test paths, 2 not selected (not runtime outcomes)' in output
     assert "'test/a/odd\\t\\n\\udcff.txt'" in output and 'test/a2/' not in output
+    unavailable = '\n'.join(report(paths, None, 'test/a', True))
+    assert 'Manifest: unavailable; selection counts withheld' in unavailable
+    assert 'unknown: \'test/a/link.js\'' in unavailable
+    assert 'js-fixture: \'test/a/dep_FIXTURE-extra.js\'' in unavailable
+    assert 'selected' not in unavailable
     many = {f'test/{i:02}/case.js': 'js-test' for i in range(GROUP_LIMIT + 2)}
     rows = list(report(many, {}, 'test', False))
     assert rows[-1].endswith('(2 other groups combined)')
@@ -268,14 +281,24 @@ def main():
     parts = prefix.split('/')
     if parts[0] != 'test' or any(part in ('', '.', '..') for part in parts):
         parser.error('--prefix must be a directory under test/')
+    root = Path(__file__).resolve().parent.parent
+    manifest_error = None
     try:
-        commit, pin, paths, selected = load(Path(__file__).resolve().parent.parent)
+        commit, pin, paths = load_inventory(root)
+        try:
+            selected = load_manifest(root, commit, paths)
+        except (ValueError, OSError) as exc:
+            selected = None
+            manifest_error = exc
         lines = list(report(paths, selected, prefix, args.audit))
     except (ValueError, OSError) as exc:
         print(f'Test262 inventory: {exc}', file=sys.stderr)
         return 2
     print(f'Test262 pin: {pin}\nSuperproject commit: {commit}')
     print('\n'.join(lines))
+    if manifest_error is not None:
+        print(f'Test262 inventory: {manifest_error}', file=sys.stderr)
+        return 2
     if 'unknown' in paths.values():
         print('Test262 inventory: unclassified pinned paths; audit with --audit', file=sys.stderr)
         return 1

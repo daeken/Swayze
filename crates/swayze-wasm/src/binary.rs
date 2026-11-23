@@ -269,9 +269,9 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// A `br` or `br_if` depth that does not name a block, loop, or the function
-/// label is reported as [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`]
-/// at the start of the immediate. This includes depths naming an `if`.
+/// A `br` or `br_if` depth that does not name an enclosing label (including the
+/// implicit function label) is reported as [`ErrorKind::InvalidIndex`] with
+/// [`IntegerField::LabelIndex`] at the start of the immediate.
 /// Oversized memory counts or page bounds are reported as
 /// [`ErrorKind::UnsupportedCount`], and a reversed pair as
 /// [`ErrorKind::InvalidMemoryLimits`] at the start of the maximum field.
@@ -686,7 +686,7 @@ enum Instruction {
 
 #[derive(Clone, Copy, Debug)]
 enum BranchTarget {
-    Block { pc: usize, result: ResultArity },
+    End { pc: usize, result: ResultArity },
     Loop(LoopTarget),
     Function,
 }
@@ -962,7 +962,7 @@ pub(super) fn execute(
             } => {
                 if !conditional || frame.pop() != 0 {
                     let (pc, result) = match target {
-                        BranchTarget::Block { pc, result } => (pc, result),
+                        BranchTarget::End { pc, result } => (pc, result),
                         BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
                         BranchTarget::Function => (code.instructions.len(), ResultArity::I32),
                     };
@@ -1001,6 +1001,7 @@ struct ControlFrame {
     base: usize,
     result: ResultArity,
     kind: ControlKind,
+    last_branch: Option<usize>,
     unreachable: bool,
 }
 
@@ -1009,6 +1010,7 @@ impl ControlFrame {
         base: 0,
         result: ResultArity::I32,
         kind: ControlKind::Function,
+        last_branch: None,
         unreachable: false,
     };
 
@@ -1033,7 +1035,7 @@ impl ControlFrame {
 #[derive(Clone, Copy)]
 enum ControlKind {
     Function,
-    Block { last_branch: Option<usize> },
+    Block,
     Loop { body_pc: usize },
     Then { if_pc: usize },
     Else { else_pc: usize },
@@ -1228,8 +1230,8 @@ fn validate_body(
     })?;
     let local_bound = parameter_count + validate_locals(&mut body)?;
     // Forward transfers reserve slots that their matching delimiters backpatch.
-    // Each target block chains its incoming branches by PC, even from nested
-    // frames; each link is visited once.
+    // Each block or if chains its incoming branches by PC, even from nested
+    // frames; each link is visited once, at the target's end.
     // A loop branch is resolved immediately to the PC saved at entry.
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
     let mut previous_branch = [None; Limit::BodyInstructions.maximum()];
@@ -1245,6 +1247,7 @@ fn validate_body(
             base,
             result,
             kind,
+            mut last_branch,
             unreachable,
         } = frame;
         let available = depth - base;
@@ -1268,20 +1271,7 @@ fn validate_body(
             // Forward edges target the next decoded slot, possibly the final
             // one-past-last index. All sources are in the decoded prefix.
             match kind {
-                ControlKind::Loop { .. } => {}
-                ControlKind::Block { mut last_branch } => {
-                    while let Some(pc) = last_branch {
-                        let Instruction::Branch {
-                            target: BranchTarget::Block { pc: target_pc, .. },
-                            ..
-                        } = &mut decoded[..count][pc]
-                        else {
-                            unreachable!("block fixups link only incoming branches");
-                        };
-                        *target_pc = count;
-                        last_branch = previous_branch[pc];
-                    }
-                }
+                ControlKind::Block | ControlKind::Loop { .. } => {}
                 ControlKind::Else { else_pc } => {
                     decoded[..count][else_pc] = Instruction::Jump { target: count };
                 }
@@ -1293,6 +1283,17 @@ fn validate_body(
                     // The implicit empty else skips straight to the join.
                     decoded[..count][if_pc] = Instruction::JumpIfZero { target: count };
                 }
+            }
+            while let Some(pc) = last_branch {
+                let Instruction::Branch {
+                    target: BranchTarget::End { pc: target_pc, .. },
+                    ..
+                } = &mut decoded[..count][pc]
+                else {
+                    unreachable!("end fixups link only incoming branches");
+                };
+                *target_pc = count;
+                last_branch = previous_branch[pc];
             }
             nesting -= 1;
             continue;
@@ -1336,7 +1337,7 @@ fn validate_body(
                     },
                 })?;
                 let kind = match opcode {
-                    BLOCK => ControlKind::Block { last_branch: None },
+                    BLOCK => ControlKind::Block,
                     LOOP => ControlKind::Loop { body_pc: pc },
                     IF => {
                         depth = consume(1)?;
@@ -1348,6 +1349,7 @@ fn validate_body(
                     base: depth,
                     result,
                     kind,
+                    last_branch: None,
                     unreachable: false,
                 };
                 nesting += 1;
@@ -1362,6 +1364,7 @@ fn validate_body(
                 frame.check_result_depth(available, offset)?;
                 // Skip the then arm and its else jump on a zero condition.
                 decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
+                // The arms share a label: keep its branch chain until end.
                 frames[nesting].kind = ControlKind::Else { else_pc: pc };
                 frames[nesting].unreachable = false;
                 depth = base;
@@ -1369,36 +1372,26 @@ fn validate_body(
             BR | BR_IF | RETURN => {
                 // The function is at depth `nesting`, outside every explicit
                 // frame. Only branches have a label immediate.
-                let label_offset = body.position();
                 let label = if opcode == RETURN {
                     nesting as u32
                 } else {
                     body.index(IntegerField::LabelIndex, (nesting + 1) as u32)?
                 };
                 let target = &mut frames[nesting - label as usize];
-                let destination = match &mut target.kind {
-                    ControlKind::Block { last_branch } => {
-                        previous_branch[pc] = *last_branch;
-                        *last_branch = Some(pc);
-                        // The block's end backpatches the forward PC.
-                        BranchTarget::Block {
+                let destination = match target.kind {
+                    ControlKind::Block | ControlKind::Then { .. } | ControlKind::Else { .. } => {
+                        previous_branch[pc] = target.last_branch;
+                        target.last_branch = Some(pc);
+                        // The target's end backpatches the forward PC.
+                        BranchTarget::End {
                             pc: 0,
                             result: target.result,
                         }
                     }
                     ControlKind::Loop { body_pc } => {
-                        BranchTarget::Loop(LoopTarget::at_branch(*body_pc, pc))
+                        BranchTarget::Loop(LoopTarget::at_branch(body_pc, pc))
                     }
                     ControlKind::Function => BranchTarget::Function,
-                    ControlKind::Then { .. } | ControlKind::Else { .. } => {
-                        return Err(Error {
-                            offset: label_offset,
-                            kind: ErrorKind::InvalidIndex {
-                                field: IntegerField::LabelIndex,
-                                index: label,
-                            },
-                        });
-                    }
                 };
                 // Pop against the active floor. Only execution of the taken
                 // branch uses the target floor.

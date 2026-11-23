@@ -171,20 +171,20 @@ fn void_floors_and_fallthrough_are_checked_even_on_untaken_paths() {
 }
 
 #[test]
-fn void_if_labels_remain_unsupported() {
-    for arm in [&[][..], &[0x05]] {
-        let prefix = [&[0, 0x41, 0, 0x04, 0x40][..], arm, &[0x41, 1, 0x0d]].concat();
-        for index in [0, 2] {
-            // The if label, and one beyond the function label.
-            bad_body(
-                &[&prefix[..], &[index, 0x0b, 0x41, 42, 0x0b]].concat(),
-                prefix.len(),
-                ErrorKind::InvalidIndex {
-                    field: IntegerField::LabelIndex,
-                    index: u32::from(index),
-                },
-            );
-        }
+fn conditional_branch_in_either_void_arm_counts_the_if_label() {
+    for (condition, arm) in [(1, &[][..]), (0, &[0x05][..])] {
+        let prefix = [&[0, 0x41, condition, 0x04, 0x40][..], arm, &[0x41, 1, 0x0d]].concat();
+        let mut body = [&prefix[..], &[0, 0x00, 0x0b, 0x41, 42, 0x0b]].concat();
+        assert_body_result(&body, 42);
+        body[prefix.len()] = 2; // One beyond the function label.
+        bad_body(
+            &body,
+            prefix.len(),
+            ErrorKind::InvalidIndex {
+                field: IntegerField::LabelIndex,
+                index: 2,
+            },
+        );
     }
 }
 
@@ -195,14 +195,14 @@ fn void_constructs_share_the_inclusive_control_depth_cap() {
         let mut body = vec![0, 0x41, 42];
         let mut last_open = 0;
         for level in 0..depth {
-            let op = [0x02, 0x03, 0x04][level % 3];
+            let op = [0x04, 0x03, 0x02][level % 3];
             if op == 0x04 {
                 body.extend([0x41, 1]);
             }
             last_open = body.len();
             body.extend([op, 0x40]);
         }
-        body.extend([0x41, 1, 0x0d, (depth - 1) as u8]); // Exit the outermost block.
+        body.extend([0x41, 1, 0x0d, (depth - 1) as u8]); // Exit the outermost if.
         body.extend(std::iter::repeat_n(0x0b, depth + 1));
         (body, last_open)
     };
@@ -226,7 +226,7 @@ fn void_control_respects_inclusive_decoded_instruction_and_body_byte_caps() {
 
     let limit = Limit::CodeBodyBytes;
     let ops = [
-        0x41, 42, 0x02, 0x40, 0x41, 1, 0x04, 0x40, 0x41, 1, 0x0d, 0x81, 0x80, 0, 0x0b, 0x0b, 0x0b,
+        0x41, 42, 0x02, 0x40, 0x41, 1, 0x04, 0x40, 0x41, 1, 0x0d, 0x80, 0x80, 0, 0x0b, 0x0b, 0x0b,
     ];
     let groups = (limit.maximum() - 1 - ops.len()) / 2;
     let mut body = vec![u8::try_from(groups).unwrap()];

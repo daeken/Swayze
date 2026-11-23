@@ -31,11 +31,11 @@
 //! an i32-result `if` requires it. `loop` accepts only `0x40`.
 //! `br` and `br_if` take an unsigned LEB32 label depth: zero names the innermost
 //! frame, and each enclosing frame, including `if`, adds one to the depth. A
-//! branch may cross any of these frames and target a `block`, a `loop`, or the
-//! implicit function label (depth equal to the number of open explicit frames).
-//! `return` has no immediate and always targets the function label. Branches to
-//! `if`, other block types, typed `select`, `br_table`, and indirect calls are
-//! unsupported.
+//! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
+//! or the implicit function label (depth equal to the number of open explicit
+//! frames). Both arms of an `if` share one label. `return` has no immediate and
+//! always targets the function label. Other block types, typed `select`,
+//! `br_table`, and indirect calls are unsupported.
 //!
 //! If present, the memory section follows any function section and precedes
 //! any global, export, and code sections. It may be empty (a zero-length vector) or
@@ -109,12 +109,13 @@
 //! a reachable else arm at the same floor. `end` checks the final result, then
 //! leaves the declared result on the parent's stack (none for void) without
 //! changing the parent's reachability flag.
-//! A transfer to an i32-result block or the function requires an i32 result;
-//! `br_if` also pops an i32 condition above any result. Validation checks these
-//! pops against the active floor, even for an outer target. Only `br_if` restores
-//! the result for fallthrough, and execution with a zero condition pops only the
-//! condition and continues. A taken block branch truncates to the target block's
-//! floor, keeps the result if required, and resumes after that block's `end`.
+//! A transfer to an i32-result `block`, i32-result `if`, or the function requires
+//! an i32 result; `br_if` also pops an i32 condition above any result. Validation
+//! checks these pops against the active floor, even for an outer target. Only
+//! `br_if` restores the result for fallthrough, and execution with a zero
+//! condition pops only the condition and continues. A taken branch to a `block`
+//! or `if` truncates to the target's floor, keeps the result if required, and
+//! resumes after the target's `end`.
 //! A taken loop branch truncates to the target loop's floor and resumes at its
 //! body start. Both preserve the target's operand prefix and locals. A function
 //! exit discards all callee operands except the result and completes the call.
@@ -150,14 +151,14 @@
 //! in Rust. Zero selects the else arm (or skips straight to the join if no
 //! `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames with explicit result arities.
-//! Each target block keeps a linked chain of incoming branch slots in fixed
-//! scratch storage. Validation backpatches `if` and `block` targets at matching
-//! delimiters to strictly later decoded instruction indices or the one-past-last
-//! index in the same body. Loop continues have a separate target at or before
-//! the branch, resolved from the target loop's saved body start. Each decoded
-//! transfer stores its target's operand floor; a block exit also carries the
-//! block's result arity. `return` and branches to the function label share an
-//! exit target at the one-past-last instruction index.
+//! Each `block` and `if` label keeps a linked chain of incoming branch slots in
+//! fixed scratch storage, patched once at `end`. The chain survives `else` and
+//! is distinct from the jumps that skip untaken `if` arms. These forward edges
+//! target strictly later decoded instruction indices or the one-past-last index
+//! in the same body. Loop continues target the loop's saved body start at or
+//! before the branch. Each branch stores its target's operand floor; a `block`
+//! or `if` exit also carries the target's result arity. `return` and branches to
+//! the function label share an exit target at the one-past-last instruction index.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
@@ -256,7 +257,7 @@
 //! control, instruction and operand bounds.
 //! Block and branch tests cover taken exits across mixed frame kinds, separate
 //! fixup chains for inner and outer blocks, stack truncation versus fallthrough,
-//! skipped traps and rejected skipped syntax, padded depths, unsupported labels,
+//! skipped traps and rejected skipped syntax, padded and out-of-range depths,
 //! delimiter errors, and exact body and execution budgets.
 //! Loop tests cover outer continues across mixed frame kinds, preserved locals
 //! and stack prefixes, different taken and fallthrough stack effects, full body
@@ -278,6 +279,9 @@
 //! i32 exits across frame kinds, active-floor operand checks and polymorphic
 //! dead tails, shared label diagnostics and instruction caps, and loop back
 //! edges followed by an exit on the last allowed dispatch.
+//! If-label tests cover shared fixups from both arms, exits across intervening
+//! frames, omitted `else`, operand floors and reachability in dead tails, and
+//! exact admission and dispatch limits.
 //! Function-exit tests cover implicit label depths through mixed control, result
 //! preservation on conditional fallthrough, active-floor and dead-tail checks,
 //! caller resumption, and exact decoded-instruction, dispatch, and call limits.

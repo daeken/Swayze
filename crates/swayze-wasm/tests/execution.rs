@@ -11,6 +11,8 @@ mod branch;
 mod function_exit;
 #[path = "execution/globals.rs"]
 mod globals;
+#[path = "execution/if_branch.rs"]
+mod if_branch;
 #[path = "execution/memory.rs"]
 mod memory;
 #[path = "execution/stack.rs"]
@@ -1837,7 +1839,7 @@ fn validates_block_type_and_delimiters_at_the_body_boundary() {
 }
 
 #[test]
-fn validates_branch_label_leb_and_rejects_unsupported_destinations() {
+fn validates_branch_label_leb_and_rejects_out_of_range_depths() {
     for opcode in [0x0c, 0x0d] {
         check_branch_label_errors(opcode);
     }
@@ -1875,32 +1877,21 @@ fn check_branch_label_errors(opcode: u8) {
         let body = [&prefix[..], &[0x80]].concat();
         bad_body(&body, body.len(), ErrorKind::TruncatedInteger { field });
     }
-    for prefix in [
-        &[0, 0x41, 1, 0x04, 0x7f][..],                        // Then label.
-        &[0, 0x03, 0x40, 0x41, 1, 0x04, 0x7f],                // Then label, even inside a loop.
-        &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05], // Else label, even inside a block.
+    for (prefix, index) in [
+        (&[0, 0x41, 1, 0x04, 0x7f][..], 2),
+        (&[0, 0x03, 0x40, 0x41, 1, 0x04, 0x7f], 3),
+        (&[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05], 3),
     ] {
         let branch = [prefix, &[opcode]].concat();
         bad_body(
-            &[&branch[..], &[0, 0x0b]].concat(),
+            &[&branch[..], &[index, 0x0b]].concat(),
             branch.len(),
-            ErrorKind::InvalidIndex { field, index: 0 },
+            ErrorKind::InvalidIndex {
+                field,
+                index: u32::from(index),
+            },
         );
         bad_body(&branch, branch.len(), ErrorKind::TruncatedInteger { field });
-    }
-    // An enclosing if still occupies a depth and may not be the target.
-    for arm in [&[][..], &[0x41, 7, 0x05]] {
-        let branch = [
-            &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f][..],
-            arm,
-            &[0x03, 0x40, opcode],
-        ]
-        .concat();
-        bad_body(
-            &[&branch[..], &[1, 0x0b, 0x0b, 0x0b, 0x0b]].concat(),
-            branch.len(),
-            ErrorKind::InvalidIndex { field, index: 1 },
-        );
     }
 }
 

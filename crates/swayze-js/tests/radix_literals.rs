@@ -35,6 +35,14 @@ fn bases_prefixes_and_lexical_boundaries() {
         ("0B0", 0.0),
         ("0x1e+0x2", 32.0), // e is a hex digit, not an exponent marker.
         ("0xB-0xE", -3.0),
+        ("0b0_1_0", 2.0),
+        ("0B1_1", 3.0),
+        ("0o0_1_7", 15.0),
+        ("0O7_1_0", 456.0),
+        ("0x0_a_B", 171.0),
+        ("0Xf_F", 255.0),
+        ("0x1_e+0x2", 32.0),
+        ("-0O0_0", -0.0),
         ("\u{FEFF}0b10/*🦀*/+0O7\u{2028}+0x10;", 25.0),
     ] {
         assert_number(source, expected);
@@ -55,6 +63,21 @@ fn missing_digits_invalid_digits_and_unsupported_suffixes_have_exact_spans() {
         ("0b102", 4, 5),
         ("\u{FEFF}0o708", 7, 8),
         ("0b1\u{00A0}2", 5, 6),
+        ("0x_1", 2, 3),
+        ("0b_1", 2, 3),
+        ("0o_1", 2, 3),
+        ("0B1__0", 3, 4),
+        ("0O7_", 3, 4),
+        ("0xA__f", 3, 4),
+        ("0b1_2", 3, 4),
+        ("0o1_8", 3, 4),
+        ("0xf_G", 3, 4),
+        ("0x0_.1", 3, 4),
+        ("0b0_/*no join*/1", 3, 4),
+        ("0o1_\u{00A0}2", 3, 4),
+        ("0xA_Ｆ", 3, 4),
+        ("0b1_02", 5, 6),
+        ("0o7_08", 5, 6),
     ] {
         assert_error(source, Malformed, start, end);
     }
@@ -63,9 +86,13 @@ fn missing_digits_invalid_digits_and_unsupported_suffixes_have_exact_spans() {
         ("0B10n", 4, 5),
         ("0O777n", 5, 6),
         ("0xdeadbeefz", 10, 11),
-        ("0x_1", 2, 3),
-        ("0b0_1", 3, 4),
-        ("0O7_", 3, 4),
+        ("0b1_0n", 5, 6),
+        ("0o7_0n", 5, 6),
+        ("0xE_Fn", 5, 6),
+        ("0xA_Btail", 5, 6),
+        ("0xA_B.1", 5, 6),
+        ("0b1_0e+2", 5, 6),
+        ("\u{FEFF}0b1_0🔑", 8, 12),
         ("0b1e+2", 3, 4),
         ("0x1.5", 3, 4),
         ("0b1$tail", 3, 4),
@@ -80,6 +107,18 @@ fn missing_digits_invalid_digits_and_unsupported_suffixes_have_exact_spans() {
     ] {
         assert_error(source, Unsupported, start, end);
     }
+}
+
+fn separate_radix_digits(source: &str) -> String {
+    let (prefix, digits) = source.split_at(2);
+    let mut separated = prefix.to_owned();
+    for (i, digit) in digits.chars().enumerate() {
+        if i != 0 {
+            separated.push('_');
+        }
+        separated.push(digit);
+    }
+    separated
 }
 
 #[test]
@@ -101,6 +140,7 @@ fn rounds_once_around_two_to_the_53rd() {
             format!("0b{integer:b}"),
         ] {
             assert_number(&source, rounded as f64);
+            assert_number(&separate_radix_digits(&source), rounded as f64);
         }
     }
 }
@@ -114,6 +154,7 @@ fn assert_binary_in_all_bases(bits: &str, expected: f64) {
             source.push(char::from_digit(digit, 16).unwrap());
         }
         assert_number(&source, expected);
+        assert_number(&separate_radix_digits(&source), expected);
     }
 }
 
@@ -156,18 +197,26 @@ fn rounds_at_the_overflow_midpoint() {
 
 #[test]
 fn exact_byte_work_and_token_limits() {
-    let source = "\u{00A0}0x1";
+    let source = "\u{00A0}0x1_0";
     let limits = Limits {
         max_tokens: 1,
-        max_source_bytes: 5,
-        max_work: 6, // Five UTF-8 bytes and one emitted instruction.
+        max_source_bytes: 7,
+        max_work: 8, // Seven UTF-8 bytes and one emitted instruction.
         ..Limits::default()
     };
     assert_eq!(
         parse_script_with_limits(source, limits).unwrap().evaluate(),
-        Ok(1.0)
+        Ok(16.0)
     );
-    for (work, start, end) in [(1, 0, 2), (2, 2, 3), (3, 3, 4), (4, 4, 5), (5, 2, 5)] {
+    for (work, start, end) in [
+        (1, 0, 2),
+        (2, 2, 3),
+        (3, 3, 4),
+        (4, 4, 5),
+        (5, 5, 6),
+        (6, 6, 7),
+        (7, 2, 7),
+    ] {
         assert_limit(
             source,
             Limits {
@@ -224,7 +273,7 @@ fn exact_byte_work_and_token_limits() {
 #[test]
 fn long_literals_are_bounded_by_source_and_work_not_the_decimal_cap() {
     let bytes = Limits::default().max_source_bytes;
-    let at_cap = format!("0x{}1", "0".repeat(bytes - 3));
+    let at_cap = format!("0x0{}1", "_0".repeat((bytes - 4) / 2));
     let limits = Limits {
         max_work: bytes + 1,
         ..Limits::default()
@@ -269,4 +318,39 @@ fn long_literals_are_bounded_by_source_and_work_not_the_decimal_cap() {
         end - 1,
         end,
     );
+}
+
+#[test]
+fn separated_overflow_rejects_invalid_tails_in_all_bases() {
+    for (prefix, digit, digit_count, out_of_base) in [
+        ("0b", '1', 1025, '2'),
+        ("0o", '7', 342, '8'),
+        ("0x", 'f', 257, 'g'),
+    ] {
+        let overflow = separate_radix_digits(&format!(
+            "{prefix}{}",
+            digit.to_string().repeat(digit_count)
+        ));
+        let end = overflow.len();
+        assert_number(&overflow, f64::INFINITY);
+        assert_error(&format!("{overflow}_"), ErrorKind::Malformed, end, end + 1);
+        assert_error(
+            &format!("{overflow}_{out_of_base}"),
+            ErrorKind::Malformed,
+            end,
+            end + 1,
+        );
+        assert_error(
+            &format!("{overflow}n"),
+            ErrorKind::Unsupported,
+            end,
+            end + 1,
+        );
+        assert_error(
+            &format!("{overflow}é"),
+            ErrorKind::Unsupported,
+            end,
+            end + 2,
+        );
+    }
 }

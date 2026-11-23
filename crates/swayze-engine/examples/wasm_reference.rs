@@ -751,6 +751,40 @@ fn fixtures() -> Vec<Fixture> {
         cases.push(Fixture::new(expected, &[condition], &if_expression));
         cases.push(Fixture::new(expected, &[condition], &block_expression));
     }
+    // All addresses are i32. Compare the full stored value, not just its low word.
+    let mut round_trip = vec![0x20, 0];
+    round_trip.extend(wide);
+    round_trip.extend([0x37, 3, 0, 0x20, 0, 0x29, 3, 0]);
+    round_trip.extend(wide);
+    round_trip.push(0x51);
+    for (address, expected) in [
+        (1, Ok(1)),
+        (65528, Ok(1)),
+        (65529, Err(WasmTrap::MemoryOutOfBounds)),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(expected),
+            bytes: singleton_module(1, &[0], &round_trip, Some(1)),
+            export: EXPORT,
+            args: vec![address],
+        });
+    }
+    // store32 of -1: signed and unsigned loads return different i64 values.
+    for (op, expected) in [(0x34, 1), (0x35, 0)] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(expected)),
+            bytes: singleton_module(
+                0,
+                &[0],
+                &[
+                    0x41, 1, 0x42, 0x7f, 0x3e, 2, 0, 0x41, 1, op, 2, 0, 0x42, 0x7f, 0x51,
+                ],
+                Some(1),
+            ),
+            export: EXPORT,
+            args: vec![],
+        });
+    }
     cases
 }
 

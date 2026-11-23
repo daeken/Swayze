@@ -4,6 +4,8 @@ use super::*;
 mod data;
 #[path = "memory_grow.rs"]
 mod grow;
+#[path = "i64_memory.rs"]
+mod i64_memory;
 
 const PAGE: i32 = 64 * 1024;
 const ONE_PAGE: &[u8] = &[1, 0, 1];
@@ -233,7 +235,7 @@ fn rejects_memory_exports_and_other_memory_features() {
         }
         expect_error(&bytes, id_offset, ErrorKind::UnsupportedSection { id });
     }
-    for opcode in [0x29, 0x30, 0x37, 0x3c, 0xfc] {
+    for opcode in [0x2a, 0x2b, 0x38, 0x39, 0xfc] {
         bad_memory_body(
             ONE_PAGE,
             &[0, 0x41, 0, opcode, 0, 0x0b],
@@ -256,10 +258,34 @@ fn checks_memory_presence_and_framed_memarg_immediates() {
         (LOAD16_S, 1),
         (LOAD16_U, 1),
         (STORE16, 1),
-    ] {
+    ]
+    .into_iter()
+    .chain(i64_memory::ops().map(|(opcode, natural, _)| (opcode, natural)))
+    {
         let body = [0, 0x41, 0, 0x41, 0, opcode, 0, 0, 0x0b];
         bad_body(&body, 5, ErrorKind::MissingMemory);
         bad_memory_body(&[0], &body, 5, ErrorKind::MissingMemory);
+        let dead = [0, 0x00, opcode, natural, 0x80];
+        bad_body(
+            &dead[..4],
+            4,
+            ErrorKind::TruncatedInteger {
+                field: MemoryOffset,
+            },
+        );
+        bad_memory_body(
+            ONE_PAGE,
+            &dead,
+            5,
+            ErrorKind::TruncatedInteger {
+                field: MemoryOffset,
+            },
+        );
+        bad_body(
+            &[0, 0x00, opcode, natural, 0, 0x0b],
+            2,
+            ErrorKind::MissingMemory,
+        );
 
         for (prefix, field) in [(&body[..6], MemoryAlignment), (&body[..7], MemoryOffset)] {
             let mut truncated = prefix.to_vec();

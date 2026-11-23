@@ -2781,7 +2781,7 @@ fn respects_section_and_body_boundaries_and_rejects_leftover_bytes() {
 fn rejects_invalid_suffixes_even_after_a_complete_valid_function() {
     let complete = module(&SECTIONS);
     for (id, kind) in [
-        (2, ErrorKind::UnsupportedSection { id: 2 }),
+        (2, ErrorKind::SectionOutOfOrder { id: 2 }),
         (8, ErrorKind::SectionOutOfOrder { id: 8 }),
     ] {
         let mut bytes = complete.clone();

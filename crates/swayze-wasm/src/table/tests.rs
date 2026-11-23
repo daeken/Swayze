@@ -383,10 +383,16 @@ fn rejects_post_mvp_segment_forms_and_wrong_offset_expressions() {
 #[test]
 fn rejects_table_import_and_unsupported_instructions() {
     let mut import = bytes(&[]);
-    let position = import.len();
-    push_section(&mut import, 2, &[1, 1, b'm', 1, b't', 1, 0x70, 0, 1]);
+    let count = push_section(&mut import, 2, &[1, 1, b'm', 1, b't', 1, 0x70, 0, 1]);
     push_section(&mut import, TABLE, TABLE_16);
-    expect_error(&import, position, ErrorKind::UnsupportedSection { id: 2 });
+    expect_error(
+        &import,
+        count,
+        ErrorKind::UnsupportedCount {
+            field: IntegerField::ImportCount,
+            count: 1,
+        },
+    );
 
     for opcode in [0x25, 0x26, 0xfc] {
         // table.get, table.set, table.grow prefix

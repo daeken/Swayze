@@ -72,6 +72,13 @@
 //! always void, regardless of the loop's fallthrough result. Other block types
 //! (including type indices) and typed `select` are unsupported.
 //!
+//! The optional import section (ID 2) follows any type section and precedes
+//! all other standard sections. Custom sections can appear before or after it.
+//! Its entire payload must be the unsigned LEB32 count zero, with valid padding
+//! allowed. A nonzero count is rejected before reading any import names or
+//! descriptors. No imported objects are supported, and an empty import section
+//! does not change instantiation.
+//!
 //! The optional table section (ID 4) follows any function section and precedes
 //! any memory, global, export, start, element, and code sections. It may be
 //! empty (a zero-length vector) or declare one `funcref` table, using
@@ -148,8 +155,8 @@
 //! Table, memory, and global exports do not require any functions. Both export
 //! and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
-//! names. All other standard sections (including import and data count)
-//! are rejected, even when empty.
+//! names. All other standard sections (including data count and tag) are
+//! rejected, even when empty.
 //!
 //! Parameters do not start on the operand stack. Validation starts with an empty
 //! stack and checks each stack effect: `local.get` pushes the indexed slot's

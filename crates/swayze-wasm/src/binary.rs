@@ -108,6 +108,8 @@ pub enum IntegerField {
     TypeCount,
     ParameterCount,
     ResultCount,
+    /// Number of entries in the import section's vector. Only zero is supported.
+    ImportCount,
     FunctionCount,
     ExportCount,
     TableCount,
@@ -376,6 +378,10 @@ impl std::error::Error for Error {}
 /// rejected before reading the size. Decodable sizes are checked against
 /// their limit before checking availability. Bad UTF-8 is reported at the start
 /// of the invalid or incomplete sequence.
+/// The optional import section is framed before checking order or uniqueness.
+/// A nonzero decoded import count reports [`ErrorKind::UnsupportedCount`] with
+/// [`IntegerField::ImportCount`] at the start of the count, before reading any
+/// names or descriptors. A zero count must consume the whole section payload.
 /// A local group's count that exceeds the remaining declared-local budget is
 /// reported as [`ErrorKind::UnsupportedCount`] with [`IntegerField::LocalCount`].
 /// With a function section present, a code count differing from its declaration
@@ -484,7 +490,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             section.name(LengthField::CustomNameSize)?;
             continue; // The rest of a custom section is opaque.
         }
-        if id <= last_standard && matches!(id, 1 | 3..=11) {
+        if id <= last_standard && matches!(id, 1..=11) {
             return Err(Error {
                 offset: id_offset,
                 kind: ErrorKind::SectionOutOfOrder { id },
@@ -492,6 +498,9 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         match id {
             1 => type_count = Some(validate_types(&mut section, &mut types)?),
+            2 => {
+                section.count(IntegerField::ImportCount, 0..=0)?;
+            }
             3 => {
                 let count = section.count(IntegerField::FunctionCount, 0..=MAX_FUNCTIONS)?;
                 // Without a type section, use a placeholder zero-arg type at

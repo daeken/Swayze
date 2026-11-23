@@ -84,11 +84,16 @@ fn validates_global_section_order_and_rejects_unsupported_scope() {
     push_section(&mut bytes, 5, &[1, 0, 1]);
     expect_error(&bytes, offset, ErrorKind::SectionOutOfOrder { id: 5 });
 
-    let bytes = module(&[(2, b"\x01\x01m\x01g\x03\x7f\0"), (6, IMMUTABLE)]);
+    let mut bytes = HEADER.to_vec();
+    let count = push_section(&mut bytes, 2, b"\x01\x01m\x01g\x03\x7f\0");
+    push_section(&mut bytes, 6, IMMUTABLE);
     expect_error(
         &bytes,
-        HEADER.len(),
-        ErrorKind::UnsupportedSection { id: 2 },
+        count,
+        ErrorKind::UnsupportedCount {
+            field: IntegerField::ImportCount,
+            count: 1,
+        },
     );
     let mut bytes = module(&[(5, &[1, 0, 1]), (6, IMMUTABLE)]);
     let start = push_section(&mut bytes, 11, &[1, 0, 0x23, 0, 0x0b, 0]);

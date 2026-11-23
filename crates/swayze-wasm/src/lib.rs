@@ -19,6 +19,8 @@
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
+//! `f32.convert_i32_s`, `f32.convert_i32_u`, `f32.convert_i64_s`, `f32.convert_i64_u`,
+//! `f64.convert_i32_s`, `f64.convert_i32_u`, `f64.convert_i64_s`, `f64.convert_i64_u`,
 //! `f32.demote_f64`, `f64.promote_f32`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
 //! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`, `f32.sqrt`,
@@ -165,6 +167,13 @@
 //! Both operations preserve signed zeros and infinities and map every NaN to
 //! the destination width's positive canonical quiet NaN, discarding its sign
 //! and payload.
+//! The integer-to-float conversions (`0xb2`–`0xb5` for f32 and `0xb7`–`0xba`
+//! for f64, in the order listed above) consume one `i32` or `i64`. The suffix
+//! `_s` interprets the operand as signed, and `_u` interprets its bits as an
+//! unsigned integer. Conversion rounds directly to the nearest value of the
+//! destination width, with ties to even, using only integer arithmetic. Zero
+//! produces positive zero and all results are finite. Each conversion costs
+//! one dispatch. Float-to-integer numeric conversions are unsupported.
 //! For both widths, `abs` clears the sign bit and `neg` flips it;
 //! each consumes one operand and produces one of the same type. `copysign`
 //! consumes two operands of its width, taking the magnitude bits from the first
@@ -524,6 +533,11 @@
 //! underflow, and overflow boundaries. They also cover live and dead typing
 //! and exact dispatch charging. Deterministic finite samples compared with
 //! native casts provide independent evidence, not a proof.
+//! Integer-to-float tests cover all eight opcodes, signed and unsigned bit
+//! interpretations, ties and their neighbors, carry into the exponent, and
+//! cases that would differ if rounded first to f64 and then to f32. They also
+//! check live and dead typing and one dispatch per opcode at the fuel limit.
+//! Direct Rust casts of deterministic samples supplement the fixed bit vectors.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

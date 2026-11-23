@@ -1223,6 +1223,33 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(bits as i64)],
         });
     }
+    // Integer inputs retain their exact bits until the guest conversion.
+    for (opcode, input, expected) in [
+        (0xb2, WasmValue::I32((1 << 24) + 1), 0x4b80_0000),
+        (0xb3, WasmValue::I32(-1), 0x4f80_0000),
+        (0xb4, WasmValue::I64(i64::MIN), 0xdf00_0000),
+        (0xb5, WasmValue::I64(-1), 0x5f80_0000),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::F32Invocation(Ok(expected)),
+            bytes: modules(if opcode < 0xb4 { 0x7f } else { 0x7e }, 0x7d, opcode),
+            export: "x",
+            args: vec![input],
+        });
+    }
+    for (opcode, input, expected) in [
+        (0xb7, WasmValue::I32(-1), 0xbff0_0000_0000_0000),
+        (0xb8, WasmValue::I32(-1), 0x41ef_ffff_ffe0_0000),
+        (0xb9, WasmValue::I64((1 << 53) + 3), 0x4340_0000_0000_0002),
+        (0xba, WasmValue::I64(-1), 0x43f0_0000_0000_0000),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::F64Invocation(Ok(expected)),
+            bytes: modules(if opcode < 0xb9 { 0x7f } else { 0x7e }, 0x7c, opcode),
+            export: "x",
+            args: vec![input],
+        });
+    }
     // Widening preserves the source value even for f32 subnormals.
     for bits in [1, 0x007f_ffff, 0x8000_0000, 0x7f80_0000] {
         cases.push(Fixture {

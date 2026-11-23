@@ -185,7 +185,6 @@ fn stacked_prefixes_do_not_expand_statement_or_jump_syntax() {
         ("a:b:c?1:2", Unsupported, "c"),
         ("a:b:;42", Unsupported, ";"),
         ("a:b:let x=42;x", Unsupported, "let"),
-        ("a:b:if(true){}42", Unsupported, "if"),
         ("a:b\u{e9}:{}42", Unsupported, "\u{e9}"),
         ("a:b\\u0030:{}42", Unsupported, "\\"),
         ("a:eval:{}42", Unsupported, "eval"),

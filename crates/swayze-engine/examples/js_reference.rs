@@ -353,7 +353,10 @@ fn fixtures() -> Vec<String> {
             "let n = 0; for (let i = 0; i < 3; i++) { done: { while (true) { break done; } } n += 14; continue; } n",
             "let n = 40; done: { doneInner: { break doneInner; n = 0; } n += 1; } done: { n += 1; break done; } n",
             "let n = 0; outer: again: for (let i = 0; i < 3; i++) { while (true) { n += 14; continue again; } } n",
-            "let n = 40; outer: done: { while (true) { n++; break outer; } n = 0; } done: outer: { n++; break done; } n"
+            "let n = 40; outer: done: { while (true) { n++; break outer; } n = 0; } done: outer: { n++; break done; } n",
+            "let n = 40; exit: if (true) { n += 2; break exit; n = 0; } else { n = 1; } n",
+            "let n = 40; exit: done: if (false) { n = 0; } else if (true) { while (true) { { n += 2; break done; } } } else { n = 1; } n",
+            "let n = 40; exit: if (false) {} else { n++; break exit; n = 0; } exit: if (true) { n++; break exit; } n"
         ]
         .map(str::to_owned),
     );

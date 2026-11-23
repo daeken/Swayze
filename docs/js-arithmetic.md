@@ -100,9 +100,10 @@ unsupported, even in code that would not run; it never falls back to an outer
 binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. One or more ASCII identifier labels can
-precede a standalone block or a `while`, `do`, or classic `for` loop. All
-labels on a statement share the same target. `break name;` exits that active
-block or loop; `continue name;` can target only a loop. Neither permits a line
+precede a standalone block, a braced `if` chain, or a `while`, `do`, or
+classic `for` loop. All labels on a statement share the same target, and an
+`if` label is active in every arm. `break name;` exits the whole labeled
+statement; `continue name;` can target only a loop. Neither permits a line
 terminator between the keyword and name. Labels are separate from lexical
 bindings, and active duplicates are rejected. Alias validation, target lookup,
 and name comparisons are charged to parse work; aliases add no statement frames.

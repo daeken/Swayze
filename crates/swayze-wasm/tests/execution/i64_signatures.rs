@@ -129,6 +129,8 @@ fn indirect_match_compares_each_position_and_the_result_type() {
     }
     let mut signatures: Vec<(&[u8], Option<u8>)> = vec![(&[I32], Some(I32)), (&MIXED, Some(I64))];
     signatures.extend(params.iter().map(|p| (p.as_slice(), Some(I64))));
+    let reordered = [I32, I64, I32, I64];
+    signatures.push((&reordered, Some(I64))); // Same types and arity, different order.
     signatures.push((&MIXED, Some(I32)));
     let ty = types(&signatures);
     let mut entry = vec![0];
@@ -141,18 +143,19 @@ fn indirect_match_compares_each_position_and_the_result_type() {
         TRAP_BODY,
         TRAP_BODY,
         TRAP_BODY,
+        TRAP_BODY,
     ];
     let bytes = module(&[
         (1, &ty),
-        (3, &[6, 0, 2, 3, 4, 5, 6]),
-        (4, &[1, 0x70, 0, 5]),
+        (3, &[7, 0, 2, 3, 4, 5, 6, 7]),
+        (4, &[1, 0x70, 0, 6]),
         (7, EXPORT),
-        (9, &[1, 0, 0x41, 0, 0x0b, 5, 1, 2, 3, 4, 5]),
+        (9, &[1, 0, 0x41, 0, 0x0b, 6, 1, 2, 3, 4, 5, 6]),
         (10, &code_bodies(&bodies)),
     ]);
     let validated = validate_module(&bytes).unwrap();
     let instance = validated.instantiate().unwrap();
-    for selector in 0..5 {
+    for selector in 0..6 {
         assert_eq!(
             instance.invoke_i32_with_args("answer", &[selector]),
             Err(InvokeError::Trap(Trap::IndirectCallTypeMismatch)),
@@ -298,6 +301,59 @@ fn start_remains_void_and_parameterless_and_reports_the_actual_result() {
         let at = push_section(&mut bytes, 10, &code_body(b"\0\xff\x0b")) + 3;
         expect_error(&bytes, at, ErrorKind::UnsupportedOpcode { opcode: 0xff });
     }
+}
+
+#[test]
+fn export_and_start_check_index_and_section_framing_before_signature() {
+    use ErrorKind::*;
+    const FIELD: IntegerField = IntegerField::FunctionIndex;
+    let ty = types(&[(&[], Some(I64))]);
+    let prefix = module(&[(1, &ty), (3, FUNCTION)]);
+    for (id, before_index) in [(7, &b"\x01\x01x\0"[..]), (8, &b""[..])] {
+        for (index, offset, kind) in [
+            (&b"\x80"[..], 1, TruncatedInteger { field: FIELD }),
+            (b"\x80\x80\x80\x80\x10", 4, IntegerOverflow { field: FIELD }),
+            (
+                b"\x81\0",
+                0,
+                InvalidIndex {
+                    field: FIELD,
+                    index: 1,
+                },
+            ),
+        ] {
+            let mut bytes = prefix.clone();
+            let at = push_section(&mut bytes, id, &[before_index, index].concat());
+            // A continuation cannot read the next section's ID as its terminal byte.
+            push_section(&mut bytes, 0, &[0]);
+            push_section(&mut bytes, 10, &code_body(TRAP_BODY));
+            expect_error(&bytes, at + before_index.len() + offset, kind);
+        }
+
+        // Even a complete index cannot be validated until the declared section fits.
+        let available = before_index.len() + 2;
+        let declared = available + 1;
+        let mut bytes = prefix.clone();
+        bytes.push(id);
+        push_u32(&mut bytes, declared);
+        bytes.extend(before_index);
+        bytes.extend(b"\x80\0");
+        expect_error(
+            &bytes,
+            bytes.len(),
+            TruncatedSection {
+                declared,
+                available,
+            },
+        );
+    }
+
+    // The start target is in bounds but has an i64 result. Its trailing byte
+    // is reported before the deferred signature check, after the padded index.
+    let mut bytes = prefix;
+    let at = push_section(&mut bytes, 8, b"\x80\0\0");
+    push_section(&mut bytes, 10, &code_body(TRAP_BODY));
+    expect_error(&bytes, at + 2, TrailingSectionBytes { id: 8 });
 }
 
 #[test]

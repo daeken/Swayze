@@ -30,11 +30,11 @@ pub struct Error {
 /// `BranchTableArityMismatch` and `BranchTableTypeMismatch` compare a
 /// `br_table` target's result to that of the first target. The former is
 /// reported for void versus a value, the latter for different numeric types.
-/// [`ErrorKind::UnsupportedExportSignature`] identifies an export whose
-/// signature contains a float parameter or result.
 /// `InvalidStartSignature` reports the parameter count and void or i32 result
 /// of a start target that is not `() -> ()`; `InvalidStartI64Result` and
 /// `InvalidStartFloatResult` report start targets with i64 or float results.
+/// [`ErrorKind::UnsupportedExportSignature`] is retained for compatibility;
+/// validation no longer emits it for exports with float parameters or results.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -381,11 +381,9 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// Export and start signature checks run only after all other module checks
-/// pass, including section framing, index bounds and code validation.
-/// [`ErrorKind::UnsupportedExportSignature`] points to the start of the
-/// first offending export's function index and takes precedence over a start
-/// signature error. [`ErrorKind::InvalidStartSignature`],
+/// The start signature check runs only after all other module checks pass,
+/// including section framing, index bounds and code validation.
+/// [`ErrorKind::InvalidStartSignature`],
 /// [`ErrorKind::InvalidStartI64Result`] and [`ErrorKind::InvalidStartFloatResult`]
 /// point to the start of the start function index.
 /// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
@@ -443,7 +441,6 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut function_count = None;
     let mut functions = Vec::new();
     let mut exports = Vec::new();
-    let mut unsupported_export = None;
     let mut start = None;
     let mut table_entries = None;
     let mut element_segments = Vec::new();
@@ -500,10 +497,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             4 => table_entries = validate_table(&mut section)?,
             5 => memory_limits = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
-            7 => {
-                let signatures = function_count.map(|count| &function_types[..count as usize]);
-                (exports, unsupported_export) = validate_exports(&mut section, signatures)?;
-            }
+            7 => exports = validate_exports(&mut section, function_count)?,
             8 => {
                 let offset = section.position();
                 let index =
@@ -555,10 +549,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
         }
     }
-    // Do not report a signature error for a placeholder type or mask malformed code.
-    if let Some(error) = unsupported_export {
-        return Err(error);
-    }
+    // Do not report a start signature error for a placeholder type or mask malformed code.
     let start_function = if let Some((index, offset)) = start {
         let signature = function_types[index];
         let parameters = u32::from(signature.parameter_count);
@@ -659,19 +650,13 @@ impl FunctionType {
         &self.parameters[..self.parameter_count as usize]
     }
 
-    fn host_result_kind(self) -> Option<ResultKind> {
-        if self
-            .parameters()
-            .iter()
-            .any(|ty| matches!(ty, ValType::F32 | ValType::F64))
-        {
-            return None;
-        }
+    fn result_kind(self) -> ResultKind {
         match self.result {
-            None => Some(ResultKind::Void),
-            Some(ValType::I32) => Some(ResultKind::I32),
-            Some(ValType::I64) => Some(ResultKind::I64),
-            Some(ValType::F32 | ValType::F64) => None,
+            None => ResultKind::Void,
+            Some(ValType::I32) => ResultKind::I32,
+            Some(ValType::I64) => ResultKind::I64,
+            Some(ValType::F32) => ResultKind::F32,
+            Some(ValType::F64) => ResultKind::F64,
         }
     }
 }
@@ -814,9 +799,8 @@ fn validate_globals(
 
 fn validate_exports(
     section: &mut Reader<'_>,
-    signatures: Option<&[FunctionType]>,
-) -> Result<(Vec<Export>, Option<Error>), Error> {
-    let mut unsupported_signature = None;
+    function_count: Option<u32>,
+) -> Result<Vec<Export>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
     let mut exports: Vec<Export> = Vec::new();
@@ -833,18 +817,8 @@ fn validate_exports(
             });
         }
         section.expect_byte(0x00)?; // function export descriptor
-        let index = if let Some(signatures) = signatures {
-            let offset = section.position();
-            let index = section.index(IntegerField::FunctionIndex, signatures.len() as u32)?;
-            if unsupported_signature.is_none()
-                && signatures[index as usize].host_result_kind().is_none()
-            {
-                unsupported_signature = Some(Error {
-                    offset,
-                    kind: ErrorKind::UnsupportedExportSignature { function: index },
-                });
-            }
-            index
+        let index = if let Some(count) = function_count {
+            section.index(IntegerField::FunctionIndex, count)?
         } else {
             // No valid target without a function section. Preserve framing and
             // order checks before the final required-section check rejects it.
@@ -861,7 +835,7 @@ fn validate_exports(
             function_index: index as usize,
         });
     }
-    Ok((exports, unsupported_signature))
+    Ok(exports)
 }
 
 fn validate_elements(
@@ -1035,13 +1009,21 @@ enum Instruction {
     },
 }
 
-/// A WebAssembly integer tagged with its exact width.
+/// A WebAssembly numeric value tagged with its exact type.
+///
+/// Float variants carry raw IEEE 754 bits, not native Rust floats. All bit
+/// patterns are valid, and equality compares the tag and payload exactly,
+/// distinguishing positive zero from negative zero and different NaN encodings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Value {
     /// A 32-bit WebAssembly integer.
     I32(i32),
     /// A 64-bit WebAssembly integer.
     I64(i64),
+    /// The exact IEEE 754 binary32 encoding of a WebAssembly `f32`.
+    F32(u32),
+    /// The exact IEEE 754 binary64 encoding of a WebAssembly `f64`.
+    F64(u64),
 }
 
 impl Value {
@@ -1049,6 +1031,8 @@ impl Value {
         match self {
             Self::I32(_) => ValType::I32,
             Self::I64(_) => ValType::I64,
+            Self::F32(_) => ValType::F32,
+            Self::F64(_) => ValType::F64,
         }
     }
 }
@@ -1068,6 +1052,19 @@ impl From<Value> for Operand {
         match value {
             Value::I32(value) => Self::I32(value),
             Value::I64(value) => Self::I64(value),
+            Value::F32(bits) => Self::F32(bits),
+            Value::F64(bits) => Self::F64(bits),
+        }
+    }
+}
+
+impl From<Operand> for Value {
+    fn from(operand: Operand) -> Self {
+        match operand {
+            Operand::I32(value) => Self::I32(value),
+            Operand::I64(value) => Self::I64(value),
+            Operand::F32(bits) => Self::F32(bits),
+            Operand::F64(bits) => Self::F64(bits),
         }
     }
 }
@@ -1631,9 +1628,7 @@ pub(super) fn invoke_index(
             actual: args.len(),
         });
     }
-    let actual = signature
-        .host_result_kind()
-        .expect("validated export signature");
+    let actual = signature.result_kind();
     if actual != expected {
         return Err(InvokeError::ResultMismatch { expected, actual });
     }
@@ -1655,12 +1650,7 @@ pub(super) fn invoke_index(
                 ExecutionError::LimitExceeded { limit } => InvokeError::LimitExceeded { limit },
             },
         )?;
-    Ok(match result {
-        None => None,
-        Some(Operand::I32(value)) => Some(Value::I32(value)),
-        Some(Operand::I64(value)) => Some(Value::I64(value)),
-        Some(Operand::F32(_) | Operand::F64(_)) => unreachable!("validated export result"),
-    })
+    Ok(result.map(Value::from))
 }
 
 pub(super) enum ExecutionError {
@@ -3003,6 +2993,33 @@ mod tests {
     fn float_bits_do_not_enlarge_operand_slots() {
         assert!(std::mem::size_of::<Operand>() <= std::mem::size_of::<Value>());
         assert!(std::mem::align_of::<Operand>() <= std::mem::align_of::<Value>());
+    }
+
+    #[test]
+    fn host_operand_conversions_preserve_tags_and_raw_bits() {
+        for (value, operand, ty) in [
+            (Value::I32(i32::MIN), Operand::I32(i32::MIN), ValType::I32),
+            (Value::I64(i64::MIN), Operand::I64(i64::MIN), ValType::I64),
+            (
+                Value::F32(0x8000_0000),
+                Operand::F32(0x8000_0000),
+                ValType::F32,
+            ),
+            (
+                Value::F32(0x7f80_0b12),
+                Operand::F32(0x7f80_0b12),
+                ValType::F32,
+            ),
+            (
+                Value::F64(0xfff0_000b_89ab_cdef),
+                Operand::F64(0xfff0_000b_89ab_cdef),
+                ValType::F64,
+            ),
+        ] {
+            assert_eq!(value.operand_type(), ty);
+            assert_eq!(Operand::from(value), operand);
+            assert_eq!(Value::from(operand), value);
+        }
     }
 
     #[test]

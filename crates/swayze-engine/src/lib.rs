@@ -1,4 +1,7 @@
 //! Host-facing Swayze API. Only the documented language subsets are supported.
+//!
+//! [`WasmValue::F32`] and [`WasmValue::F64`] carry exact IEEE 754 bits,
+//! including signed zeros and all NaN encodings, rather than Rust floats.
 
 pub use swayze_js::{
     Error as JsParseError, ErrorKind as JsErrorKind, EvalError as JsEvalError, Limit as JsLimit,

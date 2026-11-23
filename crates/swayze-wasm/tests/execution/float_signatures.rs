@@ -278,22 +278,12 @@ fn private_float_results_and_parameter_writes_check_explicit_wrong_tags() {
 }
 
 #[test]
-fn float_exports_report_the_first_padded_function_index_after_other_checks() {
+fn float_exports_still_check_framing_indices_duplicate_names_and_code() {
     use ErrorKind::*;
     let ty = types(&[(&[], Some(I32)), (&[], Some(F32)), (&MIXED, None)]);
     let prefix = module(&[(1, &ty), (3, &[3, 0, 1, 2])]);
     let first = b"\x01x\0\x81\0";
     for (exports, offset, kind) in [
-        (
-            [b"\x02".as_slice(), first, b"\x01y\0\x82\0"].concat(),
-            4,
-            UnsupportedExportSignature { function: 1 },
-        ),
-        (
-            b"\x01\x01y\0\x82\0".to_vec(),
-            4,
-            UnsupportedExportSignature { function: 2 },
-        ),
         (
             [b"\x02".as_slice(), first, b"\x01y\0\x83\0"].concat(),
             9,
@@ -340,10 +330,18 @@ fn float_exports_report_the_first_padded_function_index_after_other_checks() {
     );
     let mut bytes = prefix;
     push_section(&mut bytes, 7, &[b"\x01".as_slice(), first].concat());
+    push_section(&mut bytes, 8, &[1]); // Malformed/missing code still takes precedence.
     expect_error(&bytes, bytes.len(), MissingSection { id: 10 });
-    let body = b"\0\xff\x0b";
-    let at = push_section(&mut bytes, 10, &code_bodies(&[body, TRAP_BODY, TRAP_BODY]));
-    expect_error(&bytes, at + 3, UnsupportedOpcode { opcode: 0xff });
+    let body = b"\0\x41\0\x0b"; // Exported f32 function incorrectly returns i32.
+    let at = push_section(&mut bytes, 10, &code_bodies(&[TRAP_BODY, body, TRAP_BODY]));
+    expect_error(
+        &bytes,
+        at + 9,
+        TypeMismatch {
+            expected: ValType::F32,
+            actual: ValType::I32,
+        },
+    );
 }
 
 #[test]
@@ -394,7 +392,8 @@ fn start_signatures_still_require_void_and_no_parameters() {
         ),
     ] {
         let ty = types(&[(params, result)]);
-        let prefix = module(&[(1, &ty), (3, FUNCTION)]);
+        // Being exported with a valid export signature does not make it a valid start.
+        let prefix = module(&[(1, &ty), (3, FUNCTION), (7, EXPORT)]);
         let mut bytes = prefix.clone();
         let at = push_section(&mut bytes, 8, b"\x80\0");
         push_section(&mut bytes, 10, &code_body(TRAP_BODY));

@@ -67,6 +67,7 @@ fn eight_mixed_globals_share_the_cap_and_initialize_exact_float_bits() {
         let kind = match expected {
             Value::I32(_) => ResultKind::I32,
             Value::I64(_) => ResultKind::I64,
+            _ => unreachable!("test case uses integer reinterprets"),
         };
         let name = std::str::from_utf8(name).unwrap();
         assert_eq!(

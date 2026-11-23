@@ -37,6 +37,7 @@ fn float_const(bits: Value) -> Vec<u8> {
             bytes.push(0x44);
             bytes.extend(bits.to_le_bytes());
         }
+        _ => unreachable!("test case uses integer reinterprets"),
     }
     bytes
 }
@@ -54,6 +55,7 @@ impl FloatCase {
         let (result_byte, result_kind) = match self.snan {
             Value::I32(_) => (0x7f, ResultKind::I32),
             Value::I64(_) => (0x7e, ResultKind::I64),
+            _ => unreachable!("test case uses integer reinterprets"),
         };
         let parameters = vec![0x7f; args.len()];
         let ty = types(&[(&parameters, Some(result_byte))]);

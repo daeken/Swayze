@@ -12,8 +12,28 @@ if (process.versions.node.split('.')[0] !== '22') {
 }
 const fixtures = process.argv.slice(1);
 console.log(process.version);
+// The JS Number boundary is not an exact NaN transport. Only compare non-NaN
+// float arguments and results here; the Rust tests cover exact NaN payloads.
+const bits = new DataView(new ArrayBuffer(8));
+function decodeArg(arg) {
+    if (arg.endsWith('n')) return BigInt(arg.slice(0, -1));
+    if (!arg.startsWith('f')) return Number(arg);
+    const payload = `0x${arg.slice(4)}`;
+    let value;
+    if (arg.startsWith('f32=')) {
+        bits.setUint32(0, Number(payload));
+        value = bits.getFloat32(0);
+    } else if (arg.startsWith('f64=')) {
+        bits.setBigUint64(0, BigInt(payload));
+        value = bits.getFloat64(0);
+    } else {
+        throw new Error(`unknown argument encoding: ${arg}`);
+    }
+    if (Number.isNaN(value)) throw new Error('NaN at the reference host boundary');
+    return value;
+}
 for (const fixture of fixtures) {
-    const [hex, nameBytes, ...args] = fixture.split(':');
+    const [hex, nameBytes, result, ...args] = fixture.split(':');
     const name = Buffer.from(nameBytes, 'hex').toString('utf8');
     const module = new WebAssembly.Module(Buffer.from(hex, 'hex'));
     let instance;
@@ -26,14 +46,21 @@ for (const fixture of fixtures) {
     }
     const invoke = instance.exports[name];
     try {
-        const value = invoke(...args.map(arg => arg.endsWith('n') ? BigInt(arg.slice(0, -1)) : Number(arg)));
-        if (value === undefined) {
+        const value = invoke(...args.map(decodeArg));
+        if (result === 'void' && value === undefined) {
             console.log('void');
-        } else if (typeof value === 'bigint') {
+        } else if (result === 'i64' && typeof value === 'bigint') {
             console.log(`${value}n`);
-        } else {
-            if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
+        } else if (result === 'i32' && typeof value === 'number' && (value | 0) === value) {
             console.log(value);
+        } else if (result === 'f32' && typeof value === 'number' && !Number.isNaN(value)) {
+            bits.setFloat32(0, value);
+            console.log(`f32=${bits.getUint32(0).toString(16)}`);
+        } else if (result === 'f64' && typeof value === 'number' && !Number.isNaN(value)) {
+            bits.setFloat64(0, value);
+            console.log(`f64=${bits.getBigUint64(0).toString(16)}`);
+        } else {
+            throw new Error(`unexpected ${result} result for ${hex}: ${value}`);
         }
     } catch (error) {
         if (!(error instanceof WebAssembly.RuntimeError)) throw error;
@@ -89,10 +116,24 @@ fn singleton_module(
 enum Outcome {
     Invocation(Result<i32, WasmTrap>),
     I64Invocation(Result<i64, WasmTrap>),
+    F32Invocation(Result<u32, WasmTrap>),
+    F64Invocation(Result<u64, WasmTrap>),
     VoidInvocation(Result<(), WasmTrap>),
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
     StartTrap(WasmTrap),
+}
+
+impl Outcome {
+    fn result_kind(self) -> WasmResultKind {
+        match self {
+            Self::VoidInvocation(_) => WasmResultKind::Void,
+            Self::I64Invocation(_) => WasmResultKind::I64,
+            Self::F32Invocation(_) => WasmResultKind::F32,
+            Self::F64Invocation(_) => WasmResultKind::F64,
+            _ => WasmResultKind::I32,
+        }
+    }
 }
 
 struct Fixture<A = i32> {
@@ -138,11 +179,24 @@ impl Fixture {
 impl Fixture<WasmValue> {
     fn encode(&self) -> String {
         use std::fmt::Write;
-        let mut encoded = format!("{}:{}", hex(&self.bytes), hex(self.export.as_bytes()));
+        let result = match self.expected.result_kind() {
+            WasmResultKind::Void => "void",
+            WasmResultKind::I32 => "i32",
+            WasmResultKind::I64 => "i64",
+            WasmResultKind::F32 => "f32",
+            WasmResultKind::F64 => "f64",
+        };
+        let mut encoded = format!(
+            "{}:{}:{result}",
+            hex(&self.bytes),
+            hex(self.export.as_bytes())
+        );
         for arg in &self.args {
             match arg {
                 WasmValue::I32(arg) => write!(&mut encoded, ":{arg}"),
                 WasmValue::I64(arg) => write!(&mut encoded, ":{arg}n"),
+                WasmValue::F32(bits) => write!(&mut encoded, ":f32={bits:x}"),
+                WasmValue::F64(bits) => write!(&mut encoded, ":f64={bits:x}"),
             }
             .unwrap();
         }
@@ -1128,6 +1182,48 @@ fn typed_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
         .chain(void_cases)
         .chain(float_cases)
         .chain(sign_cases)
+        .chain(float_host_fixtures())
+}
+
+fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    let modules = |param, result, op| {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01".to_vec();
+        bytes.extend([param, 1, result]);
+        bytes.extend(b"\x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x07\x01\x05\0\x20\0");
+        bytes.extend([op, 0x0b]);
+        bytes
+    };
+    // Reinterpret across the guest boundary in both directions independently.
+    let mut cases = Vec::new();
+    for bits in [0x8000_0000_u32, 1, 0x7f80_0000] {
+        cases.push(Fixture {
+            expected: Outcome::Invocation(Ok(bits as i32)),
+            bytes: modules(0x7d, 0x7f, 0xbc),
+            export: "x",
+            args: vec![WasmValue::F32(bits)],
+        });
+        cases.push(Fixture {
+            expected: Outcome::F32Invocation(Ok(bits)),
+            bytes: modules(0x7f, 0x7d, 0xbe),
+            export: "x",
+            args: vec![WasmValue::I32(bits as i32)],
+        });
+    }
+    for bits in [0x8000_0000_0000_0000_u64, 1, 0x7ff0_0000_0000_0000] {
+        cases.push(Fixture {
+            expected: Outcome::I64Invocation(Ok(bits as i64)),
+            bytes: modules(0x7c, 0x7e, 0xbd),
+            export: "x",
+            args: vec![WasmValue::F64(bits)],
+        });
+        cases.push(Fixture {
+            expected: Outcome::F64Invocation(Ok(bits)),
+            bytes: modules(0x7e, 0x7c, 0xbf),
+            export: "x",
+            args: vec![WasmValue::I64(bits as i64)],
+        });
+    }
+    cases.into_iter()
 }
 
 fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {
@@ -1197,19 +1293,19 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
         Err(WasmInstantiationError::StartTrap(trap)) => return Ok(Outcome::StartTrap(trap)),
         Err(error) => return Err(error.into()),
     };
-    let expected_kind = match fixture.expected {
-        Outcome::VoidInvocation(_) => WasmResultKind::Void,
-        Outcome::I64Invocation(_) => WasmResultKind::I64,
-        _ => WasmResultKind::I32,
-    };
+    let expected_kind = fixture.expected.result_kind();
     match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
         Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
         Ok(Some(WasmValue::I64(value))) => Ok(Outcome::I64Invocation(Ok(value))),
+        Ok(Some(WasmValue::F32(bits))) => Ok(Outcome::F32Invocation(Ok(bits))),
+        Ok(Some(WasmValue::F64(bits))) => Ok(Outcome::F64Invocation(Ok(bits))),
         Ok(None) => Ok(Outcome::VoidInvocation(Ok(()))),
         Err(WasmInvokeError::Trap(trap)) => Ok(match expected_kind {
             WasmResultKind::Void => Outcome::VoidInvocation(Err(trap)),
             WasmResultKind::I32 => Outcome::Invocation(Err(trap)),
             WasmResultKind::I64 => Outcome::I64Invocation(Err(trap)),
+            WasmResultKind::F32 => Outcome::F32Invocation(Err(trap)),
+            WasmResultKind::F64 => Outcome::F64Invocation(Err(trap)),
         }),
         Err(host_error) => Err(host_error.into()),
     }
@@ -1254,9 +1350,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .and_then(|text| text.parse::<i64>().ok())
                     == Some(value)
             }
+            Outcome::F32Invocation(Ok(bits)) => {
+                reference
+                    .strip_prefix("f32=")
+                    .and_then(|text| u32::from_str_radix(text, 16).ok())
+                    == Some(bits)
+            }
+            Outcome::F64Invocation(Ok(bits)) => {
+                reference
+                    .strip_prefix("f64=")
+                    .and_then(|text| u64::from_str_radix(text, 16).ok())
+                    == Some(bits)
+            }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
             Outcome::Invocation(Err(_))
             | Outcome::I64Invocation(Err(_))
+            | Outcome::F32Invocation(Err(_))
+            | Outcome::F64Invocation(Err(_))
             | Outcome::VoidInvocation(Err(_)) => reference == "trap",
             Outcome::DataSegmentOutOfBounds(_)
             | Outcome::ElementSegmentOutOfBounds(_)
@@ -1270,7 +1380,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (i32, i64, or void results, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, invocation traps, or instantiation errors)"
     );
     Ok(())
 }

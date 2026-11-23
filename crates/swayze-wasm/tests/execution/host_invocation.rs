@@ -1,6 +1,9 @@
 use super::{i64_signatures::types, *};
 use swayze_wasm::{ResultKind, ValType, Value};
 
+#[path = "host_invocation/float.rs"]
+mod float;
+
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
 

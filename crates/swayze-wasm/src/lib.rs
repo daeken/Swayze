@@ -129,12 +129,9 @@
 //! any start, elements, and code may contain zero to eight function exports.
 //! Tables, memory, and globals cannot be exported. Name matching is exact (no
 //! Unicode normalization), and duplicate export names are rejected. Each export
-//! refers to a defined function by its zero-based declaration index. Only
-//! integer parameters and void or integer results are allowed in exported
-//! signatures. Distinct names may refer to the same function. After all other
-//! module checks pass, the first export with a float parameter or result reports
-//! [`ErrorKind::UnsupportedExportSignature`] at the start of its function index,
-//! before checking the start signature.
+//! refers to a defined function by its zero-based declaration index. Exports
+//! can use any supported function signature. Distinct names may refer to the
+//! same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
@@ -170,10 +167,10 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! sign operations, and comparisons each count as one dispatch. None uses native
 //! floating-point operations or quiets signaling NaNs. Floats are supported as
-//! operands, private globals, locals, `block` and `if` results, and private
-//! function parameters and results. Fallthrough, `return`, and branch exits
-//! preserve all result bits. Float host arguments and results, loop results,
-//! and floating-point numeric instructions beyond those listed remain unsupported.
+//! operands, private globals, locals, `block` and `if` results, and function
+//! parameters and results, including across the host boundary. Fallthrough,
+//! `return`, and branch exits preserve all result bits. Loop results and
+//! floating-point numeric instructions beyond those listed remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -286,11 +283,12 @@
 //! host execution limit ([`InstantiationError::StartLimitExceeded`]) discards
 //! the unpublished instance. No instantiation failure exposes an instance.
 //! [`Instance::invoke_with_values`] accepts tagged [`Value`] arguments and
-//! returns `None` for void or the exact tagged integer for an i32 or i64 result.
-//! The i32-argument methods share the same preflight: scan at most eight export
-//! names for an exact match, check arity, check the declared result kind, then
-//! check each positional argument type from first to last. There is no numeric
-//! coercion. Any preflight error returns before executing a guest instruction
+//! returns `None` for void or the exact tagged numeric result. Float arguments
+//! and results carry raw IEEE 754 bits, not native floats. The i32-argument
+//! methods share the same preflight: scan at most eight export names for an
+//! exact match, check arity, check the declared result kind, then check each
+//! positional argument type from first to last. There is no numeric coercion.
+//! Any preflight error returns before executing a guest instruction
 //! or changing guest state. Execution does not recurse in Rust. The only guest
 //! execution allocation is the fallible single-page
 //! reserve for an eligible `memory.grow`, during start or invocation. After a
@@ -329,8 +327,8 @@
 //! then fill the parameter prefix; floats retain their exact bits across the
 //! call. A callee starts with no operands. A callee returning a value pushes
 //! the full tagged result onto the caller's remaining operands; a void callee
-//! leaves them unchanged. Only the host invocation boundary converts between
-//! the private tagged values and the public, integer-only [`Value`].
+//! leaves them unchanged. At the host invocation boundary, the private tagged
+//! values and public [`Value`] map directly without re-encoding any bits.
 //! `call_indirect` interprets the selector as `u32` and traps with
 //! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
 //! [`Trap::UninitializedElement`] for a null entry, or
@@ -854,19 +852,22 @@ impl Instance<'_> {
     /// in that order. The first argument of the wrong type is reported with its
     /// zero-based index. No guest instructions run and no guest state changes
     /// unless all checks pass. No argument or result is coerced or truncated.
+    /// Float arguments and results are passed as exact IEEE 754 bits in
+    /// [`Value::F32`] and [`Value::F64`], preserving signed zeros and NaN encodings
+    /// at the host boundary without using native floating-point values.
     /// Returns `None` for [`ResultKind::Void`] or the exact tagged result otherwise.
     /// Execution has the same effects, traps, and limits as
     /// [`Self::invoke_i32_with_args`].
     ///
     /// ```
     /// use swayze_wasm::{ResultKind, Value, validate_module};
-    /// // (func (export "echo") (param i64) (result i64) local.get 0)
-    /// let bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7e\x01\x7e\x03\x02\x01\0\
+    /// // (func (export "echo") (param f32) (result f32) local.get 0)
+    /// let bytes = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7d\x01\x7d\x03\x02\x01\0\
     ///               \x07\x08\x01\x04echo\0\0\x0a\x06\x01\x04\0\x20\0\x0b";
     /// let module = validate_module(bytes)?;
     /// let instance = module.instantiate()?;
-    /// let args = [Value::I64(i64::MIN)];
-    /// assert_eq!(instance.invoke_with_values("echo", &args, ResultKind::I64)?, Some(args[0]));
+    /// let args = [Value::F32(0x7f80_0b12)]; // A signaling NaN with a nonzero payload.
+    /// assert_eq!(instance.invoke_with_values("echo", &args, ResultKind::F32)?, Some(args[0]));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn invoke_with_values(
@@ -903,6 +904,10 @@ pub enum ResultKind {
     I32,
     /// The function returns one `i64` value.
     I64,
+    /// The function returns one `f32` value as raw bits in [`Value::F32`].
+    F32,
+    /// The function returns one `f64` value as raw bits in [`Value::F64`].
+    F64,
 }
 
 impl fmt::Display for ResultKind {
@@ -911,6 +916,8 @@ impl fmt::Display for ResultKind {
             Self::Void => "void",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
         })
     }
 }

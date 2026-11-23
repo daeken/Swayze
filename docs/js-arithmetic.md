@@ -82,8 +82,8 @@ unsupported, even in code that would not run; it never falls back to an outer
 binding. Sibling blocks can reuse a name. Unlabeled `break;` exits the innermost
 loop. `continue;` reevaluates the test after the update, if there is one.
 Both require explicit semicolons. `for (init; test; update)` permits any clause
-to be empty; a missing test is true. The initializer can be a `let` declaration
-list. Its bindings are visible in the initializer, test, update, and body, but
+to be empty; a missing test is true. The initializer can be a `let` or `const`
+declaration list. Its bindings are visible in the initializer, test, update, and body, but
 not after the loop. The initializer runs once each time execution enters the
 loop statement, not on each iteration. The update and any non-declaration
 initializer must be a supported assignment, increment, or decrement of an

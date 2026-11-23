@@ -1462,11 +1462,11 @@ impl Parser<'_> {
         match init.kind {
             TokenKind::Close => return Err(Error::malformed(init.span, FOR_SEMICOLON)),
             TokenKind::Semicolon => {}
-            TokenKind::Declaration(BindingKind::Let) => {
+            TokenKind::Declaration(kind) => {
                 self.lexer.charge(1, init.span)?;
                 let scope = self.add_scope(Some(self.current_scope()), init.span)?;
                 self.for_header_scope = Some(scope);
-                self.parse_declaration_list(BindingKind::Let, DeclaratorEnd::ForHeader)?;
+                self.parse_declaration_list(kind, DeclaratorEnd::ForHeader)?;
             }
             _ => {
                 self.parse_required_store(init, ExpressionEnd::ForSemicolon, unsupported_store)?;

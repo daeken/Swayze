@@ -181,7 +181,48 @@ fn loop_undefined_can_shadow_the_root_without_affecting_implicit_initialization(
     assert_error_at("let undefined;0", ErrorKind::Malformed, "undefined");
 }
 
-fn assert_error_at(source: &str, kind: ErrorKind, marked: &str) {
+#[test]
+fn const_header_list_reinitializes_on_reentry_not_on_each_iteration() {
+    let script = parse_script(
+        "let i=1; let trace=0; let step=9;
+         for (let w=0;w<2;++w) {
+             for (const start=i, end=start+2, step=end-start-1; i<end; i+=step) {
+                 let step=start;
+                 step++;
+                 trace=trace*10+step;
+                 continue;
+             }
+         }
+         trace*100+i*10+step",
+    )
+    .unwrap();
+    // The body records 22 on the first entry and 44 on the second. The
+    // update uses the header's step, not the mutable body or Script binding.
+    assert_eq!(script.evaluate(), Ok(224459.0));
+    assert_eq!(script.evaluate(), Ok(224459.0));
+}
+
+#[test]
+fn const_headers_support_omitted_clauses_and_mutable_updates() {
+    for (statement, expected) in [
+        (
+            "for(const n=42;;seen+=n){if(seen===n){break;}continue;}",
+            42.0,
+        ),
+        ("for(const n=42;seen<n;){seen+=n;continue;}", 42.0),
+        ("for(const n=42;;){seen=n;break;}", 42.0),
+        ("for(const n=42,stop=false;stop;seen=99){seen=n;}", 0.0),
+    ] {
+        let source = format!("let seen=0;{statement}seen");
+        assert_eq!(
+            parse_script(&source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+}
+
+fn assert_error_at(source: &str, kind: ErrorKind, marked: &str) -> swayze_js::Error {
     // A prefix before '|' disambiguates identical tokens at different sites.
     let (prefix, needle) = marked.split_once('|').unwrap_or(("", marked));
     let start = source.rfind(&[prefix, needle].concat()).unwrap() + prefix.len();
@@ -195,6 +236,7 @@ fn assert_error_at(source: &str, kind: ErrorKind, marked: &str) {
         },
         "{source}"
     );
+    error
 }
 
 #[test]
@@ -234,7 +276,6 @@ fn requires_braces_delimiters_and_assignment_clauses() {
         ("for(){}42", Malformed, ")"),
         ("for(;;;){}42", Malformed, ";;|;"),
         ("for(0;false;){}42", Unsupported, "0"),
-        ("for(const i=0;false;){}42", Unsupported, "const"),
         ("for(i in j){}42", Unsupported, "in"),
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "**="),
@@ -344,6 +385,121 @@ fn let_headers_require_declarators_and_both_for_semicolons() {
         ("for(let i;;)break;0", Malformed, "break"),
     ] {
         assert_error_at(source, kind, marked);
+    }
+}
+
+#[test]
+fn const_headers_require_every_initializer_and_disallow_trailing_commas() {
+    use ErrorKind::{Malformed, Unsupported};
+    let missing = "expected '=' after the binding name";
+    for (source, kind, marked, message) in [
+        ("for(const a;false;){}0", Malformed, "a|;", missing),
+        ("for(const a,b=1;false;){}0", Malformed, "a|,", missing),
+        ("for(const a=1,b;false;){}0", Malformed, "b|;", missing),
+        (
+            "for(const a=1,;false;){}0",
+            Malformed,
+            ",|;",
+            "expected a binding name",
+        ),
+        (
+            "for(const a=1,a=2;false;){}0",
+            Malformed,
+            ",|a",
+            "duplicate binding declaration",
+        ),
+        (
+            "for(const a+=1;false;){}0",
+            Unsupported,
+            "+=",
+            "compound assignments cannot initialize declarations",
+        ),
+        (
+            "for(const a=1\nfalse;){}0",
+            Malformed,
+            "false",
+            "expected a binary operator",
+        ),
+        (
+            "for(const a=1;false){}0",
+            Malformed,
+            ")",
+            "expected ';' between for clauses",
+        ),
+        (
+            "for(const {a}=1;false;){}0",
+            Unsupported,
+            "const |{",
+            "destructuring is outside the subset",
+        ),
+    ] {
+        assert_eq!(
+            assert_error_at(source, kind, marked).message(),
+            message,
+            "{source}"
+        );
+    }
+
+    for (source, marked) in [
+        ("for(const [a]=1;false;){}0", "["),
+        ("for(const a in b){}0", "in"),
+        ("for(const a of b){}0", "of"),
+        ("for(const a=1 in b){}0", "in"),
+        ("for(const a=1 of b){}0", "of"),
+        ("for(const a=1;false;const b=1){}0", "false;|const"),
+    ] {
+        assert_error_at(source, Unsupported, marked);
+    }
+}
+
+#[test]
+fn const_headers_resolve_names_statically_in_their_own_scope() {
+    let tdz = "access before lexical binding initialization is outside the subset";
+    let unbound = "unbound name is outside the subset";
+    for (source, marked, message) in [
+        ("let n=42;for(const n=n;false;){}0", "n=|n", tdz),
+        (
+            "let n=42;if(false){for(const m=false&&n,n=1;false;){}}0",
+            "&&|n",
+            tdz,
+        ),
+        (
+            "for(const n=1;false;){break;n=2;let n=0;}0",
+            "break;|n",
+            tdz,
+        ),
+        ("for(const n=1;false;){}n", "}|n", unbound),
+        ("for(const n=1;false;){}n=2;0", "}|n", unbound),
+    ] {
+        assert_eq!(
+            assert_error_at(source, ErrorKind::Unsupported, marked).message(),
+            message,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn rejects_all_writes_to_header_consts_even_in_skipped_updates_and_bodies() {
+    for (initial, write, marked) in [
+        (1, "n=2", "n|="),
+        (1, "n+=2", "+="),
+        (0, "n&&=2", "&&="),
+        (1, "n||=2", "n|||="),
+        (1, "n??=2", "??="),
+        (1, "++n", "++"),
+        (1, "n--", "--"),
+    ] {
+        for source in [
+            format!("let n=0;for(const n={initial};false;{write}){{let n;}}0"),
+            format!("let n=0;for(const n={initial};false;){{break;{write};}}0"),
+        ] {
+            assert_eq!(
+                assert_error_at(&source, ErrorKind::Unsupported, marked).message(),
+                "assignment to const is outside the subset",
+                "{source}"
+            );
+        }
     }
 }
 
@@ -585,13 +741,51 @@ fn let_header_has_exact_source_token_nesting_and_work_costs() {
 }
 
 #[test]
-fn let_header_and_body_use_only_one_active_statement_frame() {
-    let open = "for(let i;false;){";
+fn const_header_list_has_exact_parse_work_cost() {
+    let source = "for(const a=1,b=a;false;){break;}0";
+    // Besides source bytes: one each for the header, header scope, statement
+    // frame and break patch; two decimal conversions; nine emissions; two
+    // for checking b against a; four for looking up a through b and a.
+    let limits = Limits {
+        max_nesting_depth: 1,
+        max_work: source.len() + 21,
+        ..Limits::default()
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 9);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate(), Ok(0.0));
+    let error = parse_script_with_limits(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+    )
+    .unwrap_err();
+    let start = source.find("=a").unwrap() + 1;
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+    assert_eq!(
+        error.span(),
+        Span {
+            start,
+            end: start + 1
+        }
+    );
+}
+
+#[test]
+fn lexical_header_and_body_use_only_one_active_statement_frame() {
     let limits = Limits {
         max_nesting_depth: 1,
         ..Limits::default()
     };
-    for depth in [128, 129] {
+    for (open, depth) in [
+        ("for(let i;false;){", 128),
+        ("for(let i;false;){", 129),
+        ("for(const i=0;false;){", 128),
+        ("for(const i=0;false;){", 129),
+    ] {
         let source = format!("{}break;{}0", open.repeat(depth), "}".repeat(depth));
         let result = parse_script_with_limits(&source, limits);
         if depth == 128 {

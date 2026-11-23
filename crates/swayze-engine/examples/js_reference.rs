@@ -314,6 +314,9 @@ fn fixtures() -> Vec<String> {
             "let out = 0; for (let i, step = i ?? 2; out < 6; out += step) { continue; } out",
             "let n = 0, out = 0; while (n < 3) { for (let i = 14;; i++) { out += i; break; } n++; } out",
             "let out; for (let undefined = 42, x = undefined;;) { out = x; break; } out",
+            "let i = 0, out = 0; for (const a = 20, b = a + 1; i < 2; i++) { out += b; } out",
+            "let out; for (const n = 40;;) { let n = 42; out = n; break; } out",
+            "let i = 0, out = 0; while (i < 3) { for (const step = i + 13;;) { out += step; break; } i++; } out"
         ]
         .map(str::to_owned),
     );

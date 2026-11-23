@@ -427,13 +427,18 @@
 //! 1024-dispatch limit.
 //! Float operand tests check all four reinterpretations through exact integer
 //! returns, including both zero signs and signaling and quiet NaN payloads.
-//! They cover body- and section-framed truncation, delimiter-valued bytes,
-//! type errors and polymorphic floors, candidate selection, preserved operand
-//! prefixes, rejection of unsupported float features, and the shared body-byte,
-//! instruction, operand, and dispatch caps. Size probes with the pinned toolchain
-//! on arm64 macOS found unchanged operand slots (16 bytes), call frames (856
-//! bytes each), and validation scratch layouts, including the decoded-instruction
-//! array (4,064 bytes), in both debug and release.
+//! A signaling NaN in either `select` position round-trips through both
+//! reinterpretations without ever crossing the host boundary as a float.
+//! Truncated immediates fail at their frame end even when a later body or
+//! section has enough bytes. Tests also cover delimiter-valued bytes, type
+//! errors and polymorphic floors, preserved operand prefixes, unsupported
+//! float features, and shared body-byte, instruction, operand, and dispatch caps.
+//! Before/after measurements on arm64 macOS with Rust 1.99.1 found unchanged
+//! sizes in debug and release: 16-byte operand slots, 856-byte call frames
+//! (13,696 bytes for 16), and validation scratch of 4,064 bytes for decoded
+//! instructions, 40 for the operand stack, 816 for control frames, 6,144 for
+//! branch targets, and 6,128 for branch links. These are measured layouts,
+//! not guarantees across targets or toolchains.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

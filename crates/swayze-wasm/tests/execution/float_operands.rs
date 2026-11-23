@@ -61,31 +61,51 @@ fn fixed_width_constants_and_all_reinterpretations_preserve_every_bit() {
 }
 
 #[test]
-fn select_chooses_exact_bits_of_either_same_width_candidate() {
-    let i64_result = types(&[(&[0x7f], Some(0x7e))]);
-    let mut f32_body = vec![0];
-    push_f32(&mut f32_body, F32_SNAN);
-    push_f32(&mut f32_body, 0x8000_0000);
-    f32_body.extend([0x20, 0, 0x1b, I32_FROM_F32, 0x0b]);
-    let mut f64_body = vec![0];
-    push_f64(&mut f64_body, F64_SNAN);
-    push_f64(&mut f64_body, 1 << 63);
-    f64_body.extend([0x20, 0, 0x1b, I64_FROM_F64, 0x0b]);
-    for cond in [0, 1, -1] {
-        assert_bits(
-            &i32_type(1),
-            &f32_body,
-            &[Value::I32(cond)],
-            ResultKind::I32,
-            Value::I32(if cond == 0 { i32::MIN } else { F32_SNAN as i32 }),
-        );
-        assert_bits(
-            &i64_result,
-            &f64_body,
-            &[Value::I32(cond)],
-            ResultKind::I64,
-            Value::I64(if cond == 0 { i64::MIN } else { F64_SNAN as i64 }),
-        );
+fn signaling_nan_bits_survive_reinterpret_select_and_reinterpret_back() {
+    let i32_signature = i32_type(2); // (bits, condition) -> bits
+    let i64_signature = types(&[(&[0x7e, 0x7f], Some(0x7e))]);
+    for nan_first in [false, true] {
+        let mut f32_body = vec![0];
+        let mut f64_body = vec![0];
+        for nan in [nan_first, !nan_first] {
+            if nan {
+                // Input comes from integer host arguments, never host floats.
+                f32_body.extend([0x20, 0, F32_FROM_I32]);
+                f64_body.extend([0x20, 0, F64_FROM_I64]);
+            } else {
+                push_f32(&mut f32_body, 0x8000_0000);
+                push_f64(&mut f64_body, 1 << 63);
+            }
+        }
+        f32_body.extend([0x20, 1, 0x1b, I32_FROM_F32, 0x0b]);
+        f64_body.extend([0x20, 1, 0x1b, I64_FROM_F64, 0x0b]);
+        let nan32 = Value::I32(F32_SNAN as i32);
+        let nan64 = Value::I64(F64_SNAN as i64);
+        for cond in [0, 1, -1] {
+            let selects_nan = (cond != 0) == nan_first;
+            assert_bits(
+                &i32_signature,
+                &f32_body,
+                &[nan32, Value::I32(cond)],
+                ResultKind::I32,
+                if selects_nan {
+                    nan32
+                } else {
+                    Value::I32(i32::MIN)
+                },
+            );
+            assert_bits(
+                &i64_signature,
+                &f64_body,
+                &[nan64, Value::I32(cond)],
+                ResultKind::I64,
+                if selects_nan {
+                    nan64
+                } else {
+                    Value::I64(i64::MIN)
+                },
+            );
+        }
     }
 }
 
@@ -118,11 +138,20 @@ fn float_immediates_stop_at_the_body_and_section_bounds() {
         for available in 0..width {
             let mut body = vec![0, 0, opcode]; // Decode the immediate even in dead code.
             body.resize(body.len() + available, 0x0b); // Never terminate an immediate early.
-            bad_body(&body, body.len(), kind); // The body ends with the code section.
+            // The last body ends with the code section, but a following custom
+            // section contains enough bytes for the entire immediate.
+            let mut bytes = module(&[(1, TYPE), (3, FUNCTION)]);
+            push_section(&mut bytes, 10, &code_body(&body));
+            let end = bytes.len();
+            push_section(&mut bytes, 0, &vec![0; width + 1]); // Empty name and opaque bytes.
+            expect_error(&bytes, end, kind);
+
+            // This time the code section still has enough bytes: the first
+            // body must not borrow them from the next body's frame.
             let mut bytes = module(&[(1, TYPE), (3, TWO_FUNCTIONS)]);
-            let code = code_bodies(&[&body, &[0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x41, 42, 0x0b]]);
+            let next = b"\0\x01\x01\x01\x01\x01\x41\x2a\x0b";
+            let code = code_bodies(&[&body, next]);
             let start = push_section(&mut bytes, 10, &code);
-            // Another body has enough bytes but must not satisfy the immediate.
             expect_error(&bytes, start + 2 + body.len(), kind);
         }
         // A byte that looks like `end` belongs to the immediate; no actual end follows.

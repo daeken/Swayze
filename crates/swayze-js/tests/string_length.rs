@@ -311,6 +311,73 @@ fn trivia_continues_the_read_and_a_continued_string_ends_the_prologue() {
 }
 
 #[test]
+fn suffix_probe_does_not_change_early_statement_or_directive_errors() {
+    for (source, start, width, message) in [
+        (
+            "'use strict'; 'x'./*",
+            0,
+            12,
+            "Use Strict Directives are outside the subset",
+        ),
+        (
+            "'first'; 'use strict'; (1)./*",
+            9,
+            12,
+            "Use Strict Directives are outside the subset",
+        ),
+        (
+            "'use strict'.other",
+            12,
+            1,
+            "token is outside the arithmetic subset",
+        ),
+        (
+            "'use strict';./*",
+            0,
+            12,
+            "Use Strict Directives are outside the subset",
+        ),
+        (
+            "s\n++./*",
+            2,
+            2,
+            "a line terminator cannot precede a postfix update",
+        ),
+        (
+            "{ s/*\n*/++./* } 0",
+            8,
+            2,
+            "a line terminator cannot precede a postfix update",
+        ),
+        (
+            "label: s./*",
+            8,
+            1,
+            "token is outside the arithmetic subset",
+        ),
+    ] {
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{source:?}");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + width
+            },
+            "{source:?}"
+        );
+        assert_eq!(error.message(), message, "{source:?}");
+    }
+
+    // With no explicit statement delimiter, the eligible dot is part of the
+    // same expression. The raw literal alone cannot yet be a directive.
+    let error = parse_script("'use strict'\n./*").unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Malformed);
+    assert_eq!(error.span(), Span { start: 14, end: 16 });
+    assert_eq!(error.message(), "unterminated block comment");
+}
+
+#[test]
 fn runtime_aliases_and_warm_storage_keep_exact_length() {
     let script =
         parse_script(r"let s='😀'+'\uD800'; const old=s; s+=s; s+='\0'; old.length*10+s.length")

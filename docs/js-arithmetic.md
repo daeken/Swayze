@@ -55,14 +55,17 @@ right-hand value. An eager compound reads the target before evaluating the
 right-hand side, then stores and returns the numeric result. A logical
 compound returns the old value on a skip, with no write. Otherwise it stores
 and returns the right-hand value without coercion. A comma right-hand side
-needs its own group, as in `(x = (a, b))`. The required parentheses around
-a control test are not an expression group: use `if ((x = a))`.
-A lexical initializer, an existing assignment's right-hand side, or either
-ternary arm can start with a chain of simple name assignments. Examples are
-`let y = x = 3;`, `x = y = 1;`, and `test ? x = a : x = b`. The final
-right-hand side is evaluated once; writes run from right to left, preserving
-its value. Only the selected ternary arm runs. Starting a bare assignment in
-a comma operand or control test is still outside this subset.
+needs its own group, as in `(x = (a, b))`. Use `if ((x += a))` for a compound
+assignment in a control test: the required test parentheses do not count as
+an explicit expression group.
+A lexical initializer, an existing assignment's right-hand side, either
+ternary arm, or a control test can start with a chain of simple name
+assignments. Examples are `let y = x = 3;`, `test ? x = a : x = b`, and
+`if (x = y = test)`. The final right-hand side is evaluated once; writes run
+from right to left, preserving its value. Only the selected ternary arm
+runs. A comma at test level follows the assignment, so `if (x = 0, true)`
+stores `0` and tests `true`. Starting a bare assignment after that comma is
+still outside this subset.
 Declarations, assignments, updates, and nonfinal expression statements require
 explicit semicolons. Expression statements discard their values. The script
 must end in a root-level expression, whose trailing semicolon is optional;

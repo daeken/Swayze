@@ -286,6 +286,7 @@ fn checks_inactive_headers_and_bodies_with_lexical_diagnostics() {
     for (source, kind, needle) in [
         ("for(a=0;false;){let a=1;}42", Unsupported, "for(|a"),
         ("for(;flag;){let flag=0;}42", Unsupported, ";|flag"),
+        ("for(;i=1;){}42", Unsupported, ";|i"),
         (
             "let i=0;for(;false;i=only){let only=0;}42",
             Unsupported,
@@ -320,7 +321,7 @@ fn requires_braces_and_explicit_delimiters() {
         ("for(i of j){}42", Unsupported, "of"),
         ("for(i**=1;false;){}42", Unsupported, "for(|i"),
         ("for(i=0,j=1;false;){}42", Unsupported, ","),
-        ("for(;i=1;){}42", Unsupported, "="),
+        ("for(;i+=1;){}42", Unsupported, "+="),
         ("for(;false;i++){}42", Unsupported, "false;|i"),
         ("for(;false;i+1){}42", Unsupported, "false;|i"),
         ("for(;false;i=0,i=1){}42", Unsupported, ","),

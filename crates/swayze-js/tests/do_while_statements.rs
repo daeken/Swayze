@@ -150,7 +150,7 @@ fn checks_both_parts_even_when_a_jump_or_branch_skips_them() {
         ("do{break; const x=1; x=2;}while(false);0", Unsupported),
         ("do{break outer;}while(false);0", Malformed),
         ("do{break;}while(1+);0", Malformed),
-        ("let x=0;do{break;}while(x=1);x", Unsupported),
+        ("const x=0;do{break;}while(x=1);x", Unsupported),
         ("do{break;}while(false && missing);0", Unsupported),
         ("if(false){do{let x=0;}while(x++);}0", Unsupported),
     ] {

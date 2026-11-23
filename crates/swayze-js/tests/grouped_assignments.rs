@@ -478,26 +478,6 @@ fn rejects_targets_and_positions_outside_the_slice() {
             "assignment expressions",
         ),
         (
-            "let x, a=1; if (x @=@ a) {} x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;while(x@=@1){}x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;do{}while(x@=@1);x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
-            "let x;for(;x@=@1;){}x",
-            Unsupported,
-            "assignment expressions",
-        ),
-        (
             "let x, a=1, b=2; (x = a@,@ b)",
             Unsupported,
             "sequence in an assignment RHS",

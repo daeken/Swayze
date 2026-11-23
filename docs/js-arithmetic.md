@@ -25,14 +25,17 @@ Arithmetic and relational comparisons (`<`, `<=`, `>`, `>=`) convert `true`
 to `1`, `false` and `null` to `+0`, and `undefined` to NaN. Every relational
 comparison involving NaN is false. Strict equality (`===`, `!==`) compares
 types without coercion: signed zeros compare equal, while NaN is unequal to
-itself. Comparisons return Booleans.
+itself. Loose equality (`==`, `!=`) uses the same comparison for matching
+types, equates `null` with `undefined`, and converts Booleans to Numbers
+when compared to a Number. Other mixed types are unequal in this subset.
+Comparisons return Booleans.
 
 Bitwise operations (`~`, `&`, `^`, `|`, `<<`, `>>`, `>>>`) convert operands to
 32-bit integers by truncating and reducing modulo 2³². Nonfinite values and
 signed zeros become zero. Shifts use the low five bits of the count. Results
 are signed 32-bit integers represented as Numbers, except `>>>`, which returns
 an unsigned result. From tighter to looser, binary precedence is arithmetic,
-shifts, relational comparisons, strict equality, `&`, `^`, `|`, then logical
+shifts, relational comparisons, equality (loose and strict), `&`, `^`, `|`, then logical
 operators.
 
 Conditional expressions (`test ? consequent : alternate`) evaluate only the

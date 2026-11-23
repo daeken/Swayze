@@ -578,7 +578,7 @@ fn logical_punctuators_use_maximal_munch_without_crossing_trivia() {
     use ErrorKind::{Malformed, Unsupported};
     for (source, kind, start, end) in [
         ("!===1", Malformed, 0, 3), // `!==` followed by `=`, not `!` followed by `===`
-        ("!=1", Unsupported, 0, 2),
+        ("!=1", Malformed, 0, 2),
         ("1&=2", Unsupported, 1, 3),
         ("1|=2", Unsupported, 1, 3),
         ("1&&=2", Unsupported, 1, 4),
@@ -900,7 +900,6 @@ fn consts_decline_reserved_and_non_subset_names_without_splitting() {
         ("const xé=1; 1", 7, 9),
         ("const x\\u0061=1; 1", 7, 8),
         ("const x=1; x\u{200D}", 12, 15),
-        ("const x==1; x", 7, 9),
         ("const x=>1; x", 7, 9),
     ] {
         assert_error(source, Unsupported, start, end);
@@ -914,6 +913,7 @@ fn const_grammar_requires_initializers_delimiters_and_one_final_expression() {
         ("const", Malformed, 5, 5),
         ("const x; x", Malformed, 7, 8),
         ("const x=; x", Malformed, 8, 9),
+        ("const x==1; x", Malformed, 7, 9),
         ("const x===1; x", Malformed, 7, 10),
         ("Const x=1; x", Malformed, 6, 7), // Syntax is checked before name resolution.
         ("const x=1", Unsupported, 9, 9),
@@ -1103,7 +1103,7 @@ fn only_explicit_simple_assignments_before_the_final_expression() {
         ("let x=1; x=x=2; x", Unsupported, 12, 13),
         ("let x=1; x+=2; x", Unsupported, 10, 12),
         ("let x=1; x**=2; x", Unsupported, 10, 13),
-        ("let x=1; x==2; x", Unsupported, 10, 12),
+        ("let x=1; x==2; x", Unsupported, 15, 16),
         ("let x=1; x=>2; x", Unsupported, 10, 12),
         ("let x=1; x; x=2; x", Unsupported, 12, 13),
         ("let x=1; x=2; x; 🚧", Unsupported, 17, 21),

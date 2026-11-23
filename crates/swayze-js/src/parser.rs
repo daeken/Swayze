@@ -219,6 +219,8 @@ pub(crate) enum Instruction {
     ShiftLeft,
     ShiftRight,
     ShiftRightUnsigned,
+    LooseEqual,
+    LooseNotEqual,
     StrictEqual,
     StrictNotEqual,
     LessThan,
@@ -290,6 +292,8 @@ enum Operator {
     BitwiseOr,
     BitwiseXor,
     BitwiseAnd,
+    LooseEqual,
+    LooseNotEqual,
     StrictEqual,
     StrictNotEqual,
     LessThan,
@@ -319,7 +323,7 @@ impl Operator {
             Self::BitwiseOr => 3,
             Self::BitwiseXor => 4,
             Self::BitwiseAnd => 5,
-            Self::StrictEqual | Self::StrictNotEqual => 6,
+            Self::LooseEqual | Self::LooseNotEqual | Self::StrictEqual | Self::StrictNotEqual => 6,
             Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
@@ -347,6 +351,8 @@ impl Operator {
             Self::ShiftLeft => Instruction::ShiftLeft,
             Self::ShiftRight => Instruction::ShiftRight,
             Self::ShiftRightUnsigned => Instruction::ShiftRightUnsigned,
+            Self::LooseEqual => Instruction::LooseEqual,
+            Self::LooseNotEqual => Instruction::LooseNotEqual,
             Self::StrictEqual => Instruction::StrictEqual,
             Self::StrictNotEqual => Instruction::StrictNotEqual,
             Self::LessThan => Instruction::LessThan,
@@ -610,15 +616,19 @@ impl Lexer<'_> {
     fn equals_or_bang(&mut self, first: char, start: usize) -> Result<TokenKind, Error> {
         if self.peek() == Some('=') {
             self.consume('=')?;
-            if self.peek() == Some('=') {
+            let strict = self.peek() == Some('=');
+            if strict {
                 self.consume('=')?;
-                return Ok(TokenKind::Operator(if first == '=' {
-                    Operator::StrictEqual
-                } else {
-                    Operator::StrictNotEqual
-                }));
             }
-        } else if first == '=' {
+            return Ok(TokenKind::Operator(match (first, strict) {
+                ('=', false) => Operator::LooseEqual,
+                ('!', false) => Operator::LooseNotEqual,
+                ('=', true) => Operator::StrictEqual,
+                ('!', true) => Operator::StrictNotEqual,
+                _ => unreachable!("not an equality operator"),
+            }));
+        }
+        if first == '=' {
             if self.peek() != Some('>') {
                 return Ok(TokenKind::Equals);
             }
@@ -1871,6 +1881,8 @@ impl Parser<'_> {
             | Instruction::ShiftLeft
             | Instruction::ShiftRight
             | Instruction::ShiftRightUnsigned
+            | Instruction::LooseEqual
+            | Instruction::LooseNotEqual
             | Instruction::StrictEqual
             | Instruction::StrictNotEqual
             | Instruction::LessThan

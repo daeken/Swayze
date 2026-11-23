@@ -63,7 +63,7 @@ pub enum Limit {
     Work,
     /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
-    /// Fixed source-byte ceiling for the whole quoted String token, including both quotes.
+    /// Fixed source-byte ceiling for a quoted String or template token, including delimiters.
     StringLiteralBytes,
     /// Fixed ceiling on aggregate decoded UTF-16 code units across all String literals in one Script.
     StringLiteralUnits,
@@ -476,6 +476,7 @@ fn check_postfix_line_break(operator: Span, after_line_break: bool) -> Result<()
 enum TokenKind {
     Number(f64),
     String(StringRange),
+    Template(StringRange),
     Boolean(bool),
     Null,
     Identifier,
@@ -499,6 +500,16 @@ enum TokenKind {
     Colon,
     Comma,
     Semicolon,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TokenPosition {
+    // Fixed syntax or a continuation that doesn't allow a property suffix.
+    Plain,
+    // Starts a statement or operand, so a backtick can open an untagged template.
+    Operand,
+    // May lex a `.length` continuation, but never a tagged template.
+    AfterPrimary,
 }
 
 struct Token {
@@ -643,7 +654,7 @@ impl Lexer<'_> {
         Ok(())
     }
 
-    fn next(&mut self, allow_dot: bool) -> Result<Option<Token>, Error> {
+    fn next(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {
         let after_line_break = self.skip_trivia()?;
         let Some(c) = self.peek() else {
             return Ok(None);
@@ -659,7 +670,7 @@ impl Lexer<'_> {
         let kind = match c {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
-            '.' if allow_dot => {
+            '.' if position == TokenPosition::AfterPrimary => {
                 self.consume_length(first)?;
                 // Lookahead after a name may cache the complete suffix. Use
                 // the dot span for emission, not a span including trivia.
@@ -669,7 +680,20 @@ impl Lexer<'_> {
                     after_line_break,
                 }));
             }
-            '\'' | '"' => TokenKind::String(self.string_literal(c, start)?),
+            '\'' | '"' | '`' => {
+                let template = c == '`';
+                if template && position != TokenPosition::Operand {
+                    // Infix backticks remain unsupported at the opener. Do not
+                    // scan a tag's template body (even on a skipped path).
+                    return Err(unsupported_token(first));
+                }
+                let range = self.string_literal(c, start)?;
+                if template {
+                    TokenKind::Template(range)
+                } else {
+                    TokenKind::String(range)
+                }
+            }
             _ if is_identifier_start(c) => self.identifier(start)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
             '&' | '|' | '^' => self.bitwise_or_logical(c)?,
@@ -1283,7 +1307,7 @@ impl Parser<'_> {
                 self.parse_block_item()?;
                 continue;
             }
-            let first = self.next_token()?.ok_or_else(|| {
+            let first = self.next_token(TokenPosition::Operand)?.ok_or_else(|| {
                 Error::unsupported(
                     Span::at(self.lexer.offset),
                     if saw_statement {
@@ -1305,6 +1329,7 @@ impl Parser<'_> {
             };
             let before = self.instructions.len();
             let (end, delimiter) = self.parse_expression(start, ExpressionEnd::Script)?;
+            // Only a bare quoted String can be a directive; a Template cannot.
             // A bare literal emits one instruction. Any expression that STARTS
             // with that token and continues (even across a newline) emits more;
             // an expression that starts with a group doesn't qualify at all.
@@ -1327,7 +1352,7 @@ impl Parser<'_> {
             }
             // A root semicolon terminates the final expression only at EOF.
             // Otherwise discard the completed value and resume with the cached token.
-            let next = self.next_token()?;
+            let next = self.next_token(TokenPosition::Operand)?;
             if next.is_none() {
                 break;
             }
@@ -1343,22 +1368,25 @@ impl Parser<'_> {
         })
     }
 
-    fn next_token(&mut self) -> Result<Option<Token>, Error> {
-        self.next_token_with_dot(false)
-    }
-
-    fn next_token_with_dot(&mut self, allow_dot: bool) -> Result<Option<Token>, Error> {
+    fn next_token(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {
         match self.lookahead.take() {
-            Some(Some(token)) if !allow_dot && matches!(token.kind, TokenKind::LengthSuffix) => {
+            Some(Some(token))
+                if position != TokenPosition::AfterPrimary
+                    && matches!(token.kind, TokenKind::LengthSuffix) =>
+            {
                 Err(unsupported_token(token.span))
             }
             Some(next) => Ok(next),
-            None => self.lexer.next(allow_dot),
+            None => self.lexer.next(position),
         }
     }
 
-    fn require_token(&mut self, message: &'static str) -> Result<Token, Error> {
-        self.next_token()?
+    fn require_token(
+        &mut self,
+        position: TokenPosition,
+        message: &'static str,
+    ) -> Result<Token, Error> {
+        self.next_token(position)?
             .ok_or_else(|| Error::malformed(Span::at(self.lexer.offset), message))
     }
 
@@ -1478,7 +1506,7 @@ impl Parser<'_> {
             StatementKind::IfThen { branch } => {
                 // Only this freshly closed then-arm can take the next `else`.
                 // In particular, a `}` belongs to the parent, so leave it cached.
-                let next = self.next_token()?;
+                let next = self.next_token(TokenPosition::Operand)?;
                 if let Some(Token {
                     kind: TokenKind::Else,
                     span,
@@ -1489,7 +1517,7 @@ impl Parser<'_> {
                     self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
                     self.patch_if_jump(branch, span)?;
                     let missing = "expected '{' or 'if' after 'else'";
-                    let arm = self.require_token(missing)?;
+                    let arm = self.require_token(TokenPosition::Plain, missing)?;
                     let parent = self.statement_frames[..index]
                         .last()
                         .map_or(0, |frame| frame.scope);
@@ -1618,12 +1646,12 @@ impl Parser<'_> {
 
     fn parse_do_tail(&mut self) -> Result<(usize, Span), Error> {
         let missing_while = "expected 'while' after the do body";
-        let keyword = self.require_token(missing_while)?;
+        let keyword = self.require_token(TokenPosition::Plain, missing_while)?;
         if !matches!(keyword.kind, TokenKind::While) {
             return Err(Error::malformed(keyword.span, missing_while));
         }
         let exit = self.parse_statement_test("expected '(' after 'while'")?;
-        let next = self.next_token()?;
+        let next = self.next_token(TokenPosition::Plain)?;
         match next {
             Some(Token {
                 kind: TokenKind::Semicolon,
@@ -1649,7 +1677,7 @@ impl Parser<'_> {
 
     fn parse_for_header(&mut self, label_start: usize) -> Result<StatementFrame, Error> {
         let missing_open = "expected '(' after 'for'";
-        let open = self.require_token(missing_open)?;
+        let open = self.require_token(TokenPosition::Plain, missing_open)?;
         if !matches!(open.kind, TokenKind::Open) {
             return Err(Error::malformed(open.span, missing_open));
         }
@@ -1658,7 +1686,8 @@ impl Parser<'_> {
         self.enter_nesting(open.span)?;
         self.lexer.charge(1, open.span)?;
 
-        let init = self.require_token("expected a for initializer or ';'")?;
+        let init =
+            self.require_token(TokenPosition::Operand, "expected a for initializer or ';'")?;
         match init.kind {
             TokenKind::Close => return Err(Error::malformed(init.span, FOR_SEMICOLON)),
             TokenKind::Semicolon => {}
@@ -1676,7 +1705,7 @@ impl Parser<'_> {
         // Loop back edges skip the initializer. Reentering the statement
         // executes its InitBinding instructions again, in the same fixed slots.
         let test = self.instructions.len();
-        let first = self.require_token("expected a for test or ';'")?;
+        let first = self.require_token(TokenPosition::Operand, "expected a for test or ';'")?;
         let end = if matches!(first.kind, TokenKind::Semicolon) {
             self.emit(Instruction::Boolean(true), first.span)?;
             first.span
@@ -1686,7 +1715,7 @@ impl Parser<'_> {
         };
         let exit = self.emit_statement_test(end)?;
 
-        let first = self.require_token("expected a for update or ')'")?;
+        let first = self.require_token(TokenPosition::Operand, "expected a for update or ')'")?;
         if matches!(first.kind, TokenKind::Semicolon) {
             return Err(Error::malformed(
                 first.span,
@@ -1728,7 +1757,7 @@ impl Parser<'_> {
                 first.span,
                 UpdateResult::New,
             ),
-            TokenKind::Identifier => match self.next_token_with_dot(true)? {
+            TokenKind::Identifier => match self.next_token(TokenPosition::AfterPrimary)? {
                 Some(Token {
                     kind: TokenKind::Assignment(op),
                     span,
@@ -1768,7 +1797,7 @@ impl Parser<'_> {
     }
 
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
-        let open = self.require_token(missing_open)?;
+        let open = self.require_token(TokenPosition::Plain, missing_open)?;
         if !matches!(open.kind, TokenKind::Open) {
             return Err(Error::malformed(open.span, missing_open));
         }
@@ -1784,7 +1813,10 @@ impl Parser<'_> {
     }
 
     fn require_block_open(&mut self, missing_open: &'static str) -> Result<Span, Error> {
-        Self::block_open(self.require_token(missing_open)?, missing_open)
+        Self::block_open(
+            self.require_token(TokenPosition::Plain, missing_open)?,
+            missing_open,
+        )
     }
 
     fn block_open(open: Token, missing_open: &'static str) -> Result<Span, Error> {
@@ -1799,7 +1831,10 @@ impl Parser<'_> {
     }
 
     fn parse_block_item(&mut self) -> Result<(), Error> {
-        let first = self.require_token("expected a statement or '}' in the block")?;
+        let first = self.require_token(
+            TokenPosition::Operand,
+            "expected a statement or '}' in the block",
+        )?;
         self.check_statement_boundary(first.span)?;
         if matches!(first.kind, TokenKind::CloseBrace) {
             return self.close_block(first.span);
@@ -1829,7 +1864,7 @@ impl Parser<'_> {
                 let name = self.parse_update_target(first.span)?;
                 return self.parse_statement_update(name, op, first.span, UpdateResult::New);
             }
-            TokenKind::Identifier => match self.next_token_with_dot(true)? {
+            TokenKind::Identifier => match self.next_token(TokenPosition::AfterPrimary)? {
                 Some(Token {
                     kind: TokenKind::Colon,
                     ..
@@ -1867,7 +1902,7 @@ impl Parser<'_> {
         loop {
             // Each stored span follows an already metered name and colon.
             try_push(&mut self.labels, label, label)?;
-            let first = self.require_token(missing)?;
+            let first = self.require_token(TokenPosition::Plain, missing)?;
             match first.kind {
                 TokenKind::OpenBrace
                 | TokenKind::If
@@ -1881,7 +1916,7 @@ impl Parser<'_> {
                     if let Some(Token {
                         kind: TokenKind::Colon,
                         ..
-                    }) = self.next_token()?
+                    }) = self.next_token(TokenPosition::Plain)?
                     {
                         label = first.span;
                         continue;
@@ -1953,7 +1988,7 @@ impl Parser<'_> {
 
     fn parse_statement_jump(&mut self, keyword: &Token) -> Result<(), Error> {
         let is_continue = matches!(keyword.kind, TokenKind::Continue);
-        let (index, next) = match self.next_token()? {
+        let (index, next) = match self.next_token(TokenPosition::Plain)? {
             Some(Token {
                 kind: TokenKind::Identifier,
                 span,
@@ -1976,7 +2011,7 @@ impl Parser<'_> {
                 {
                     return Err(Error::malformed(span, "continue target must label a loop"));
                 }
-                (index, self.next_token()?)
+                (index, self.next_token(TokenPosition::Plain)?)
             }
             Some(Token {
                 kind: TokenKind::Declaration(BindingKind::Let),
@@ -2074,7 +2109,7 @@ impl Parser<'_> {
     // Emit and record one binding before reading the next; true means a comma
     // was consumed and another binding name is required.
     fn parse_declarator(&mut self, kind: BindingKind, mode: DeclaratorEnd) -> Result<bool, Error> {
-        let name = self.require_token("expected a binding name")?;
+        let name = self.require_token(TokenPosition::Plain, "expected a binding name")?;
         match name.kind {
             TokenKind::Identifier => {}
             TokenKind::Declaration(_) => {
@@ -2143,7 +2178,7 @@ impl Parser<'_> {
             BindingKind::Const => "expected '=' after the binding name",
             BindingKind::Let => "expected '=', ',' or ';' after the binding name",
         };
-        let delimiter = self.require_token(expected_delimiter)?;
+        let delimiter = self.require_token(TokenPosition::Plain, expected_delimiter)?;
         let (end, separator) = match delimiter.kind {
             TokenKind::Comma | TokenKind::Semicolon if kind == BindingKind::Let => {
                 // A metered primitive push, not a name read or a prefilled slot.
@@ -2151,7 +2186,8 @@ impl Parser<'_> {
                 (delimiter.span, Some(delimiter.kind))
             }
             TokenKind::Assignment(None) => {
-                let first = self.require_token("expected a binding initializer")?;
+                let first =
+                    self.require_token(TokenPosition::Operand, "expected a binding initializer")?;
                 self.parse_expression(first.into(), ExpressionEnd::Declarator(mode))?
             }
             TokenKind::Assignment(Some(_)) => {
@@ -2206,7 +2242,7 @@ impl Parser<'_> {
     ) -> Result<LeadingUpdate, Error> {
         // Look ahead once after the checked update. Only binary operators and
         // '?' opt into the expression path; ',' still starts a store suffix.
-        match self.next_token()? {
+        match self.next_token(TokenPosition::Plain)? {
             Some(following)
                 if matches!(following.kind, TokenKind::Question)
                     || matches!(following.kind, TokenKind::Operator(op) if op.is_binary()) =>
@@ -2226,7 +2262,7 @@ impl Parser<'_> {
     }
 
     fn parse_update_target(&mut self, operator: Span) -> Result<Span, Error> {
-        self.next_token()?
+        self.next_token(TokenPosition::Plain)?
             .filter(|t| matches!(t.kind, TokenKind::Identifier))
             .map(|t| t.span)
             .ok_or_else(|| Error::unsupported(operator, UPDATE_TARGET_REQUIRED))
@@ -2331,7 +2367,7 @@ impl Parser<'_> {
             }
             binary => (None, binary),
         };
-        let first = self.require_token("expected an assignment value")?;
+        let first = self.require_token(TokenPosition::Operand, "expected an assignment value")?;
         let (rhs_end, delimiter) = self.parse_expression(first.into(), end)?;
         if let Some(binary) = binary {
             self.emit(binary, operator_span)?;
@@ -2361,7 +2397,10 @@ impl Parser<'_> {
         };
         // The comma was already consumed, and the store (or its skip edge)
         // leaves no value to discard. Parse just the remaining operands.
-        let first = self.require_token("expected an operand before end of source")?;
+        let first = self.require_token(
+            TokenPosition::Operand,
+            "expected an operand before end of source",
+        )?;
         self.parse_discarded_expression(first.into(), suffix_end)
     }
 
@@ -2649,7 +2688,7 @@ impl Parser<'_> {
             // sequence without reusing the test marker for an assignment.
             ExpressionStart::Token(first) if statement_test => {
                 self.open_pending(Pending::StatementTest, first.span)?;
-                (self.next_token()?, true, true)
+                (self.next_token(TokenPosition::Operand)?, true, true)
             }
             ExpressionStart::Token(first) => (Some(first), true, false),
             ExpressionStart::Update {
@@ -2772,7 +2811,7 @@ impl Parser<'_> {
                     direct_read = None;
                     self.emit(Instruction::StringLength, span)?;
                 }
-                (true, TokenKind::String(range)) => {
+                (true, TokenKind::String(range) | TokenKind::Template(range)) => {
                     self.emit(Instruction::String(range), span)?;
                     needs_operand = false;
                     allow_dot = true;
@@ -2796,7 +2835,7 @@ impl Parser<'_> {
                     // Charge the load, assignment marker or update at the name
                     // before looking ahead, preserving the read's work order.
                     self.lexer.charge(1, span)?;
-                    match self.next_token_with_dot(true)? {
+                    match self.next_token(TokenPosition::AfterPrimary)? {
                         Some(Token {
                             kind: TokenKind::Assignment(op),
                             span: operator,
@@ -2805,7 +2844,7 @@ impl Parser<'_> {
                             self.begin_expression_assignment(span, op, operator, group_start)?;
                             after_open = false;
                             allow_assignment = true;
-                            next = self.next_token()?;
+                            next = self.next_token(TokenPosition::Operand)?;
                             continue;
                         }
                         Some(Token {
@@ -2994,6 +3033,13 @@ impl Parser<'_> {
                         _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
                     }
                 }
+                (false, TokenKind::Template(_)) => {
+                    // Normally rejected by the lexer before decoding the body.
+                    return Err(unsupported_token(Span {
+                        start: span.start,
+                        end: span.start + 1,
+                    }));
+                }
                 (false, TokenKind::Open) => {
                     return Err(Error::unsupported(
                         span,
@@ -3036,7 +3082,13 @@ impl Parser<'_> {
                 kind,
                 TokenKind::Question | TokenKind::Colon | TokenKind::Comma
             );
-            next = self.next_token_with_dot(allow_dot)?;
+            next = self.next_token(if needs_operand {
+                TokenPosition::Operand
+            } else if allow_dot {
+                TokenPosition::AfterPrimary
+            } else {
+                TokenPosition::Plain
+            })?;
         };
         let at_eof = delimiter.is_none();
         self.reduce_expression(end, &mut direct_read)?;

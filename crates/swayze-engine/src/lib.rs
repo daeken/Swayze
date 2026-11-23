@@ -7,10 +7,10 @@
 //! including signed zeros and all NaN encodings, rather than Rust floats.
 
 pub use swayze_js::{
-    Error as JsParseError, ErrorKind as JsErrorKind, EvalError as JsEvalError,
-    EvalScratch as JsEvalScratch, Limit as JsLimit, Limits as JsLimits,
+    CompletionScript as JsCompletionScript, Error as JsParseError, ErrorKind as JsErrorKind,
+    EvalError as JsEvalError, EvalScratch as JsEvalScratch, Limit as JsLimit, Limits as JsLimits,
     PrimitiveValue as JsPrimitiveValue, Script, Span as JsSpan, Value as JsValue, parse_script,
-    parse_script_with_limits,
+    parse_script_for_completion, parse_script_for_completion_with_limits, parse_script_with_limits,
 };
 pub use swayze_wasm::{
     Error as WasmValidationError, ErrorKind as WasmErrorKind, ExecutionLimit as WasmExecutionLimit,

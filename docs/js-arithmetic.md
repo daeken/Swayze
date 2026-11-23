@@ -201,6 +201,19 @@ arithmetic. Signed zero is preserved; overflow to infinity and arithmetic that
 produces NaN return numeric values, not evaluation errors. No specific NaN bit
 pattern is promised.
 
+## Hashbang and normal completion
+
+At byte zero, `#!` starts a metered comment through LF, CR, LS, PS or EOF,
+with no token emitted. A BOM, whitespace, or any other preceding bytes prevent
+it from being a hashbang. The ordinary source and parse work limits still apply.
+
+`parse_script_for_completion` and its `_with_limits` variant allow EOF after
+complete statements, including an empty or comment-only source. Execute the
+result with `execute_with_scratch`; all reached operations still run with the
+usual checks and limits, but any final value is discarded. This is not access
+to ECMAScript Script completion values and does not add ASI. The existing
+`parse_script`/`evaluate*` value APIs still require a final expression.
+
 ## String literals
 
 Single- and double-quoted literals decode to exact UTF-16 during parsing,

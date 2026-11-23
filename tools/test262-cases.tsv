@@ -12,4 +12,4 @@ required	adapted	test/language/expressions/template-literal/mongolian-vowel-sepa
 frontier	adapted	test/language/expressions/template-literal/literal-expr-template.js	463:530	480:507	509:528
 frontier	adapted	test/language/expressions/template-literal/middle-list-one-expr-template.js	459:525	476:504	506:523
 frontier	adapted	test/language/expressions/template-literal/middle-list-many-expr-template.js	572:645	589:622	624:643
-frontier	raw	test/language/comments/hashbang/not-empty.js
+required	raw	test/language/comments/hashbang/not-empty.js

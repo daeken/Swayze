@@ -10,7 +10,8 @@ mod radix_integer;
 
 pub use eval::{EvalError, EvalScratch, PrimitiveValue, Value};
 pub use parser::{
-    Error, ErrorKind, Limit, Limits, Script, Span, parse_script, parse_script_with_limits,
+    CompletionScript, Error, ErrorKind, Limit, Limits, Script, Span, parse_script,
+    parse_script_for_completion, parse_script_for_completion_with_limits, parse_script_with_limits,
 };
 
 #[cfg(test)]

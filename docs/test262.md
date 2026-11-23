@@ -48,9 +48,11 @@ expression in Swayze and compares it with a separately evaluated primitive
 literal expectation. It compares exact value tags and UTF-16 code units,
 distinguishes `+0` and `-0`, and treats any two NaNs as the same value. It is not
 a general assertion rewriter. **Raw** mode is reserved for reviewed positive
-`raw` cases run unchanged. The hashbang comment case is an unmodified frontier;
-it does not yet pass. Strict variants
-are reported as not run, never as passes. No negative, module or harness-heavy
+`raw` cases run unchanged. The required hashbang comment case is the first
+unmodified pass: Swayze parses the original bytes and executes the resulting
+Script to normal completion, without a harness or injected value. The summary
+counts raw and adapted passes separately. Strict variants are reported as not
+run, never as passes. No negative, module or harness-heavy
 cases are credited.
 
 The required adapted sloppy-mode cases cover numeric separators in integer,

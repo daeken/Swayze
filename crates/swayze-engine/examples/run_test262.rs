@@ -14,7 +14,8 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 use swayze_engine::{
-    JsErrorKind, JsEvalError, JsEvalScratch, JsLimit, JsPrimitiveValue, JsValue, parse_script,
+    JsErrorKind, JsEvalError, JsEvalScratch, JsLimit, JsParseError, JsPrimitiveValue, JsValue,
+    parse_script, parse_script_for_completion,
 };
 
 const PIN: &str = "2a1ade303f72d3de80565c921d685222405c32ce";
@@ -332,13 +333,13 @@ fn same_value(lhs: JsPrimitiveValue<'_>, rhs: JsPrimitiveValue<'_>) -> bool {
 }
 
 fn evaluate(sources: (&str, Option<&str>)) -> Outcome {
-    fn parse(source: &str) -> Result<swayze_engine::Script, Outcome> {
-        parse_script(source).map_err(|error| match error.kind() {
+    fn parse_error(error: JsParseError) -> Outcome {
+        match error.kind() {
             JsErrorKind::Unsupported => Outcome::Unsupported(error.message()),
             JsErrorKind::LimitExceeded(JsLimit::Allocation) => Outcome::Infra(error.message()),
             JsErrorKind::LimitExceeded(_) => Outcome::Unsupported(error.message()),
             JsErrorKind::Malformed => Outcome::Fail(error.message()),
-        })
+        }
     }
     fn eval_error(error: JsEvalError) -> Outcome {
         match error {
@@ -358,20 +359,25 @@ fn evaluate(sources: (&str, Option<&str>)) -> Outcome {
         }
     }
     let result = (|| {
-        let actual = parse(sources.0)?;
         let mut actual_scratch = JsEvalScratch::new();
+        let Some(expected_source) = sources.1 else {
+            let script = parse_script_for_completion(sources.0).map_err(parse_error)?;
+            script
+                .execute_with_scratch(&mut actual_scratch)
+                .map_err(eval_error)?;
+            return Ok(Outcome::Pass);
+        };
+        let actual = parse_script(sources.0).map_err(parse_error)?;
         let lhs = actual
             .evaluate_primitive_with_scratch(&mut actual_scratch)
             .map_err(eval_error)?;
-        if let Some(source) = sources.1 {
-            let expected = parse(source)?;
-            let mut expected_scratch = JsEvalScratch::new();
-            let rhs = expected
-                .evaluate_primitive_with_scratch(&mut expected_scratch)
-                .map_err(eval_error)?;
-            if !same_value(lhs, rhs) {
-                return Err(Outcome::Fail("SameValue mismatch"));
-            }
+        let expected = parse_script(expected_source).map_err(parse_error)?;
+        let mut expected_scratch = JsEvalScratch::new();
+        let rhs = expected
+            .evaluate_primitive_with_scratch(&mut expected_scratch)
+            .map_err(eval_error)?;
+        if !same_value(lhs, rhs) {
+            return Err(Outcome::Fail("SameValue mismatch"));
         }
         Ok(Outcome::Pass)
     })();
@@ -381,6 +387,7 @@ fn evaluate(sources: (&str, Option<&str>)) -> Outcome {
 #[derive(Default)]
 struct Totals {
     pass: usize,
+    raw_pass: usize,
     unsupported: usize,
     fail: usize,
     infra: usize,
@@ -394,6 +401,7 @@ impl Totals {
         let (class, detail) = match outcome {
             Outcome::Pass => {
                 self.pass += 1;
+                self.raw_pass += usize::from(case.assertion.is_none());
                 self.required_pass += usize::from(gated);
                 ("pass", "")
             }
@@ -515,6 +523,11 @@ fn run() -> Result<u8, Diagnostic> {
         "required-pass={} required-unsupported={}",
         totals.required_pass, totals.required_unsupported
     );
+    println!(
+        "adapted-pass={} raw-pass={}",
+        totals.pass - totals.raw_pass,
+        totals.raw_pass
+    );
     if totals.required_pass == 0 {
         println!("no passing required variants");
     }
@@ -566,6 +579,29 @@ fn self_test() {
     assert!(metadata("/*---\nincludes: [test.js]\n---*/").is_err());
     assert!(metadata("/*---\nflags: [async]\n---*/").is_err());
     assert_eq!(metadata("/*---\nflags: [raw]\n---*/"), Ok(Variants::Raw));
+    let raw = Case {
+        path: "test/raw-synthetic.js",
+        required: true,
+        assertion: None,
+    };
+    let mut totals = Totals::default();
+    run_case(
+        &raw,
+        "#! kept in source\n/*---\nflags: [raw]\n---*/\nlet x = 1;",
+        &mut totals,
+    );
+    assert_eq!(
+        (totals.status(), totals.raw_pass, totals.required_pass),
+        (0, 1, 1)
+    );
+    assert!(matches!(
+        evaluate(("#! comment\u{2028}let = ;", None)),
+        Outcome::Fail(_)
+    ));
+    assert_eq!(
+        evaluate(("#! comment\n{ (0).length; }", None)),
+        Outcome::Unsupported("evaluation outside Swayze slice")
+    );
     assert_eq!(
         metadata("/*---\nflags: [onlyStrict]\n---*/"),
         Ok(Variants::Strict)

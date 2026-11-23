@@ -134,11 +134,6 @@ fn lexical_bindings_win_before_either_unbound_read_fallback() {
         ("let x = typeof (", "x", "); x"),
         ("const y = typeof ", "x", ", x = 1; y"),
         (
-            "let x = 1; if (false) {typeof (((",
-            "x",
-            "))); let x = 0;} x",
-        ),
-        (
             "if (false) { typeof ",
             "undefined",
             "; let undefined = 1; } 0",
@@ -161,6 +156,19 @@ fn lexical_bindings_win_before_either_unbound_read_fallback() {
         ErrorKind::Unsupported,
         "assignment to const is outside the subset",
     );
+}
+
+#[test]
+fn later_binding_blocks_the_same_typeof_read_on_live_and_dead_paths() {
+    for condition in ['1', '0'] {
+        assert_parse_error(
+            &format!("let x = true; if ({condition}) {{ typeof ((("),
+            "x",
+            "))); let x = 0; } x",
+            ErrorKind::Unsupported,
+            "access before lexical binding initialization is outside the subset",
+        );
+    }
 }
 
 #[test]

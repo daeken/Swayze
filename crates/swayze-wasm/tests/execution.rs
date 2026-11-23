@@ -21,6 +21,8 @@ mod i64_control;
 mod i64_locals;
 #[path = "execution/i64_operands.rs"]
 mod i64_operands;
+#[path = "execution/i64_signatures.rs"]
+mod i64_signatures;
 #[path = "execution/if_branch.rs"]
 mod if_branch;
 #[path = "execution/memory.rs"]
@@ -406,11 +408,11 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
             },
         ),
         (
-            &[0x60, 1, 0x7e],
+            &[0x60, 1, 0x7d],
             2,
             UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7e,
+                found: 0x7d,
             },
         ),
         (
@@ -422,11 +424,11 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
             },
         ),
         (
-            &[0x60, 0, 1, 0x7e],
+            &[0x60, 0, 1, 0x7d],
             3,
             UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7e,
+                found: 0x7d,
             },
         ),
         (&[0x60, 0, 0x80], 3, TruncatedInteger { field: ResultCount }),
@@ -2554,7 +2556,7 @@ fn bounds_type_function_code_and_export_counts() {
     }
     for (id, payload, index, expected) in [
         (1, &[1, 0x61, 0, 1, 0x7f][..], 1, 0x60),
-        (1, &[1, 0x60, 0, 1, 0x7e], 4, 0x7f),
+        (1, &[1, 0x60, 0, 1, 0x7d], 4, 0x7f),
         (7, &[1, 0, 1, 0], 2, 0),
     ] {
         bad_payload(
@@ -2607,11 +2609,11 @@ fn rejects_malformed_parameter_type_vectors() {
     );
     bad_payload(
         1,
-        &[1, 0x60, 2, 0x7f, 0x7e, 1, 0x7f],
+        &[1, 0x60, 2, 0x7e, 0x7d, 1, 0x7f],
         4,
         ErrorKind::UnexpectedByte {
             expected: 0x7f,
-            found: 0x7e,
+            found: 0x7d,
         },
     );
 }

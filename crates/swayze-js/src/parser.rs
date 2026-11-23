@@ -1618,7 +1618,7 @@ impl Parser<'_> {
 
     fn parse_for_clause(&mut self, first: Token, end: ForClauseEnd) -> Result<Span, Error> {
         // Keep the consuming store path for a leading assignment or update.
-        // An assignment (but not an update) can then continue at a comma.
+        // Either can then continue with a sequence suffix at a comma.
         let store_end = ExpressionEnd::ForStore(end);
         match first.kind {
             TokenKind::Update(op) => return self.parse_prefix_update(op, first.span, store_end),
@@ -2094,7 +2094,8 @@ impl Parser<'_> {
                 ExpressionEnd::Semicolon(_) | ExpressionEnd::ForStore(ForClauseEnd::Init),
                 Some(TokenKind::Semicolon),
             )
-            | (ExpressionEnd::ForStore(ForClauseEnd::Update), Some(TokenKind::Close)) => {}
+            | (ExpressionEnd::ForStore(ForClauseEnd::Update), Some(TokenKind::Close))
+            | (ExpressionEnd::ForStore(_), Some(TokenKind::Comma)) => {}
             (ExpressionEnd::Semicolon(_), None | Some(TokenKind::CloseBrace)) => {
                 return Err(Error::unsupported(
                     span,
@@ -2136,7 +2137,7 @@ impl Parser<'_> {
             operator,
         )?;
         self.finish_write(access, span, false)?;
-        Ok(span)
+        self.finish_store_clause(end, span, kind)
     }
 
     // The caller has already charged the name's emission work, just as for a
@@ -2191,12 +2192,22 @@ impl Parser<'_> {
         if let Some(skip) = skip {
             self.patch_jump(skip, rhs_end)?;
         }
+        self.finish_store_clause(end, rhs_end, delimiter)
+    }
+
+    fn finish_store_clause(
+        &mut self,
+        end: ExpressionEnd,
+        span: Span,
+        delimiter: Option<TokenKind>,
+    ) -> Result<Span, Error> {
         if let (ExpressionEnd::ForStore(clause), Some(TokenKind::Comma)) = (end, delimiter) {
-            // The store (or its skip edge) already leaves no value to discard.
+            // The comma was already consumed, and the store (or its skip edge)
+            // leaves no value to discard. Parse just the remaining operands.
             let first = self.require_token("expected an operand before end of source")?;
             return self.parse_discarded_expression(first, ExpressionEnd::ForClause(clause));
         }
-        Ok(rhs_end)
+        Ok(span)
     }
 
     fn begin_write(&mut self, name: Span, operator_span: Span, load: bool) -> Result<usize, Error> {

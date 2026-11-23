@@ -136,13 +136,12 @@ to be empty; a missing test is true. The initializer can be a `let` or `const`
 declaration list. Its bindings are visible in the initializer, test, update, and body, but
 not after the loop. The initializer runs once each time execution enters the
 loop statement, not on each iteration. The update and any non-declaration
-initializer discards its result. A supported comma sequence can start with
-an assignment, as in `for (x = 0, y = 2; x < 2; x += 1, y *= 2) {}`. The
-first assignment finishes before the next operand, and a short-circuited
-logical assignment still proceeds to the rest of the sequence. A standalone
-increment or decrement is also accepted, but a leading ungrouped update
-cannot yet start a comma sequence.
-`break;` skips the update. The subset has no
+initializer discard their results. A comma sequence can start with an
+assignment, prefix update, or same-line postfix update, as in
+`for (++x, y = 0; y < 2; x++, ++y) {}`. The first assignment or update
+finishes before the next operand, and a short-circuited logical assignment
+still proceeds to the rest of the sequence. `continue;` runs the whole
+updater sequence; `break;` skips it. The subset has no
 closures and does not model their observable per-iteration environments.
 `do { ... } while (test);` runs the body before testing, and requires the
 trailing semicolon. The test is outside the body's lexical scope. `continue;`

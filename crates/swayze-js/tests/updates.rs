@@ -49,6 +49,126 @@ fn all_four_forms_work_in_statements_and_both_for_clauses() {
 }
 
 #[test]
+fn for_sequences_run_after_leading_updates_in_order_and_follow_loop_jumps() {
+    for init in ["++x", "x++"] {
+        for update in ["--x", "x--"] {
+            let source = format!(
+                "let x=1,y,n=0;
+                 for({init},y=x; n<2; {update},y=y*10+x,++n){{
+                     if(n){{break;}}continue;
+                 }}
+                 x*1000+y*10+n"
+            );
+            // Init sets x and y to 2. Continue runs all three updater operands
+            // (x=1, y=21, n=1); break skips them all on the next iteration.
+            let script = parse_script(&source).unwrap();
+            assert_eq!(script.evaluate(), Ok(1211.0), "{source}");
+            assert_eq!(script.evaluate(), Ok(1211.0), "{source}");
+        }
+    }
+    for (source, expected) in [
+        ("let x=0,y;for(++x,y=0;y<2;x++,++y){}x*10+y", 32.0),
+        ("let x=1,y;for(x++,y=x++ ** 2;false;){}x*10+y", 34.0),
+        ("let x=0,y;for(let i=x++,end=2;i<end;++i,y=i){}x*10+y", 12.0),
+        ("let x=0;for(++\nx\n, x/**/++\n;false;){}x", 2.0),
+    ] {
+        assert_eq!(
+            parse_script(source).unwrap().evaluate(),
+            Ok(expected),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn for_update_sequence_delimiters_and_targets_keep_their_diagnostics() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, kind, message) in [
+        (
+            "let x;for(++x,@;@false;){}x",
+            Malformed,
+            "expected an operand",
+        ),
+        (
+            "let x;for(;false;x--,@)@{}x",
+            Malformed,
+            "expected an operand",
+        ),
+        (
+            "let x;for(x++,/*💡*/@@",
+            Malformed,
+            "expected an operand before end of source",
+        ),
+        (
+            "let x;for(;false;--x,/*💡*/@@",
+            Malformed,
+            "expected an operand before end of source",
+        ),
+        (
+            "let x;for(--x,@,@null;false;){}x",
+            Malformed,
+            "expected an operand",
+        ),
+        ("let x;for(x--,null@)@{}x", Malformed, "between for clauses"),
+        (
+            "let x;for(;false;++x,null@;@){}x",
+            Malformed,
+            "after the for update",
+        ),
+        (
+            "let x;for(++x @in@ x){}x",
+            Unsupported,
+            "outside the subset",
+        ),
+        (
+            "let x;for(x++ @of@ x){}x",
+            Unsupported,
+            "outside the subset",
+        ),
+        (
+            "let x;for(x++,x @in@ x){}x",
+            Unsupported,
+            "outside the subset",
+        ),
+        (
+            "let x;for(++x,x @of@ x){}x",
+            Unsupported,
+            "outside the subset",
+        ),
+        (
+            "let x;for(@++@(x),null;false;){}x",
+            Unsupported,
+            "identifier",
+        ),
+        (
+            "let x;for(;false;(x)@--@,null){}x",
+            Unsupported,
+            "identifier",
+        ),
+        ("let x;for(++x@.@p,null;false;){}x", Unsupported, "token"),
+        (
+            "const x=0;for(;false;x@++@,missing){}x",
+            Unsupported,
+            "assignment to const",
+        ),
+        (
+            "let x;for(;false;++x,@missing@=2){let missing;}x",
+            Unsupported,
+            "unbound name",
+        ),
+        (
+            "let x;for(let i=x++, @null@;false;){}x",
+            Unsupported,
+            "binding name",
+        ),
+        ("let x;@++@x,0;x", Unsupported, "expressions"),
+        ("let x;{x@--@,0;}x", Unsupported, "expressions"),
+    ] {
+        assert_error(source, kind, message);
+    }
+}
+
+#[test]
 fn nearest_bindings_are_updated_and_body_bindings_are_fresh() {
     let source = "let x=0;let trace=0;
         for(++x;x<4;x++){let x=7;++x;trace=trace*10+x;continue;}
@@ -139,6 +259,8 @@ fn respects_ecmascript_line_terminators_without_asi() {
                     format!("let x=0;if(true){{x{trivia}@{op}@;}}x"),
                     format!("let x=0;for(x{trivia}@{op}@;false;){{}}x"),
                     format!("let x=0;for(;false;x{trivia}@{op}@){{}}x"),
+                    format!("let x=0;for(x{trivia}@{op}@,null;false;){{}}x"),
+                    format!("let x=0;for(;false;x{trivia}@{op}@,null){{}}x"),
                     format!("let x=0;x{trivia}@{op}@x;x"),
                 ] {
                     assert_error(&marked, Unsupported, "line terminator");

@@ -473,7 +473,7 @@ fn rejects_targets_and_positions_outside_the_slice() {
         ),
         ("let x;(0,x@=@42)", Unsupported, "assignment expressions"),
         (
-            "let x;(x=true ? x@=@1 : 2)",
+            "let x;(x=true ? x@+=@1 : 2)",
             Unsupported,
             "assignment expressions",
         ),

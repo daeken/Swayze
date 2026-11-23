@@ -154,7 +154,7 @@ fn nullish_punctuation_uses_maximal_munch_without_exposing_unsupported_operators
         ("null?/**/?1:2", Malformed, 9, 10),
         ("null??=1", Unsupported, 4, 7),
         ("undefined?.x", Unsupported, 9, 11),
-        ("null==undefined", Unsupported, 4, 6),
+        ("null??==1", Unsupported, 4, 7), // `??=` then `=`, not `??` then `==`.
     ] {
         let error = parse_script(source).unwrap_err();
         assert_eq!(error.kind(), kind, "{source}: {error}");

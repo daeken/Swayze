@@ -65,6 +65,17 @@ impl Value {
         }
     }
 
+    fn loosely_equals(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Undefined) | (Self::Undefined, Self::Null) => true,
+            (Self::Number(_), Self::Boolean(_)) | (Self::Boolean(_), Self::Number(_)) => {
+                self.to_number() == other.to_number()
+            }
+            // Same tags use strict equality; all other mixed tags are unequal.
+            _ => self.strictly_equals(other),
+        }
+    }
+
     fn strictly_equals(self, other: Self) -> bool {
         match (self, other) {
             // Binary64 equality equates signed zeros and never equates NaN.
@@ -133,8 +144,11 @@ impl Script {
     /// low five bits of the converted count. Bitwise results are Numbers
     /// representing signed 32-bit integers, except for zero-fill right shift
     /// (`>>>`), which returns an unsigned 32-bit result.
-    /// Strict equality and inequality compare tags and values without coercion
-    /// and return a Boolean.
+    /// Equality and inequality return Booleans. Strict equality (`===`) never
+    /// coerces. Loose equality (`==`) uses strict equality for matching tags,
+    /// equates `null` with `undefined`, and compares a Number and a Boolean
+    /// numerically after converting the Boolean. Other mixed tags are unequal.
+    /// `!==` and `!=` negate their corresponding equality results.
     ///
     /// Logical negation (`!`), short-circuit operators (`&&`, `||`), and the
     /// conditional operator (`?:`) share truthiness: `false`, `null`, `undefined`,
@@ -286,6 +300,12 @@ fn evaluate(
             })?,
             Instruction::ShiftRightUnsigned => apply_binary(&mut stack, |lhs, rhs| {
                 Value::Number(f64::from(lhs.to_uint32().wrapping_shr(rhs.to_uint32())))
+            })?,
+            Instruction::LooseEqual => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Boolean(lhs.loosely_equals(rhs))
+            })?,
+            Instruction::LooseNotEqual => apply_binary(&mut stack, |lhs, rhs| {
+                Value::Boolean(!lhs.loosely_equals(rhs))
             })?,
             Instruction::StrictEqual => apply_binary(&mut stack, |lhs, rhs| {
                 Value::Boolean(lhs.strictly_equals(rhs))
@@ -457,6 +477,8 @@ mod tests {
             (&[one, Instruction::ShiftRightUnsigned][..], 1),
             (&[one, Instruction::Divide][..], 1),
             (&[one, Instruction::Remainder][..], 1),
+            (&[Instruction::LooseEqual][..], 1),
+            (&[one, Instruction::LooseNotEqual][..], 1),
             (&[Instruction::StrictEqual][..], 1),
             (&[one, Instruction::LessThanOrEqual][..], 1),
             (&[one, Instruction::Subtract, one][..], 1),

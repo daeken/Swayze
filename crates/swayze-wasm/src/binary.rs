@@ -49,6 +49,7 @@ pub enum ErrorKind {
     LengthOverflow { field: LengthField },
     TruncatedInteger { field: IntegerField },
     IntegerOverflow { field: IntegerField },
+    TruncatedFloatConst { ty: ValType },
     TruncatedSection { declared: usize, available: usize },
     TruncatedBody { declared: usize, available: usize },
     TruncatedName { declared: usize, available: usize },
@@ -144,11 +145,14 @@ impl IntegerField {
     }
 }
 
-/// A concrete type used for operands, locals, and function signatures.
+/// A concrete operand type. Only integers are supported in declarations and
+/// across the host boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValType {
     I32,
     I64,
+    F32,
+    F64,
 }
 
 impl fmt::Display for ValType {
@@ -156,6 +160,8 @@ impl fmt::Display for ValType {
         f.write_str(match self {
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
         })
     }
 }
@@ -174,7 +180,7 @@ pub enum Limit {
     /// Decoded operations across the whole body, including `if`, `else`, `br`, `br_if`,
     /// and `br_table`, but not `block`, `loop`, or `end`.
     BodyInstructions,
-    /// Peak number of explicitly stacked operands of either type during body validation.
+    /// Peak number of explicitly stacked operands of any type during body validation.
     OperandStackDepth,
     /// Number of simultaneously open `block`, `loop`, and `if` frames, excluding the function frame.
     ControlDepth,
@@ -226,6 +232,7 @@ impl fmt::Display for Error {
             IntegerOverflow { field } => {
                 write!(f, "LEB{} overflow for {field:?}", field.leb_width())
             }
+            TruncatedFloatConst { ty } => write!(f, "truncated fixed-width {ty}.const immediate"),
             TruncatedSection {
                 declared,
                 available,
@@ -605,32 +612,51 @@ const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntegerType {
+    I32,
+    I64,
+}
+
+impl From<IntegerType> for ValType {
+    fn from(ty: IntegerType) -> Self {
+        match ty {
+            IntegerType::I32 => Self::I32,
+            IntegerType::I64 => Self::I64,
+        }
+    }
+}
+
 // Unused parameter slots are always i32, so derived equality is structural
 // (arity, every positional parameter type, and result), independent of type indices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FunctionType {
-    parameters: [ValType; MAX_PARAMETERS as usize],
+    parameters: [IntegerType; MAX_PARAMETERS as usize],
     parameter_count: u8,
-    result: Option<ValType>,
+    result: Option<IntegerType>,
 }
 
 impl FunctionType {
     // Keep the existing framing checks for a module missing its type section.
     const PLACEHOLDER: Self = Self {
-        parameters: [ValType::I32; MAX_PARAMETERS as usize],
+        parameters: [IntegerType::I32; MAX_PARAMETERS as usize],
         parameter_count: 0,
-        result: Some(ValType::I32),
+        result: Some(IntegerType::I32),
     };
 
-    fn parameters(&self) -> &[ValType] {
+    fn parameters(&self) -> &[IntegerType] {
         &self.parameters[..self.parameter_count as usize]
+    }
+
+    fn result_type(self) -> Option<ValType> {
+        self.result.map(ValType::from)
     }
 
     fn result_kind(self) -> ResultKind {
         match self.result {
             None => ResultKind::Void,
-            Some(ValType::I32) => ResultKind::I32,
-            Some(ValType::I64) => ResultKind::I64,
+            Some(IntegerType::I32) => ResultKind::I32,
+            Some(IntegerType::I64) => ResultKind::I64,
         }
     }
 }
@@ -643,7 +669,7 @@ fn validate_types(
     for signature in &mut types[..count as usize] {
         section.expect_byte(0x60)?; // functype
         let parameter_count = section.count(IntegerField::ParameterCount, 0..=MAX_PARAMETERS)?;
-        let mut parameters = [ValType::I32; MAX_PARAMETERS as usize];
+        let mut parameters = [IntegerType::I32; MAX_PARAMETERS as usize];
         for ty in &mut parameters[..parameter_count as usize] {
             *ty = section.integer_type()?;
         }
@@ -765,8 +791,8 @@ fn validate_globals(
         };
         *global = Global {
             initial_value: match ty {
-                ValType::I32 => Value::I32(section.i32_const_expr()?),
-                ValType::I64 => Value::I64(section.i64_const_expr()?),
+                IntegerType::I32 => Value::I32(section.i32_const_expr()?),
+                IntegerType::I64 => Value::I64(section.i64_const_expr()?),
             },
             mutable,
         };
@@ -928,6 +954,8 @@ const BR_TABLE: u8 = 0x0e;
 const RETURN: u8 = 0x0f;
 const I32_CONST: u8 = 0x41;
 const I64_CONST: u8 = 0x42;
+const F32_CONST: u8 = 0x43;
+const F64_CONST: u8 = 0x44;
 
 const MAX_BR_TABLE_ENTRIES: u32 = 16;
 // Separate per-body pool, including defaults. Each target uses at least one
@@ -940,7 +968,7 @@ enum Instruction {
     Nop,
     Drop,
     Select,
-    Const(Value),
+    Const(Operand),
     Convert(Conversion),
     LocalGet(u32),
     LocalSet(u32),
@@ -975,10 +1003,50 @@ pub enum Value {
 }
 
 impl Value {
-    fn zero(ty: ValType) -> Self {
+    fn zero(ty: IntegerType) -> Self {
         match ty {
-            ValType::I32 => Self::I32(0),
-            ValType::I64 => Self::I64(0),
+            IntegerType::I32 => Self::I32(0),
+            IntegerType::I64 => Self::I64(0),
+        }
+    }
+
+    fn integer_type(self) -> IntegerType {
+        match self {
+            Self::I32(_) => IntegerType::I32,
+            Self::I64(_) => IntegerType::I64,
+        }
+    }
+
+    fn operand_type(self) -> ValType {
+        self.integer_type().into()
+    }
+}
+
+// Floats are operand-only. Keep their IEEE 754 encodings in integer storage
+// so even signaling NaNs pass through without a native float operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Operand {
+    I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
+}
+
+impl From<Value> for Operand {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::I32(value) => Self::I32(value),
+            Value::I64(value) => Self::I64(value),
+        }
+    }
+}
+
+impl Operand {
+    fn into_integer(self) -> Value {
+        match self {
+            Self::I32(value) => Value::I32(value),
+            Self::I64(value) => Value::I64(value),
+            _ => unreachable!("validated integer storage or function boundary"),
         }
     }
 
@@ -986,22 +1054,24 @@ impl Value {
         match self {
             Self::I32(_) => ValType::I32,
             Self::I64(_) => ValType::I64,
+            Self::F32(_) => ValType::F32,
+            Self::F64(_) => ValType::F64,
         }
     }
 
     // Only validated code reaches execution. These checks guard the internal
-    // invariant; an i64 cannot be silently read as an i32 or vice versa.
+    // invariant; no operand can be silently read as a different type.
     fn as_i32(self) -> i32 {
         match self {
             Self::I32(value) => value,
-            Self::I64(_) => unreachable!("validated i32 operand"),
+            _ => unreachable!("validated i32 operand"),
         }
     }
 
     fn as_i64(self) -> i64 {
         match self {
             Self::I64(value) => value,
-            Self::I32(_) => unreachable!("validated i64 operand"),
+            _ => unreachable!("validated i64 operand"),
         }
     }
 }
@@ -1011,22 +1081,40 @@ enum Conversion {
     WrapI64,
     ExtendI32S,
     ExtendI32U,
+    I32ReinterpretF32,
+    I64ReinterpretF64,
+    F32ReinterpretI32,
+    F64ReinterpretI64,
 }
 
 impl Conversion {
     fn types(self) -> (ValType, ValType) {
-        use ValType::{I32, I64};
+        use ValType::{F32, F64, I32, I64};
         match self {
             Self::WrapI64 => (I64, I32),
             Self::ExtendI32S | Self::ExtendI32U => (I32, I64),
+            Self::I32ReinterpretF32 => (F32, I32),
+            Self::I64ReinterpretF64 => (F64, I64),
+            Self::F32ReinterpretI32 => (I32, F32),
+            Self::F64ReinterpretI64 => (I64, F64),
         }
     }
 
-    fn apply(self, value: Value) -> Value {
+    fn apply(self, value: Operand) -> Operand {
         match self {
-            Self::WrapI64 => Value::I32(value.as_i64() as i32),
-            Self::ExtendI32S => Value::I64(i64::from(value.as_i32())),
-            Self::ExtendI32U => Value::I64(i64::from(value.as_i32() as u32)),
+            Self::WrapI64 => Operand::I32(value.as_i64() as i32),
+            Self::ExtendI32S => Operand::I64(i64::from(value.as_i32())),
+            Self::ExtendI32U => Operand::I64(i64::from(value.as_i32() as u32)),
+            Self::I32ReinterpretF32 => match value {
+                Operand::F32(bits) => Operand::I32(bits as i32),
+                _ => unreachable!("validated f32 operand"),
+            },
+            Self::I64ReinterpretF64 => match value {
+                Operand::F64(bits) => Operand::I64(bits as i64),
+                _ => unreachable!("validated f64 operand"),
+            },
+            Self::F32ReinterpretI32 => Operand::F32(value.as_i32() as u32),
+            Self::F64ReinterpretI64 => Operand::F64(value.as_i64() as u64),
         }
     }
 }
@@ -1234,7 +1322,7 @@ impl I64BinaryOp {
         }
     }
 
-    fn apply(self, lhs: i64, rhs: i64) -> Result<Value, Trap> {
+    fn apply(self, lhs: i64, rhs: i64) -> Result<Operand, Trap> {
         // Mask to six bits before shifting, including for negative counts.
         let shift = (rhs & 63) as u32;
         let comparison = match self {
@@ -1248,47 +1336,47 @@ impl I64BinaryOp {
             Self::LeU => (lhs as u64) <= (rhs as u64),
             Self::GeS => lhs >= rhs,
             Self::GeU => (lhs as u64) >= (rhs as u64),
-            Self::Add => return Ok(Value::I64(lhs.wrapping_add(rhs))),
-            Self::Sub => return Ok(Value::I64(lhs.wrapping_sub(rhs))),
-            Self::Mul => return Ok(Value::I64(lhs.wrapping_mul(rhs))),
+            Self::Add => return Ok(Operand::I64(lhs.wrapping_add(rhs))),
+            Self::Sub => return Ok(Operand::I64(lhs.wrapping_sub(rhs))),
+            Self::Mul => return Ok(Operand::I64(lhs.wrapping_mul(rhs))),
             Self::DivS if rhs == 0 => return Err(Trap::IntegerDivideByZero),
             Self::DivS => {
                 return lhs
                     .checked_div(rhs)
-                    .map(Value::I64)
+                    .map(Operand::I64)
                     .ok_or(Trap::IntegerOverflow);
             }
             // Same-width casts reinterpret the operands and preserve the result bits.
             Self::DivU => {
                 return (lhs as u64)
                     .checked_div(rhs as u64)
-                    .map(|value| Value::I64(value as i64))
+                    .map(|value| Operand::I64(value as i64))
                     .ok_or(Trap::IntegerDivideByZero);
             }
             // Wasm remainder by -1 is zero even for i64::MIN, unlike checked_rem.
-            Self::RemS if rhs == -1 => return Ok(Value::I64(0)),
+            Self::RemS if rhs == -1 => return Ok(Operand::I64(0)),
             Self::RemS => {
                 return lhs
                     .checked_rem(rhs)
-                    .map(Value::I64)
+                    .map(Operand::I64)
                     .ok_or(Trap::IntegerDivideByZero);
             }
             Self::RemU => {
                 return (lhs as u64)
                     .checked_rem(rhs as u64)
-                    .map(|value| Value::I64(value as i64))
+                    .map(|value| Operand::I64(value as i64))
                     .ok_or(Trap::IntegerDivideByZero);
             }
-            Self::And => return Ok(Value::I64(lhs & rhs)),
-            Self::Or => return Ok(Value::I64(lhs | rhs)),
-            Self::Xor => return Ok(Value::I64(lhs ^ rhs)),
-            Self::Shl => return Ok(Value::I64(((lhs as u64) << shift) as i64)),
-            Self::ShrS => return Ok(Value::I64(lhs >> shift)),
-            Self::ShrU => return Ok(Value::I64(((lhs as u64) >> shift) as i64)),
-            Self::Rotl => return Ok(Value::I64(lhs.rotate_left(shift))),
-            Self::Rotr => return Ok(Value::I64(lhs.rotate_right(shift))),
+            Self::And => return Ok(Operand::I64(lhs & rhs)),
+            Self::Or => return Ok(Operand::I64(lhs | rhs)),
+            Self::Xor => return Ok(Operand::I64(lhs ^ rhs)),
+            Self::Shl => return Ok(Operand::I64(((lhs as u64) << shift) as i64)),
+            Self::ShrS => return Ok(Operand::I64(lhs >> shift)),
+            Self::ShrU => return Ok(Operand::I64(((lhs as u64) >> shift) as i64)),
+            Self::Rotl => return Ok(Operand::I64(lhs.rotate_left(shift))),
+            Self::Rotr => return Ok(Operand::I64(lhs.rotate_right(shift))),
         };
-        Ok(Value::I32(i32::from(comparison)))
+        Ok(Operand::I32(i32::from(comparison)))
     }
 }
 
@@ -1318,7 +1406,7 @@ struct CallFrame {
     function_index: usize,
     pc: usize,
     locals: [Value; MAX_LOCAL_SLOTS],
-    operands: [Value; Limit::OperandStackDepth.maximum()],
+    operands: [Operand; Limit::OperandStackDepth.maximum()],
     depth: usize,
 }
 
@@ -1327,7 +1415,7 @@ impl CallFrame {
         function_index: 0,
         pc: 0,
         locals: [Value::I32(0); MAX_LOCAL_SLOTS],
-        operands: [Value::I32(0); Limit::OperandStackDepth.maximum()],
+        operands: [Operand::I32(0); Limit::OperandStackDepth.maximum()],
         depth: 0,
     };
 
@@ -1349,16 +1437,16 @@ impl CallFrame {
         frame
     }
 
-    fn push(&mut self, value: Value) {
+    fn push(&mut self, value: Operand) {
         self.operands[self.depth] = value;
         self.depth += 1;
     }
 
     fn push_i32(&mut self, value: i32) {
-        self.push(Value::I32(value));
+        self.push(Operand::I32(value));
     }
 
-    fn pop(&mut self) -> Value {
+    fn pop(&mut self) -> Operand {
         self.depth -= 1;
         self.operands[self.depth]
     }
@@ -1371,7 +1459,7 @@ impl CallFrame {
         let (pc, result) = match edge.target {
             BranchTarget::End { pc, result } => (pc, result),
             BranchTarget::Loop(LoopTarget(pc)) => (pc, None),
-            BranchTarget::Function => (code.instructions.len(), code.signature.result),
+            BranchTarget::Function => (code.instructions.len(), code.signature.result_type()),
         };
         let value = result.map(|ty| {
             let value = self.pop();
@@ -1407,12 +1495,12 @@ pub(super) fn invoke_index(
     }
     // Arity bounds both passes over the borrowed arguments to four items.
     for (index, (&expected, arg)) in parameters.iter().zip(args.clone()).enumerate() {
-        let actual = arg.operand_type();
+        let actual = arg.integer_type();
         if actual != expected {
             return Err(InvokeError::ArgumentTypeMismatch {
                 index,
-                expected,
-                actual,
+                expected: expected.into(),
+                actual: actual.into(),
             });
         }
     }
@@ -1447,14 +1535,15 @@ pub(super) fn execute(
             // Fallthrough and function exits leave exactly the declared results
             // in this frame. Completing the call requires no dispatch.
             debug_assert_eq!(frame.pc, code.instructions.len());
-            debug_assert_eq!(frame.depth, usize::from(code.signature.result.is_some()));
-            let value = code.signature.result.map(|ty| {
+            let result = code.signature.result_type();
+            debug_assert_eq!(frame.depth, usize::from(result.is_some()));
+            let value = result.map(|ty| {
                 let value = frame.operands[0];
                 debug_assert_eq!(value.operand_type(), ty);
                 value
             });
             if active == 0 {
-                return Ok(value);
+                return Ok(value.map(Operand::into_integer));
             }
             active -= 1;
             if let Some(value) = value {
@@ -1486,13 +1575,19 @@ pub(super) fn execute(
                 let value = op.apply(frame.pop());
                 frame.push(value);
             }
-            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
-            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
-            Instruction::LocalTee(index) => {
-                frame.locals[index as usize] = frame.operands[frame.depth - 1];
+            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize].into()),
+            Instruction::LocalSet(index) => {
+                frame.locals[index as usize] = frame.pop().into_integer()
             }
-            Instruction::GlobalGet(index) => frame.push(instance.globals[index as usize].get()),
-            Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop()),
+            Instruction::LocalTee(index) => {
+                frame.locals[index as usize] = frame.operands[frame.depth - 1].into_integer();
+            }
+            Instruction::GlobalGet(index) => {
+                frame.push(instance.globals[index as usize].get().into())
+            }
+            Instruction::GlobalSet(index) => {
+                instance.globals[index as usize].set(frame.pop().into_integer());
+            }
             Instruction::Call(target) => {
                 let index = match target {
                     CallTarget::Direct(index) => index as usize,
@@ -1519,7 +1614,10 @@ pub(super) fn execute(
                 let callee_code = &module.functions[index];
                 let end = frame.depth;
                 frame.depth -= callee_code.signature.parameter_count as usize;
-                let args = frame.operands[frame.depth..end].iter().copied();
+                let args = frame.operands[frame.depth..end]
+                    .iter()
+                    .copied()
+                    .map(Operand::into_integer);
                 let callee = CallFrame::new(index, callee_code, args);
                 active += 1;
                 frames[active] = callee;
@@ -1539,7 +1637,7 @@ pub(super) fn execute(
             }
             Instruction::I64Unary(op) => {
                 let result = op.apply(frame.pop().as_i64());
-                frame.push(Value::I64(result));
+                frame.push(Operand::I64(result));
             }
             Instruction::I64Binary(op) => {
                 let rhs = frame.pop().as_i64();
@@ -1560,7 +1658,7 @@ pub(super) fn execute(
                     .memory
                     .load(address, offset, kind)
                     .map_err(ExecutionError::Trap)?;
-                frame.push(Value::I64(value));
+                frame.push(Operand::I64(value));
             }
             Instruction::StoreI32 { width, offset } => {
                 let value = frame.pop_i32();
@@ -1810,9 +1908,9 @@ impl OperandStack {
             self.pop(frame, 1, Some(ValType::I32), offset)?;
         }
         for &ty in parameters.iter().rev() {
-            self.pop(frame, 1, Some(ty), offset)?;
+            self.pop(frame, 1, Some(ty.into()), offset)?;
         }
-        if let Some(result) = signature.result {
+        if let Some(result) = signature.result_type() {
             self.push(result, offset)?;
         }
         Ok(())
@@ -1841,19 +1939,23 @@ impl OperandStack {
         // Either known candidate sets the result type, and if both are known
         // they must agree. Implicit or unknown candidates defer.
         let mut candidates = self.types[remaining..self.depth].iter().flatten().copied();
-        let result = candidates.next();
-        if candidates.next().is_some_and(|other| Some(other) != result) {
-            // The check is symmetric; retain the i32-only select diagnostic.
+        let first = candidates.next();
+        if let (Some(first), Some(second)) = (first, candidates.next())
+            && first != second
+        {
+            // The check is symmetric; preserve the existing diagnostic for
+            // an i32/i64 pair in either order. Otherwise name both candidates.
+            let (expected, actual) = match (first, second) {
+                (ValType::I64, ValType::I32) => (ValType::I32, ValType::I64),
+                pair => pair,
+            };
             return Err(Error {
                 offset,
-                kind: ErrorKind::TypeMismatch {
-                    expected: ValType::I32,
-                    actual: ValType::I64,
-                },
+                kind: ErrorKind::TypeMismatch { expected, actual },
             });
         }
         self.depth = remaining;
-        self.push_slot(result, offset)
+        self.push_slot(first, offset)
     }
 }
 
@@ -1978,15 +2080,15 @@ fn decode_plain(
     let load = |body: &mut Reader<'_>, kind: LoadKind, ty| {
         let offset = decode_memarg(body, offset, kind.width(), has_memory)?;
         Ok(match ty {
-            ValType::I32 => Instruction::LoadI32 { kind, offset },
-            ValType::I64 => Instruction::LoadI64 { kind, offset },
+            IntegerType::I32 => Instruction::LoadI32 { kind, offset },
+            IntegerType::I64 => Instruction::LoadI64 { kind, offset },
         })
     };
     let store = |body: &mut Reader<'_>, width: AccessWidth, ty| {
         let offset = decode_memarg(body, offset, width, has_memory)?;
         Ok(match ty {
-            ValType::I32 => Instruction::StoreI32 { width, offset },
-            ValType::I64 => Instruction::StoreI64 { width, offset },
+            IntegerType::I32 => Instruction::StoreI32 { width, offset },
+            IntegerType::I64 => Instruction::StoreI64 { width, offset },
         })
     };
     Ok(match opcode {
@@ -2027,25 +2129,25 @@ fn decode_plain(
             }
             Instruction::GlobalSet(index)
         }
-        0x28 => load(body, LoadKind::WordUnsigned, ValType::I32)?,
-        0x29 => load(body, LoadKind::Doubleword, ValType::I64)?,
-        0x2c => load(body, LoadKind::ByteSigned, ValType::I32)?,
-        0x2d => load(body, LoadKind::ByteUnsigned, ValType::I32)?,
-        0x2e => load(body, LoadKind::HalfwordSigned, ValType::I32)?,
-        0x2f => load(body, LoadKind::HalfwordUnsigned, ValType::I32)?,
-        0x30 => load(body, LoadKind::ByteSigned, ValType::I64)?,
-        0x31 => load(body, LoadKind::ByteUnsigned, ValType::I64)?,
-        0x32 => load(body, LoadKind::HalfwordSigned, ValType::I64)?,
-        0x33 => load(body, LoadKind::HalfwordUnsigned, ValType::I64)?,
-        0x34 => load(body, LoadKind::WordSigned, ValType::I64)?,
-        0x35 => load(body, LoadKind::WordUnsigned, ValType::I64)?,
-        0x36 => store(body, AccessWidth::Word, ValType::I32)?,
-        0x37 => store(body, AccessWidth::Doubleword, ValType::I64)?,
-        0x3a => store(body, AccessWidth::Byte, ValType::I32)?,
-        0x3b => store(body, AccessWidth::Halfword, ValType::I32)?,
-        0x3c => store(body, AccessWidth::Byte, ValType::I64)?,
-        0x3d => store(body, AccessWidth::Halfword, ValType::I64)?,
-        0x3e => store(body, AccessWidth::Word, ValType::I64)?,
+        0x28 => load(body, LoadKind::WordUnsigned, IntegerType::I32)?,
+        0x29 => load(body, LoadKind::Doubleword, IntegerType::I64)?,
+        0x2c => load(body, LoadKind::ByteSigned, IntegerType::I32)?,
+        0x2d => load(body, LoadKind::ByteUnsigned, IntegerType::I32)?,
+        0x2e => load(body, LoadKind::HalfwordSigned, IntegerType::I32)?,
+        0x2f => load(body, LoadKind::HalfwordUnsigned, IntegerType::I32)?,
+        0x30 => load(body, LoadKind::ByteSigned, IntegerType::I64)?,
+        0x31 => load(body, LoadKind::ByteUnsigned, IntegerType::I64)?,
+        0x32 => load(body, LoadKind::HalfwordSigned, IntegerType::I64)?,
+        0x33 => load(body, LoadKind::HalfwordUnsigned, IntegerType::I64)?,
+        0x34 => load(body, LoadKind::WordSigned, IntegerType::I64)?,
+        0x35 => load(body, LoadKind::WordUnsigned, IntegerType::I64)?,
+        0x36 => store(body, AccessWidth::Word, IntegerType::I32)?,
+        0x37 => store(body, AccessWidth::Doubleword, IntegerType::I64)?,
+        0x3a => store(body, AccessWidth::Byte, IntegerType::I32)?,
+        0x3b => store(body, AccessWidth::Halfword, IntegerType::I32)?,
+        0x3c => store(body, AccessWidth::Byte, IntegerType::I64)?,
+        0x3d => store(body, AccessWidth::Halfword, IntegerType::I64)?,
+        0x3e => store(body, AccessWidth::Word, IntegerType::I64)?,
         0x3f | 0x40 => {
             // Core 1.0 reserves a literal zero byte here, not a LEB32 index.
             body.expect_byte(0)?;
@@ -2056,8 +2158,14 @@ fn decode_plain(
                 Instruction::MemoryGrow
             }
         }
-        I32_CONST => Instruction::Const(Value::I32(body.integer(IntegerField::I32Const)? as i32)),
-        I64_CONST => Instruction::Const(Value::I64(body.i64_const()?)),
+        I32_CONST => Instruction::Const(Operand::I32(body.integer(IntegerField::I32Const)? as i32)),
+        I64_CONST => Instruction::Const(Operand::I64(body.i64_const()?)),
+        F32_CONST => Instruction::Const(Operand::F32(u32::from_le_bytes(
+            body.float_const_bytes(ValType::F32)?,
+        ))),
+        F64_CONST => Instruction::Const(Operand::F64(u64::from_le_bytes(
+            body.float_const_bytes(ValType::F64)?,
+        ))),
         0x45 => Instruction::Unary(UnaryOp::Eqz),
         0x46 => Instruction::Binary(BinaryOp::Eq),
         0x47 => Instruction::Binary(BinaryOp::Ne),
@@ -2119,6 +2227,10 @@ fn decode_plain(
         0xa7 => Instruction::Convert(Conversion::WrapI64),
         0xac => Instruction::Convert(Conversion::ExtendI32S),
         0xad => Instruction::Convert(Conversion::ExtendI32U),
+        0xbc => Instruction::Convert(Conversion::I32ReinterpretF32),
+        0xbd => Instruction::Convert(Conversion::I64ReinterpretF64),
+        0xbe => Instruction::Convert(Conversion::F32ReinterpretI32),
+        0xbf => Instruction::Convert(Conversion::F64ReinterpretI64),
         _ => {
             return Err(Error {
                 offset,
@@ -2188,7 +2300,8 @@ fn validate_body(
     let mut count = 0;
     let mut operands = OperandStack::new();
     // Slot zero is the function frame, which does not count against the cap.
-    let mut frames = [ControlFrame::function(signature.result); Limit::ControlDepth.maximum() + 1];
+    let mut frames =
+        [ControlFrame::function(signature.result_type()); Limit::ControlDepth.maximum() + 1];
     let mut nesting = 0;
     let end_offset = loop {
         let offset = body.position();
@@ -2480,12 +2593,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn integer_type(&mut self) -> Result<ValType, Error> {
+    fn integer_type(&mut self) -> Result<IntegerType, Error> {
         let offset = self.position();
         // Preserve the original expected byte for unsupported and missing types.
         match self.byte() {
-            Some(I32) => Ok(ValType::I32),
-            Some(I64) => Ok(ValType::I64),
+            Some(I32) => Ok(IntegerType::I32),
+            Some(I64) => Ok(IntegerType::I64),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {
@@ -2603,6 +2716,15 @@ impl<'a> Reader<'a> {
         )
     }
 
+    fn float_const_bytes<const N: usize>(&mut self, ty: ValType) -> Result<[u8; N], Error> {
+        let (bytes, rest) = self.remaining.split_first_chunk().ok_or(Error {
+            offset: self.end,
+            kind: ErrorKind::TruncatedFloatConst { ty },
+        })?;
+        self.remaining = rest;
+        Ok(*bytes)
+    }
+
     fn i64_const(&mut self) -> Result<i64, Error> {
         let field = IntegerField::I64Const;
         let mut value = 0u64;
@@ -2679,6 +2801,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn float_bits_do_not_enlarge_operand_slots() {
+        assert!(std::mem::size_of::<Operand>() <= std::mem::size_of::<Value>());
+        assert!(std::mem::align_of::<Operand>() <= std::mem::align_of::<Value>());
+    }
+
+    #[test]
     fn signed_and_unsigned_extension_differ_in_the_high_bits() {
         // The public i32 result cannot observe those high bits; test the
         // conversions used by dispatch directly as well as wrap round trips.
@@ -2688,11 +2816,11 @@ mod tests {
             (i32::MIN, -0x8000_0000, 0x8000_0000),
             (-1, -1, 0xffff_ffff),
         ] {
-            let input = Value::I32(input);
+            let input = Operand::I32(input);
             let extended_s = Conversion::ExtendI32S.apply(input);
             let extended_u = Conversion::ExtendI32U.apply(input);
-            assert_eq!(extended_s, Value::I64(signed));
-            assert_eq!(extended_u, Value::I64(unsigned));
+            assert_eq!(extended_s, Operand::I64(signed));
+            assert_eq!(extended_u, Operand::I64(unsigned));
             assert_eq!(Conversion::WrapI64.apply(extended_s), input);
             assert_eq!(Conversion::WrapI64.apply(extended_u), input);
         }

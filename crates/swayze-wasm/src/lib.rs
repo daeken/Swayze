@@ -17,6 +17,8 @@
 //! Supported instructions are `local.get`, `local.set`, `local.tee`, `global.get`,
 //! `global.set` (each with an unsigned LEB32 index), `i32.const <signed LEB32>`,
 //! `i64.const <signed LEB64>`, `i64.extend_i32_s`, `i64.extend_i32_u`, `i32.wrap_i64`,
+//! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
+//! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
 //! `i64.le_s`, `i64.le_u`, `i64.ge_s`, `i64.ge_u`, `i64.add`, `i64.sub`, `i64.mul`,
 //! `i64.div_s`, `i64.div_u`, `i64.rem_s`, `i64.rem_u`,
@@ -139,6 +141,17 @@
 //! `i64.const` pushes one i64 and accepts valid padding within ten signed LEB128
 //! bytes. In a ten-byte encoding the terminal byte must be `0x00` or `0x7f` to
 //! match the sign bit. The immediate cannot read beyond its body frame.
+//! In function bodies, `f32.const` (`0x43`) and `f64.const` (`0x44`) read
+//! exactly four and eight little-endian bytes respectively, without crossing
+//! the body frame. Each pushes one operand holding the exact IEEE 754 bits.
+//! The four reinterpretations (`0xbc` through `0xbf` in the order listed above)
+//! consume one operand and change only its type, between i32 and f32 or between
+//! i64 and f64. Constants and reinterpretations each count as one dispatch;
+//! they do not perform floating-point arithmetic, quiet signaling NaNs, or
+//! canonicalize any bits. Floats are operand-only: function signatures (and
+//! thus exports and host arguments/results), locals, globals, control label
+//! results, floating-point memory instructions, and other floating-point
+//! numeric instructions remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -148,9 +161,9 @@
 //! i64 values can be operands (including load results and stored values),
 //! locals, private globals, `block` and `if` results, and function parameters
 //! or results, including across the host boundary.
-//! `nop` has no stack effect; `drop` discards an operand of either type.
-//! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
-//! i64) and an i32 condition, pushed in first-candidate, second-candidate,
+//! `nop` has no stack effect; `drop` discards an operand of any supported type.
+//! Untyped `select` (`0x1b`) consumes two candidates of the same type and an
+//! i32 condition, pushed in first-candidate, second-candidate,
 //! condition order above the active floor. In one dispatch it pushes the first
 //! candidate for any nonzero condition and the second for zero. Unlike `if`,
 //! `select` does not skip either candidate's computation; a producer may trap
@@ -183,8 +196,8 @@
 //! For example, a `local.tee` at that floor still pushes a concrete operand of
 //! the local's declared type. In a dead tail, any known candidate type determines
 //! the `select` result; mismatched known candidates still fail at `select`.
-//! Without a known candidate type, the result is unknown and can satisfy either
-//! type. Every push, including an unknown result, occupies a slot and counts
+//! Without a known candidate type, the result is unknown and can satisfy any
+//! supported operand type. Every push, including an unknown result, occupies a slot and counts
 //! against the stack cap. No operand access crosses the active floor.
 //! At `else` or `end`, an unreachable frame may supply a missing result
 //! implicitly, but a known result of the wrong type or any excess operands
@@ -287,7 +300,8 @@
 //! and the exact body frame has been checked.
 //! Execution does not dispatch instructions skipped by a control transfer.
 //! Each active call frame has its own fixed operand stack and separate fixed
-//! local storage, both holding tagged i32/i64 values. Parameters are copied
+//! local storage. Only the private operand slots can hold f32 or f64 bits;
+//! locals and globals hold tagged i32/i64 values. Parameters are copied
 //! from the supplied arguments or caller's operands, and each declared local
 //! starts at zero of its own type for every frame, including reused frame
 //! slots. A callee starts with no operands. A callee returning a value pushes
@@ -394,7 +408,7 @@
 //! values and `i32::MIN`, signed and unsigned right shifts, preserved operand
 //! prefixes, underflow at control floors (including both untaken arms), and
 //! exact decoded-instruction and dispatch budget boundaries.
-//! Stack-operation tests check selection order for both types, including i64
+//! Integer stack-operation tests check selection order for both widths, including i64
 //! candidates with identical low words, and zero, positive, and negative i32
 //! conditions. They check eager producer traps for either unselected candidate,
 //! preserved operands across mixed control, exact underflow offsets including
@@ -411,6 +425,15 @@
 //! result types in polymorphic tails. Boundary tests cover the shared 32-slot
 //! stack (including frozen prefixes) and one dispatch per i64 opcode at the
 //! 1024-dispatch limit.
+//! Float operand tests check all four reinterpretations through exact integer
+//! returns, including both zero signs and signaling and quiet NaN payloads.
+//! They cover body- and section-framed truncation, delimiter-valued bytes,
+//! type errors and polymorphic floors, candidate selection, preserved operand
+//! prefixes, rejection of unsupported float features, and the shared body-byte,
+//! instruction, operand, and dispatch caps. Size probes with the pinned toolchain
+//! on arm64 macOS found unchanged operand slots (16 bytes), call frames (856
+//! bytes each), and validation scratch layouts, including the decoded-instruction
+//! array (4,064 bytes), in both debug and release.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

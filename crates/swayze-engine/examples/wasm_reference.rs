@@ -857,6 +857,14 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![1],
         });
     }
+    // Keep the NaNs inside Wasm; return their bits as integers across the host boundary.
+    let signaling_f32 = 0x7f80_0042_u32.to_le_bytes();
+    let mut select_f32 = vec![0x43];
+    select_f32.extend(signaling_f32);
+    select_f32.extend([0x43, 0, 0, 0, 0x80, 0x20, 0, 0x1b, 0xbc]);
+    cases.push(Fixture::new(0x7f80_0042, &[1], &select_f32));
+    cases.push(Fixture::new(i32::MIN, &[0], &select_f32));
+    cases.push(Fixture::new(-42, &[-42], &[0x20, 0, 0xbe, 0xbc]));
     cases
 }
 
@@ -882,7 +890,26 @@ fn typed_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             export: "x",
             args: vec![WasmValue::I64(arg)],
         });
-    add_cases.chain(void_cases)
+    let f64_const = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01\x7e\
+                      \x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x0e\x01\x0c\0\x44\x42\0\0\0\0\0\xf0\x7f\xbd\x0b";
+    let f64_roundtrip = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7e\x01\x7e\
+                          \x03\x02\x01\0\x07\x05\x01\x01x\0\0\x0a\x08\x01\x06\0\x20\0\xbf\xbd\x0b";
+    let f64_bits = 0x7ff0_0000_0000_0042_i64;
+    let float_cases = [
+        Fixture {
+            expected: Outcome::I64Invocation(Ok(f64_bits)),
+            bytes: f64_const.to_vec(),
+            export: "x",
+            args: vec![],
+        },
+        Fixture {
+            expected: Outcome::I64Invocation(Ok(f64_bits)),
+            bytes: f64_roundtrip.to_vec(),
+            export: "x",
+            args: vec![WasmValue::I64(f64_bits)],
+        },
+    ];
+    add_cases.chain(void_cases).chain(float_cases)
 }
 
 fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {

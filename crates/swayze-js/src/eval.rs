@@ -112,7 +112,8 @@ impl Script {
     /// truthiness but evaluates only the selected branch's assignments, leaving
     /// no operand stack result. A falsy test with no `else` performs no writes.
     /// A `while` statement evaluates its test before each iteration and runs its
-    /// assignments in order only when the test is truthy. It leaves no result.
+    /// body only when the test is truthy. `break;` exits the innermost enclosing
+    /// loop, and `continue;` returns to its test. None leaves a result.
     ///
     /// This runs no host callbacks and does not read source text. Initializations
     /// and assignments use fresh immutable `const` and mutable `let` slots for
@@ -261,6 +262,12 @@ fn evaluate(
                 }
             }
             Instruction::Jump(target) => ip = check_forward_target(ip, target, ops.len())?,
+            Instruction::JumpStatement(target) => {
+                if !stack.is_empty() {
+                    return Err(EvalError::InvalidScript);
+                }
+                ip = check_forward_target(ip, target, ops.len())?;
+            }
             Instruction::LoopBack(target) => {
                 // `ip` already points past this instruction. Reject self and
                 // forward edges, and only re-enter a test at statement depth.
@@ -431,6 +438,27 @@ mod tests {
                 Err(EvalError::InvalidScript)
             );
         }
+    }
+
+    #[test]
+    fn statement_forward_jump_checks_target_and_empty_stack() {
+        use Instruction::{JumpStatement, Number};
+        let one = Number(1.0);
+        for target in [0, 3, usize::MAX] {
+            assert_eq!(
+                evaluate(&[JumpStatement(target), one], 1, 0),
+                Err(EvalError::InvalidScript)
+            );
+        }
+        // A regular expression jump could finish with this result on the stack.
+        assert_eq!(
+            evaluate(&[one, JumpStatement(2)], 1, 0),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            evaluate(&[JumpStatement(2), Instruction::LoadBinding(0), one], 1, 0),
+            Ok(Value::Number(1.0))
+        );
     }
 
     #[test]

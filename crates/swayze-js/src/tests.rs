@@ -26,7 +26,7 @@ fn assert_limit(source: &str, limits: Limits, limit: Limit, start: usize, end: u
 
 #[test]
 fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
-    use Instruction::{Boolean, Jump, JumpIfFalseStatement, StoreBinding};
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, StoreBinding};
 
     assert_postfix(
         "let x=0;if(true){x=1;}else{x=2+(3+4);}x",
@@ -37,7 +37,7 @@ fn if_emits_forward_jumps_and_accounts_for_the_peak_in_either_branch() {
             JumpIfFalseStatement(7),
             Number(1.0),
             StoreBinding(0),
-            Jump(13),
+            JumpStatement(13),
             Number(2.0),
             Number(3.0),
             Number(4.0),
@@ -91,7 +91,7 @@ fn while_emits_an_exit_and_back_edge_with_balanced_stack_depth() {
 
 #[test]
 fn nested_control_edges_target_their_own_tests_and_joins() {
-    use Instruction::{Boolean, Jump, JumpIfFalseStatement, LoopBack};
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
 
     assert_postfix(
         "while(false){if(true){while(false){}}else{if(1+(2+3)){}}}42",
@@ -103,7 +103,7 @@ fn nested_control_edges_target_their_own_tests_and_joins() {
             Boolean(false),
             JumpIfFalseStatement(7),
             LoopBack(4),
-            Jump(14),
+            JumpStatement(14),
             Number(1.0),
             Number(2.0),
             Number(3.0),
@@ -114,6 +114,100 @@ fn nested_control_edges_target_their_own_tests_and_joins() {
             Number(42.0),
         ],
         3,
+    );
+}
+
+#[test]
+fn loop_jumps_resolve_to_their_own_test_and_exit_across_if_frames() {
+    use Instruction::{Boolean, JumpIfFalseStatement, JumpStatement, LoopBack};
+
+    assert_postfix(
+        "while(true){if(false){break;}while(false){if(false){break;}else{continue;}break;}if(true){continue;}break;}42",
+        &[
+            Boolean(true),
+            JumpIfFalseStatement(19),
+            Boolean(false),
+            JumpIfFalseStatement(5),
+            JumpStatement(19),
+            Boolean(false),
+            JumpIfFalseStatement(14),
+            Boolean(false),
+            JumpIfFalseStatement(11),
+            JumpStatement(14),
+            JumpStatement(12),
+            LoopBack(5),
+            JumpStatement(14),
+            LoopBack(5),
+            Boolean(true),
+            JumpIfFalseStatement(17),
+            LoopBack(0),
+            JumpStatement(19),
+            LoopBack(0),
+            Number(42.0),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn loop_jumps_charge_emission_and_each_deferred_break_patch() {
+    let source = "while(false){break;continue;break;}true";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 13,
+        max_nesting_depth: 1,
+        // Source bytes, seven instructions, one expression marker, one frame,
+        // and two deferred break patches.
+        max_work: source.len() + 11,
+    };
+    assert_eq!(
+        parse_script_with_limits(source, limits)
+            .unwrap()
+            .instruction_count(),
+        7
+    );
+    let end = source.find("true").unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_tokens: 12,
+            ..limits
+        },
+        Limit::Tokens,
+        end,
+        end + 1,
+    );
+    let semicolon = source.find(';').unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_work: semicolon + 1 + 4,
+            ..limits
+        },
+        Limit::Work,
+        semicolon,
+        semicolon + 1,
+    ); // Enough for the first `break;` token pair, but not its instruction.
+    let close = source.find('}').unwrap();
+    assert_limit(
+        source,
+        Limits {
+            max_work: close + 1 + 9,
+            ..limits
+        },
+        Limit::Work,
+        close,
+        close + 1,
+    ); // Enough for the back edge and one patch, but not the second patch.
+    assert_limit(
+        source,
+        Limits {
+            max_work: limits.max_work - 1,
+            ..limits
+        },
+        Limit::Work,
+        end,
+        end + 4,
     );
 }
 

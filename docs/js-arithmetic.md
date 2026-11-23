@@ -35,7 +35,9 @@ All operands and arms must use supported syntax and bindings.
 
 `if (test) { ... }` and `while (test) { ... }` statements may precede the final
 expression. Braced bodies hold simple assignments to earlier `let` bindings
-and nested `if` and `while` statements. Only the selected `if` arm runs; a false
+and nested `if` and `while` statements. Unlabeled `break;` exits the innermost
+`while`; `continue;` reevaluates its test. Both require explicit semicolons.
+Only the selected `if` arm runs; a false
 test with no `else` skips the body. A `while` reevaluates its test before each
 iteration. Untaken arms and skipped loop bodies are still checked. The parser
 uses at most 128 active statement frames, separate from the expression nesting

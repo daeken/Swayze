@@ -212,6 +212,8 @@ pub(crate) enum Instruction {
     // Keep the test value when jumping; otherwise pop it before evaluating the RHS.
     ShortCircuit { target: usize, when_truthy: bool },
     Jump(usize),
+    // Unconditional statement transfers require an empty operand stack.
+    JumpStatement(usize),
     // The only backward edge; re-enter the test with an empty operand stack.
     LoopBack(usize),
 }
@@ -247,6 +249,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         nesting_depth: 0,
         pending: Vec::new(),
         statement_frames: Vec::new(),
+        innermost_loop: None,
         instructions: Vec::new(),
         bindings: Vec::new(),
         stack_depth: 0,
@@ -324,6 +327,8 @@ enum TokenKind {
     If,
     Else,
     While,
+    Break,
+    Continue,
     Equals,
     Operator(Operator),
     Open,
@@ -370,7 +375,7 @@ fn is_excluded_name(name: &str) -> bool {
     matches!(
         name,
         // Other keywords, reserved literals, future/strict reserved words, and `await`.
-        "break" | "case" | "catch" | "class" | "continue" | "debugger" | "default"
+        "case" | "catch" | "class" | "debugger" | "default"
             | "delete" | "do" | "enum" | "export" | "extends"
             | "finally" | "for" | "function" | "import" | "in" | "instanceof"
             | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
@@ -536,6 +541,8 @@ impl Lexer<'_> {
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
+            "break" => Ok(TokenKind::Break),
+            "continue" => Ok(TokenKind::Continue),
             "true" => Ok(TokenKind::Boolean(true)),
             "false" => Ok(TokenKind::Boolean(false)),
             _ if is_excluded_name(name) => Err(Error::unsupported(
@@ -800,9 +807,19 @@ enum ExpressionEnd {
 // Every test starts and every arm enters and joins at operand depth zero.
 #[derive(Clone, Copy)]
 enum StatementFrame {
-    IfThen { branch: usize },
-    IfElse { join: usize },
-    While { test: usize, exit: usize },
+    IfThen {
+        branch: usize,
+    },
+    IfElse {
+        join: usize,
+    },
+    While {
+        test: usize,
+        exit: usize,
+        enclosing_loop: Option<usize>,
+        // Head of a list threaded through unpatched break instructions.
+        break_head: usize,
+    },
 }
 
 struct Parser<'s> {
@@ -814,6 +831,8 @@ struct Parser<'s> {
     nesting_depth: usize,
     pending: Vec<(Pending, Span)>,
     statement_frames: Vec<StatementFrame>,
+    // Index into statement_frames; opening or closing an if does not change it.
+    innermost_loop: Option<usize>,
     instructions: Vec<Instruction>,
     // Parse-only declarations in slot order; never retained by Script.
     bindings: Vec<Binding>,
@@ -848,6 +867,10 @@ impl Parser<'_> {
                     self.open_statement(first)?;
                     continue;
                 }
+                TokenKind::Break | TokenKind::Continue => {
+                    self.parse_loop_jump(&first)?;
+                    continue;
+                }
                 TokenKind::Identifier => {
                     let next = self.next_token()?;
                     if let Some(Token {
@@ -867,6 +890,10 @@ impl Parser<'_> {
             break;
         }
         if let Some(token) = self.next_token()? {
+            if matches!(token.kind, TokenKind::Break | TokenKind::Continue) {
+                // A jump here also has no enclosing loop.
+                self.parse_loop_jump(&token)?;
+            }
             return Err(Error::unsupported(
                 token.span,
                 "no additional statements are supported after the final expression",
@@ -920,7 +947,12 @@ impl Parser<'_> {
                 let test = self.instructions.len();
                 let exit = self.parse_statement_test("expected '(' after 'while'")?;
                 (
-                    StatementFrame::While { test, exit },
+                    StatementFrame::While {
+                        test,
+                        exit,
+                        enclosing_loop: self.innermost_loop,
+                        break_head: UNPATCHED,
+                    },
                     "expected '{' to open the while body",
                 )
             }
@@ -928,7 +960,12 @@ impl Parser<'_> {
         };
         let brace = self.require_block_open(missing_brace)?;
         self.lexer.charge(1, brace)?;
-        try_push(&mut self.statement_frames, frame, brace)
+        let index = self.statement_frames.len();
+        try_push(&mut self.statement_frames, frame, brace)?;
+        if matches!(frame, StatementFrame::While { .. }) {
+            self.innermost_loop = Some(index);
+        }
+        Ok(())
     }
 
     fn close_block(&mut self, close: Span) -> Result<(), Error> {
@@ -949,7 +986,7 @@ impl Parser<'_> {
                 }) = next
                 {
                     let join = self.instructions.len();
-                    self.emit(Instruction::Jump(UNPATCHED), span)?;
+                    self.emit(Instruction::JumpStatement(UNPATCHED), span)?;
                     self.patch_jump(branch, span)?;
                     self.require_block_open("expected '{' after 'else'")?;
                     self.statement_frames[index] = StatementFrame::IfElse { join };
@@ -959,9 +996,16 @@ impl Parser<'_> {
                 self.patch_jump(branch, close)?;
             }
             StatementFrame::IfElse { join } => self.patch_jump(join, close)?,
-            StatementFrame::While { test, exit } => {
+            StatementFrame::While {
+                test,
+                exit,
+                enclosing_loop,
+                break_head,
+            } => {
                 self.emit(Instruction::LoopBack(test), close)?;
                 self.patch_jump(exit, close)?;
+                self.patch_breaks(break_head, close)?;
+                self.innermost_loop = enclosing_loop;
             }
         }
         self.statement_frames.pop();
@@ -993,11 +1037,12 @@ impl Parser<'_> {
     }
 
     fn parse_block_item(&mut self) -> Result<(), Error> {
-        let first = self.require_token("expected an assignment, if, while, or '}' in the block")?;
+        let first = self.require_token("expected a statement or '}' in the block")?;
         self.check_statement_boundary(first.span)?;
         match first.kind {
             TokenKind::CloseBrace => self.close_block(first.span),
             TokenKind::If | TokenKind::While => self.open_statement(first),
+            TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
             TokenKind::Identifier => {
                 let equals = self.require_token("expected '=' after the assignment name")?;
                 if !matches!(equals.kind, TokenKind::Equals) {
@@ -1010,9 +1055,75 @@ impl Parser<'_> {
             }
             _ => Err(Error::unsupported(
                 first.span,
-                "only simple assignments, if, and while are supported in these blocks",
+                "only assignments and supported control statements are allowed in these blocks",
             )),
         }
+    }
+
+    fn parse_loop_jump(&mut self, keyword: &Token) -> Result<(), Error> {
+        let next = self.next_token()?;
+        if let Some(Token {
+            kind: TokenKind::Identifier | TokenKind::Declaration(BindingKind::Let),
+            span,
+            after_line_break: false,
+        }) = next
+        {
+            return Err(Error::unsupported(
+                span,
+                "labeled loop jumps are outside the subset",
+            ));
+        }
+        // The stored frame index bypasses any intervening if frames.
+        let index = self.innermost_loop.ok_or_else(|| {
+            Error::malformed(
+                keyword.span,
+                "break and continue require an enclosing while",
+            )
+        })?;
+        let missing = "loop jumps require explicit semicolons";
+        let Some(next) = next else {
+            return Err(Error::unsupported(Span::at(self.lexer.offset), missing));
+        };
+        if !matches!(next.kind, TokenKind::Semicolon) {
+            // An apparent ASI boundary still cannot terminate a jump here.
+            return Err(
+                if next.after_line_break || matches!(next.kind, TokenKind::CloseBrace) {
+                    Error::unsupported(next.span, missing)
+                } else {
+                    Error::malformed(next.span, "expected ';' after loop jump")
+                },
+            );
+        }
+        let StatementFrame::While {
+            test, break_head, ..
+        } = &mut self.statement_frames[index]
+        else {
+            unreachable!("innermost loop index must refer to a while frame");
+        };
+        let instruction = if matches!(keyword.kind, TokenKind::Continue) {
+            Instruction::LoopBack(*test)
+        } else {
+            let previous = std::mem::replace(break_head, self.instructions.len());
+            Instruction::JumpStatement(previous)
+        };
+        self.emit(instruction, next.span)
+    }
+
+    fn patch_breaks(&mut self, mut head: usize, close: Span) -> Result<(), Error> {
+        let target = self.instructions.len();
+        while head != UNPATCHED {
+            // Each break is linked at emission and visited once at its loop's close.
+            self.lexer.charge(1, close)?;
+            let Some(Instruction::JumpStatement(previous)) = self.instructions.get_mut(head) else {
+                return Err(Error::malformed(close, "invalid pending break"));
+            };
+            if *previous != UNPATCHED && *previous >= head {
+                return Err(Error::malformed(close, "invalid pending break link"));
+            }
+            head = *previous;
+            *previous = target;
+        }
+        Ok(())
     }
 
     fn parse_declaration(&mut self, kind: BindingKind) -> Result<(), Error> {
@@ -1031,7 +1142,11 @@ impl Parser<'_> {
                     "Boolean literals cannot be used as binding names",
                 ));
             }
-            TokenKind::If | TokenKind::Else | TokenKind::While => {
+            TokenKind::If
+            | TokenKind::Else
+            | TokenKind::While
+            | TokenKind::Break
+            | TokenKind::Continue => {
                 return Err(Error::unsupported(
                     name.span,
                     "control-flow keywords are reserved names",
@@ -1152,7 +1267,14 @@ impl Parser<'_> {
                         "declarations are only allowed as top-level statements before the final expression",
                     ));
                 }
-                (_, TokenKind::If | TokenKind::Else | TokenKind::While) => {
+                (
+                    _,
+                    TokenKind::If
+                    | TokenKind::Else
+                    | TokenKind::While
+                    | TokenKind::Break
+                    | TokenKind::Continue,
+                ) => {
                     return Err(Error::unsupported(
                         span,
                         "control-flow keywords are not expression tokens",
@@ -1438,7 +1560,8 @@ impl Parser<'_> {
                 Instruction::JumpIfFalse(slot)
                 | Instruction::JumpIfFalseStatement(slot)
                 | Instruction::ShortCircuit { target: slot, .. }
-                | Instruction::Jump(slot),
+                | Instruction::Jump(slot)
+                | Instruction::JumpStatement(slot),
             ) if *slot == UNPATCHED => slot,
             _ => return Err(Error::malformed(span, "invalid forward jump")),
         };
@@ -1461,6 +1584,12 @@ impl Parser<'_> {
                     "expected one statement test operand",
                 ));
             }
+            Instruction::JumpStatement(_) if self.stack_depth != 0 => {
+                return Err(Error::malformed(
+                    span,
+                    "statement jump requires an empty operand stack",
+                ));
+            }
             Instruction::LoopBack(target)
                 if target >= self.instructions.len() || self.stack_depth != 0 =>
             {
@@ -1471,7 +1600,9 @@ impl Parser<'_> {
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfFalseStatement(_)
             | Instruction::ShortCircuit { .. } => (1, 0),
-            Instruction::Jump(_) | Instruction::LoopBack(_) => (0, 0),
+            Instruction::Jump(_) | Instruction::JumpStatement(_) | Instruction::LoopBack(_) => {
+                (0, 0)
+            }
             Instruction::Positive | Instruction::Negate | Instruction::Not => (1, 1),
             Instruction::Add
             | Instruction::Subtract

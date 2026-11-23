@@ -66,8 +66,8 @@ fn checks_every_nested_block_even_if_never_reached() {
         ("c=1;", Unsupported),
         ("let y=1;", Unsupported),
         ("const y=1;", Unsupported),
-        ("break;", Unsupported),
-        ("continue;", Unsupported),
+        ("break", Unsupported),
+        ("continue\n", Unsupported),
         ("{x=1;}", Unsupported),
         ("1;", Unsupported),
         ("x=1", Unsupported),
@@ -104,13 +104,13 @@ fn fixed_statement_cap_counts_both_control_kinds_but_not_if_arms_twice() {
         prefix.push_str("while(false){if(false){}else{");
     }
     let closes = "}".repeat(128);
-    let at_cap = format!("{prefix}{closes}");
+    let at_cap = format!("{prefix}break;continue;{closes}");
     let limits = Limits {
         max_nesting_depth: 1,
         ..Limits::default()
     };
-    // Each statement test uses its own expression budget. Frames are reusable
-    // after closing, so two separate chains at the cap fit in one script.
+    // Each test uses its own expression budget and neither jump needs a frame.
+    // Frames are reusable, so two separate chains at the cap fit in one script.
     assert_eq!(
         parse_script_with_limits(&format!("{at_cap}{at_cap}42"), limits)
             .unwrap()

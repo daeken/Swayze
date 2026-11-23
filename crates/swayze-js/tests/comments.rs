@@ -1,6 +1,6 @@
 use swayze_js::{
-    ErrorKind, EvalScratch, Limit, Limits, Span, parse_script, parse_script_for_completion,
-    parse_script_for_completion_with_limits, parse_script_with_limits,
+    ErrorKind, EvalScratch, Limit, Limits, ParseErrorType, Span, parse_script,
+    parse_script_for_completion, parse_script_for_completion_with_limits, parse_script_with_limits,
 };
 
 fn evaluate(source: &str) -> f64 {
@@ -210,6 +210,7 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
         let error = parse_script_for_completion(&source).unwrap_err();
         assert_eq!(parse_script(&source).unwrap_err(), error);
         assert_eq!(error.kind(), ErrorKind::Malformed);
+        assert_eq!(error.parse_error_type(), None);
         assert_eq!(error.message(), "unterminated block comment");
         assert_eq!(
             error.span(),
@@ -244,24 +245,39 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
             }
         );
     }
-    for (source, start) in [
-        ("# a lone hash", 0),
-        ("#name", 0),
-        ("# ! not a hashbang", 0),
-        (" \t#! wrong", 2),
-        ("\u{FEFF}#! wrong", 3),
-        ("\u{2028}#! wrong", 3),
-        ("/* comment */#! wrong", 13),
-        ("// comment\n#! wrong", 11),
-        ("#! first\r\n#! second", 10),
-        ("1; #! wrong", 3),
-        ("(1 + #! wrong", 5),
-        ("if (false) { #! wrong\n }", 13),
+    let syntax_error = Some(ParseErrorType::SyntaxError);
+    for (source, start, error_type) in [
+        ("# a lone hash", 0, None),
+        ("#name", 0, None),
+        (" #name", 1, None),
+        ("# ! not a hashbang", 0, None),
+        (" # ! not a hashbang", 1, None),
+        (" #! wrong", 1, syntax_error),
+        (" \t#! wrong", 2, syntax_error),
+        ("\u{FEFF}#! wrong", 3, syntax_error),
+        ("\n#! wrong", 1, syntax_error),
+        ("\r\n#! wrong", 2, syntax_error),
+        ("\u{2028}#! wrong", 3, syntax_error),
+        ("/* comment */#! wrong", 13, syntax_error),
+        ("// comment\n#! wrong", 11, syntax_error),
+        ("#! first\r\n#! second", 10, syntax_error),
+        ("; #! wrong", 2, None),
+        ("1; #! wrong", 3, None),
+        ("(1 + #! wrong", 5, None),
+        ("if (false) { #! wrong\n }", 13, None),
     ] {
         let error = parse_script(source).unwrap_err();
         assert_eq!(parse_script_for_completion(source).unwrap_err(), error);
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.message(), "token is outside the arithmetic subset");
+        assert_eq!(error.parse_error_type(), error_type, "{source:?}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported JavaScript input at UTF-8 bytes {start}..{}: token is outside the arithmetic subset",
+                start + 1
+            )
+        );
         assert_eq!(
             error.span(),
             Span {
@@ -274,6 +290,7 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
     // Later #! is not consumed while probing a .length suffix: the dot wins.
     let error = parse_script("'s'. #! wrong").unwrap_err();
     assert_eq!(error.span(), Span { start: 3, end: 4 });
+    assert_eq!(error.parse_error_type(), None);
     // The hashbang does not suppress the directive prologue.
     let error = parse_script_for_completion("#!\n'use strict';").unwrap_err();
     assert_eq!(
@@ -281,6 +298,40 @@ fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
         "Use Strict Directives are outside the subset"
     );
     assert_eq!(error.span(), Span { start: 3, end: 15 });
+}
+
+#[test]
+fn earlier_parse_failures_win_over_hashbang_like_text() {
+    for (source, kind, message, start, end) in [
+        (
+            "/* unterminated #!",
+            ErrorKind::Malformed,
+            "unterminated block comment",
+            0,
+            18,
+        ),
+        (
+            "const x; #! wrong",
+            ErrorKind::Malformed,
+            "expected '=' after the binding name",
+            7,
+            8,
+        ),
+        (
+            "var #! wrong",
+            ErrorKind::Unsupported,
+            "reserved or excluded name is outside the subset",
+            0,
+            3,
+        ),
+    ] {
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(parse_script_for_completion(source).unwrap_err(), error);
+        assert_eq!(error.kind(), kind, "{source:?}");
+        assert_eq!(error.message(), message);
+        assert_eq!(error.span(), Span { start, end });
+        assert_eq!(error.parse_error_type(), None);
+    }
 }
 
 #[test]
@@ -339,7 +390,7 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
         assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
         assert_eq!(error.span(), Span { start, end });
     }
-    for (source, limits, kind, start, end) in [
+    for (source, limits, kind, start, end, error_type) in [
         (
             source,
             Limits {
@@ -350,6 +401,7 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
             ErrorKind::LimitExceeded(Limit::Tokens),
             7,
             8,
+            None,
         ),
         (
             source,
@@ -362,6 +414,32 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
             ErrorKind::LimitExceeded(Limit::SourceBytes),
             2,
             4,
+            None,
+        ),
+        (
+            " #!é",
+            Limits {
+                max_source_bytes: 1,
+                max_tokens: 0,
+                max_work: 0,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::SourceBytes),
+            1,
+            2,
+            None,
+        ),
+        (
+            "\u{FEFF}#!",
+            Limits {
+                max_tokens: 0,
+                max_work: 2,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::Work),
+            0,
+            3,
+            None,
         ),
         (
             " #!é",
@@ -373,6 +451,7 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
             ErrorKind::LimitExceeded(Limit::Tokens),
             1,
             2,
+            None,
         ),
         (
             " #!é",
@@ -383,16 +462,19 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
             ErrorKind::LimitExceeded(Limit::Work),
             1,
             2,
+            None,
         ),
         (
             " #!é",
             Limits {
+                max_source_bytes: " #!é".len(),
                 max_work: 2,
                 ..limits
             },
             ErrorKind::Unsupported,
             1,
             2,
+            Some(ParseErrorType::SyntaxError),
         ),
     ] {
         let error = parse_script_with_limits(source, limits).unwrap_err();
@@ -402,6 +484,7 @@ fn hashbang_uses_single_line_comment_work_and_limit_order() {
         );
         assert_eq!(error.kind(), kind);
         assert_eq!(error.span(), Span { start, end });
+        assert_eq!(error.parse_error_type(), error_type);
     }
     let no_tokens = Limits {
         max_tokens: 0,

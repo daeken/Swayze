@@ -53,17 +53,22 @@ for (const fixture of fixtures) {
         continue;
     }
     try {
-        const value = exported(...args.map(decodeArg));
-        if (result === 'void' && value === undefined) {
+        const globalRead = result.startsWith('global-');
+        if (globalRead && !(exported instanceof WebAssembly.Global)) {
+            throw new Error('expected a global export');
+        }
+        const kind = globalRead ? result.slice(7) : result;
+        const value = globalRead ? exported.value : exported(...args.map(decodeArg));
+        if (kind === 'void' && value === undefined) {
             console.log('void');
-        } else if (result === 'i64' && typeof value === 'bigint') {
+        } else if (kind === 'i64' && typeof value === 'bigint') {
             console.log(`${value}n`);
-        } else if (result === 'i32' && typeof value === 'number' && (value | 0) === value) {
+        } else if (kind === 'i32' && typeof value === 'number' && (value | 0) === value) {
             console.log(value);
-        } else if (result === 'f32' && typeof value === 'number' && !Number.isNaN(value)) {
+        } else if (kind === 'f32' && typeof value === 'number' && !Number.isNaN(value)) {
             bits.setFloat32(0, value);
             console.log(`f32=${bits.getUint32(0).toString(16)}`);
-        } else if (result === 'f64' && typeof value === 'number' && !Number.isNaN(value)) {
+        } else if (kind === 'f64' && typeof value === 'number' && !Number.isNaN(value)) {
             bits.setFloat64(0, value);
             console.log(`f64=${bits.getBigUint64(0).toString(16)}`);
         } else {
@@ -127,6 +132,7 @@ enum Outcome {
     F64Invocation(Result<u64, WasmTrap>),
     VoidInvocation(Result<(), WasmTrap>),
     MemoryRead { offset: u32, bytes: [u8; 4] },
+    GlobalRead(WasmValue),
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
     StartTrap(WasmTrap),
@@ -139,6 +145,12 @@ impl Outcome {
             Self::I64Invocation(_) => WasmResultKind::I64,
             Self::F32Invocation(_) => WasmResultKind::F32,
             Self::F64Invocation(_) => WasmResultKind::F64,
+            Self::GlobalRead(value) => match value {
+                WasmValue::I32(_) => WasmResultKind::I32,
+                WasmValue::I64(_) => WasmResultKind::I64,
+                WasmValue::F32(_) => WasmResultKind::F32,
+                WasmValue::F64(_) => WasmResultKind::F64,
+            },
             _ => WasmResultKind::I32,
         }
     }
@@ -202,8 +214,13 @@ impl Fixture<WasmValue> {
             WasmResultKind::F32 => "f32",
             WasmResultKind::F64 => "f64",
         };
+        let prefix = if matches!(self.expected, Outcome::GlobalRead(_)) {
+            "global-"
+        } else {
+            ""
+        };
         let mut encoded = format!(
-            "{}:{}:{result}",
+            "{}:{}:{prefix}{result}",
             hex(&self.bytes),
             hex(self.export.as_bytes())
         );
@@ -1596,6 +1613,27 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     cases.into_iter()
 }
 
+fn global_export_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
+    let values = [
+        (0x7f, &b"\x41\x2a"[..], WasmValue::I32(42)),
+        (0x7e, &b"\x42\x7f"[..], WasmValue::I64(-1)),
+        (0x7d, &b"\x43\0\0\0\x80"[..], WasmValue::F32(0x8000_0000)),
+        (0x7c, &b"\x44\x01\0\0\0\0\0\0\0"[..], WasmValue::F64(1)),
+    ];
+    values.into_iter().map(|(ty, initializer, value)| {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        bytes.extend([6, 4 + u8::try_from(initializer.len()).unwrap(), 1, ty, 0]);
+        bytes.extend(initializer);
+        bytes.extend(b"\x0b\x07\x05\x01\x01g\x03\0");
+        Fixture {
+            expected: Outcome::GlobalRead(value),
+            bytes,
+            export: "g",
+            args: vec![],
+        }
+    })
+}
+
 fn memory_export_fixtures() -> [Fixture<WasmValue>; 2] {
     [
         Fixture {
@@ -1699,6 +1737,9 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
         instance.read_memory(fixture.export, offset, &mut bytes)?;
         return Ok(Outcome::MemoryRead { offset, bytes });
     }
+    if let Outcome::GlobalRead(_) = fixture.expected {
+        return Ok(Outcome::GlobalRead(instance.read_global(fixture.export)?));
+    }
     let expected_kind = fixture.expected.result_kind();
     match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
         Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
@@ -1723,6 +1764,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(Fixture::into_typed)
         .chain(typed_fixtures())
         .chain(memory_export_fixtures())
+        .chain(global_export_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
@@ -1770,6 +1812,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     == Some(bits)
             }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
+            Outcome::GlobalRead(value) => {
+                reference
+                    == match value {
+                        WasmValue::I32(value) => value.to_string(),
+                        WasmValue::I64(value) => format!("{value}n"),
+                        WasmValue::F32(bits) => format!("f32={bits:x}"),
+                        WasmValue::F64(bits) => format!("f64={bits:x}"),
+                    }
+            }
             Outcome::MemoryRead { bytes, .. } => {
                 reference.strip_prefix("memory=") == Some(hex(&bytes).as_str())
             }
@@ -1790,7 +1841,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, global snapshots, invocation traps, or instantiation errors)"
     );
     Ok(())
 }

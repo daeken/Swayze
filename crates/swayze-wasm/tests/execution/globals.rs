@@ -90,16 +90,6 @@ fn validates_global_section_order_and_rejects_unsupported_scope() {
         HEADER.len(),
         ErrorKind::UnsupportedSection { id: 2 },
     );
-    let mut bytes = module(&[(6, IMMUTABLE)]);
-    let start = push_section(&mut bytes, 7, b"\x01\x01g\x03\0");
-    expect_error(
-        &bytes,
-        start + 3,
-        ErrorKind::UnexpectedByte {
-            expected: 0,
-            found: 3,
-        },
-    );
     let mut bytes = module(&[(5, &[1, 0, 1]), (6, IMMUTABLE)]);
     let start = push_section(&mut bytes, 11, &[1, 0, 0x23, 0, 0x0b, 0]);
     expect_error(

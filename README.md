@@ -6,7 +6,7 @@ Start with the **[engine design](docs/design.md)** for the threat model, languag
 
 `Script::evaluate_primitive()` returns a `JsPrimitiveValue`: either an existing scalar `JsValue` or a borrowed UTF-16 slice, including any lone surrogates. `evaluate_value()` remains scalar-only and `evaluate()` remains Number-only. Strings support assignment, truthiness, equality and UTF-16 code-unit ordering within the documented subset. Unary `+`, `-`, and `~` convert Strings to Numbers within a separate work budget. Concatenation and implicit coercion by other operators remain unsupported. Exhaustive `JsLimit` matches need two new arms for literal bytes and aggregate UTF-16 units; `JsLimits` is unchanged.
 
-A module can export its defined memory by name. `WasmInstance::read_memory()` copies a checked range into a caller buffer; it does not expose a live view or permit host writes. Unexported memory is not accessible through this method. Function and memory exports share the eight-name limit. Exhaustive `WasmInvokeError` matches need to handle `ExportNotFunction`.
+A module can export its defined memory by name. `WasmInstance::read_memory()` copies a checked range into a caller buffer; it does not expose a live view or permit host writes. Unexported memory is not accessible through this method. `WasmInstance::read_global()` takes an owned snapshot of a named global's exact numeric value, without exposing a live handle or write access. Function, memory, and global exports share the eight-name limit. Exhaustive `WasmInvokeError` matches need to handle `ExportNotFunction`.
 
 | Path | Responsibility today |
 | --- | --- |

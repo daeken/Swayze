@@ -97,7 +97,7 @@
 //!
 //! The optional global section (ID 6) follows any type, function, table, and
 //! memory sections and precedes any export, start, element, and code sections.
-//! It may contain zero to eight private globals total, indexed from zero in
+//! It may contain zero to eight defined globals total, indexed from zero in
 //! declaration order. Each declaration uses a value type byte (`0x7f` for i32,
 //! `0x7e` for i64, `0x7d` for f32, or `0x7c` for f64) and a literal mutability
 //! byte (`0x00` for immutable or `0x01` for mutable). The initializer is exactly
@@ -105,8 +105,8 @@
 //! by `end`. Integer immediates are signed LEB32 or LEB64 with valid padding
 //! accepted; float immediates are four or eight little-endian bytes. The
 //! initializer cannot read past the global section frame. Every body can read
-//! any declared global and can set only mutable globals. Global imports,
-//! exports, and initializer reads are unsupported.
+//! any declared global and can set only mutable globals. Global imports and
+//! initializer reads are unsupported.
 //!
 //! The optional start section (ID 8) comes after any exports and before any
 //! elements, code, and data. Its entire payload is one unsigned LEB32 index
@@ -136,14 +136,15 @@
 //!
 //! An optional export section after any table, memory, and globals and before
 //! any start, elements, code, and data may contain zero to eight names total
-//! across function and memory exports. Matching is exact (no Unicode normalization),
-//! and duplicate names are rejected across both kinds. An export descriptor is
-//! either `0x00` followed by a defined function index or `0x02` followed by the
-//! defined memory index zero. Both indices are unsigned LEB32 and accept valid
-//! padding. Distinct names may refer to the same function or memory. A nonempty
-//! list of only memory exports does not require type, function, or code sections;
-//! a present empty export section retains their existing requirement. Tables and
-//! globals cannot be exported. Both export and custom names must be UTF-8.
+//! across function, memory, and global exports. Matching is exact (no Unicode
+//! normalization), and duplicate names are rejected across all kinds. An export
+//! descriptor is `0x00` followed by a defined function index, `0x02` followed by
+//! the defined memory index zero, or `0x03` followed by a defined global index.
+//! All indices are unsigned LEB32 and accept valid padding. Distinct names may
+//! refer to the same target. A nonempty list with no function exports does not
+//! require type, function, or code sections unless one is explicitly present;
+//! a present empty export section retains their existing requirement. Tables
+//! cannot be exported. Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
 //! are rejected, even when empty.
@@ -271,7 +272,7 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! width conversions, sign operations, rounding, square root, `mul`, `min`/`max`,
 //! and comparisons each count as one dispatch. None uses native floating-point
-//! operations. Floats are supported as operands, private globals, locals, `block`,
+//! operations. Floats are supported as operands, globals, locals, `block`,
 //! `if`, and `loop` results, and function parameters and results, including across
 //! the host boundary. Fallthrough, `return`, and branch exits preserve all result
 //! bits. Floating-point numeric instructions beyond those listed remain unsupported.
@@ -282,7 +283,7 @@
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
 //! i64 values can be operands (including load results and stored values),
-//! locals, private globals, `block`, `if`, and `loop` results, and function
+//! locals, globals, `block`, `if`, and `loop` results, and function
 //! parameters or results, including across the host boundary.
 //! `nop` has no stack effect; `drop` discards an operand of any supported type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type and an
@@ -512,6 +513,10 @@
 //! way to write it. It checks the exact name and export kind before checking the
 //! full range against the instance's current size. It does not dispatch guest
 //! instructions or use guest fuel, allocate, or retain the destination.
+//! [`Instance::read_global`] returns an owned snapshot of an explicitly named
+//! global's current value, preserving its exact type and bits. Both immutable
+//! and mutable globals can be read, but neither can be written or borrowed by
+//! the host. Like a memory copy, a global snapshot does not run guest code.
 //! [`prepare`] remains a stub.
 //!
 //! # Evidence and gaps
@@ -844,6 +849,7 @@ struct Export {
 enum ExportTarget {
     Function(usize),
     Memory,
+    Global(usize),
 }
 
 impl fmt::Debug for Module {
@@ -1008,7 +1014,7 @@ impl Instance<'_> {
     /// # Errors
     ///
     /// Returns [`ReadMemoryError::ExportNotFound`] for a missing name,
-    /// [`ReadMemoryError::ExportNotMemory`] for a function export, or
+    /// [`ReadMemoryError::ExportNotMemory`] for a function or global export, or
     /// [`ReadMemoryError::OutOfBounds`] for an invalid range.
     ///
     /// # Examples
@@ -1032,8 +1038,45 @@ impl Instance<'_> {
     ) -> Result<(), ReadMemoryError> {
         match self.module.find_export(name) {
             None => Err(ReadMemoryError::ExportNotFound),
-            Some(ExportTarget::Function(_)) => Err(ReadMemoryError::ExportNotMemory),
+            Some(ExportTarget::Function(_) | ExportTarget::Global(_)) => {
+                Err(ReadMemoryError::ExportNotMemory)
+            }
             Some(ExportTarget::Memory) => self.memory.copy_out(offset, dest),
+        }
+    }
+
+    /// Copy the current value of an exact named global export.
+    ///
+    /// Reads both immutable and mutable globals. The returned [`Value`] is an
+    /// owned snapshot: it preserves all bits, including signed zeros and
+    /// signaling NaN payloads, and does not change if the guest later writes
+    /// to the global. Reads observe completed writes by the start function and
+    /// by invocations, including writes before a trap or execution limit.
+    /// This operation does not allocate, run guest code, consume guest fuel,
+    /// or provide a way to borrow or mutate a global.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadGlobalError::ExportNotFound`] for a missing name or
+    /// [`ReadGlobalError::ExportNotGlobal`] for a function or memory export.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use swayze_wasm::{Value, validate_module};
+    /// // (module (global (export "g") i32 (i32.const 42)))
+    /// let bytes = b"\0asm\x01\0\0\0\x06\x06\x01\x7f\0\x41\x2a\x0b\x07\x05\x01\x01g\x03\0";
+    /// let module = validate_module(bytes)?;
+    /// assert_eq!(module.instantiate()?.read_global("g")?, Value::I32(42));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn read_global(&self, name: &str) -> Result<Value, ReadGlobalError> {
+        match self.module.find_export(name) {
+            None => Err(ReadGlobalError::ExportNotFound),
+            Some(ExportTarget::Function(_) | ExportTarget::Memory) => {
+                Err(ReadGlobalError::ExportNotGlobal)
+            }
+            Some(ExportTarget::Global(index)) => Ok(self.globals[index].get().into()),
         }
     }
 
@@ -1146,7 +1189,9 @@ impl Instance<'_> {
     ) -> Result<Option<Value>, InvokeError> {
         match self.module.find_export(name) {
             None => Err(InvokeError::ExportNotFound),
-            Some(ExportTarget::Memory) => Err(InvokeError::ExportNotFunction),
+            Some(ExportTarget::Memory | ExportTarget::Global(_)) => {
+                Err(InvokeError::ExportNotFunction)
+            }
             Some(ExportTarget::Function(index)) => {
                 binary::invoke_index(self, index, args, expected)
             }
@@ -1176,6 +1221,26 @@ impl fmt::Display for ReadMemoryError {
 }
 
 impl std::error::Error for ReadMemoryError {}
+
+/// Why a host snapshot of an explicitly named global export failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadGlobalError {
+    /// This module has no export with the requested name.
+    ExportNotFound,
+    /// The named export exists but is not a global.
+    ExportNotGlobal,
+}
+
+impl fmt::Display for ReadGlobalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ExportNotFound => "WebAssembly export not found",
+            Self::ExportNotGlobal => "WebAssembly export is not a global",
+        })
+    }
+}
+
+impl std::error::Error for ReadGlobalError {}
 
 /// A result kind supported by a typed invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

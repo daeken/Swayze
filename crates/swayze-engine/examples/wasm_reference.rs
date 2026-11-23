@@ -737,6 +737,20 @@ fn fixtures() -> Vec<Fixture> {
             args: vec![],
         });
     }
+    // Both a value-producing if and a block transfer preserve full i64 bits.
+    let wide = [0x42, 0xaa, 0x80, 0x80, 0x80, 0x10]; // (1 << 32) + 42
+    let mut if_expression = vec![0x20, 0, 0x04, 0x7e];
+    if_expression.extend(wide);
+    if_expression.extend([0x05, 0x42, 42, 0x0b, 0x42, 42, 0x52]);
+    let mut block_expression = vec![0x02, 0x7e];
+    block_expression.extend(wide);
+    block_expression.extend([0x20, 0, 0x0d, 0, 0x42, 1, 0x7c, 0x0b]);
+    block_expression.extend(wide);
+    block_expression.push(0x51);
+    for (condition, expected) in [(0, 0), (-1, 1)] {
+        cases.push(Fixture::new(expected, &[condition], &if_expression));
+        cases.push(Fixture::new(expected, &[condition], &block_expression));
+    }
     cases
 }
 

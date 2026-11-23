@@ -55,7 +55,7 @@ fn both_extensions_dispatch_and_wrap_back_to_i32_for_existing_ops() {
     }
 }
 
-fn push_i64(body: &mut Vec<u8>, mut value: i64) {
+pub(super) fn push_i64(body: &mut Vec<u8>, mut value: i64) {
     body.push(0x42);
     // Use ten-byte signed LEB64 so the fixture keeps the entire 64-bit pattern.
     for _ in 0..9 {
@@ -529,7 +529,7 @@ fn memory_and_globals_do_not_accept_i64_operands_even_in_dead_code() {
 }
 
 #[test]
-fn i64_remains_unsupported_in_signatures_and_control_labels() {
+fn i64_remains_unsupported_in_signatures_and_loop_labels() {
     for (payload, offset, expected) in [
         (&b"\x01\x60\x01\x7e\0"[..], 3, 0x7f), // Parameter.
         (b"\x01\x60\0\x01\x7e", 4, 0x7f),      // Result.
@@ -544,20 +544,14 @@ fn i64_remains_unsupported_in_signatures_and_control_labels() {
             },
         );
     }
-    for (body, offset, expected) in [
-        (&b"\0\x02\x7e\x0b"[..], 2, 0x7f),  // Block result.
-        (b"\0\x03\x7e\x0b", 2, 0x40),       // Loop result.
-        (b"\0\x41\0\x04\x7e\x0b", 4, 0x7f), // If result.
-    ] {
-        bad_body(
-            body,
-            offset,
-            ErrorKind::UnexpectedByte {
-                expected,
-                found: 0x7e,
-            },
-        );
-    }
+    bad_body(
+        b"\0\x03\x7e\x0b",
+        2,
+        ErrorKind::UnexpectedByte {
+            expected: 0x40,
+            found: 0x7e,
+        },
+    );
 }
 
 #[test]

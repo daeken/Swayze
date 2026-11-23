@@ -38,9 +38,10 @@
 //! LEB32 type index followed by the literal reserved byte `0x00` (not a LEB32
 //! table index). It requires a defined table even in unreachable code; a
 //! defined zero-entry table qualifies. The control constructs may nest together.
-//! `if` and `block` accept block type byte `0x40` (void) or `0x7f` (one i32
-//! result), with no block parameters. A void `if` may omit `else`; an i32-result
-//! `if` requires it. `loop` accepts only `0x40`.
+//! `if` and `block` accept block type byte `0x40` (void), `0x7f` (one i32
+//! result), or `0x7e` (one i64 result), with no block parameters. A void `if`
+//! may omit `else`; a value-producing `if` requires it. `loop` accepts only
+//! `0x40`.
 //! `br` and `br_if` take an unsigned LEB32 label depth: zero names the innermost
 //! frame, and each enclosing frame, including `if`, adds one to the depth. A
 //! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
@@ -49,7 +50,7 @@
 //! always targets the function label. `br_table` takes an unsigned LEB32 count
 //! (0 to 16), exactly that many unsigned LEB32 label depths, and a mandatory
 //! unsigned LEB32 default depth. All listed labels and the default must have
-//! the same label result arity: void (including a loop continue) or one i32.
+//! the same label result: void (including a loop continue), i32, or i64.
 //! Other block types and typed `select` are unsupported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
@@ -140,8 +141,9 @@
 //! one i32. The other i64 comparisons consume two i64s and push one i32;
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
-//! i64 is limited to internal operands, declared locals, and private globals:
-//! signatures, control labels, and memory instructions do not accept i64.
+//! i64 is limited to internal operands, declared locals, private globals,
+//! and `block` and `if` results. Function signatures and memory instructions
+//! do not accept i64.
 //! `nop` has no stack effect; `drop` discards an operand of either type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type (i32 or
 //! i64) and an i32 condition, pushed in first-candidate, second-candidate,
@@ -178,15 +180,15 @@
 //! Without a known candidate type, the result is unknown and can satisfy either
 //! type. Every push, including an unknown result, occupies a slot and counts
 //! against the stack cap. No operand access crosses the active floor.
-//! At `else` or `end`, an unreachable frame may
-//! supply a missing i32 result implicitly, but a known result of the wrong type or
-//! any excess operands are still rejected. Every new frame starts reachable,
+//! At `else` or `end`, an unreachable frame may supply a missing result
+//! implicitly, but a known result of the wrong type or any excess operands
+//! are still rejected. Every new frame starts reachable,
 //! even inside an unreachable frame. `else` checks the then result and starts
 //! a reachable else arm at the same floor. `end` checks the final result, then
 //! leaves the declared result on the parent's stack (none for void) without
 //! changing the parent's reachability flag.
-//! A transfer to an i32-result `block`, `if`, or function requires an i32
-//! result; transfers to void labels require no result. `br_if` pops an i32
+//! A transfer to a value-producing label requires an operand of the declared
+//! type; transfers to void labels require no result. `br_if` pops an i32
 //! condition above any result, and `br_table` pops an i32 selector above any
 //! common result. Validation checks these pops against the active floor, even
 //! for an outer target. Only `br_if`
@@ -194,7 +196,7 @@
 //! only the condition and continues. `br_table` treats its selector as `u32`:
 //! it selects the zero-based explicit entry, or the default if out of range.
 //! A taken branch to a `block` or `if` truncates to the target's floor, keeps
-//! the result if required, and resumes after the target's `end`.
+//! the full tagged result if required, and resumes after the target's `end`.
 //! A taken loop branch truncates to the target loop's floor and resumes at its
 //! body start. Both preserve the target's operand prefix and locals. A function
 //! exit discards all callee operands except the declared result, if any, and
@@ -253,7 +255,7 @@
 //! be retried by a later dispatch within the same execution limits. Zero selects the else arm (or skips straight to the join if
 //! no `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of operand types and a fixed stack of control
-//! frames with explicit result arities.
+//! frames with declared result types (if any).
 //! Each `block` and `if` label keeps a linked chain of incoming branch edges in
 //! fixed scratch storage, patched once per edge at `end`. Edges are identified by
 //! slot, so a table can refer to several labels and repeat the same label. The
@@ -261,7 +263,8 @@
 //! arms. These forward edges target strictly later decoded instruction indices
 //! or the one-past-last index in the same body. Loop continues target the loop's
 //! saved body start at or before the branch. Each branch stores its target's
-//! operand floor; a `block` or `if` exit also carries the target's result arity.
+//! operand floor; a `block` or `if` exit also records the target's result type,
+//! if any.
 //! `return` and branches to the function label share an exit target at the
 //! one-past-last instruction index.
 //! Each table decodes to one instruction that indexes a separate per-body array
@@ -416,6 +419,10 @@
 //! fixup chains for inner and outer blocks, stack truncation versus fallthrough,
 //! skipped traps and rejected skipped syntax, padded and out-of-range depths,
 //! delimiter errors, and exact body and execution budgets.
+//! i64 control tests check full-width results through both `if` arms, normal
+//! `block` exits, and taken and untaken branches. They check typed table labels,
+//! arm and transfer validation at the active floor, counted unknown operands,
+//! and shared body, control, operand, and dispatch limits.
 //! Loop tests cover outer continues across mixed frame kinds, preserved locals
 //! and stack prefixes, different taken and fallthrough stack effects, full body
 //! validation, shared caps, and the exact dispatch boundary in a called nested

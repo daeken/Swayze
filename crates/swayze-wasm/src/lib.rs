@@ -54,10 +54,10 @@
 //! LEB32 type index followed by the literal reserved byte `0x00` (not a LEB32
 //! table index). It requires a defined table even in unreachable code; a
 //! defined zero-entry table qualifies. The control constructs may nest together.
-//! `if` and `block` accept block type byte `0x40` (void) or one result type:
-//! `0x7f` (i32), `0x7e` (i64), `0x7d` (f32), or `0x7c` (f64). They do not
+//! `if`, `block`, and `loop` accept block type byte `0x40` (void) or one result
+//! type: `0x7f` (i32), `0x7e` (i64), `0x7d` (f32), or `0x7c` (f64). They do not
 //! accept block parameters. A void `if` may omit `else`; a value-producing
-//! `if` requires it. `loop` accepts only `0x40`.
+//! `if` requires it.
 //! `br` and `br_if` take an unsigned LEB32 label depth: zero names the innermost
 //! frame, and each enclosing frame, including `if`, adds one to the depth. A
 //! branch may cross any of these frames and target an `if`, a `block`, a `loop`,
@@ -66,8 +66,9 @@
 //! always targets the function label. `br_table` takes an unsigned LEB32 count
 //! (0 to 16), exactly that many unsigned LEB32 label depths, and a mandatory
 //! unsigned LEB32 default depth. All listed labels and the default must have
-//! the same label result: void (including a loop continue), i32, i64, f32, or f64.
-//! Other block types and typed `select` are unsupported.
+//! the same label payload type: void, i32, i64, f32, or f64. Loop labels are
+//! always void, regardless of the loop's fallthrough result. Other block types
+//! (including type indices) and typed `select` are unsupported.
 //!
 //! The optional table section (ID 4) follows any function section and precedes
 //! any memory, global, export, start, element, and code sections. It may be
@@ -268,11 +269,10 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! width conversions, sign operations, rounding, square root, `mul`, `min`/`max`,
 //! and comparisons each count as one dispatch. None uses native floating-point
-//! operations. Floats are supported as operands, private globals, locals, `block`
-//! and `if` results, and function parameters and results, including across the
-//! host boundary. Fallthrough, `return`, and branch exits preserve all result bits.
-//! Loop results and floating-point numeric instructions beyond those listed
-//! remain unsupported.
+//! operations. Floats are supported as operands, private globals, locals, `block`,
+//! `if`, and `loop` results, and function parameters and results, including across
+//! the host boundary. Fallthrough, `return`, and branch exits preserve all result
+//! bits. Floating-point numeric instructions beyond those listed remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -280,8 +280,8 @@
 //! i64 arithmetic and binary bit operations consume two i64s and push one i64.
 //! `i64.clz`, `i64.ctz`, and `i64.popcnt` each consume and produce one i64.
 //! i64 values can be operands (including load results and stored values),
-//! locals, private globals, `block` and `if` results, and function parameters
-//! or results, including across the host boundary.
+//! locals, private globals, `block`, `if`, and `loop` results, and function
+//! parameters or results, including across the host boundary.
 //! `nop` has no stack effect; `drop` discards an operand of any supported type.
 //! Untyped `select` (`0x1b`) consumes two candidates of the same type and an
 //! i32 condition, pushed in first-candidate, second-candidate,
@@ -328,19 +328,20 @@
 //! leaves the declared result on the parent's stack (none for void) without
 //! changing the parent's reachability flag.
 //! A transfer to a value-producing label requires an operand of the declared
-//! type; transfers to void labels require no result. `br_if` pops an i32
-//! condition above any result, and `br_table` pops an i32 selector above any
-//! common result. Validation checks these pops against the active floor, even
-//! for an outer target. Only `br_if`
-//! restores the result for fallthrough, and execution with a zero condition pops
-//! only the condition and continues. `br_table` treats its selector as `u32`:
-//! it selects the zero-based explicit entry, or the default if out of range.
+//! type; transfers to void labels require no payload. `br_if` pops an i32
+//! condition above any payload, and `br_table` pops an i32 selector above any
+//! common payload. Validation checks these pops against the active floor, even
+//! for an outer target. Only `br_if` restores the payload for fallthrough, and
+//! execution with a zero condition pops only the condition and continues.
+//! `br_table` treats its selector as `u32`: it selects the zero-based explicit
+//! entry, or the default if out of range.
 //! A taken branch to a `block` or `if` truncates to the target's floor, keeps
 //! the full tagged result if required, and resumes after the target's `end`.
-//! A taken loop branch truncates to the target loop's floor and resumes at its
-//! body start. Both preserve the target's operand prefix and locals. A function
-//! exit discards all callee operands except the declared result, if any, and
-//! completes the call.
+//! A taken loop branch truncates to the target loop's floor without carrying
+//! any operand and resumes at its body start. A loop produces its declared
+//! result only when execution falls through its `end`. Both sorts of branches
+//! preserve the target's operand prefix and locals. A function exit discards
+//! all callee operands except the declared result, if any, and completes the call.
 //! Both `if` arms and the entire `br_if` fallthrough path are validated regardless
 //! of the condition. Unreachable code is fully decoded and checked, including
 //! all immediates, indices, mutability, delimiters, and limits.
@@ -665,10 +666,11 @@
 //! the incompatible label immediate, active floors and concrete dead-tail
 //! results, and the unchanged body, stack, control, table, and dispatch ceilings.
 //! Loop tests cover outer continues across mixed frame kinds, preserved locals
-//! and stack prefixes, different taken and fallthrough stack effects, full body
-//! validation, shared caps, and the exact dispatch boundary in a called nested
-//! loop and instance reuse after hitting the limit. Transfers check operand
-//! underflow against the innermost floor even on an untaken path.
+//! and stack prefixes, different taken and fallthrough stack effects, and exact
+//! fallthrough bits for all four numeric result types. They check that result
+//! loops still have void labels for `br`, `br_if`, and `br_table`, floor and
+//! dead-tail validation, shared caps, exact dispatch boundaries across calls,
+//! and instance reuse after hitting the limit.
 //! Void-control tests cover omitted, empty, and nonempty `else` arms, joins at
 //! enclosing delimiters and function exit, unchanged result-`if` diagnostics,
 //! zero-result branch exits across mixed frames and preserved operand prefixes,

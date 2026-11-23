@@ -57,6 +57,8 @@ mod if_branch;
 mod int_to_float;
 #[path = "execution/memory.rs"]
 mod memory;
+#[path = "execution/result_loop.rs"]
+mod result_loop;
 #[path = "execution/stack.rs"]
 mod stack;
 #[path = "execution/start.rs"]
@@ -2140,12 +2142,13 @@ fn rejects_loop_floor_violations_and_nonempty_results() {
 
 #[test]
 fn validates_loop_type_and_delimiters_within_the_body_frame() {
-    for found in [0x7f, 0x7e, 0, 0xc0] {
+    // Type indices (even zero), reference types and SIMD types aren't admitted.
+    for found in [0, 0xc0, 0x70, 0x7b] {
         bad_body(
             &[0, 0x03, found],
             2,
             ErrorKind::UnexpectedByte {
-                expected: 0x40,
+                expected: 0x7f,
                 found,
             },
         );
@@ -2153,7 +2156,7 @@ fn validates_loop_type_and_delimiters_within_the_body_frame() {
     let mut code = code_body(&[0, 0x03]);
     let boundary = code.len();
     code.extend([0x40, 0x0b]); // A block type outside the body can't complete it.
-    bad_code(&code, boundary, ErrorKind::TruncatedByte { expected: 0x40 });
+    bad_code(&code, boundary, ErrorKind::TruncatedByte { expected: 0x7f });
     let prefix = &[0, 0x41, 42, 0x03, 0x40][..];
     for (tail, offset, kind) in [
         (&[][..], 0, ErrorKind::TruncatedByte { expected: 0x0b }),

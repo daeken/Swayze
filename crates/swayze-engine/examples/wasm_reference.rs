@@ -1178,10 +1178,59 @@ fn typed_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(arg)],
         }
     });
+    // Typed loop fallthrough returns the result, independent of its void label.
+    let result_loops = [
+        (0x7f, &b"\x41\x7f"[..], Outcome::Invocation(Ok(-1))),
+        (0x7e, &b"\x42\x7f"[..], Outcome::I64Invocation(Ok(-1))),
+        (
+            0x7d,
+            &b"\x43\0\0\0\x80"[..],
+            Outcome::F32Invocation(Ok(0x8000_0000)),
+        ),
+        (
+            0x7c,
+            &b"\x44\x01\0\0\0\0\0\0\0"[..],
+            Outcome::F64Invocation(Ok(1)),
+        ),
+    ]
+    .into_iter()
+    .map(|(ty, constant, expected)| {
+        let mut bytes = b"\0asm\x01\0\0\0\x01\x05\x01\x60\0\x01".to_vec();
+        bytes.push(ty);
+        bytes.extend(b"\x03\x02\x01\0\x07\x05\x01\x01x\0\0");
+        let len = 5 + u8::try_from(constant.len()).unwrap();
+        bytes.extend([0x0a, len + 2, 1, len, 0, 0x03, ty]);
+        bytes.extend(constant);
+        bytes.extend([0x0b, 0x0b]);
+        Fixture {
+            expected,
+            bytes,
+            export: "x",
+            args: vec![],
+        }
+    });
+    let loop_backedges = [(1, 50), (40, 89)].map(|(trips, expected)| Fixture {
+        expected: Outcome::Invocation(Ok(expected)),
+        bytes: singleton_module(
+            1,
+            &[1, 1, 0x7f],
+            &[
+                0x41, 40, 0x03, 0x7f, // Preserve 40 beneath the result loop.
+                0x20, 1, 0x41, 1, 0x6a, 0x21, 1, 0x41, 7, 0x02, 0x7e, 0x42, 2, 0x20, 0, 0x41, 1,
+                0x6b, 0x22, 0, 0x0d, 1, // Taken backedge drops 7 and 2.
+                0x0b, 0xa7, 0x6a, 0x20, 1, 0x6a, 0x0b, 0x6a,
+            ],
+            None,
+        ),
+        export: EXPORT,
+        args: vec![WasmValue::I32(trips)],
+    });
     add_cases
         .chain(void_cases)
         .chain(float_cases)
         .chain(sign_cases)
+        .chain(result_loops)
+        .chain(loop_backedges)
         .chain(float_host_fixtures())
 }
 

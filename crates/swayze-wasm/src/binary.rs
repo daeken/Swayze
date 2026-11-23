@@ -2576,6 +2576,15 @@ impl ControlFrame {
         self.base
     }
 
+    fn label_result(&self) -> Option<ValType> {
+        // A continue supplies loop inputs, not the fallthrough result. Core
+        // 1.0 loops have no inputs; the other labels use their end result.
+        match self.kind {
+            ControlKind::Loop { .. } => None,
+            _ => self.result,
+        }
+    }
+
     fn pop_result(self, stack: &mut OperandStack, offset: usize) -> Result<(), Error> {
         let depth = stack.depth - self.base;
         let expected = usize::from(self.result.is_some());
@@ -3260,12 +3269,7 @@ fn validate_body(
         }
         match opcode {
             BLOCK | LOOP | IF => {
-                let result = if opcode == LOOP {
-                    body.expect_byte(EMPTY_BLOCK_TYPE)?;
-                    None
-                } else {
-                    body.block_result()?
-                };
+                let result = body.block_result()?;
                 let next = frames.get_mut(nesting + 1).ok_or(Error {
                     offset,
                     kind: ErrorKind::LimitExceeded {
@@ -3318,12 +3322,13 @@ fn validate_body(
                 // Pop against the active floor. Only execution of the taken
                 // branch uses the target floor.
                 let conditional = opcode == BR_IF;
-                operands.pop_transfer(frame, conditional, target.result, offset)?;
+                let label_result = target.label_result();
+                operands.pop_transfer(frame, conditional, label_result, offset)?;
                 decoded[pc] = Instruction::Branch { edge, conditional };
                 if !conditional {
                     operands.depth = frames[nesting].mark_unreachable();
-                } else if let Some(ty) = target.result {
-                    // Fallthrough restores the result, even if it was implicit.
+                } else if let Some(ty) = label_result {
+                    // Fallthrough restores the payload, even if it was implicit.
                     operands.push(ty, offset)?;
                 }
             }
@@ -3338,17 +3343,18 @@ fn validate_body(
                     let label_offset = body.position();
                     let label = body.index(IntegerField::LabelIndex, (nesting + 1) as u32)?;
                     let target = &mut frames[nesting - label as usize];
-                    let expected = *common.get_or_insert(target.result);
-                    if target.result != expected {
+                    let actual = target.label_result();
+                    let expected = *common.get_or_insert(actual);
+                    if actual != expected {
                         return Err(Error {
                             offset: label_offset,
-                            kind: match (expected, target.result) {
+                            kind: match (expected, actual) {
                                 (Some(expected), Some(actual)) => {
                                     ErrorKind::BranchTableTypeMismatch { expected, actual }
                                 }
                                 _ => ErrorKind::BranchTableArityMismatch {
                                     expected: usize::from(expected.is_some()),
-                                    actual: usize::from(target.result.is_some()),
+                                    actual: usize::from(actual.is_some()),
                                 },
                             },
                         });
@@ -3363,8 +3369,8 @@ fn validate_body(
                     );
                     target_count += 1;
                 }
-                let result = common.expect("every table has a default");
-                operands.pop_transfer(frame, true, result, offset)?;
+                let label_result = common.expect("every table has a default");
+                operands.pop_transfer(frame, true, label_result, offset)?;
                 decoded[pc] = Instruction::BranchTable {
                     first,
                     explicit_count,

@@ -528,18 +528,6 @@ fn i32_memory_operands_and_i32_globals_reject_i64_even_in_dead_code() {
 }
 
 #[test]
-fn i64_remains_unsupported_in_loop_labels() {
-    bad_body(
-        b"\0\x03\x7e\x0b",
-        2,
-        ErrorKind::UnexpectedByte {
-            expected: 0x40,
-            found: 0x7e,
-        },
-    );
-}
-
-#[test]
 fn mixed_operands_share_the_exact_stack_cap_including_frozen_prefixes() {
     let limit = Limit::OperandStackDepth;
     assert_eq!(limit.maximum(), 32);

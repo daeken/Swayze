@@ -7,7 +7,7 @@
 //! sections. Modules with functions must have one to eight types, one to eight
 //! function declarations, and exactly as many code bodies as function
 //! declarations, in that section order. Each type must have zero to four `i32`
-//! parameters and exactly one `i32` result, even if unused.
+//! parameters and either no result (void) or one `i32` result, even if unused.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 `i32` locals in total. The
 //! number of groups and each group's local count are unsigned LEB32; zero-count
@@ -75,8 +75,10 @@
 //! globals, if present) may contain zero to eight function exports. Memory and
 //! globals cannot be exported. Name matching is exact (no Unicode normalization),
 //! and duplicate export names are rejected. Each export refers to a defined
-//! function by its zero-based declaration index. Distinct names may refer to
-//! the same function.
+//! function with one `i32` result by its zero-based declaration index. A void
+//! function may be called by guest code but cannot be exported:
+//! [`ErrorKind::VoidFunctionExport`] points to the start of the function index.
+//! Distinct names may refer to the same function.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import, start, and data count)
@@ -94,7 +96,8 @@
 //! `i32.eqz`, `i32.clz`, `i32.ctz`, and `i32.popcnt` each consume one and push
 //! one; the binary operators consume two and push one. `call` consumes as many
 //! i32s as the target function's type has parameters (the top operand is the
-//! last parameter) and pushes one result.
+//! last parameter) and pushes one `i32` for a result function or nothing for
+//! a void function.
 //! Loads consume an i32 base address and push an i32. Stores consume an i32
 //! address and an i32 value (value on top) and produce no result. `memory.size`
 //! takes no operands and pushes the instance's actual page count (0 or 1).
@@ -112,10 +115,11 @@
 //! a reachable else arm at the same floor. `end` checks the final result, then
 //! leaves the declared result on the parent's stack (none for void) without
 //! changing the parent's reachability flag.
-//! A transfer to an i32-result `block`, i32-result `if`, or the function requires
-//! an i32 result. `br_if` also pops an i32 condition above any result, and
-//! `br_table` pops an i32 selector above any common result. Validation checks
-//! these pops against the active floor, even for an outer target. Only `br_if`
+//! A transfer to an i32-result `block`, `if`, or function requires an i32
+//! result; transfers to void labels require no result. `br_if` pops an i32
+//! condition above any result, and `br_table` pops an i32 selector above any
+//! common result. Validation checks these pops against the active floor, even
+//! for an outer target. Only `br_if`
 //! restores the result for fallthrough, and execution with a zero condition pops
 //! only the condition and continues. `br_table` treats its selector as `u32`:
 //! it selects the zero-based explicit entry, or the default if out of range.
@@ -123,14 +127,16 @@
 //! the result if required, and resumes after the target's `end`.
 //! A taken loop branch truncates to the target loop's floor and resumes at its
 //! body start. Both preserve the target's operand prefix and locals. A function
-//! exit discards all callee operands except the result and completes the call.
+//! exit discards all callee operands except the declared result, if any, and
+//! completes the call.
 //! Both `if` arms and the entire `br_if` fallthrough path are validated regardless
 //! of the condition. Unreachable code is fully decoded and checked, including
 //! all immediates, indices, mutability, delimiters, and limits.
 //! The function has a floor of zero and its own unreachable flag; its `end`
-//! must be the final byte of the body frame and checks for one i32 result. The
-//! inclusive limits are 256 body bytes (including the locals vector and all
-//! delimiters), 127 decoded instructions (including `unreachable`, `nop`,
+//! must be the final byte of the body frame and checks for the declared result
+//! arity, including that a void function leaves no operands. The inclusive
+//! limits are 256 body bytes (including the locals vector and all delimiters),
+//! 127 decoded instructions (including `unreachable`, `nop`,
 //! `drop`, `select`, `if`, `else`, `br`, `br_if`, `br_table`, and `return`, but
 //! not `block`, `loop`, or `end`), 32 explicitly stacked i32 operands including
 //! those below floors, and 16 simultaneously open `block`, `loop`, and `if`
@@ -152,7 +158,7 @@
 //! with no allocation. Failed instantiation exposes no instance. The typed
 //! [`Instance::invoke_i32_with_args`] method
 //! scans at most eight export names for an exact match, then checks the selected
-//! function's arity and begins execution without allocating or recursing
+//! function's argument count and begins execution without allocating or recursing
 //! in Rust. Zero selects the else arm (or skips straight to the join if no
 //! `else` is present); every nonzero i32 selects the then arm.
 //! Validation uses a fixed stack of control frames with explicit result arities.
@@ -175,9 +181,10 @@
 //! Each active call frame has its own fixed operand stack and local storage.
 //! Parameters are copied from the supplied arguments or caller's operands, and
 //! declared locals start at zero for every frame. A callee starts with no
-//! operands. Its single result is pushed onto the caller's remaining operands
-//! before execution resumes. [`Instance::invoke_i32`] is equivalent to passing an
-//! empty argument slice. The top operand is the right-hand side of each binary
+//! operands. A callee returning i32 pushes that value onto the caller's
+//! remaining operands; a void callee leaves them unchanged.
+//! [`Instance::invoke_i32`] is equivalent to passing an empty argument slice.
+//! The top operand is the right-hand side of each binary
 //! operation. `i32.eqz` tests for zero, and `i32.eq` and `i32.ne` compare the
 //! operand bits for equality or inequality. Ordering comparisons interpret the
 //! bits as signed `i32` for `_s` and unsigned `u32` for `_u`. These tests and
@@ -302,6 +309,14 @@
 //! Function-exit tests cover implicit label depths through mixed control, result
 //! preservation on conditional fallthrough, active-floor and dead-tail checks,
 //! caller resumption, and exact decoded-instruction, dispatch, and call limits.
+//! Void-function tests cover padded zero result counts and rejection of void
+//! exports at the function index, mixed forward calls with four arguments,
+//! caller operand and local preservation, and shared global effects. They
+//! exercise fallthrough, `return`, `br`, `br_if`, and `br_table` function exits,
+//! table typing against void loop labels and i32-result labels, exact operand
+//! and result errors at active floors and delimiters, and polymorphic dead
+//! tails without synthetic results. Recursive void calls and free completion
+//! and resumption are checked at the exact frame, operand, and dispatch bounds.
 //! Memory tests cover exact limits, width-specific alignment and framed memarg
 //! decoding, actual page counts and the reserved `memory.size` byte, absent and
 //! zero-page memory, ordering and unsupported features, operand floors and
@@ -320,12 +335,12 @@
 //! floors in all bodies, and unsupported imports, exports, and global offsets.
 //! They exercise shared state across exports and calls, fresh instances, and
 //! suppression of later writes after a trap or exhausted dispatch budget.
-//! Parsing uses fixed scratch tables for up to eight type arities, eight resolved
-//! function arities, and eight global declarations. It checks local group counts
-//! against the remaining local budget without expanding groups, uses bounded
-//! borrowed frames, and decodes instructions into a fixed-size scratch array. After checking `end`
-//! and the complete body frame, it calls `Vec::try_reserve_exact` for the count and
-//! copies those instructions. The body, export, and data segment vectors are
+//! Parsing uses fixed scratch tables for up to eight type signatures, eight
+//! resolved function signatures, and eight global declarations. It checks local
+//! group counts against the remaining local budget without expanding groups,
+//! uses bounded borrowed frames, and decodes instructions into a fixed-size
+//! scratch array. After checking `end` and the complete body frame, it calls
+//! `Vec::try_reserve_exact` for the count and copies those instructions. The body, export, and data segment vectors are
 //! reserved fallibly after checking their counts. Each name and segment payload
 //! is reserved fallibly after checking its length, with an aggregate limit for
 //! data payloads. The count caps bound aggregate decoding to eight body budgets and

@@ -23,6 +23,8 @@ mod stack;
 mod unreachable;
 #[path = "execution/void_control.rs"]
 mod void_control;
+#[path = "execution/void_functions.rs"]
+mod void_functions;
 
 const HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const TYPE: &[u8] = &[1, 0x60, 0, 1, 0x7f];
@@ -402,14 +404,6 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
             },
         ),
         (
-            &[0x60, 0, 0],
-            2,
-            UnsupportedCount {
-                field: ResultCount,
-                count: 0,
-            },
-        ),
-        (
             &[0x60, 0, 2],
             2,
             UnsupportedCount {
@@ -425,6 +419,7 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
                 found: 0x7e,
             },
         ),
+        (&[0x60, 0, 0x80], 3, TruncatedInteger { field: ResultCount }),
         (&[0x60, 0, 1], 3, TruncatedByte { expected: 0x7f }),
     ] {
         let types = [&[2][..], &TYPE[1..], second].concat();
@@ -2527,7 +2522,7 @@ fn bounds_type_function_code_and_export_counts() {
     for (id, prefix, field, bad_counts) in [
         (1, &[][..], TypeCount, &[0, 9][..]),
         (1, &[1, 0x60], ParameterCount, &[5]),
-        (1, &[1, 0x60, 0], ResultCount, &[0, 2]),
+        (1, &[1, 0x60, 0], ResultCount, &[2]),
         (3, &[], FunctionCount, &[0, 9]),
         (7, &[], ExportCount, &[9]),
         (10, &[], CodeCount, &[0, 9]),

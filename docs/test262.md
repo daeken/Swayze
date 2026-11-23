@@ -20,6 +20,10 @@ checks representative paths, and rejects tracked changes. It does not inventory
 untracked files. The default merge gate uses only this non-executing check.
 Normal Cargo builds do not initialize, download, or execute the corpus.
 
+To see the full pinned file inventory and which paths are selected (not which
+passed), run `python3 tools/test262-inventory.py`. See the
+[inventory guide](test262-inventory.md) for count rules and audit output.
+
 ## Run the reviewed slice
 
 In a disposable, credential-free checkout of the reviewed commit with the

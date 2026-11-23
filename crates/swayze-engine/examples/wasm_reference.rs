@@ -1,4 +1,4 @@
-//! Opt-in differential Wasm i32 smoke check: run tools/check-wasm-reference.sh.
+//! Opt-in differential Wasm smoke check: run tools/check-wasm-reference.sh.
 
 use std::{error::Error, process::Command};
 use swayze_engine::{WasmInstantiationError, WasmInvokeError, WasmTrap, validate_module};
@@ -25,8 +25,12 @@ for (const fixture of fixtures) {
     const invoke = instance.exports[name];
     try {
         const value = invoke(...args.map(Number));
-        if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
-        console.log(value);
+        if (value === undefined) {
+            console.log('void');
+        } else {
+            if ((value | 0) !== value) throw new Error(`expected signed i32 for ${hex}`);
+            console.log(value);
+        }
     } catch (error) {
         if (!(error instanceof WebAssembly.RuntimeError)) throw error;
         console.log('trap');
@@ -80,6 +84,7 @@ fn singleton_module(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Invocation(Result<i32, WasmTrap>),
+    VoidInvocation(Result<(), WasmTrap>),
     DataSegmentOutOfBounds(usize),
 }
 
@@ -535,6 +540,18 @@ fn fixtures() -> Vec<Fixture> {
         &[],
         &[0x41, 42, 0x41, 0, 0x0e, 0, 0, 0x00],
     ));
+    // Export x returns no value, unless its argument selects the trap arm.
+    let void_export = b"\0asm\x01\0\0\0\x01\x05\x01\x60\x01\x7f\0\
+                        \x03\x02\x01\0\x07\x05\x01\x01x\0\0\
+                        \x0a\x0a\x01\x08\0\x20\0\x04\x40\x00\x0b\x0b";
+    for (input, expected) in [(0, Ok(())), (-1, Err(WasmTrap::Unreachable))] {
+        cases.push(Fixture {
+            expected: Outcome::VoidInvocation(expected),
+            bytes: void_export.to_vec(),
+            export: "x",
+            args: vec![input],
+        });
+    }
     cases
 }
 
@@ -577,6 +594,13 @@ fn evaluate(fixture: &Fixture) -> Result<Outcome, Box<dyn Error>> {
         }
         Err(error) => return Err(error.into()),
     };
+    if matches!(fixture.expected, Outcome::VoidInvocation(_)) {
+        return match instance.invoke_void_with_args(fixture.export, &fixture.args) {
+            Ok(()) => Ok(Outcome::VoidInvocation(Ok(()))),
+            Err(WasmInvokeError::Trap(trap)) => Ok(Outcome::VoidInvocation(Err(trap))),
+            Err(host_error) => Err(host_error.into()),
+        };
+    }
     match instance.invoke_i32_with_args(fixture.export, &fixture.args) {
         Ok(value) => Ok(Outcome::Invocation(Ok(value))),
         Err(WasmInvokeError::Trap(trap)) => Ok(Outcome::Invocation(Err(trap))),
@@ -613,7 +637,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let actual = evaluate(fixture).map_err(|error| format!("fixture {encoded}: {error}"))?;
         let agrees = match actual {
             Outcome::Invocation(Ok(value)) => reference.parse::<i32>().ok() == Some(value),
-            Outcome::Invocation(Err(_)) => reference == "trap",
+            Outcome::VoidInvocation(Ok(())) => reference == "void",
+            Outcome::Invocation(Err(_)) | Outcome::VoidInvocation(Err(_)) => reference == "trap",
             Outcome::DataSegmentOutOfBounds(_) => reference == "instantiation-error",
         };
         if !agrees || actual != expected {
@@ -624,7 +649,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (i32 results, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (i32 or void results, invocation traps, or instantiation errors)"
     );
     Ok(())
 }

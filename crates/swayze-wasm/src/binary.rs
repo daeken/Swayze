@@ -1,5 +1,5 @@
 use crate::{
-    ExecutionLimit, Export, Instance, InvokeError, Module, Trap,
+    ExecutionLimit, Export, Instance, InvokeError, Module, ResultKind, Trap,
     memory::{AccessWidth, DataSegment, LoadKind, MEMORY_PAGE_BYTES},
 };
 use std::{fmt, ops::RangeInclusive, str};
@@ -23,8 +23,7 @@ pub struct Error {
 /// the depth differs from the frame's result arity (zero for void, one for i32),
 /// unless a missing result is supplied by an unreachable frame's implicit i32.
 /// `BranchTableArityMismatch` compares a `br_table` target's result arity to
-/// that of the first target. `VoidFunctionExport` indicates that a function
-/// export names a function with no result.
+/// that of the first target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -45,7 +44,6 @@ pub enum ErrorKind {
     TruncatedData { declared: usize, available: usize },
     InvalidUtf8Name,
     DuplicateExportName,
-    VoidFunctionExport { index: u32 },
     UnsupportedCount { field: IntegerField, count: u32 },
     InvalidIndex { field: IntegerField, index: u32 },
     TruncatedMemoryLimitsFlags,
@@ -201,9 +199,6 @@ impl fmt::Display for Error {
             ),
             InvalidUtf8Name => f.write_str("invalid UTF-8 in name"),
             DuplicateExportName => f.write_str("duplicate export name"),
-            VoidFunctionExport { index } => {
-                write!(f, "cannot export function {index} without an i32 result")
-            }
             UnsupportedCount { field, count } => write!(f, "unsupported {field:?} of {count}"),
             InvalidIndex { field, index } => write!(f, "invalid {field:?} {index}"),
             TruncatedMemoryLimitsFlags => f.write_str("missing memory limits flags"),
@@ -287,8 +282,6 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
-/// [`ErrorKind::VoidFunctionExport`] points to the start of the exported
-/// function's index immediate.
 /// A `br`, `br_if`, or `br_table` depth that does not name an enclosing label
 /// (including the implicit function label) is reported as
 /// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`] at the start of
@@ -383,10 +376,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             }
             5 => memory_bytes = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
-            7 => {
-                let declarations = function_count.map(|count| &function_types[..count as usize]);
-                exports = validate_exports(&mut section, declarations)?;
-            }
+            7 => exports = validate_exports(&mut section, function_count)?,
             10 => {
                 let declarations = function_count.map(|count| &function_types[..count as usize]);
                 functions = validate_code(
@@ -479,14 +469,14 @@ const I32: u8 = 0x7f;
 #[derive(Clone, Copy, Debug)]
 struct FunctionType {
     parameters: u32,
-    result: ResultArity,
+    result: ResultKind,
 }
 
 impl FunctionType {
     // Keep the existing framing checks for a module missing its type section.
     const PLACEHOLDER: Self = Self {
         parameters: 0,
-        result: ResultArity::I32,
+        result: ResultKind::I32,
     };
 }
 
@@ -502,10 +492,10 @@ fn validate_types(
             section.expect_byte(I32)?;
         }
         let result = if section.count(IntegerField::ResultCount, 0..=1)? == 0 {
-            ResultArity::Void
+            ResultKind::Void
         } else {
             section.expect_byte(I32)?;
-            ResultArity::I32
+            ResultKind::I32
         };
         *signature = FunctionType { parameters, result };
     }
@@ -578,7 +568,7 @@ fn validate_globals(
 
 fn validate_exports(
     section: &mut Reader<'_>,
-    declarations: Option<&[FunctionType]>,
+    function_count: Option<u32>,
 ) -> Result<Vec<Export>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
@@ -596,16 +586,8 @@ fn validate_exports(
             });
         }
         section.expect_byte(0x00)?; // function export descriptor
-        let index = if let Some(declarations) = declarations {
-            let index_offset = section.position();
-            let index = section.index(IntegerField::FunctionIndex, declarations.len() as u32)?;
-            if declarations[index as usize].result == ResultArity::Void {
-                return Err(Error {
-                    offset: index_offset,
-                    kind: ErrorKind::VoidFunctionExport { index },
-                });
-            }
-            index
+        let index = if let Some(function_count) = function_count {
+            section.index(IntegerField::FunctionIndex, function_count)?
         } else {
             // No valid target without a function section. Preserve framing and
             // order checks before the final required-section check rejects it.
@@ -691,13 +673,7 @@ const MAX_BR_TABLE_ENTRIES: u32 = 16;
 // byte of its body's frame, independent of the decoded instruction count.
 const MAX_BODY_TABLE_TARGETS: usize = Limit::CodeBodyBytes.maximum();
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResultArity {
-    Void,
-    I32,
-}
-
-impl ResultArity {
+impl ResultKind {
     fn count(self) -> usize {
         match self {
             Self::Void => 0,
@@ -738,7 +714,7 @@ struct BranchEdge {
 
 #[derive(Clone, Copy, Debug)]
 enum BranchTarget {
-    End { pc: usize, result: ResultArity },
+    End { pc: usize, result: ResultKind },
     Loop(LoopTarget),
     Function,
 }
@@ -905,12 +881,12 @@ impl CallFrame {
     fn take_branch(&mut self, edge: BranchEdge, code: &ValidatedCode) {
         let (pc, result) = match edge.target {
             BranchTarget::End { pc, result } => (pc, result),
-            BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultArity::Void),
+            BranchTarget::Loop(LoopTarget(pc)) => (pc, ResultKind::Void),
             BranchTarget::Function => (code.instructions.len(), code.signature.result),
         };
         let value = match result {
-            ResultArity::Void => None,
-            ResultArity::I32 => Some(self.pop()),
+            ResultKind::Void => None,
+            ResultKind::I32 => Some(self.pop()),
         };
         // Restore the target's prefix, not the active frame's.
         self.depth = edge.floor;
@@ -925,14 +901,20 @@ pub(super) fn execute(
     instance: &Instance<'_>,
     function_index: usize,
     args: &[i32],
-) -> Result<i32, InvokeError> {
+    expected: ResultKind,
+) -> Result<Option<i32>, InvokeError> {
     let module = instance.module;
-    let parameter_count = module.functions[function_index].signature.parameters as usize;
+    let signature = module.functions[function_index].signature;
+    let parameter_count = signature.parameters as usize;
     if args.len() != parameter_count {
         return Err(InvokeError::ArityMismatch {
             expected: parameter_count,
             actual: args.len(),
         });
+    }
+    let actual = signature.result;
+    if actual != expected {
+        return Err(InvokeError::ResultMismatch { expected, actual });
     }
     let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
     frames[0] = CallFrame::new(function_index, args);
@@ -948,11 +930,11 @@ pub(super) fn execute(
             debug_assert_eq!(frame.pc, code.instructions.len());
             debug_assert_eq!(frame.depth, code.signature.result.count());
             let value = match code.signature.result {
-                ResultArity::Void => None,
-                ResultArity::I32 => Some(frame.operands[0]),
+                ResultKind::Void => None,
+                ResultKind::I32 => Some(frame.operands[0]),
             };
             if active == 0 {
-                return Ok(value.expect("validated exports return one i32"));
+                return Ok(value);
             }
             active -= 1;
             if let Some(value) = value {
@@ -1070,14 +1052,14 @@ fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
 #[derive(Clone, Copy)]
 struct ControlFrame {
     base: usize,
-    result: ResultArity,
+    result: ResultKind,
     kind: ControlKind,
     last_branch: Option<BranchSlot>,
     unreachable: bool,
 }
 
 impl ControlFrame {
-    fn function(result: ResultArity) -> Self {
+    fn function(result: ResultKind) -> Self {
         Self {
             base: 0,
             result,
@@ -1369,7 +1351,7 @@ fn validate_body(
             unreachable,
         } = frame;
         let available = depth - base;
-        let requires_else = result == ResultArity::I32 && matches!(kind, ControlKind::Then { .. });
+        let requires_else = result == ResultKind::I32 && matches!(kind, ControlKind::Then { .. });
         let opcode = body.byte().ok_or_else(|| {
             let expected = if requires_else { ELSE } else { END };
             body.error(ErrorKind::TruncatedByte { expected })
@@ -1449,7 +1431,7 @@ fn validate_body(
             BLOCK | LOOP | IF => {
                 let result = if opcode == LOOP {
                     body.expect_byte(EMPTY_BLOCK_TYPE)?;
-                    ResultArity::Void
+                    ResultKind::Void
                 } else {
                     body.block_result()?
                 };
@@ -1680,12 +1662,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn block_result(&mut self) -> Result<ResultArity, Error> {
+    fn block_result(&mut self) -> Result<ResultKind, Error> {
         let offset = self.position();
         // Preserve the original expected byte in errors for block and if.
         match self.byte() {
-            Some(EMPTY_BLOCK_TYPE) => Ok(ResultArity::Void),
-            Some(I32) => Ok(ResultArity::I32),
+            Some(EMPTY_BLOCK_TYPE) => Ok(ResultKind::Void),
+            Some(I32) => Ok(ResultKind::I32),
             Some(found) => Err(Error {
                 offset,
                 kind: ErrorKind::UnexpectedByte {

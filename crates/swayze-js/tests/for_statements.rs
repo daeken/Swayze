@@ -451,16 +451,26 @@ fn stores_remain_standalone_in_both_clauses() {
 
     let requires_group = "a sequence in an assignment RHS requires parentheses";
     let assignment_expr = "assignment expressions require a simple name followed by an assignment operator at the start of an expression group";
-    let update_expr = "increment and decrement expressions are outside the subset";
+    let standalone_update = "increment and decrement expressions are outside the subset";
+    let update_expr =
+        "increment and decrement expressions require an explicit group containing only the update";
     for (source, marked, message) in [
         ("let i;for(i??=null,0;false;){}0", ",", requires_group),
         ("let i;for(;false;i+=true?1:2,1){}0", ",", requires_group),
         ("let i;for(i, i=1;false;){}0", "=", assignment_expr),
         ("let i;for(;false;((i)=1)){}0", "=", assignment_expr),
-        ("let i=0,j=0;for(i++,j++;false;){}0", "i|++", update_expr),
-        ("let i=0,j=0;for(;false;++i,j--){}0", "++", update_expr),
+        (
+            "let i=0,j=0;for(i++,j++;false;){}0",
+            "i|++",
+            standalone_update,
+        ),
+        (
+            "let i=0,j=0;for(;false;++i,j--){}0",
+            "++",
+            standalone_update,
+        ),
         ("let i;for(;false;0,i--){}0", "--", update_expr),
-        ("let i;for((i++);false;){}0", "++", update_expr),
+        ("let i;for((i++ + 1);false;){}0", "++", update_expr),
         (
             "let i;for(;false;i/*\n*/++){}0",
             "++",

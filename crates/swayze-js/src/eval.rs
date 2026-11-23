@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     Script,
-    parser::{BindingKind, Instruction, ShortCircuitCondition},
+    parser::{BindingKind, Instruction, ShortCircuitCondition, Update, UpdateResult},
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
@@ -177,6 +177,10 @@ impl Script {
     /// and updates) load one initialized `let`, convert its value to Number
     /// as above, and store the result of adding or subtracting `1`. Neither
     /// prefix nor postfix form leaves a result.
+    /// An update that occupies its own expression group, such as `(x++)`,
+    /// performs the same write and yields a Number: the new Number for
+    /// prefix, or the old coerced Number (including signed zero or NaN)
+    /// for postfix.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. A comma sequence evaluates its operands
     /// from left to right, discarding each but the last without coercion.
@@ -301,14 +305,7 @@ fn evaluate(
                 });
             }
             Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
-                let Some(Some(Slot {
-                    kind: BindingKind::Let,
-                    value,
-                    ..
-                })) = bindings.get_mut(slot)
-                else {
-                    return Err(EvalError::InvalidScript);
-                };
+                let value = writable_binding(&mut bindings, slot)?;
                 *value = if matches!(op, Instruction::StoreBindingKeep(_)) {
                     *stack.last().ok_or(EvalError::InvalidScript)?
                 } else {
@@ -317,6 +314,20 @@ fn evaluate(
                     }
                     stack.pop().ok_or(EvalError::InvalidScript)?
                 };
+            }
+            Instruction::UpdateBinding { slot, op, result } => {
+                let value = writable_binding(&mut bindings, slot)?;
+                let old = value.to_number();
+                let new = match op {
+                    Update::Increment => old + 1.0,
+                    Update::Decrement => old - 1.0,
+                };
+                let result = match result {
+                    UpdateResult::New => new,
+                    UpdateResult::Old => old,
+                };
+                push_operand(&mut stack, max_operands, Value::Number(result))?;
+                *value = Value::Number(new);
             }
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
@@ -422,6 +433,17 @@ fn evaluate(
 
     match stack.as_slice() {
         [value] => Ok(*value),
+        _ => Err(EvalError::InvalidScript),
+    }
+}
+
+fn writable_binding(bindings: &mut [Option<Slot>], slot: usize) -> Result<&mut Value, EvalError> {
+    match bindings.get_mut(slot) {
+        Some(Some(Slot {
+            kind: BindingKind::Let,
+            value,
+            ..
+        })) => Ok(value),
         _ => Err(EvalError::InvalidScript),
     }
 }
@@ -965,6 +987,28 @@ mod tests {
             ),
             Ok(Value::Number(5.0)),
         );
+    }
+
+    #[test]
+    fn grouped_update_checks_mutable_initialization_slot_bounds_and_push_capacity() {
+        use Instruction::{Add, Boolean, UpdateBinding};
+        let update = |slot| UpdateBinding {
+            slot,
+            op: Update::Increment,
+            result: UpdateResult::Old,
+        };
+        let value = Boolean(true);
+        for ops in [
+            [update(0), INIT_LET, value],   // read/write before initialization
+            [value, INIT_CONST, update(0)], // immutable slot
+            [value, INIT_LET, update(1)],   // out of range
+            [value, INIT_LET, update(usize::MAX)],
+        ] {
+            assert_eq!(evaluate(&ops, 1, 1), Err(EvalError::InvalidScript));
+        }
+        let ops = [value, INIT_LET, value, update(0), Add];
+        assert_eq!(evaluate(&ops, 1, 1), Err(EvalError::InvalidScript));
+        assert_eq!(evaluate(&ops, 2, 1), Ok(Value::Number(2.0)));
     }
 
     #[test]

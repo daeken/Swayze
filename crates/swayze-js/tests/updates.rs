@@ -180,12 +180,12 @@ fn respects_ecmascript_line_terminators_without_asi() {
 }
 
 #[test]
-fn rejects_expression_values_and_other_targets_with_maximal_munch() {
+fn rejects_ungrouped_and_mixed_expression_updates_and_other_targets() {
     use ErrorKind::Unsupported;
     for (source, message) in [
         ("let x=0;let y=@++@x;y", "expressions"),
         ("let x=0;x+=x@++@;x", "expressions"),
-        ("let x=0;(x@--@)", "expressions"),
+        ("let x=0;(x@--@ - 1)", "expressions"),
         ("let x=0;true?@++@x:x", "expressions"),
         ("let x=0;if(x@++@){}0", "expressions"),
         ("let x=0;while(@--@x){}0", "expressions"),
@@ -313,4 +313,275 @@ fn for_updates_count_toward_exact_dispatch_ceiling() {
     }
     let script = parse_script("let i=9007199254740992;for(;;i++){continue;}i").unwrap();
     assert_eq!(script.evaluate(), Err(EvalError::DispatchLimitExceeded));
+}
+
+#[test]
+fn grouped_updates_yield_and_store_numbers_without_losing_old_number_bits() {
+    for (init, old, incremented, decremented) in [
+        ("=true", 1.0, 2.0, 0.0),
+        ("=false", 0.0, 1.0, -1.0),
+        ("=null", 0.0, 1.0, -1.0),
+        ("", f64::NAN, f64::NAN, f64::NAN),
+        ("=0/0", f64::NAN, f64::NAN, f64::NAN),
+        ("=0", 0.0, 1.0, -1.0),
+        ("=-0", -0.0, 1.0, -1.0),
+        ("=-1", -1.0, 0.0, -2.0),
+        ("=1e309", f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        (
+            "=-1e309",
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        (
+            "=9007199254740992",
+            9007199254740992.0,
+            9007199254740992.0,
+            9007199254740991.0,
+        ),
+    ] {
+        for (form, new, result) in [
+            ("++x", incremented, incremented),
+            ("--x", decremented, decremented),
+            ("x++", incremented, old),
+            ("x--", decremented, old),
+        ] {
+            for (tail, expected) in [("", result), ("; x", new)] {
+                let source = format!("let x{init}; ({form}){tail}");
+                let Value::Number(actual) =
+                    parse_script(&source).unwrap().evaluate_value().unwrap()
+                else {
+                    panic!("expected a Number: {source}");
+                };
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "{source}");
+                } else {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{source}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_updates_run_once_in_order_with_expressions_and_control() {
+    for (source, expected) in [
+        ("let x=1; ((x++) + 1)*10 + x", 22.0),
+        ("let x=1; (x++)*1000 + (++x)*100 + (x--)*10 + x", 1332.0),
+        ("let x=2; (x++)**(x--)", 8.0),
+        ("let x=4; (x-=(x++))*10+x", 0.0),
+        ("let x=0, y=(++x), z=(x++); x*100+y*10+z", 211.0),
+        ("let x=0, y; y = (x++); y*10+x", 1.0),
+        ("let x=0, y=1; (y&&=(++x))*10+x", 11.0),
+        ("let x=0, y=1; (y||=(++x))*10+x", 10.0),
+        ("let x=0; (x++), (++x), x", 2.0),
+        ("let x=0; true ? (++x) : (x--)", 1.0),
+        ("let x=0; (x++) || (++x)", 2.0),
+        (
+            "let x=0; false && (++x); true || (x++); 0 ?? (--x); true ? x : (x--)",
+            0.0,
+        ),
+        (
+            "let x=1; if ((x--)) { (++x); } else { (x++); (x++); } x",
+            1.0,
+        ),
+        ("let x=3; while ((--x)) {} do {} while ((x--)); x", -1.0),
+        (
+            "let x=0,s=0; for((++x); (x++)<8; (++x)) { s+=x; continue; } s*100+x",
+            2010.0,
+        ),
+        (
+            "let x=1; for(let x=3;x<4;(x++)) { let x=20; (x--); } x",
+            1.0,
+        ),
+        (
+            "const x=2; let y; { let x=3; (y=(x++)*10+x); } y*10+x",
+            342.0,
+        ),
+        (
+            "let y; { let undefined=true; y=(undefined++)*10+undefined; } y",
+            12.0,
+        ),
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+        assert_eq!(script.evaluate(), Ok(expected), "{source}");
+    }
+}
+
+#[test]
+fn only_a_complete_explicit_update_group_yields_a_value() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, message) in [
+        ("let x=0;(x@++@ + 1)", "explicit group"),
+        ("let x=0;(@++@x + 1)", "explicit group"),
+        ("let x=0;(x@--@, 1)", "explicit group"),
+        ("let x=0;(@--@x ? 1 : 2)", "explicit group"),
+        ("let x=0;(0,x@++@)", "explicit group"),
+        ("let x=0;(x=@++@x)", "explicit group"),
+        ("let x=0;(x=x@++@)", "explicit group"),
+        ("let x=0;(0?@--@x:1)", "explicit group"),
+        ("let x=0;(1+x@++@)", "explicit group"),
+        ("let x=0;((x)@++@)", "explicit group"),
+        ("let x=0;(@++@(x))", "single identifier"),
+        ("let x=0;(x@++@=2)", "explicit group"),
+        ("let x=0;(x@++@++)", "explicit group"),
+        ("let x=0;(!@++@x)", "explicit group"),
+        ("let x=0;let y=x@++@;y", "explicit group"),
+        ("let x=0;let y=@++@x;y", "explicit group"),
+        ("let x=0;do{}while(x@++@);x", "explicit group"),
+        ("let x=0;if(true){}else if(@--@x){}x", "explicit group"),
+        ("let x=0;for(;@--@x;){}x", "explicit group"),
+        ("(null@++@)", "explicit group"),
+    ] {
+        assert_error(source, Unsupported, message);
+    }
+    for source in ["let x=0;(x++/*💡*/@@", "let x=0;(--x@@"] {
+        assert_error(source, Malformed, "expected a closing parenthesis");
+    }
+}
+
+#[test]
+fn grouped_update_targets_are_validated_even_when_not_evaluated() {
+    use ErrorKind::{Malformed, Unsupported};
+    for (source, message) in [
+        ("const x=0; false && (x/*💡*/@++@)", "assignment to const"),
+        (
+            "let x=0; if(false){ const x=1; (@--@/*💡*/x); } x",
+            "assignment to const",
+        ),
+        ("for(const x=0;false;(x@--@)){}0", "assignment to const"),
+        (
+            "let x=0; { true || (++/*💡*/@x@); const x=1; } x",
+            "initialization",
+        ),
+        ("let x = false ? (@x@++) : 0; x", "initialization"),
+        ("let y=(--@x@),x=1; y", "initialization"),
+        ("true || (@undefined@++)", "unbound name"),
+        ("false && (++/*💡*/@absent@); later", "unbound name"),
+        ("for(;false;(@x@--)){let x=0;}0", "unbound name"),
+        ("const y=0; (y@=@(absent++))", "assignment to const"),
+    ] {
+        assert_error(source, Unsupported, message);
+    }
+    assert_error("false && (missing++); let x=@;@0", Malformed, "operand");
+}
+
+#[test]
+fn only_postfix_forbids_a_line_terminator_before_its_operator() {
+    for newline in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+        for trivia in [
+            newline.to_owned(),
+            format!("/*💡{newline}*/"),
+            format!("//💡{newline}"),
+        ] {
+            for op in ["++", "--"] {
+                let source = format!("let x=1; (x{trivia}@{op}@)");
+                assert_error(&source, ErrorKind::Unsupported, "line terminator");
+            }
+            let source =
+                format!("let x=1; (++{trivia}x{trivia}) * 10 + (x/*💡*/\u{00a0}--{trivia}) + x");
+            assert_eq!(parse_script(&source).unwrap().evaluate(), Ok(23.0));
+        }
+    }
+}
+
+#[test]
+fn grouped_updates_charge_the_group_one_emission_and_one_lookup() {
+    for form in ["x/*💡*/++", "--/*💡*/x"] {
+        let source = format!("let x=false;({form})");
+        let span = |start, len| Span {
+            start,
+            end: start + len,
+        };
+        let target = span(source.rfind('x').unwrap(), 1);
+        let open = span(source.find('(').unwrap(), 1);
+        let close = span(source.len() - 1, 1);
+        let limits = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 9,
+            max_nesting_depth: 1,
+            // Scan the source, emit three instructions, push a group marker,
+            // and charge one candidate and one comparison byte for the target.
+            max_work: source.len() + 6,
+        };
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 3);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(
+            script.evaluate(),
+            Ok(if form.starts_with('x') { 0.0 } else { -1.0 })
+        );
+        for (limits, limit, where_) in [
+            (
+                Limits {
+                    max_source_bytes: source.len() - 1,
+                    ..limits
+                },
+                Limit::SourceBytes,
+                close,
+            ),
+            (
+                Limits {
+                    max_tokens: 8,
+                    ..limits
+                },
+                Limit::Tokens,
+                close,
+            ),
+            (
+                Limits {
+                    max_nesting_depth: 0,
+                    ..limits
+                },
+                Limit::NestingDepth,
+                open,
+            ),
+            (
+                Limits {
+                    max_work: target.end + 3,
+                    ..limits
+                },
+                Limit::Work,
+                target,
+            ),
+            (
+                Limits {
+                    max_work: limits.max_work - 1,
+                    ..limits
+                },
+                Limit::Work,
+                target,
+            ),
+        ] {
+            let error = parse_script_with_limits(&source, limits).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit), "{source}");
+            assert_eq!(error.span(), where_, "{source}");
+        }
+    }
+}
+
+#[test]
+fn grouped_updates_count_at_the_existing_prepared_and_dispatch_caps() {
+    let limits = Limits {
+        max_tokens: 5000,
+        ..Limits::default()
+    };
+    for (unary, expected) in [(4089, Ok(0.0)), (4090, Err(EvalError::LimitExceeded))] {
+        let source = format!("let x=false; false && (x++); {}x", "+ ".repeat(unary));
+        let script = parse_script_with_limits(&source, limits).unwrap();
+        assert_eq!(script.instruction_count(), 7 + unary);
+        assert_eq!(script.max_stack_depth(), 1);
+        assert_eq!(script.evaluate(), expected);
+    }
+
+    // 2 initialization dispatches, 3275 taken iterations at 5 each,
+    // 4 dispatches for the final test, then the final load and unary operators.
+    for (unary, expected) in [(2, Ok(3276.0)), (3, Err(EvalError::DispatchLimitExceeded))] {
+        let source = format!("let n=0; while((n++)<3275){{}} {}n", "+ ".repeat(unary));
+        let script = parse_script(&source).unwrap();
+        assert_eq!(script.max_stack_depth(), 2);
+        assert_eq!(script.evaluate(), expected);
+        assert_eq!(script.evaluate(), expected);
+    }
 }

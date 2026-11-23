@@ -44,7 +44,8 @@ expression in Swayze and compares it with a separately evaluated primitive
 literal expectation. It compares exact value tags and UTF-16 code units,
 distinguishes `+0` and `-0`, and treats any two NaNs as the same value. It is not
 a general assertion rewriter. **Raw** mode is reserved for reviewed positive
-`raw` cases run unchanged; there are none in the first cohort. Strict variants
+`raw` cases run unchanged. The hashbang comment case is an unmodified frontier;
+it does not yet pass. Strict variants
 are reported as not run, never as passes. No negative, module or harness-heavy
 cases are credited.
 
@@ -53,7 +54,8 @@ fraction and exponent positions; U+2028, U+2029 and U+180E in Strings; unary
 positive and negative zero; `typeof x` for an unbound name; and two cooked
 no-substitution template literals, including U+180E. The template cases were
 first reproduced as unsupported and then promoted to required after the fix.
-A required variant becoming
+The three template substitution cases are still frontier cases, including nested
+substitutions. A required variant becoming
 unsupported, a wrong result, or no required passes exits 1; infrastructure
 errors exit 2. An unsupported frontier case alone does not fail the run.
 Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)

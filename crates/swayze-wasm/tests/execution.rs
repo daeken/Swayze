@@ -17,6 +17,8 @@ mod float_control;
 mod float_locals;
 #[path = "execution/float_operands.rs"]
 mod float_operands;
+#[path = "execution/float_signatures.rs"]
+mod float_signatures;
 #[path = "execution/function_exit.rs"]
 mod function_exit;
 #[path = "execution/globals.rs"]
@@ -416,11 +418,11 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
             },
         ),
         (
-            &[0x60, 1, 0x7d],
+            &[0x60, 1, 0x70],
             2,
             UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7d,
+                found: 0x70,
             },
         ),
         (
@@ -432,11 +434,11 @@ fn rejects_malformed_type_entries_even_if_no_function_references_them() {
             },
         ),
         (
-            &[0x60, 0, 1, 0x7d],
+            &[0x60, 0, 1, 0x7b],
             3,
             UnexpectedByte {
                 expected: 0x7f,
-                found: 0x7d,
+                found: 0x7b,
             },
         ),
         (&[0x60, 0, 0x80], 3, TruncatedInteger { field: ResultCount }),
@@ -2563,7 +2565,7 @@ fn bounds_type_function_code_and_export_counts() {
     }
     for (id, payload, index, expected) in [
         (1, &[1, 0x61, 0, 1, 0x7f][..], 1, 0x60),
-        (1, &[1, 0x60, 0, 1, 0x7d], 4, 0x7f),
+        (1, &[1, 0x60, 0, 1, 0x70], 4, 0x7f),
         (7, &[1, 0, 1, 0], 2, 0),
     ] {
         bad_payload(
@@ -2616,11 +2618,11 @@ fn rejects_malformed_parameter_type_vectors() {
     );
     bad_payload(
         1,
-        &[1, 0x60, 2, 0x7e, 0x7d, 1, 0x7f],
+        &[1, 0x60, 2, 0x7e, 0x7b, 1, 0x7f],
         4,
         ErrorKind::UnexpectedByte {
             expected: 0x7f,
-            found: 0x7d,
+            found: 0x7b,
         },
     );
 }

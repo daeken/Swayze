@@ -7,8 +7,8 @@
 //! start, element, and data sections. Modules with functions must have one to eight
 //! types, one to eight function declarations, and exactly as many code bodies
 //! as function declarations, in that section order. Each type must have zero
-//! to four parameters, each `i32` or `i64` in any order, and either no result
-//! (void) or one `i32` or `i64` result, even if unused.
+//! to four parameters in any order and either no result (void) or one result,
+//! even if unused. Each parameter and result can be `i32`, `i64`, `f32`, or `f64`.
 //! Every function declares its own zero-based index into the type table; types
 //! may be shared. Each body may declare up to 16 locals in total, in addition
 //! to its parameters. The number of groups and each group's local count are
@@ -129,9 +129,12 @@
 //! any start, elements, and code may contain zero to eight function exports.
 //! Tables, memory, and globals cannot be exported. Name matching is exact (no
 //! Unicode normalization), and duplicate export names are rejected. Each export
-//! refers to a defined function by its zero-based declaration index, and any
-//! supported function signature can be exported. Distinct names may refer to
-//! the same function.
+//! refers to a defined function by its zero-based declaration index. Only
+//! integer parameters and void or integer results are allowed in exported
+//! signatures. Distinct names may refer to the same function. After all other
+//! module checks pass, the first export with a float parameter or result reports
+//! [`ErrorKind::UnsupportedExportSignature`] at the start of its function index,
+//! before checking the start signature.
 //! Both export and custom names must be UTF-8.
 //! Custom payloads after the name are opaque and discarded, even for well-known
 //! names. All other standard sections (including import and data count)
@@ -167,10 +170,10 @@
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
 //! sign operations, and comparisons each count as one dispatch. None uses native
 //! floating-point operations or quiets signaling NaNs. Floats are supported as
-//! operands, private globals, private declared locals, and `block` and `if`
-//! results. Both fallthrough and branch exits preserve all result bits. Float
-//! function signatures (and thus host arguments and results), memory instructions,
-//! and other floating-point numeric instructions remain unsupported.
+//! operands, private globals, locals, `block` and `if` results, and private
+//! function parameters and results. Fallthrough, `return`, and branch exits
+//! preserve all result bits. Float host arguments and results, loop results,
+//! and floating-point numeric instructions beyond those listed remain unsupported.
 //! The two extensions pop an i32 and push an i64,
 //! sign-extending for `_s` and zero-extending for `_u`. Wrapping pops an i64
 //! and pushes its low 32 bits as i32. `i64.eqz` consumes one i64 and pushes
@@ -322,10 +325,12 @@
 //! local storage. Operand, local, and instance global slots use the same
 //! private tagged values, including raw f32 and f64 encodings. Each frame starts
 //! by copying a fixed array of typed zeros, including the exact +0 encoding
-//! for every float local, even when reusing a frame slot. Integer arguments
-//! then fill the parameter prefix. A callee starts with no operands. A callee
-//! returning a value pushes the full tagged result onto the caller's remaining
-//! operands; a void callee leaves them unchanged.
+//! for every float local, even when reusing a frame slot. Tagged arguments
+//! then fill the parameter prefix; floats retain their exact bits across the
+//! call. A callee starts with no operands. A callee returning a value pushes
+//! the full tagged result onto the caller's remaining operands; a void callee
+//! leaves them unchanged. Only the host invocation boundary converts between
+//! the private tagged values and the public, integer-only [`Value`].
 //! `call_indirect` interprets the selector as `u32` and traps with
 //! [`Trap::TableOutOfBounds`] for a selector outside the table's logical length,
 //! [`Trap::UninitializedElement`] for a null entry, or
@@ -578,6 +583,9 @@
 //! Mixed-signature tests cover full-width arguments and returns, structural
 //! equality and same-arity mismatches, active floors and concrete results in
 //! dead tails, and the unchanged void-only, parameterless start boundary.
+//! Private float call tests include all four parameter tags, exact signaling NaN
+//! and signed-zero bits across function exits, same-arity indirect mismatches,
+//! padded export and start indices, and shared frame and dispatch budgets.
 //! Host invocation tests check exact mixed arguments and tagged results, shared
 //! side-effect-free preflight and error precedence, exact names and aliases,
 //! and state persistence across successes, traps, and host limits.
@@ -686,7 +694,7 @@ impl Module {
             table,
         };
         if let Some(index) = self.start_function {
-            binary::execute(&instance, index, std::iter::empty()).map_err(|error| match error {
+            binary::execute_start(&instance, index).map_err(|error| match error {
                 binary::ExecutionError::Trap(trap) => InstantiationError::StartTrap(trap),
                 binary::ExecutionError::LimitExceeded { limit } => {
                     InstantiationError::StartLimitExceeded { limit }

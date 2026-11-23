@@ -271,6 +271,16 @@ impl fmt::Debug for LinearMemory {
 mod tests {
     use super::*;
 
+    fn assert_reserve_request(fresh: &Vec<Chunk>, requested_chunks: usize, expected_pages: usize) {
+        assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
+        assert_eq!(requested_chunks, expected_pages * CHUNKS_PER_PAGE);
+        // Check requested bytes, not allocator capacity after reserve.
+        assert_eq!(
+            requested_chunks * size_of::<Chunk>(),
+            expected_pages * MEMORY_PAGE_BYTES
+        );
+    }
+
     #[test]
     fn zero_minimum_with_core_maximum_never_reserves_at_instantiation() {
         // (module (memory 0 65536))
@@ -300,19 +310,20 @@ mod tests {
                 minimum_pages,
                 maximum_pages: Some(MEMORY32_MAX_PAGES),
             });
-            let expected_chunks = minimum_pages as usize * CHUNKS_PER_PAGE;
+            let expected_pages = minimum_pages as usize;
             let memory = LinearMemory::new_preflighted_with(limits, &[], |fresh, requested| {
-                assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
-                assert_eq!(requested, expected_chunks);
+                assert_reserve_request(fresh, requested, expected_pages);
                 fresh.try_reserve_exact(requested)
             })
             .unwrap();
-            assert_eq!(memory.chunks.borrow().len(), expected_chunks);
+            assert_eq!(
+                memory.chunks.borrow().len(),
+                expected_pages * CHUNKS_PER_PAGE
+            );
             assert_eq!(memory.size_in_pages(), minimum_pages as i32);
 
             let error = LinearMemory::new_preflighted_with(limits, &[], |fresh, requested| {
-                assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
-                assert_eq!(requested, expected_chunks);
+                assert_reserve_request(fresh, requested, expected_pages);
                 fresh.try_reserve_exact(usize::MAX)
             })
             .unwrap_err();
@@ -322,6 +333,7 @@ mod tests {
 
     #[test]
     fn unaligned_access_and_data_cross_an_internal_chunk_seam() {
+        // Cross byte 1024 within page zero, not the 64-KiB page boundary.
         let start = CHUNK_BYTES as u32 - 3;
         let segments = [
             DataSegment {
@@ -362,6 +374,31 @@ mod tests {
     }
 
     #[test]
+    fn direct_two_page_grow_requests_128_kib_in_one_attempt() {
+        let memory = LinearMemory::new_preflighted(
+            Some(MemoryLimits {
+                minimum_pages: 0,
+                maximum_pages: Some(MEMORY32_MAX_PAGES),
+            }),
+            &[],
+        )
+        .unwrap();
+        let mut attempts = 0;
+        let reserve = |fresh: &mut Vec<Chunk>, requested| {
+            attempts += 1;
+            assert_reserve_request(fresh, requested, 2);
+            assert!(memory.chunks.try_borrow_mut().is_ok());
+            fresh.try_reserve_exact(requested)
+        };
+        assert_eq!(memory.grow_with(2, reserve), 0);
+        assert_eq!(attempts, 1);
+        let chunks = memory.chunks.borrow();
+        let bytes = chunks.as_flattened();
+        assert_eq!(bytes.len(), 128 * 1024);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn reserves_only_for_eligible_growth_and_can_retry_after_reserve_failure() {
         let make_memory = |minimum_pages, maximum_pages| {
             LinearMemory::new_preflighted(
@@ -386,11 +423,10 @@ mod tests {
             for delta in [MAX_INSTANCE_MEMORY_PAGES - previous as u32 + 1, u32::MAX] {
                 assert_eq!(memory.grow_with(delta, no_reserve), -1);
             }
-            let expected_chunks = (previous + 1) as usize * CHUNKS_PER_PAGE;
+            let expected_pages = (previous + 1) as usize;
             for _ in 0..2 {
                 let fail = |fresh: &mut Vec<Chunk>, requested| {
-                    assert_eq!((fresh.len(), fresh.capacity()), (0, 0));
-                    assert_eq!(requested, expected_chunks);
+                    assert_reserve_request(fresh, requested, expected_pages);
                     assert!(memory.chunks.try_borrow_mut().is_ok()); // No live borrow at reserve.
                     // Capacity overflow supplies a TryReserveError without real OOM.
                     fresh.try_reserve_exact(usize::MAX)
@@ -410,7 +446,7 @@ mod tests {
             assert_eq!(memory.grow(1), previous);
             {
                 let chunks = memory.chunks.borrow();
-                assert_eq!(chunks.len(), expected_chunks);
+                assert_eq!(chunks.len(), expected_pages * CHUNKS_PER_PAGE);
                 // Scan the entire new page, including after a failed attempt.
                 assert!(
                     chunks[previous as usize * CHUNKS_PER_PAGE..]

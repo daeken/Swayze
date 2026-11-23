@@ -153,10 +153,26 @@ fn deterministic_raw_bit_round_trips() {
 #[test]
 #[ignore = "opt-in: supply a Node-verified SWAYZE_NUMBER_FORMAT_TSV file"]
 fn node_oracle_tsv() {
+    use std::{fs::File, io::Read};
+
+    const ROWS: usize = 6_212;
+    const MAX_BYTES: usize = ROWS * (16 + 1 + MAX_UNITS + 1);
     let path = std::env::var_os("SWAYZE_NUMBER_FORMAT_TSV").expect("set SWAYZE_NUMBER_FORMAT_TSV");
-    let fixtures = std::fs::read_to_string(path).expect("read the oracle TSV");
-    assert!(!fixtures.is_empty() && fixtures.ends_with('\n'));
-    for line in fixtures.split_terminator('\n') {
+    let mut fixtures = String::new();
+    // The extra byte distinguishes a valid full-size file from a prefix.
+    File::open(path)
+        .expect("open the oracle TSV")
+        .take(MAX_BYTES as u64 + 1)
+        .read_to_string(&mut fixtures)
+        .expect("read the oracle TSV");
+    assert!(fixtures.len() <= MAX_BYTES, "oracle TSV exceeds byte cap");
+    assert!(
+        fixtures.ends_with('\n'),
+        "oracle TSV requires a final newline"
+    );
+    let lines = fixtures.split_terminator('\n');
+    assert_eq!(lines.clone().count(), ROWS, "unexpected oracle row count");
+    for line in lines {
         let (hex, expected) = line.split_once('\t').expect("bits<TAB>text");
         assert!(
             hex.len() == 16
@@ -164,7 +180,11 @@ fn node_oracle_tsv() {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
-        assert!(!expected.is_empty() && expected.is_ascii() && !expected.contains('\t'));
+        assert!(
+            (1..=MAX_UNITS).contains(&expected.len())
+                && expected.is_ascii()
+                && !expected.contains('\t')
+        );
         assert_format(u64::from_str_radix(hex, 16).unwrap(), expected);
     }
 }

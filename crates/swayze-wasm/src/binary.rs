@@ -17,7 +17,7 @@ pub struct Error {
 /// indicates an `if` closed by `end` without an `else`. The depth in
 /// `StackUnderflow` and `InvalidResultDepth` counts only operands above the
 /// active frame's entry stack floor. The latter is reported at a delimiter
-/// when an arm or function fails to produce exactly one result.
+/// when a block, arm, or function fails to produce exactly one result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -76,6 +76,7 @@ pub enum IntegerField {
     TypeIndex,
     FunctionIndex,
     LocalIndex,
+    LabelIndex,
     I32Const,
     /// Number of declared locals in one group.
     LocalCount,
@@ -92,11 +93,12 @@ pub enum Limit {
     SectionBytes,
     /// Declared bytes in the code body, including the locals vector and `end`.
     CodeBodyBytes,
-    /// Decoded operations across the whole body, including `if` and `else` but not `end`.
+    /// Decoded operations across the whole body, including `if`, `else` and `br_if`,
+    /// but not `block` or `end`.
     BodyInstructions,
     /// Peak number of live i32 operands in the code body.
     OperandStackDepth,
-    /// Number of simultaneously open `if` frames, excluding the function frame.
+    /// Number of simultaneously open `block` and `if` frames, excluding the function frame.
     ControlDepth,
     /// Name bytes in one custom section, excluding its length field.
     CustomNameBytes,
@@ -211,6 +213,8 @@ impl std::error::Error for Error {}
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
 /// A repeated export name is reported at the start of its length field.
+/// A `br_if` label outside the supported target set is reported as
+/// [`ErrorKind::InvalidIndex`] with [`IntegerField::LabelIndex`].
 pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let limit = Limit::ModuleBytes;
     if bytes.len() > limit.maximum() {
@@ -409,9 +413,11 @@ fn validate_exports(
     Ok(exports)
 }
 
+const BLOCK: u8 = 0x02;
 const IF: u8 = 0x04;
 const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
+const BR_IF: u8 = 0x0d;
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
@@ -424,6 +430,7 @@ enum Instruction {
     Binary(BinaryOp),
     JumpIfZero { target: usize },
     Jump { target: usize },
+    BranchIfNonzero { target: usize, floor: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -604,6 +611,15 @@ pub(super) fn execute(
                 }
             }
             Instruction::Jump { target } => frame.pc = target,
+            Instruction::BranchIfNonzero { target, floor } => {
+                if frame.pop() != 0 {
+                    let result = frame.pop();
+                    // Match the depth of a normal block exit, preserving its prefix.
+                    frame.depth = floor;
+                    frame.push(result);
+                    frame.pc = target;
+                }
+            }
         }
     }
 }
@@ -623,13 +639,14 @@ fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
 }
 
 #[derive(Clone, Copy)]
-struct IfFrame {
+struct ControlFrame {
     base: usize,
-    arm: IfArm,
+    kind: ControlKind,
 }
 
 #[derive(Clone, Copy)]
-enum IfArm {
+enum ControlKind {
+    Block { last_branch: Option<usize> },
     Then { if_pc: usize },
     Else { else_pc: usize },
 }
@@ -728,24 +745,25 @@ fn validate_body(
         },
     })?;
     let local_bound = parameter_count + validate_locals(&mut body)?;
-    // An if/else reserves an instruction slot, then its matching delimiter
-    // backpatches it. A final function end requires all frames to have closed.
+    // Control transfers reserve slots that their matching delimiters backpatch.
+    // Each block chains just its own branches by PC; each link is visited once.
     let mut decoded = [Instruction::Const(0); Limit::BodyInstructions.maximum()];
+    let mut previous_branch = [None; Limit::BodyInstructions.maximum()];
     let mut count = 0;
     let mut depth = 0usize;
-    let mut frames = [IfFrame {
+    let mut frames = [ControlFrame {
         base: 0,
-        arm: IfArm::Then { if_pc: 0 },
+        kind: ControlKind::Block { last_branch: None },
     }; Limit::ControlDepth.maximum()];
     let mut nesting = 0;
     let end_offset = loop {
         let offset = body.position();
         let frame = frames[..nesting].last().copied();
         let base = frame.map_or(0, |frame| frame.base);
-        let arm = frame.map(|frame| frame.arm);
+        let kind = frame.map(|frame| frame.kind);
         let available = depth - base;
         let opcode = body.byte().ok_or_else(|| {
-            let expected = if matches!(arm, Some(IfArm::Then { .. })) {
+            let expected = if matches!(kind, Some(ControlKind::Then { .. })) {
                 ELSE
             } else {
                 END
@@ -753,38 +771,49 @@ fn validate_body(
             body.error(ErrorKind::TruncatedByte { expected })
         })?;
         if opcode == END {
-            match arm {
-                Some(IfArm::Then { .. }) => {
-                    return Err(Error {
-                        offset,
-                        kind: ErrorKind::MissingElse,
-                    });
+            if matches!(kind, Some(ControlKind::Then { .. })) {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::MissingElse,
+                });
+            }
+            check_result_depth(available, offset)?;
+            // Closing a frame targets the next decoded slot, possibly the
+            // final one-past-last index. All sources are in the decoded prefix.
+            match kind {
+                Some(ControlKind::Block { mut last_branch }) => {
+                    while let Some(pc) = last_branch {
+                        decoded[..count][pc] = Instruction::BranchIfNonzero {
+                            target: count,
+                            floor: base,
+                        };
+                        last_branch = previous_branch[pc];
+                    }
                 }
-                Some(IfArm::Else { else_pc }) => {
-                    check_result_depth(available, offset)?;
-                    // The source must be in the decoded prefix. Its target is
-                    // the next slot, possibly the final one-past-last index.
+                Some(ControlKind::Else { else_pc }) => {
                     decoded[..count][else_pc] = Instruction::Jump { target: count };
-                    nesting -= 1;
-                    continue;
                 }
                 None => {
-                    check_result_depth(available, offset)?;
                     body.finish(ErrorKind::TrailingBodyBytes)?;
                     break offset;
                 }
+                Some(ControlKind::Then { .. }) => unreachable!("checked for missing else"),
             }
+            nesting -= 1;
+            continue;
         }
         let pc = count;
-        if pc == decoded.len() {
-            return Err(Error {
-                offset,
-                kind: ErrorKind::LimitExceeded {
-                    limit: Limit::BodyInstructions,
-                },
-            });
+        if opcode != BLOCK {
+            if pc == decoded.len() {
+                return Err(Error {
+                    offset,
+                    kind: ErrorKind::LimitExceeded {
+                        limit: Limit::BodyInstructions,
+                    },
+                });
+            }
+            count += 1;
         }
-        count += 1;
         let consume = |operands| {
             available
                 .checked_sub(operands)
@@ -795,7 +824,7 @@ fn validate_body(
                 })
         };
         match opcode {
-            IF => {
+            BLOCK | IF => {
                 body.expect_byte(I32)?; // Only a single i32 result, no block parameters.
                 let next = frames.get_mut(nesting).ok_or(Error {
                     offset,
@@ -803,15 +832,17 @@ fn validate_body(
                         limit: Limit::ControlDepth,
                     },
                 })?;
-                depth = consume(1)?;
-                *next = IfFrame {
-                    base: depth,
-                    arm: IfArm::Then { if_pc: pc },
+                let kind = if opcode == IF {
+                    depth = consume(1)?;
+                    ControlKind::Then { if_pc: pc }
+                } else {
+                    ControlKind::Block { last_branch: None }
                 };
+                *next = ControlFrame { base: depth, kind };
                 nesting += 1;
             }
             ELSE => {
-                let Some(IfArm::Then { if_pc }) = arm else {
+                let Some(ControlKind::Then { if_pc }) = kind else {
                     return Err(Error {
                         offset,
                         kind: ErrorKind::UnexpectedElse,
@@ -820,8 +851,23 @@ fn validate_body(
                 check_result_depth(available, offset)?;
                 // Skip the then arm and its else jump on a zero condition.
                 decoded[..pc][if_pc] = Instruction::JumpIfZero { target: count };
-                frames[nesting - 1].arm = IfArm::Else { else_pc: pc };
+                frames[nesting - 1].kind = ControlKind::Else { else_pc: pc };
                 depth = base;
+            }
+            BR_IF => {
+                // Only label zero of a block is supported. Decode the entire
+                // immediate even when there is no supported target.
+                let block = matches!(kind, Some(ControlKind::Block { .. }));
+                body.index(IntegerField::LabelIndex, u32::from(block))?;
+                // Check both operands, but retain the branch result on fallthrough.
+                depth = consume(2)? + 1;
+                let Some(ControlKind::Block { last_branch }) = kind else {
+                    unreachable!("label validation requires a block")
+                };
+                previous_branch[pc] = last_branch;
+                frames[nesting - 1].kind = ControlKind::Block {
+                    last_branch: Some(pc),
+                };
             }
             _ => {
                 let instruction = decode_plain(
@@ -839,8 +885,10 @@ fn validate_body(
                     Instruction::LocalSet(_) => consume(1)?,
                     Instruction::LocalTee(_) | Instruction::Eqz => consume(1)? + 1,
                     Instruction::Binary(_) => consume(2)? + 1,
-                    Instruction::JumpIfZero { .. } | Instruction::Jump { .. } => {
-                        unreachable!("only control delimiters create jumps")
+                    Instruction::JumpIfZero { .. }
+                    | Instruction::Jump { .. }
+                    | Instruction::BranchIfNonzero { .. } => {
+                        unreachable!("plain instructions do not create jumps")
                     }
                 };
                 if depth > Limit::OperandStackDepth.maximum() {

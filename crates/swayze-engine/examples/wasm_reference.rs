@@ -262,6 +262,14 @@ fn fixtures() -> Vec<Fixture> {
             args,
         });
     }
+    // A taken branch keeps 39, discards 7, and preserves 3 below the block.
+    // Fallthrough adds 7 and 39 before returning the block result.
+    let branch = [
+        0x41, 3, 0x02, 0x7f, 0x41, 7, 0x41, 39, 0x20, 0, 0x0d, 0, 0x6a, 0x0b, 0x6a,
+    ];
+    for (condition, expected) in [(0, 49), (1, 42), (-1, 42)] {
+        cases.push(Fixture::new(expected, &[condition], &branch));
+    }
     cases
 }
 

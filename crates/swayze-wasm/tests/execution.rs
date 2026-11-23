@@ -1618,9 +1618,287 @@ fn arm_operand_limit_includes_values_below_its_floor() {
 }
 
 #[test]
+fn branches_join_innermost_blocks_across_mixed_nesting() {
+    let body = [
+        0, 0x41, 40, 0x02, 0x7f, // Outer block preserves 40 below its floor.
+        0x41, 5, 0x20, 0, 0x04, 0x7f, // Both if arms preserve 5.
+        0x02, 0x7f, 0x41, 20, 0x41, 2, 0x20, 1, 0x0d, 0, 0x6a, 0x0b,
+        // Then: takes 2 or falls through to add 20 + 2; joins at the else jump.
+        0x05, 0x02, 0x7f, 0x41, 3, 0x41, 1, 0x20, 1, 0x0d, 0x80, 0x80, 0x80, 0x80, 0, 0x45, 0x6a,
+        0x0b, 0x0b, // Else: takes 1 (padded label) or falls through to make 3.
+        0x20, 2, 0x0d, 0, 0x6a, 0x0b, // Outer branch drops 5 only when taken.
+        0x6a, 0x0b, // Both exits preserve 40.
+    ];
+    let module = exported_function(&i32_type(3), &code_body(&body));
+    let instance = module.instantiate();
+    for (args, expected) in [
+        ([1, 1, 0], 47),
+        ([1, 0, 0], 67),
+        ([0, 1, 0], 46),
+        ([0, 0, 0], 48),
+        ([1, 1, -1], 42),
+        ([1, 0, 1], 62),
+        ([0, 1, i32::MIN], 41),
+    ] {
+        assert_eq!(instance.invoke_i32_with_args("answer", &args), Ok(expected));
+    }
+}
+
+#[test]
+fn patches_multiple_branches_to_function_exit_and_only_fallthrough_traps() {
+    let body = [
+        0, 0x02, 0x7f, 0x41, 7, 0x20, 0, 0x0d, 0, // First exit returns 7.
+        0x41, 8, 0x20, 1, 0x0d, 0, // Second exit drops 7 and returns 8.
+        0x6a, 0x41, 0, 0x6d, 0x0b, 0x0b, // Divide by zero only on fallthrough.
+    ];
+    let module = exported_function(&i32_type(2), &code_body(&body));
+    let instance = module.instantiate();
+    let invoke = |args| instance.invoke_i32_with_args("answer", args);
+    assert_eq!(invoke(&[1, 1]), Ok(7));
+    assert_eq!(invoke(&[0, 1]), Ok(8));
+    assert_eq!(
+        invoke(&[0, 0]),
+        Err(InvokeError::Trap(Trap::IntegerDivideByZero))
+    );
+    assert_eq!(invoke(&[-1, 0]), Ok(7));
+}
+
+#[test]
+fn block_requires_a_new_result_and_checks_all_fallthrough_code() {
+    let prefix = &[0, 0x41, 9, 0x02, 0x7f][..];
+    // A block cannot return a frozen value, and the normal path always needs
+    // exactly one new value, even after a branch with literal condition 1.
+    bad_body(
+        &[prefix, &[0x0b, 0x0b]].concat(),
+        5,
+        ErrorKind::InvalidResultDepth { depth: 0 },
+    );
+    let taken = &[0x41, 7, 0x41, 1, 0x0d, 0];
+    let branch = [prefix, taken].concat();
+    bad_body(
+        &[&branch[..], &[0x41, 8, 0x0b, 0x6a, 0x0b]].concat(),
+        branch.len() + 2,
+        ErrorKind::InvalidResultDepth { depth: 2 },
+    );
+    bad_body(
+        &[&branch[..], &[0x03, 0x7f, 0x0b, 0x0b]].concat(),
+        branch.len(),
+        ErrorKind::UnsupportedOpcode { opcode: 0x03 },
+    );
+    bad_body(
+        &[&branch[..], &[0x0d, 0x80]].concat(),
+        branch.len() + 2,
+        ErrorKind::TruncatedInteger {
+            field: IntegerField::LabelIndex,
+        },
+    );
+    bad_body(
+        &[&branch[..], &[0x0b, 0x0b]].concat(),
+        branch.len() + 1,
+        ErrorKind::InvalidResultDepth { depth: 2 },
+    );
+}
+
+#[test]
+fn block_floors_protect_enclosing_arm_operands_even_on_untaken_paths() {
+    // The untaken else arm has two values which the new block cannot access.
+    let prefix = &[
+        0, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05, 0x41, 8, 0x41, 9, 0x02, 0x7f,
+    ];
+    for (bad, op, depth) in [
+        (&[0x0d, 0][..], 0, 0),      // Neither condition nor result.
+        (&[0x41, 1, 0x0d, 0], 2, 1), // Condition but no result.
+        (&[0x41, 1, 0x6a], 2, 1),    // Arithmetic cannot use the frozen value either.
+        (&[0x04, 0x7f], 0, 0),       // A nested if would also need its own condition.
+    ] {
+        let body = [&prefix[..], bad, &[0x0b, 0x6a, 0x6a, 0x0b, 0x0b]].concat();
+        bad_body(
+            &body,
+            prefix.len() + op,
+            ErrorKind::StackUnderflow { depth },
+        );
+    }
+}
+
+#[test]
+fn validates_block_type_and_delimiters_at_the_body_boundary() {
+    for found in [0x40, 0x7e, 0, 0xff] {
+        bad_body(
+            &[0, 0x02, found],
+            2,
+            ErrorKind::UnexpectedByte {
+                expected: 0x7f,
+                found,
+            },
+        );
+    }
+    bad_body(&[0, 0x02], 2, ErrorKind::TruncatedByte { expected: 0x7f });
+    let prefix = &[0, 0x02, 0x7f, 0x41, 7][..];
+    for (tail, at, kind) in [
+        (&[][..], 0, ErrorKind::TruncatedByte { expected: 0x0b }),
+        (&[0x0b], 1, ErrorKind::TruncatedByte { expected: 0x0b }),
+        (&[0x0b, 0x0b, 0x0b], 2, ErrorKind::TrailingBodyBytes),
+        (&[0x05, 0x0b, 0x0b], 0, ErrorKind::UnexpectedElse),
+    ] {
+        bad_body(&[prefix, tail].concat(), prefix.len() + at, kind);
+    }
+    // The outer if still needs its own else after the inner block closes.
+    bad_body(
+        &[
+            0, 0x41, 1, 0x04, 0x7f, 0x02, 0x7f, 0x41, 7, 0x0b, 0x0b, 0x0b,
+        ],
+        10,
+        ErrorKind::MissingElse,
+    );
+}
+
+#[test]
+fn validates_branch_label_leb_and_only_accepts_zero_in_a_block() {
+    let field = IntegerField::LabelIndex;
+    let prefix = &[0, 0x02, 0x7f, 0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d][..];
+    for (label, index) in [(&[1][..], 1), (&[0xff, 0xff, 0xff, 0xff, 0x0f], u32::MAX)] {
+        let body = [prefix, label, &[0x0b, 0x0b, 0x0b]].concat();
+        bad_body(
+            &body,
+            prefix.len(),
+            ErrorKind::InvalidIndex { field, index },
+        );
+    }
+    for fifth in [0x10, 0x80] {
+        let body = [
+            prefix,
+            &[0x80, 0x80, 0x80, 0x80, fifth, 0, 0x0b, 0x0b, 0x0b],
+        ]
+        .concat();
+        bad_body(
+            &body,
+            prefix.len() + 4,
+            ErrorKind::IntegerOverflow { field },
+        );
+    }
+    for prefix in [
+        &[0][..],                                             // Function label.
+        &[0, 0x41, 1, 0x04, 0x7f],                            // Then label.
+        &[0, 0x02, 0x7f, 0x41, 1, 0x04, 0x7f, 0x41, 7, 0x05], // Else label, even inside a block.
+    ] {
+        let branch = [prefix, &[0x41, 7, 0x41, 1, 0x0d]].concat();
+        bad_body(
+            &[&branch[..], &[0, 0x0b]].concat(),
+            branch.len(),
+            ErrorKind::InvalidIndex { field, index: 0 },
+        );
+        bad_body(&branch, branch.len(), ErrorKind::TruncatedInteger { field });
+    }
+}
+
+#[test]
+fn bounds_blocks_and_ifs_on_the_same_control_stack() {
+    let limit = Limit::ControlDepth;
+    for mixed in [false, true] {
+        let nested = |depth| {
+            let mut body = vec![0];
+            let is_if = |level| mixed && level % 2 == 1;
+            let mut last_open = 0;
+            for level in 0..depth {
+                if is_if(level) {
+                    body.extend([0x41, 1]);
+                }
+                last_open = body.len();
+                body.extend([if is_if(level) { 0x04 } else { 0x02 }, 0x7f]);
+            }
+            body.extend([0x41, 9]);
+            for level in (0..depth).rev() {
+                if is_if(level) {
+                    body.extend([0x05, 0x41, 8]);
+                }
+                body.push(0x0b);
+            }
+            body.push(0x0b);
+            (body, last_open)
+        };
+        assert_body_result(&nested(limit.maximum()).0, 9);
+        let (body, last_open) = nested(limit.maximum() + 1);
+        bad_body(&body, last_open, ErrorKind::LimitExceeded { limit });
+    }
+}
+
+#[test]
+fn counts_br_if_but_not_block_or_end_as_body_instructions() {
+    let limit = Limit::BodyInstructions;
+    let mut body = vec![0, 0x02, 0x7f, 0x41, 1];
+    body.extend(std::iter::repeat_n(0x45, limit.maximum() - 3));
+    body.extend([0x41, 1, 0x0d, 0, 0x0b, 0x0b]); // Branch is instruction 127.
+    assert_body_result(&body, 1);
+    let branch = body.len() - 4;
+    body.insert(branch, 0x45); // Now the branch itself exceeds the cap.
+    bad_body(&body, branch + 1, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn counts_block_encoding_and_branch_immediate_in_body_bytes() {
+    let limit = Limit::CodeBodyBytes;
+    let ops = [0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d, 0x80, 0, 0x0b, 0x0b];
+    let groups = (limit.maximum() - 1 - ops.len()) / 2;
+    let mut body = vec![u8::try_from(groups).unwrap()];
+    body.extend([0, 0x7f].repeat(groups));
+    body.extend(ops);
+    assert_eq!(body.len(), limit.maximum());
+    assert_body_result(&body, 7);
+    body.insert(body.len() - 3, 0x80); // One more LEB padding byte for label zero.
+    bad_code(&code_body(&body), 1, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn counts_frozen_operands_toward_the_branch_stack_limit() {
+    let limit = Limit::OperandStackDepth;
+    let floor = limit.maximum() - 2;
+    let mut body = vec![0];
+    body.extend([0x41, 1].repeat(floor));
+    body.extend([0x02, 0x7f, 0x41, 7, 0x41, 1, 0x0d, 0, 0x0b]);
+    let condition = body.len() - 5;
+    body.extend(std::iter::repeat_n(0x6a, floor));
+    body.push(0x0b);
+    assert_body_result(&body, floor as i32 + 7);
+    body.splice(condition..condition, [0x41, 1]);
+    bad_body(&body, condition + 2, ErrorKind::LimitExceeded { limit });
+}
+
+#[test]
+fn charges_taken_br_if_but_not_its_skipped_tail_or_block_delimiters() {
+    let limit = ExecutionLimit::InstructionDispatches;
+    assert_eq!(limit.maximum(), 1024);
+    // Leaf: 126 dispatches (result, 123 eqz, condition, br_if), skipping its tail.
+    let mut leaf = vec![0, 0x02, 0x7f, 0x41, 1];
+    leaf.extend(std::iter::repeat_n(0x45, 123));
+    leaf.extend([0x41, 1, 0x0d, 0, 0x45, 0x0b, 0x0b]);
+    let entry = |extra| {
+        let mut body = vec![1, 1, 0x7f];
+        body.extend([0x10, 2]);
+        body.extend(std::iter::repeat_n(0x45, extra));
+        body.extend([0x21, 0]);
+        body.extend([0x10, 2, 0x21, 0].repeat(6));
+        body.extend([0x10, 2, 0x0b]);
+        body
+    };
+    let module = exported_functions(
+        0,
+        &[(b"exact", 0), (b"over", 1)],
+        &[&entry(1), &entry(2), &leaf],
+    );
+    let instance = module.instantiate();
+    // 7 * (call + 126 + local.set) + eqz + call + 126 = 1024.
+    assert_eq!(instance.invoke_i32("exact"), Ok(0));
+    // A second eqz in the caller runs the budget out before the final br_if.
+    assert_eq!(
+        instance.invoke_i32("over"),
+        Err(InvokeError::LimitExceeded { limit })
+    );
+}
+
+#[test]
 fn rejects_every_opcode_outside_the_slice() {
     for opcode in 0..=u8::MAX {
-        if ![0x04, 0x05, 0x0b, 0x10, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
+        if ![0x02, 0x04, 0x05, 0x0b, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x41].contains(&opcode)
             && !(0x45..=0x4f).contains(&opcode)
             && !(0x6a..=0x70).contains(&opcode)
         {

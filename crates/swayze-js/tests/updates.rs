@@ -1,10 +1,10 @@
 use swayze_js::{
-    ErrorKind, EvalError, Limit, Limits, Span, Value, parse_script, parse_script_with_limits,
+    Error, ErrorKind, EvalError, Limit, Limits, Span, Value, parse_script, parse_script_with_limits,
 };
 
 const FORMS: [(&str, f64); 4] = [("++x", 1.0), ("x++", 1.0), ("--x", -1.0), ("x--", -1.0)];
 
-fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
+fn assert_error_at(marked: &str, kind: ErrorKind) -> Error {
     let (prefix, rest) = marked.split_once('@').unwrap();
     let (token, suffix) = rest.split_once('@').unwrap();
     let source = format!("{prefix}{token}{suffix}");
@@ -18,7 +18,12 @@ fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
         },
         "{source:?}: {error}"
     );
-    assert!(error.message().contains(message), "{source:?}: {error}");
+    error
+}
+
+fn assert_error(marked: &str, kind: ErrorKind, message: &str) {
+    let error = assert_error_at(marked, kind);
+    assert!(error.message().contains(message), "{marked:?}: {error}");
 }
 
 #[test]
@@ -98,10 +103,16 @@ fn statement_update_sequences_require_a_nonempty_suffix_and_explicit_semicolon()
     );
     for source in [
         "let x=0; ++x,x/*💡*/@@",
+        "let x=0; x++,null/*💡*/@@",
+        "let x=0; {++x,x/*💡*/@}@ x",
         "let x=0; {x--,null/*💡*/@}@ x",
         "let x=0; x++,null/*💡\u{2028}*/@x@",
     ] {
-        assert_error(source, Unsupported, "require explicit semicolons");
+        assert_eq!(
+            assert_error_at(source, Unsupported).message(),
+            "increments and decrements require explicit semicolons",
+            "{source}",
+        );
     }
     for source in ["let x=0; x++,x;/*💡*/@@", "let x=0; {--x,null;}/*💡*/@@"] {
         assert_error(source, Unsupported, "a final expression is required");

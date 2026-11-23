@@ -1,4 +1,7 @@
-use swayze_js::{ErrorKind, Limit, Limits, Span, parse_script, parse_script_with_limits};
+use swayze_js::{
+    ErrorKind, EvalScratch, Limit, Limits, Span, parse_script, parse_script_for_completion,
+    parse_script_for_completion_with_limits, parse_script_with_limits,
+};
 
 fn evaluate(source: &str) -> f64 {
     parse_script(source).unwrap().evaluate().unwrap()
@@ -168,7 +171,6 @@ fn comments_do_not_join_tokens_or_enable_other_syntax() {
         "1;/* comment */2\n3",
         "1; // comment\u{2028}const x=1;",
         "1/**/\nvar x=2",
-        "#!/usr/bin/env node\n1",
         "1;/* comment */#extra",
         "<!-- not trivia\n1",
         "1\n--> not trivia",
@@ -187,6 +189,197 @@ fn comments_do_not_join_tokens_or_enable_other_syntax() {
         "regular expression literals are outside the arithmetic subset"
     );
     assert_eq!(error.span(), Span { start: 9, end: 10 });
+}
+
+#[test]
+fn hashbang_is_trivia_only_at_byte_zero_in_both_parse_apis() {
+    for terminator in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+        for body in ["", " /* unterminated? \u{0085}\u{000B}\u{000C}\0🌹 ' #!"] {
+            let source = format!("#!{body}{terminator}/* ordinary trivia */ 42");
+            assert_eq!(evaluate(&source), 42.0);
+            assert_eq!(
+                parse_script_for_completion(&source)
+                    .unwrap()
+                    .execute_with_scratch(&mut EvalScratch::new()),
+                Ok(())
+            );
+        }
+    }
+    for source in [
+        "#!",
+        "#! slash /* is just text 🌹",
+        "#! ignored\n/* metadata */",
+    ] {
+        assert_eq!(
+            parse_script_for_completion(source)
+                .unwrap()
+                .execute_with_scratch(&mut EvalScratch::new()),
+            Ok(())
+        );
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "empty scripts are outside the arithmetic subset"
+        );
+        assert_eq!(
+            error.span(),
+            Span {
+                start: source.len(),
+                end: source.len()
+            }
+        );
+    }
+    for (source, start) in [
+        ("# a lone hash", 0),
+        ("# ! not a hashbang", 0),
+        (" \t#! wrong", 2),
+        ("\u{FEFF}#! wrong", 3),
+        ("\u{2028}#! wrong", 3),
+        ("/* comment */#! wrong", 13),
+        ("// comment\n#! wrong", 11),
+        ("#! first\r\n#! second", 10),
+        ("1; #! wrong", 3),
+        ("(1 + #! wrong", 5),
+    ] {
+        let error = parse_script(source).unwrap_err();
+        assert_eq!(parse_script_for_completion(source).unwrap_err(), error);
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.message(), "token is outside the arithmetic subset");
+        assert_eq!(
+            error.span(),
+            Span {
+                start,
+                end: start + 1
+            },
+            "{source:?}"
+        );
+    }
+    // Later #! is not consumed while probing a .length suffix: the dot wins.
+    let error = parse_script("'s'. #! wrong").unwrap_err();
+    assert_eq!(error.span(), Span { start: 3, end: 4 });
+    // The hashbang does not suppress the directive prologue.
+    let error = parse_script_for_completion("#!\n'use strict';").unwrap_err();
+    assert_eq!(
+        error.message(),
+        "Use Strict Directives are outside the subset"
+    );
+    assert_eq!(error.span(), Span { start: 3, end: 15 });
+}
+
+#[test]
+fn hashbang_uses_single_line_comment_work_and_limit_order() {
+    let source = "#!é\u{2028}1";
+    let limits = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 1,
+        max_nesting_depth: 0,
+        max_work: source.len() + 2, // One conversion byte and one emission.
+    };
+    let script = parse_script_with_limits(source, limits).unwrap();
+    assert_eq!(script.instruction_count(), 1);
+    assert_eq!(script.max_stack_depth(), 1);
+    assert_eq!(script.evaluate(), Ok(1.0));
+    assert_eq!(
+        parse_script_for_completion_with_limits(source, limits)
+            .unwrap()
+            .execute_with_scratch(&mut EvalScratch::new()),
+        Ok(())
+    );
+    for (max_work, start, end) in [
+        (0, 0, 1),
+        (1, 1, 2),
+        (3, 2, 4),
+        (6, 4, 7),
+        (7, 7, 8),
+        (8, 7, 8),
+        (9, 7, 8),
+    ] {
+        let limits = Limits { max_work, ..limits };
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(
+            parse_script_for_completion_with_limits(source, limits).unwrap_err(),
+            error
+        );
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(error.span(), Span { start, end });
+    }
+    for (source, limits, kind, start, end) in [
+        (
+            source,
+            Limits {
+                max_tokens: 0,
+                max_work: 7,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::Tokens),
+            7,
+            8,
+        ),
+        (
+            source,
+            Limits {
+                max_source_bytes: 3,
+                max_tokens: 0,
+                max_work: 0,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::SourceBytes),
+            2,
+            4,
+        ),
+        (
+            " #!é",
+            Limits {
+                max_tokens: 0,
+                max_work: 1,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::Tokens),
+            1,
+            2,
+        ),
+        (
+            " #!é",
+            Limits {
+                max_work: 1,
+                ..limits
+            },
+            ErrorKind::LimitExceeded(Limit::Work),
+            1,
+            2,
+        ),
+        (
+            " #!é",
+            Limits {
+                max_work: 2,
+                ..limits
+            },
+            ErrorKind::Unsupported,
+            1,
+            2,
+        ),
+    ] {
+        let error = parse_script_with_limits(source, limits).unwrap_err();
+        assert_eq!(
+            parse_script_for_completion_with_limits(source, limits).unwrap_err(),
+            error
+        );
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.span(), Span { start, end });
+    }
+    let no_tokens = Limits {
+        max_tokens: 0,
+        max_work: 4,
+        ..limits
+    };
+    assert!(parse_script_for_completion_with_limits("#!é", no_tokens).is_ok());
+    assert_eq!(
+        parse_script_with_limits("#!é", no_tokens)
+            .unwrap_err()
+            .span(),
+        Span { start: 4, end: 4 }
+    );
 }
 
 #[test]

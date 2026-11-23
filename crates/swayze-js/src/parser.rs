@@ -157,36 +157,62 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A validated Script in the supported primitive-value subset. Only the parser constructs it.
-pub struct Script {
-    instructions: Vec<Instruction>,
-    string_units: Vec<u16>,
-    max_stack_depth: usize,
-    binding_slots: usize,
+/// A validated Script with a required final expression. Only the parser constructs it.
+pub struct Script(pub(crate) PreparedScript);
+
+/// A validated Script for execution without observing a result value.
+/// Only the parser constructs it; see [`parse_script_for_completion`].
+pub struct CompletionScript {
+    pub(crate) program: PreparedScript,
+    pub(crate) exit: ExitStack,
+}
+
+pub(crate) struct PreparedScript {
+    pub(crate) instructions: Vec<Instruction>,
+    pub(crate) string_units: Vec<u16>,
+    pub(crate) max_stack_depth: usize,
+    pub(crate) binding_slots: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExitStack {
+    Empty,
+    Value,
+}
+
+impl ExitStack {
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Value => 1,
+        }
+    }
 }
 
 impl Script {
     /// The number of prepared instructions, including jumps and skipped paths.
     /// A loop can dispatch the same instruction more than once during evaluation.
     pub fn instruction_count(&self) -> usize {
-        self.instructions().len()
+        self.0.instructions.len()
     }
 
     /// The peak operand stack size required across all control-flow paths.
     pub fn max_stack_depth(&self) -> usize {
-        self.max_stack_depth
+        self.0.max_stack_depth
     }
 
+    #[cfg(test)]
     pub(crate) fn instructions(&self) -> &[Instruction] {
-        &self.instructions
+        &self.0.instructions
     }
 
     pub(crate) fn string_units(&self) -> &[u16] {
-        &self.string_units
+        &self.0.string_units
     }
 
+    #[cfg(test)]
     pub(crate) fn binding_slots(&self) -> usize {
-        self.binding_slots
+        self.0.binding_slots
     }
 }
 
@@ -195,8 +221,14 @@ impl fmt::Debug for Script {
         f.debug_struct("Script")
             .field("instruction_count", &self.instruction_count())
             .field("max_stack_depth", &self.max_stack_depth())
-            .field("binding_slots", &self.binding_slots)
+            .field("binding_slots", &self.0.binding_slots)
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for CompletionScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionScript").finish_non_exhaustive()
     }
 }
 
@@ -296,6 +328,32 @@ pub fn parse_script(source: &str) -> Result<Script, Error> {
 
 /// Parse a complete Script in the supported subset with caller-supplied limits.
 pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, Error> {
+    parse(source, limits, false).map(|(program, _)| Script(program))
+}
+
+/// Parse a complete Script for execution without observing its result.
+///
+/// The subset and default limits are the same as for [`parse_script`], except
+/// EOF can also follow zero or more complete statements, with no final expression.
+/// This includes empty and comment-only source. It does not add automatic
+/// semicolon insertion or expose JavaScript Script completion values.
+pub fn parse_script_for_completion(source: &str) -> Result<CompletionScript, Error> {
+    parse_script_for_completion_with_limits(source, Limits::default())
+}
+
+/// Like [`parse_script_for_completion`], with caller-supplied [`Limits`].
+pub fn parse_script_for_completion_with_limits(
+    source: &str,
+    limits: Limits,
+) -> Result<CompletionScript, Error> {
+    parse(source, limits, true).map(|(program, exit)| CompletionScript { program, exit })
+}
+
+fn parse(
+    source: &str,
+    limits: Limits,
+    allow_empty_exit: bool,
+) -> Result<(PreparedScript, ExitStack), Error> {
     if source.len() > limits.max_source_bytes {
         // Starting within the source, back up at most three continuation bytes.
         let mut start = limits.max_source_bytes;
@@ -332,7 +390,7 @@ pub fn parse_script_with_limits(source: &str, limits: Limits) -> Result<Script, 
         stack_depth: 0,
         max_stack_depth: 0,
     }
-    .parse()
+    .parse(allow_empty_exit)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -608,9 +666,12 @@ impl Lexer<'_> {
             if is_trivia_space(c) {
                 line_break |= is_line_terminator(c);
                 self.consume(c)?;
-            } else if c == '/' && self.rest().starts_with("//") {
-                self.consume('/')?;
-                self.consume('/')?;
+            } else if (c == '/' && self.rest().starts_with("//"))
+                || (c == '#' && self.offset == 0 && self.rest().starts_with("#!"))
+            {
+                // A hashbang is only a comment at the absolute start of the Script.
+                self.consume(c)?;
+                self.consume(if c == '#' { '!' } else { '/' })?;
                 // Leave the line terminator for the next trivia iteration.
                 while let Some(c) = self.peek().filter(|&c| !is_line_terminator(c)) {
                     self.consume(c)?;
@@ -1298,25 +1359,30 @@ struct Parser<'s> {
 }
 
 impl Parser<'_> {
-    fn parse(mut self) -> Result<Script, Error> {
+    fn parse(mut self, allow_empty_exit: bool) -> Result<(PreparedScript, ExitStack), Error> {
         self.add_scope(None, Span::at(0))?;
         let mut saw_statement = false;
         let mut in_directive_prologue = true;
-        loop {
+        let exit = loop {
             if !self.statement_frames.is_empty() {
                 self.parse_block_item()?;
                 continue;
             }
-            let first = self.next_token(TokenPosition::Operand)?.ok_or_else(|| {
-                Error::unsupported(
-                    Span::at(self.lexer.offset),
+            let Some(first) = self.next_token(TokenPosition::Operand)? else {
+                let eof = Span::at(self.lexer.offset);
+                if allow_empty_exit {
+                    self.check_statement_boundary(eof)?;
+                    break ExitStack::Empty;
+                }
+                return Err(Error::unsupported(
+                    eof,
                     if saw_statement {
                         "a final expression is required after statements"
                     } else {
                         "empty scripts are outside the arithmetic subset"
                     },
-                )
-            })?;
+                ));
+            };
             self.check_statement_boundary(first.span)?;
             // Reaching this loop's EOF check again means a statement was parsed,
             // even if it emitted nothing. The final expression exits the loop.
@@ -1348,24 +1414,28 @@ impl Parser<'_> {
                 in_directive_prologue = false;
             }
             if delimiter.is_none() {
-                break;
+                break ExitStack::Value;
             }
             // A root semicolon terminates the final expression only at EOF.
             // Otherwise discard the completed value and resume with the cached token.
             let next = self.next_token(TokenPosition::Operand)?;
             if next.is_none() {
-                break;
+                break ExitStack::Value;
             }
             self.lookahead = Some(next);
             self.emit(Instruction::Discard, end)?;
-        }
+        };
+        // Resolve names on all paths before returning either shape of program.
         self.resolve_accesses()?;
-        Ok(Script {
-            instructions: self.instructions,
-            string_units: self.lexer.string_units,
-            max_stack_depth: self.max_stack_depth,
-            binding_slots: self.bindings.len(),
-        })
+        Ok((
+            PreparedScript {
+                instructions: self.instructions,
+                string_units: self.lexer.string_units,
+                max_stack_depth: self.max_stack_depth,
+                binding_slots: self.bindings.len(),
+            },
+            exit,
+        ))
     }
 
     fn next_token(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {

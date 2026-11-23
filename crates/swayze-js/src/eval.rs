@@ -1,8 +1,11 @@
 use std::{cmp::Ordering, fmt};
 
 use crate::{
-    Script,
-    parser::{BindingKind, Instruction, ShortCircuitCondition, Update, UpdateResult},
+    CompletionScript, Script,
+    parser::{
+        BindingKind, ExitStack, Instruction, PreparedScript, ShortCircuitCondition, Update,
+        UpdateResult,
+    },
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
@@ -417,12 +420,42 @@ impl Script {
     }
 
     fn run(&self, scratch: &mut EvalScratch) -> Result<Operand, EvalError> {
+        self.0
+            .run(ExitStack::Value, scratch)?
+            .ok_or(EvalError::InvalidScript)
+    }
+}
+
+impl CompletionScript {
+    /// Execute the Script to normal completion without returning a result value.
+    ///
+    /// A final expression, if present, is evaluated normally and its value is
+    /// discarded without coercion. Execution uses the same fresh binding slots,
+    /// scratch reset, and budgets as [`Script::evaluate_primitive_with_scratch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same execution errors as the value API, including errors in
+    /// reached statements and in the discarded expression. There are no
+    /// result-type errors.
+    pub fn execute_with_scratch(&self, scratch: &mut EvalScratch) -> Result<(), EvalError> {
+        self.program.run(self.exit, scratch).map(|_| ())
+    }
+}
+
+impl PreparedScript {
+    fn run(
+        &self,
+        exit: ExitStack,
+        scratch: &mut EvalScratch,
+    ) -> Result<Option<Operand>, EvalError> {
         scratch.reset();
         let result = evaluate(
-            self.instructions(),
-            self.max_stack_depth(),
-            self.binding_slots(),
-            self.string_units(),
+            &self.instructions,
+            self.max_stack_depth,
+            self.binding_slots,
+            &self.string_units,
+            exit,
             scratch,
         );
         if result.is_err() {
@@ -443,18 +476,20 @@ fn evaluate(
     max_operands: usize,
     binding_slots: usize,
     string_units: &[u16],
+    exit: ExitStack,
     scratch: &mut EvalScratch,
-) -> Result<Operand, EvalError> {
+) -> Result<Option<Operand>, EvalError> {
     if ops.len() > MAX_INSTRUCTIONS {
         return Err(EvalError::LimitExceeded);
     }
-    // Back edges require an empty stack, so repeated passes cannot build up
-    // operands. A path to the peak needs that many distinct pushes and at
-    // least one less distinct pop to finish or reach a loop back edge. Each
-    // binding also needs a push and initializer, plus a final expression.
-    if max_operands == 0
-        || max_operands > ops.len().div_ceil(2)
-        || binding_slots > ops.len().saturating_sub(1) / 2
+    // Back edges require an empty stack. A path to the peak needs that many
+    // distinct pushes and at least peak - exit_arity distinct pops to finish
+    // or reach a back edge. Each binding has its own initializer and operand
+    // producer, separate from any instruction that produces a final result.
+    let exit_arity = exit.arity();
+    if max_operands < exit_arity
+        || max_operands > (ops.len() + exit_arity) / 2
+        || binding_slots > ops.len().saturating_sub(exit_arity) / 2
     {
         return Err(EvalError::InvalidScript);
     }
@@ -790,8 +825,11 @@ fn evaluate(
         }
     }
 
-    match stack.as_slice() {
-        [value] => Ok(*value),
+    // `ops.len()` is the join frontier. A statement exit must not leave an
+    // operand and an expression exit must leave exactly one, even if ignored.
+    match (exit, stack.as_slice()) {
+        (ExitStack::Empty, []) => Ok(None),
+        (ExitStack::Value, [value]) => Ok(Some(*value)),
         _ => Err(EvalError::InvalidScript),
     }
 }
@@ -1027,9 +1065,17 @@ mod tests {
 
     // Keep the scalar instruction fixtures independent of the String pool.
     fn evaluate(ops: &[Instruction], peak: usize, slots: usize) -> Result<Value, EvalError> {
-        match super::evaluate(ops, peak, slots, &[], &mut EvalScratch::new())? {
-            Operand::Scalar(value) => Ok(value),
-            Operand::String(_) => panic!("unexpected String in scalar fixture"),
+        match super::evaluate(
+            ops,
+            peak,
+            slots,
+            &[],
+            ExitStack::Value,
+            &mut EvalScratch::new(),
+        )? {
+            Some(Operand::Scalar(value)) => Ok(value),
+            Some(Operand::String(_)) => panic!("unexpected String in scalar fixture"),
+            None => panic!("missing result in scalar fixture"),
         }
     }
 
@@ -1039,9 +1085,66 @@ mod tests {
             script.max_stack_depth(),
             script.binding_slots(),
             script.string_units(),
+            ExitStack::Value,
             &mut EvalScratch::new(),
         )
         .map(|_| ())
+    }
+
+    #[test]
+    fn normal_exit_checks_declared_arity_even_after_a_jump() {
+        use Instruction::{Discard, Jump, JumpStatement, Number};
+        let run = |ops: &[Instruction], peak, exit| {
+            super::evaluate(ops, peak, 0, &[], exit, &mut EvalScratch::new())
+                .map(|result| result.is_some())
+        };
+        assert_eq!(run(&[], 0, ExitStack::Empty), Ok(false));
+        assert_eq!(run(&[], 0, ExitStack::Value), Err(EvalError::InvalidScript));
+        assert_eq!(run(&[JumpStatement(1)], 0, ExitStack::Empty), Ok(false));
+        let one = Number(1.0);
+        assert_eq!(run(&[one, Jump(2)], 1, ExitStack::Value), Ok(true));
+        assert_eq!(
+            run(&[one, Jump(2)], 1, ExitStack::Empty),
+            Err(EvalError::InvalidScript)
+        );
+        let consumed = [one, Discard, JumpStatement(3)];
+        assert_eq!(run(&consumed, 1, ExitStack::Empty), Ok(false));
+        assert_eq!(
+            run(&consumed, 1, ExitStack::Value),
+            Err(EvalError::InvalidScript)
+        );
+        assert_eq!(
+            run(&[one, one, Jump(3)], 2, ExitStack::Value),
+            Err(EvalError::InvalidScript)
+        );
+    }
+
+    #[test]
+    fn completion_uses_shared_instructions_and_resets_scratch() {
+        use crate::{parse_script, parse_script_for_completion};
+        let legacy = parse_script("let x = 'a' + 'b'; x").unwrap();
+        let completion = parse_script_for_completion("#! prefix\nlet x = 'a' + 'b'; x").unwrap();
+        assert_eq!(completion.program.instructions, legacy.instructions());
+        assert_eq!(completion.exit, ExitStack::Value);
+        let empty = parse_script_for_completion("#! no instructions\n; {} ;").unwrap();
+        assert_eq!(empty.exit, ExitStack::Empty);
+        assert!(empty.program.instructions.is_empty());
+        assert_eq!(empty.program.max_stack_depth, 0);
+        assert_eq!(empty.program.binding_slots, 0);
+        let mut scratch = EvalScratch::new();
+        let Operand::String(first_range) = legacy.run(&mut scratch).unwrap() else {
+            panic!("expected a runtime String");
+        };
+        completion.execute_with_scratch(&mut scratch).unwrap();
+        assert_eq!(first_range.get(scratch.pools(&[])), Some(&[97, 98][..]));
+        empty.execute_with_scratch(&mut scratch).unwrap();
+        assert_eq!(first_range.get(scratch.pools(&[])), None);
+        let error = parse_script_for_completion("'a' + 'b'; false.length").unwrap();
+        assert_eq!(
+            error.execute_with_scratch(&mut scratch),
+            Err(EvalError::UnsupportedPropertyReceiver)
+        );
+        assert_eq!(first_range.get(scratch.pools(&[])), None);
     }
 
     const INIT_CONST: Instruction = Instruction::InitBinding {
@@ -1124,8 +1227,8 @@ mod tests {
             ] {
                 let mut scratch = EvalScratch::new();
                 let literals = script.string_units();
-                let Operand::String(result) =
-                    super::evaluate(&ops, 2, 0, literals, &mut scratch).unwrap()
+                let Some(Operand::String(result)) =
+                    super::evaluate(&ops, 2, 0, literals, ExitStack::Value, &mut scratch).unwrap()
                 else {
                     panic!("mixed Add must return a String");
                 };

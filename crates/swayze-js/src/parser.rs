@@ -378,6 +378,12 @@ impl Operator {
 }
 
 #[derive(Clone, Copy)]
+enum Update {
+    Increment,
+    Decrement,
+}
+
+#[derive(Clone, Copy)]
 enum TokenKind {
     Number(f64),
     Boolean(bool),
@@ -392,6 +398,7 @@ enum TokenKind {
     Break,
     Continue,
     Assignment(Option<Operator>),
+    Update(Update),
     Operator(Operator),
     Open,
     Close,
@@ -776,7 +783,12 @@ impl Lexer<'_> {
     fn operator(&mut self, c: char, start: usize) -> Result<TokenKind, Error> {
         if matches!(c, '+' | '-' | '*') && self.peek() == Some(c) {
             self.consume(c)?;
-            if c == '*' && self.peek() == Some('=') {
+            match c {
+                '+' => return Ok(TokenKind::Update(Update::Increment)),
+                '-' => return Ok(TokenKind::Update(Update::Decrement)),
+                _ => {}
+            }
+            if self.peek() == Some('=') {
                 self.consume('=')?;
             }
             return Err(Error::unsupported(
@@ -1014,7 +1026,7 @@ struct Access {
 #[derive(Clone, Copy)]
 struct WriteAccess {
     operator_span: Span,
-    // For a compound assignment, patch this load to the same slot as the store.
+    // A read-modify-write patches this load to the same slot as the store.
     load: Option<usize>,
 }
 
@@ -1025,6 +1037,9 @@ enum ExpressionEnd {
     ForSemicolon,
     ForClose,
 }
+
+const STORE_STATEMENT_END: ExpressionEnd =
+    ExpressionEnd::Semicolon("assignments require explicit semicolons");
 
 // One frame per active statement, including across both arms of an if.
 // Every test starts and every arm enters and joins at operand depth zero.
@@ -1115,15 +1130,17 @@ impl Parser<'_> {
                     self.parse_loop_jump(&first)?;
                     continue;
                 }
+                TokenKind::Update(op) => {
+                    self.parse_prefix_update(op, first.span, STORE_STATEMENT_END)?;
+                    continue;
+                }
                 TokenKind::Identifier => {
                     let next = self.next_token()?;
-                    if let Some(Token {
-                        kind: TokenKind::Assignment(op),
-                        span,
-                        ..
-                    }) = next
+                    if let Some(operator) = &next
+                        && self
+                            .parse_store_after_name(first.span, operator, STORE_STATEMENT_END)?
+                            .is_some()
                     {
-                        self.parse_assignment_statement(first.span, op, span)?;
                         continue;
                     }
                     self.lookahead = Some(next);
@@ -1355,6 +1372,8 @@ impl Parser<'_> {
         self.lexer.charge(1, open.span)?;
 
         let init = self.require_token("expected a for initializer or ';'")?;
+        let unsupported_store =
+            "for initializers and updates must assign to, increment or decrement a name";
         if matches!(init.kind, TokenKind::Close) {
             return Err(Error::malformed(
                 init.span,
@@ -1362,7 +1381,7 @@ impl Parser<'_> {
             ));
         }
         if !matches!(init.kind, TokenKind::Semicolon) {
-            self.parse_for_assignment(init, ExpressionEnd::ForSemicolon)?;
+            self.parse_required_store(init, ExpressionEnd::ForSemicolon, unsupported_store)?;
         }
 
         let test = self.instructions.len();
@@ -1391,7 +1410,8 @@ impl Parser<'_> {
             let skip_update = self.instructions.len();
             self.emit(Instruction::JumpStatement(UNPATCHED), first.span)?;
             let update = self.instructions.len();
-            let close = self.parse_for_assignment(first, ExpressionEnd::ForClose)?;
+            let close =
+                self.parse_required_store(first, ExpressionEnd::ForClose, unsupported_store)?;
             self.emit(Instruction::LoopBack(test), close)?;
             self.patch_jump(skip_update, close)?;
             (update, close)
@@ -1404,16 +1424,47 @@ impl Parser<'_> {
         }))
     }
 
-    fn parse_for_assignment(&mut self, first: Token, end: ExpressionEnd) -> Result<Span, Error> {
-        let unsupported = "for initializers and updates must be assignments to names";
-        if !matches!(first.kind, TokenKind::Identifier) {
-            return Err(Error::unsupported(first.span, unsupported));
+    fn parse_required_store(
+        &mut self,
+        first: Token,
+        end: ExpressionEnd,
+        unsupported: &'static str,
+    ) -> Result<Span, Error> {
+        match first.kind {
+            TokenKind::Update(op) => self.parse_prefix_update(op, first.span, end),
+            TokenKind::Identifier => {
+                let operator =
+                    self.require_token("expected an assignment or update operator after the name")?;
+                self.parse_store_after_name(first.span, &operator, end)?
+                    .ok_or_else(|| Error::unsupported(operator.span, unsupported))
+            }
+            _ => Err(Error::unsupported(first.span, unsupported)),
         }
-        let operator = self.require_token("expected an assignment operator after the name")?;
-        let TokenKind::Assignment(op) = operator.kind else {
-            return Err(Error::unsupported(operator.span, unsupported));
-        };
-        self.parse_assignment(first.span, op, operator.span, end)
+    }
+
+    fn parse_store_after_name(
+        &mut self,
+        name: Span,
+        operator: &Token,
+        end: ExpressionEnd,
+    ) -> Result<Option<Span>, Error> {
+        match operator.kind {
+            TokenKind::Assignment(op) => self
+                .parse_assignment(name, op, operator.span, end)
+                .map(Some),
+            // The lexer records LineTerminator trivia (including inside comments)
+            // while scanning it. The cached token never needs a trivia rescan.
+            TokenKind::Update(op) => {
+                if operator.after_line_break {
+                    return Err(Error::unsupported(
+                        operator.span,
+                        "a line terminator cannot precede a postfix update",
+                    ));
+                }
+                self.parse_update(name, op, operator.span, end).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn parse_statement_test(&mut self, missing_open: &'static str) -> Result<usize, Error> {
@@ -1454,20 +1505,16 @@ impl Parser<'_> {
                 self.open_statement(first)
             }
             TokenKind::Break | TokenKind::Continue => self.parse_loop_jump(&first),
-            TokenKind::Identifier => {
-                let operator =
-                    self.require_token("expected an assignment operator after the name")?;
-                let TokenKind::Assignment(op) = operator.kind else {
-                    return Err(Error::unsupported(
-                        operator.span,
-                        "only assignments to names are supported in these blocks",
-                    ));
-                };
-                self.parse_assignment_statement(first.span, op, operator.span)
-            }
+            TokenKind::Identifier | TokenKind::Update(_) => self
+                .parse_required_store(
+                    first,
+                    STORE_STATEMENT_END,
+                    "only assignments, increments and decrements of names are supported here",
+                )
+                .map(|_| ()),
             _ => Err(Error::unsupported(
                 first.span,
-                "only declarations, assignments and supported control statements are allowed in these blocks",
+                "only declarations, assignments, increments, decrements and supported control statements are allowed in these blocks",
             )),
         }
     }
@@ -1632,15 +1679,85 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_assignment_statement(
+    fn parse_prefix_update(
+        &mut self,
+        op: Update,
+        operator: Span,
+        end: ExpressionEnd,
+    ) -> Result<Span, Error> {
+        let Some(name) = self
+            .next_token()?
+            .filter(|t| matches!(t.kind, TokenKind::Identifier))
+        else {
+            return Err(Error::unsupported(
+                operator,
+                "increment and decrement require a single identifier target",
+            ));
+        };
+        self.parse_update(name.span, op, operator, end)
+    }
+
+    fn parse_update(
         &mut self,
         name: Span,
-        op: Option<Operator>,
-        operator_span: Span,
-    ) -> Result<(), Error> {
-        let end = ExpressionEnd::Semicolon("assignments require explicit semicolons");
-        self.parse_assignment(name, op, operator_span, end)?;
-        Ok(())
+        op: Update,
+        operator: Span,
+        end: ExpressionEnd,
+    ) -> Result<Span, Error> {
+        let next = self.next_token()?;
+        let span = next
+            .as_ref()
+            .map_or(Span::at(self.lexer.offset), |t| t.span);
+        let kind = next.as_ref().map(|t| t.kind);
+        // Only a complete, explicitly delimited update is a supported write.
+        match (end, kind) {
+            (
+                ExpressionEnd::Semicolon(_) | ExpressionEnd::ForSemicolon,
+                Some(TokenKind::Semicolon),
+            )
+            | (ExpressionEnd::ForClose, Some(TokenKind::Close)) => {}
+            (ExpressionEnd::Semicolon(_), None | Some(TokenKind::CloseBrace)) => {
+                return Err(Error::unsupported(
+                    span,
+                    "increments and decrements require explicit semicolons",
+                ));
+            }
+            (ExpressionEnd::Semicolon(_), _) if next.is_some_and(|t| t.after_line_break) => {
+                return Err(Error::unsupported(
+                    span,
+                    "increments and decrements require explicit semicolons",
+                ));
+            }
+            (
+                ExpressionEnd::ForSemicolon,
+                None | Some(TokenKind::Close | TokenKind::OpenBrace | TokenKind::CloseBrace),
+            ) => {
+                return Err(Error::malformed(span, "expected ';' between for clauses"));
+            }
+            (
+                ExpressionEnd::ForClose,
+                None | Some(TokenKind::Semicolon | TokenKind::OpenBrace | TokenKind::CloseBrace),
+            ) => {
+                return Err(Error::malformed(span, "expected ')' after the for update"));
+            }
+            _ => {
+                return Err(Error::unsupported(
+                    operator,
+                    "increment and decrement expressions are outside the subset",
+                ));
+            }
+        }
+        let access = self.begin_write(name, operator, true)?;
+        self.emit(Instruction::Number(1.0), operator)?;
+        self.emit(
+            match op {
+                Update::Increment => Instruction::Add,
+                Update::Decrement => Instruction::Subtract,
+            },
+            operator,
+        )?;
+        self.finish_write(access, span)?;
+        Ok(span)
     }
 
     fn parse_assignment(
@@ -1650,15 +1767,7 @@ impl Parser<'_> {
         operator_span: Span,
         end: ExpressionEnd,
     ) -> Result<Span, Error> {
-        // Record the target before the RHS reads to preserve diagnostic order.
-        let write = WriteAccess {
-            operator_span,
-            load: op.map(|_| self.instructions.len()),
-        };
-        let access = self.record_access(name, Some(write))?;
-        if op.is_some() {
-            self.emit(Instruction::LoadBinding(UNPATCHED), name)?;
-        }
+        let access = self.begin_write(name, operator_span, op.is_some())?;
         // The assignment test is not part of the RHS expression grammar.
         let (skip, binary) = match op.map(Operator::instruction) {
             Some(Instruction::ShortCircuit { condition, .. }) => {
@@ -1679,12 +1788,29 @@ impl Parser<'_> {
         if let Some(binary) = binary {
             self.emit(binary, operator_span)?;
         }
-        self.accesses[access].instruction = self.instructions.len();
-        self.emit(Instruction::StoreBinding(UNPATCHED), end)?;
+        self.finish_write(access, end)?;
         if let Some(skip) = skip {
             self.patch_jump(skip, end)?;
         }
         Ok(end)
+    }
+
+    fn begin_write(&mut self, name: Span, operator_span: Span, load: bool) -> Result<usize, Error> {
+        // Record one target before any RHS reads to preserve diagnostic order.
+        let write = WriteAccess {
+            operator_span,
+            load: load.then_some(self.instructions.len()),
+        };
+        let access = self.record_access(name, Some(write))?;
+        if load {
+            self.emit(Instruction::LoadBinding(UNPATCHED), name)?;
+        }
+        Ok(access)
+    }
+
+    fn finish_write(&mut self, access: usize, end: Span) -> Result<(), Error> {
+        self.accesses[access].instruction = self.instructions.len();
+        self.emit(Instruction::StoreBinding(UNPATCHED), end)
     }
 
     fn record_access(&mut self, name: Span, write: Option<WriteAccess>) -> Result<usize, Error> {
@@ -1794,7 +1920,7 @@ impl Parser<'_> {
                         else {
                             return Err(Error::malformed(
                                 access.name,
-                                "invalid pending compound assignment load",
+                                "invalid pending write target load",
                             ));
                         };
                         *op = Instruction::LoadBinding(slot);
@@ -1844,6 +1970,12 @@ impl Parser<'_> {
                 after_line_break,
             } = token;
             match (needs_operand, kind) {
+                (_, TokenKind::Update(_)) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "increment and decrement expressions are outside the subset",
+                    ));
+                }
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
                         span,

@@ -169,6 +169,10 @@ impl Script {
     /// Logical assignments (`&&=`, `||=`, `??=`) use the same tests to skip
     /// both RHS evaluation and the store on an initialized `let` target.
     /// They leave no result, and their RHS is still checked during parsing.
+    /// Standalone `++` and `--` updates (also allowed in `for` initializers
+    /// and updates) load one initialized `let`, convert its value to Number
+    /// as above, and store the result of adding or subtracting `1`. Neither
+    /// prefix nor postfix form leaves a result.
     /// A conditional expression evaluates its test and only the selected arm,
     /// preserving the selected value and type. An `if` statement uses the same
     /// truthiness but executes only the selected branch, leaving no operand

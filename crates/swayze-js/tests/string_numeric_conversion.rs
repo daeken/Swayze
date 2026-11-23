@@ -131,6 +131,15 @@ fn unary_conversions_evaluate_operands_once_in_source_order() {
 }
 
 const BINARY_OPS: [&str; 4] = ["*", "/", "%", "**"];
+// The expected results for the snapshotted operands '9' and '2'.
+const BITWISE_OPS: [(&str, f64); 6] = [
+    ("&", 0.0),
+    ("^", 11.0),
+    ("|", 11.0),
+    ("<<", 36.0),
+    (">>", 2.0),
+    (">>>", 2.0),
+];
 
 fn assert_number(source: &str, expected: f64) {
     let script = parse_script(source).unwrap_or_else(|err| panic!("{source}: {err}"));
@@ -204,8 +213,45 @@ fn multiplicative_and_power_preserve_number_special_cases() {
 }
 
 #[test]
+fn binary_bitwise_coerces_strings_before_applying_32_bit_kernels() {
+    for (source, expected) in [
+        ("' 0x1f ' & '0o12'", 10.0),
+        ("true & '3.9'", 1.0),
+        ("'4294967299.9' ^ '-2.9'", -3.0),
+        ("'0b101' ^ undefined", 5.0),
+        ("'4294967295' | false", -1.0),
+        ("null | '9007199254740993'", 0.0), // Rounded to 2^53 before wrapping.
+        ("'0x20000000000003' | 0", 4.0),
+        ("true << '-1.9'", -2_147_483_648.0),
+        ("'1' << '4294967329.75'", 2.0),
+        ("'8' >> '-4294967294.9'", 2.0),
+        ("'2147483648' >> '32'", -2_147_483_648.0),
+        ("'-2' >>> true", 2_147_483_647.0),
+        ("'-1' >>> '-1'", 1.0),
+        ("'-1' >>> '32'", 4_294_967_295.0),
+        ("'-1' >>> '9007199254740993'", 4_294_967_295.0),
+        ("'-0' | '-0'", 0.0),
+        ("'Infinity' ^ '-Infinity'", 0.0),
+        ("'1_0' & '-1'", 0.0),
+        ("'5' ^ '-0x1'", 5.0),
+        (r"'\uD800' | '7'", 7.0),
+        ("'5' << '1e+'", 5.0),
+        ("'junk' >> '2'", 0.0),
+        ("'-7' >>> 'junk'", 4_294_967_289.0),
+    ] {
+        assert_number(source, expected);
+    }
+    assert_number("let x = '-1'; x >>>= '32'; x", 4_294_967_295.0);
+    assert_number("let x = 'bad'; (x &= '-1'), x", 0.0);
+}
+
+#[test]
 fn binary_expressions_run_once_left_to_right_and_compounds_snapshot_before_rhs() {
-    for (op, expected) in BINARY_OPS.into_iter().zip([18.0, 4.5, 1.0, 81.0]) {
+    for (op, expected) in BINARY_OPS
+        .into_iter()
+        .zip([18.0, 4.5, 1.0, 81.0])
+        .chain(BITWISE_OPS)
+    {
         assert_number(
             &format!(
                 "let x = '9', order = 0; \
@@ -494,13 +540,18 @@ fn unary_budget_prefix(padding: usize) -> String {
 }
 
 #[test]
-fn unary_and_binary_share_credits_and_charge_both_strings_once() {
-    // Two credits are enough for two empty Strings, but one is not. Use the
-    // same range twice to ensure aliasing doesn't waive the second charge.
-    let exact = unary_budget_prefix(61);
-    let one_short = unary_budget_prefix(62);
+fn unary_arithmetic_and_bitwise_share_credits_and_charge_both_strings_once() {
+    // After unary conversions and one credit for division, two credits are
+    // enough for two empty Strings, but one is not. Use the same range twice
+    // to ensure aliasing doesn't waive the second charge.
+    let exact = format!("{}'' / true; ", unary_budget_prefix(60));
+    let one_short = format!("{}'' / true; ", unary_budget_prefix(61));
     let error = EvalError::StringNumericConversionLimitExceeded;
-    for (op, expected) in BINARY_OPS.into_iter().zip([0.0, f64::NAN, f64::NAN, 1.0]) {
+    for (op, expected) in BINARY_OPS
+        .into_iter()
+        .zip([0.0, f64::NAN, f64::NAN, 1.0])
+        .chain(BITWISE_OPS.map(|(op, _)| (op, 0.0)))
+    {
         for expr in [format!("empty {op} empty"), format!("(empty {op}= empty)")] {
             let suffix = format!("let empty = ''; {expr}");
             assert_number(&format!("{exact}{suffix}"), expected);
@@ -516,7 +567,7 @@ fn unary_and_binary_share_credits_and_charge_both_strings_once() {
 #[test]
 fn rhs_errors_precede_coercion_and_skipped_binary_operators_do_not_convert() {
     let exhausted = unary_budget_prefix(63);
-    for op in BINARY_OPS {
+    for op in BINARY_OPS.into_iter().chain(BITWISE_OPS.map(|(op, _)| op)) {
         for source in [
             format!("{exhausted}'' {op} ('' + '')"),
             format!("{exhausted}let x = ''; x {op}= ('' + ''); x"),
@@ -543,12 +594,16 @@ fn rhs_errors_precede_coercion_and_skipped_binary_operators_do_not_convert() {
                 .kind(),
             ErrorKind::Malformed
         );
-        assert_eq!(
-            parse_script(&format!("const x = ''; true || (x {op}= '')"))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Unsupported
-        );
+        for source in [
+            format!("const x = ''; x {op}= ''; x"),
+            format!("const x = ''; true || (x {op}= '')"),
+        ] {
+            assert_eq!(
+                parse_script(&source).unwrap_err().kind(),
+                ErrorKind::Unsupported,
+                "{source}"
+            );
+        }
     }
 }
 
@@ -561,17 +616,27 @@ fn binary_dispatch_precedes_conversion_at_the_exact_boundary() {
         );
         // One literal statement then a binary expression use the last five
         // dispatches; only the extra unary `+` puts the binary op over the limit.
-        let exact = format!("{prefix}0; '' ** ''");
-        if succeeds {
-            assert_number(&exact, 1.0);
-        } else {
+        for (op, expected) in [("**", 1.0)]
+            .into_iter()
+            .chain(BITWISE_OPS.map(|(op, _)| (op, 0.0)))
+        {
+            let exact = format!("{prefix}0; '' {op} ''");
+            if succeeds {
+                assert_number(&exact, expected);
+            } else {
+                assert_eq!(
+                    parse_script(&exact).unwrap().evaluate(),
+                    Err(EvalError::StringNumericConversionLimitExceeded),
+                    "{op}"
+                );
+            }
+            let over = parse_script(&format!("{prefix}+0; '' {op} ''")).unwrap();
             assert_eq!(
-                parse_script(&exact).unwrap().evaluate(),
-                Err(EvalError::StringNumericConversionLimitExceeded)
+                over.evaluate(),
+                Err(EvalError::DispatchLimitExceeded),
+                "{op}"
             );
         }
-        let over = parse_script(&format!("{prefix}+0; '' ** ''")).unwrap();
-        assert_eq!(over.evaluate(), Err(EvalError::DispatchLimitExceeded));
     }
 }
 
@@ -623,7 +688,7 @@ fn dispatch_precedes_conversion_and_comparisons_have_an_independent_budget() {
         "const x = '{}'; let i = 0; while (i++ < 64) {{ x === x; }} ",
         "z".repeat(1024)
     );
-    for expr in ["+'42'", "'84' / '2'"] {
+    for expr in ["+'42'", "'84' / '2'", "'21' << '33'"] {
         assert_number(&format!("{prefix}{expr}"), 42.0);
         assert_eq!(
             parse_script(&format!("{prefix}{expr}, x < x"))

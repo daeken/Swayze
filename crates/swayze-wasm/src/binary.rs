@@ -1,5 +1,5 @@
 use crate::{
-    ExecutionLimit, Export, Instance, InvokeError, Module, ResultKind, Trap,
+    ExecutionLimit, Export, ExportTarget, Instance, InvokeError, Module, ResultKind, Trap,
     memory::{
         AccessWidth, DataSegment, LoadKind, MAX_MEMORY_PAGES, MEMORY_PAGE_BYTES, MemoryLimits,
     },
@@ -303,7 +303,7 @@ impl fmt::Display for Error {
             }
             ImmutableGlobal { index } => write!(f, "cannot set immutable global {index}"),
             MissingMemory => {
-                f.write_str("memory instruction or data segment requires a defined memory")
+                f.write_str("memory instruction, export, or data segment requires a defined memory")
             }
             InvalidMemoryAlignment { exponent } => {
                 write!(
@@ -380,7 +380,11 @@ impl std::error::Error for Error {}
 /// reported as [`ErrorKind::UnsupportedCount`] with [`IntegerField::LocalCount`].
 /// A code count differing from the function count is reported as
 /// [`ErrorKind::UnsupportedCount`] with [`IntegerField::CodeCount`].
-/// A repeated export name is reported at the start of its length field.
+/// A repeated export name (regardless of kind) is reported at the start of its
+/// length field, before checking the descriptor. An export index is decoded
+/// within the section frame. In a memory export, a nonzero index reports
+/// [`ErrorKind::InvalidIndex`] with [`IntegerField::MemoryIndex`] at the start
+/// of that field, even if the module has no memory.
 /// The start signature check runs only after all other module checks pass,
 /// including section framing, index bounds and code validation.
 /// [`ErrorKind::InvalidStartSignature`],
@@ -407,9 +411,10 @@ impl std::error::Error for Error {}
 /// [`ErrorKind::InvalidMemoryAlignment`] points to the memarg's exponent.
 /// For `memory.size`, `memory.grow`, or `call_indirect`, a malformed reserved
 /// byte is reported as [`ErrorKind::TruncatedByte`] or [`ErrorKind::UnexpectedByte`].
-/// [`ErrorKind::MissingMemory`] points to the instruction opcode or the data
-/// segment's memory index. A data length above the remaining aggregate budget
-/// is reported as [`ErrorKind::LimitExceeded`] at the start of the length field.
+/// [`ErrorKind::MissingMemory`] points to the instruction opcode or to the start
+/// of a memory export or data segment's memory index. A data length above the
+/// remaining aggregate budget is reported as [`ErrorKind::LimitExceeded`] at
+/// the start of the length field.
 /// Oversized global counts are reported as [`ErrorKind::UnsupportedCount`]
 /// with [`IntegerField::GlobalCount`]. Invalid or missing global mutability
 /// bytes are reported as [`ErrorKind::InvalidGlobalMutability`] or
@@ -448,7 +453,7 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
     let mut globals = [Global::EMPTY; MAX_GLOBALS as usize];
     let mut global_count = 0;
     let mut data_segments = Vec::new();
-    let mut has_function_sections = false;
+    let mut requires_function_sections = false;
     let limit = Limit::SectionCount;
     for _ in 0..limit.maximum() {
         let id_offset = module.position();
@@ -497,7 +502,15 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
             4 => table_entries = validate_table(&mut section)?,
             5 => memory_limits = validate_memory(&mut section)?,
             6 => global_count = validate_globals(&mut section, &mut globals)?,
-            7 => exports = validate_exports(&mut section, function_count)?,
+            7 => {
+                exports = validate_exports(&mut section, function_count, memory_limits.is_some())?;
+                // Exempt only a nonempty list consisting of memory exports. An
+                // empty list retains the legacy function-section requirement.
+                requires_function_sections |= exports.is_empty()
+                    || exports
+                        .iter()
+                        .any(|export| matches!(export.target, ExportTarget::Function(_)));
+            }
             8 => {
                 let offset = section.position();
                 let index =
@@ -531,12 +544,12 @@ pub fn validate_module(bytes: &[u8]) -> Result<Module, Error> {
         }
         section.finish(ErrorKind::TrailingSectionBytes { id })?;
         last_standard = id;
-        has_function_sections |= matches!(id, 1 | 3 | 7 | 10);
+        requires_function_sections |= matches!(id, 1 | 3 | 10);
     }
     if !module.remaining.is_empty() {
         return Err(module.error(ErrorKind::LimitExceeded { limit }));
     }
-    if has_function_sections {
+    if requires_function_sections {
         // The presence of all three sections makes the count and index checks
         // above sufficient to associate exports, calls, and start with validated bodies.
         for (id, present) in [
@@ -800,6 +813,7 @@ fn validate_globals(
 fn validate_exports(
     section: &mut Reader<'_>,
     function_count: Option<u32>,
+    has_memory: bool,
 ) -> Result<Vec<Export>, Error> {
     let allocation_error = section.error(ErrorKind::AllocationFailed);
     let count = section.count(IntegerField::ExportCount, 0..=MAX_EXPORTS)?;
@@ -816,13 +830,32 @@ fn validate_exports(
                 kind: ErrorKind::DuplicateExportName,
             });
         }
-        section.expect_byte(0x00)?; // function export descriptor
-        let index = if let Some(count) = function_count {
-            section.index(IntegerField::FunctionIndex, count)?
-        } else {
-            // No valid target without a function section. Preserve framing and
-            // order checks before the final required-section check rejects it.
-            section.integer(IntegerField::FunctionIndex)?
+        let descriptor_offset = section.position();
+        let target = match section.byte() {
+            Some(0x00) => {
+                let index = if let Some(count) = function_count {
+                    section.index(IntegerField::FunctionIndex, count)?
+                } else {
+                    // No valid target without a function section. Preserve framing
+                    // and order checks before the final required-section check.
+                    section.integer(IntegerField::FunctionIndex)?
+                };
+                ExportTarget::Function(index as usize)
+            }
+            Some(0x02) => {
+                let index_offset = section.position();
+                section.index(IntegerField::MemoryIndex, 1)?;
+                require_memory(has_memory, index_offset)?;
+                ExportTarget::Memory
+            }
+            // Preserve the existing diagnostics for missing or unsupported kinds.
+            Some(found) => {
+                return Err(Error {
+                    offset: descriptor_offset,
+                    kind: ErrorKind::UnexpectedByte { expected: 0, found },
+                });
+            }
+            None => return Err(section.error(ErrorKind::TruncatedByte { expected: 0 })),
         };
         let mut owned = String::new();
         owned.try_reserve_exact(name.len()).map_err(|_| Error {
@@ -832,7 +865,7 @@ fn validate_exports(
         owned.push_str(name);
         exports.push(Export {
             name: owned,
-            function_index: index as usize,
+            target,
         });
     }
     Ok(exports)

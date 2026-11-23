@@ -44,9 +44,16 @@ for (const fixture of fixtures) {
         console.log('instantiation-error');
         continue;
     }
-    const invoke = instance.exports[name];
+    const exported = instance.exports[name];
+    if (result === 'memory') {
+        if (!(exported instanceof WebAssembly.Memory)) throw new Error('expected a memory export');
+        const [offset, length] = args.map(Number);
+        const bytes = Buffer.from(exported.buffer, offset, length);
+        console.log(`memory=${bytes.toString('hex')}`);
+        continue;
+    }
     try {
-        const value = invoke(...args.map(decodeArg));
+        const value = exported(...args.map(decodeArg));
         if (result === 'void' && value === undefined) {
             console.log('void');
         } else if (result === 'i64' && typeof value === 'bigint') {
@@ -119,6 +126,7 @@ enum Outcome {
     F32Invocation(Result<u32, WasmTrap>),
     F64Invocation(Result<u64, WasmTrap>),
     VoidInvocation(Result<(), WasmTrap>),
+    MemoryRead { offset: u32, bytes: [u8; 4] },
     DataSegmentOutOfBounds(usize),
     ElementSegmentOutOfBounds(usize),
     StartTrap(WasmTrap),
@@ -179,6 +187,14 @@ impl Fixture {
 impl Fixture<WasmValue> {
     fn encode(&self) -> String {
         use std::fmt::Write;
+        if let Outcome::MemoryRead { offset, bytes } = self.expected {
+            return format!(
+                "{}:{}:memory:{offset}:{}",
+                hex(&self.bytes),
+                hex(self.export.as_bytes()),
+                bytes.len()
+            );
+        }
         let result = match self.expected.result_kind() {
             WasmResultKind::Void => "void",
             WasmResultKind::I32 => "i32",
@@ -1580,6 +1596,37 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
     cases.into_iter()
 }
 
+fn memory_export_fixtures() -> [Fixture<WasmValue>; 2] {
+    [
+        Fixture {
+            // A data-only module; the memory export index is valid padded zero.
+            bytes: b"\0asm\x01\0\0\0\x05\x03\x01\0\x01\x07\x08\x01\x03mem\x02\x80\0\
+                     \x0b\x08\x01\0\x41\x03\x0b\x02hi"
+                .to_vec(),
+            export: "mem",
+            expected: Outcome::MemoryRead {
+                offset: 2,
+                bytes: *b"\0hi\0",
+            },
+            args: vec![],
+        },
+        Fixture {
+            // Mixed function and memory exports; start replaces the data's first byte.
+            bytes: b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0\x03\x02\x01\0\x05\x03\x01\0\x01\
+                     \x07\x0b\x02\x01x\0\0\x03mem\x02\0\x08\x01\0\
+                     \x0a\x0b\x01\x09\0\x41\0\x41\x41\x3a\0\0\x0b\
+                     \x0b\x08\x01\0\x41\0\x0b\x02hi"
+                .to_vec(),
+            export: "mem",
+            expected: Outcome::MemoryRead {
+                offset: 0,
+                bytes: *b"\xc1i\0\0",
+            },
+            args: vec![],
+        },
+    ]
+}
+
 fn with_data(segments: &[(i32, &[u8])], address: i32, expected: Outcome) -> Fixture {
     let mut bytes = singleton_module(1, &[0], &[0x20, 0, 0x28, 2, 0], Some(1));
     let mut payload = vec![u8::try_from(segments.len()).unwrap()];
@@ -1647,6 +1694,11 @@ fn evaluate(fixture: &Fixture<WasmValue>) -> Result<Outcome, Box<dyn Error>> {
         Err(WasmInstantiationError::StartTrap(trap)) => return Ok(Outcome::StartTrap(trap)),
         Err(error) => return Err(error.into()),
     };
+    if let Outcome::MemoryRead { offset, .. } = fixture.expected {
+        let mut bytes = [0; 4];
+        instance.read_memory(fixture.export, offset, &mut bytes)?;
+        return Ok(Outcome::MemoryRead { offset, bytes });
+    }
     let expected_kind = fixture.expected.result_kind();
     match instance.invoke_with_values(fixture.export, &fixture.args, expected_kind) {
         Ok(Some(WasmValue::I32(value))) => Ok(Outcome::Invocation(Ok(value))),
@@ -1670,6 +1722,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .map(Fixture::into_typed)
         .chain(typed_fixtures())
+        .chain(memory_export_fixtures())
         .collect();
     let encoded: Vec<_> = cases.iter().map(Fixture::encode).collect();
     // Only generated modules reach the fixed driver, never files or user inputs.
@@ -1717,6 +1770,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     == Some(bits)
             }
             Outcome::VoidInvocation(Ok(())) => reference == "void",
+            Outcome::MemoryRead { bytes, .. } => {
+                reference.strip_prefix("memory=") == Some(hex(&bytes).as_str())
+            }
             Outcome::Invocation(Err(_))
             | Outcome::I64Invocation(Err(_))
             | Outcome::F32Invocation(Err(_))
@@ -1734,7 +1790,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!(
-        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, invocation traps, or instantiation errors)"
+        "Matched all {count} fixtures against Node {version} (integer, non-NaN float, or void host results, memory copies, invocation traps, or instantiation errors)"
     );
     Ok(())
 }

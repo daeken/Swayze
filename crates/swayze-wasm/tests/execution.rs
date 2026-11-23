@@ -57,6 +57,8 @@ mod if_branch;
 mod int_to_float;
 #[path = "execution/memory.rs"]
 mod memory;
+#[path = "execution/memory_exports.rs"]
+mod memory_exports;
 #[path = "execution/result_loop.rs"]
 mod result_loop;
 #[path = "execution/stack.rs"]

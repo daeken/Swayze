@@ -364,6 +364,28 @@ fn grouped_updates_yield_and_store_numbers_without_losing_old_number_bits() {
 }
 
 #[test]
+fn postfix_preserves_the_old_coerced_number_and_stores_the_new_number() {
+    for source in [
+        "let x = -0; const old = (x++); 1 / old === -1 / 0 && x === 1",
+        "let x = true; const old = (x++); old === 1 && x === 2",
+    ] {
+        let script = parse_script(source).unwrap();
+        assert_eq!(
+            script.evaluate_value(),
+            Ok(Value::Boolean(true)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn skipped_grouped_updates_leave_a_valid_let_unchanged() {
+    let source = "let x = true; false && (x++); true ? x : (--x)";
+    let script = parse_script(source).unwrap();
+    assert_eq!(script.evaluate_value(), Ok(Value::Boolean(true)));
+}
+
+#[test]
 fn grouped_updates_run_once_in_order_with_expressions_and_control() {
     for (source, expected) in [
         ("let x=1; ((x++) + 1)*10 + x", 22.0),

@@ -705,6 +705,20 @@ fn fixtures() -> Vec<Fixture> {
         &[0],
         &[0x00, 0x1b, 0xa7],
     ));
+    // Declared slots follow the i32 parameter. Check typed zero and tee/get
+    // without truncating the stored i64 value to its low word.
+    cases.extend([
+        Fixture::with_locals(1, &[42], &[2, 1, 0x7f, 1, 0x7e], &[0x20, 2, 0x50]),
+        Fixture::with_locals(
+            42,
+            &[42],
+            &[2, 1, 0x7f, 1, 0x7e],
+            &[
+                0x42, 0xaa, 0x80, 0x80, 0x80, 0x10, 0x22, 2, 0x1a, // i64.const; tee; drop
+                0x20, 2, 0x42, 42, 0x52, 0x04, 0x7f, 0x20, 0, 0x05, 0x41, 0, 0x0b,
+            ],
+        ),
+    ]);
     cases
 }
 

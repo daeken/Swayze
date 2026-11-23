@@ -135,7 +135,7 @@ impl IntegerField {
     }
 }
 
-/// A concrete type on the internal operand stack, not a supported signature type.
+/// A concrete internal operand or local type, not a description of supported signatures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValType {
     I32,
@@ -572,6 +572,7 @@ const MAX_PARAMETERS: u32 = 4;
 const MAX_DECLARED_LOCALS: u32 = 16;
 const MAX_LOCAL_SLOTS: usize = (MAX_PARAMETERS + MAX_DECLARED_LOCALS) as usize;
 const I32: u8 = 0x7f;
+const I64: u8 = 0x7e;
 
 // All supported parameters are i32; their count and the result kind are
 // therefore a complete structural signature, independent of type indices.
@@ -1225,8 +1226,10 @@ impl I64BinaryOp {
 }
 
 /// Only the decoder constructs this, after checking all indices, global set
-/// mutability, every stack effect, and the complete body frame. Block and if
-/// jump targets are strictly later decoded instruction indices or the
+/// mutability, every stack effect, and the complete body frame. Each local
+/// index is below the exact parameter-plus-declaration bound, and writes
+/// preserve the slot's declared tag. Block and if jump targets are strictly
+/// later decoded instruction indices or the
 /// one-past-last index. Block and if exits carry their target floor and result
 /// arity. Loop continues target an in-body index at or before the branch.
 /// Function exits target the one-past-last index with the signature's result
@@ -1237,6 +1240,9 @@ impl I64BinaryOp {
 #[derive(Debug)]
 pub(super) struct ValidatedCode {
     signature: FunctionType,
+    // The tags provide local types during validation; each call copies these
+    // typed zeros before loading i32 arguments into the parameter prefix.
+    local_zeros: [Value; MAX_LOCAL_SLOTS],
     instructions: Vec<Instruction>,
     table_targets: Vec<BranchEdge>,
 }
@@ -1244,7 +1250,7 @@ pub(super) struct ValidatedCode {
 struct CallFrame {
     function_index: usize,
     pc: usize,
-    locals: [i32; MAX_LOCAL_SLOTS],
+    locals: [Value; MAX_LOCAL_SLOTS],
     operands: [Value; Limit::OperandStackDepth.maximum()],
     depth: usize,
 }
@@ -1253,18 +1259,23 @@ impl CallFrame {
     const EMPTY: Self = Self {
         function_index: 0,
         pc: 0,
-        locals: [0; MAX_LOCAL_SLOTS],
+        locals: [Value::I32(0); MAX_LOCAL_SLOTS],
         operands: [Value::I32(0); Limit::OperandStackDepth.maximum()],
         depth: 0,
     };
 
-    fn new(function_index: usize, args: impl ExactSizeIterator<Item = i32>) -> Self {
+    fn new(
+        function_index: usize,
+        code: &ValidatedCode,
+        args: impl ExactSizeIterator<Item = i32>,
+    ) -> Self {
         let mut frame = Self {
             function_index,
+            locals: code.local_zeros,
             ..Self::EMPTY
         };
         for (local, arg) in frame.locals[..args.len()].iter_mut().zip(args) {
-            *local = arg;
+            *local = Value::I32(arg);
         }
         frame
     }
@@ -1344,7 +1355,11 @@ pub(super) fn execute(
 ) -> Result<Option<i32>, ExecutionError> {
     let module = instance.module;
     let mut frames = [CallFrame::EMPTY; ExecutionLimit::CallDepth.maximum()];
-    frames[0] = CallFrame::new(function_index, args.iter().copied());
+    frames[0] = CallFrame::new(
+        function_index,
+        &module.functions[function_index],
+        args.iter().copied(),
+    );
     let mut active = 0;
     let mut remaining_dispatches = ExecutionLimit::InstructionDispatches.maximum();
     loop {
@@ -1393,10 +1408,10 @@ pub(super) fn execute(
                 let value = op.apply(frame.pop());
                 frame.push(value);
             }
-            Instruction::LocalGet(index) => frame.push_i32(frame.locals[index as usize]),
-            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop_i32(),
+            Instruction::LocalGet(index) => frame.push(frame.locals[index as usize]),
+            Instruction::LocalSet(index) => frame.locals[index as usize] = frame.pop(),
             Instruction::LocalTee(index) => {
-                frame.locals[index as usize] = frame.operands[frame.depth - 1].as_i32();
+                frame.locals[index as usize] = frame.operands[frame.depth - 1];
             }
             Instruction::GlobalGet(index) => frame.push_i32(instance.globals[index as usize].get()),
             Instruction::GlobalSet(index) => instance.globals[index as usize].set(frame.pop_i32()),
@@ -1423,13 +1438,14 @@ pub(super) fn execute(
                 }
                 // Keep the caller's prefix; the argument suffix is already in
                 // parameter order. Reset reused frame storage before entering.
+                let callee_code = &module.functions[index];
                 let end = frame.depth;
-                frame.depth -= module.functions[index].signature.parameters as usize;
+                frame.depth -= callee_code.signature.parameters as usize;
                 let args = frame.operands[frame.depth..end]
                     .iter()
                     .copied()
                     .map(Value::as_i32);
-                let callee = CallFrame::new(index, args);
+                let callee = CallFrame::new(index, callee_code, args);
                 active += 1;
                 frames[active] = callee;
             }
@@ -1502,18 +1518,24 @@ pub(super) fn execute(
     }
 }
 
-fn validate_locals(body: &mut Reader<'_>) -> Result<u32, Error> {
+fn decode_locals(
+    body: &mut Reader<'_>,
+    parameters: u32,
+) -> Result<([Value; MAX_LOCAL_SLOTS], u32), Error> {
     let groups = body.integer(IntegerField::LocalGroupCount)?;
-    let mut remaining = MAX_DECLARED_LOCALS;
+    let mut zeros = [Value::I32(0); MAX_LOCAL_SLOTS];
+    let mut bound = parameters;
+    let limit = parameters + MAX_DECLARED_LOCALS;
     // Every group consumes at least two bytes of the bounded body, even if its
-    // count is zero. No declarations are expanded or allocated here.
+    // count is zero. Expand only checked counts into the fixed slot array.
     for _ in 0..groups {
-        let count = body.count(IntegerField::LocalCount, 0..=remaining)?;
-        body.expect_byte(I32)?;
-        // Count was checked against the remaining budget before subtraction.
-        remaining -= count;
+        let count = body.count(IntegerField::LocalCount, 0..=limit - bound)?;
+        let zero = body.local_zero()?;
+        let end = bound + count;
+        zeros[bound as usize..end as usize].fill(zero);
+        bound = end;
     }
-    Ok(MAX_DECLARED_LOCALS - remaining)
+    Ok((zeros, bound))
 }
 
 #[derive(Clone, Copy)]
@@ -1705,6 +1727,7 @@ fn validate_plain_stack(
     frame: ControlFrame,
     offset: usize,
     functions: &[FunctionType],
+    local_zeros: &[Value; MAX_LOCAL_SLOTS],
 ) -> Result<(), Error> {
     use ValType::{I32, I64};
     let i32_type = Some(I32);
@@ -1717,9 +1740,8 @@ fn validate_plain_stack(
             let (from, to) = op.types();
             (1, Some(from), Some(to))
         }
-        Instruction::LocalGet(_) | Instruction::GlobalGet(_) | Instruction::MemorySize => {
-            (0, None, i32_type)
-        }
+        Instruction::LocalGet(index) => (0, None, Some(local_zeros[index as usize].operand_type())),
+        Instruction::GlobalGet(_) | Instruction::MemorySize => (0, None, i32_type),
         Instruction::Call(target) => {
             let (signature, selectors) = match target {
                 CallTarget::Direct(index) => (functions[index as usize], 0),
@@ -1728,11 +1750,15 @@ fn validate_plain_stack(
             let result = (signature.result == ResultKind::I32).then_some(I32);
             (signature.parameters as usize + selectors, i32_type, result)
         }
-        Instruction::LocalSet(_) | Instruction::GlobalSet(_) => (1, i32_type, None),
-        Instruction::LocalTee(_)
-        | Instruction::Unary(_)
-        | Instruction::MemoryGrow
-        | Instruction::LoadI32 { .. } => (1, i32_type, i32_type),
+        Instruction::LocalSet(index) => (1, Some(local_zeros[index as usize].operand_type()), None),
+        Instruction::LocalTee(index) => {
+            let ty = Some(local_zeros[index as usize].operand_type());
+            (1, ty, ty)
+        }
+        Instruction::GlobalSet(_) => (1, i32_type, None),
+        Instruction::Unary(_) | Instruction::MemoryGrow | Instruction::LoadI32 { .. } => {
+            (1, i32_type, i32_type)
+        }
         Instruction::StoreI32 { .. } => (2, i32_type, None),
         Instruction::Binary(_) => (2, i32_type, i32_type),
         Instruction::I64Eqz => (1, Some(I64), i32_type),
@@ -1980,7 +2006,7 @@ fn validate_body(
             available,
         },
     })?;
-    let local_bound = signature.parameters + validate_locals(&mut body)?;
+    let (local_zeros, local_bound) = decode_locals(&mut body, signature.parameters)?;
     // Forward transfers reserve slots that their matching delimiters backpatch.
     // Each block or if chains its incoming edges, each visited once at the
     // target's end. Loop edges resolve immediately to the PC saved at entry.
@@ -2191,6 +2217,7 @@ fn validate_body(
                         frame,
                         offset,
                         environment.functions,
+                        &local_zeros,
                     )?;
                 }
                 decoded[pc] = instruction;
@@ -2216,6 +2243,7 @@ fn validate_body(
     retained_targets.extend_from_slice(&table_targets[..target_count]);
     Ok(ValidatedCode {
         signature,
+        local_zeros,
         instructions,
         table_targets: retained_targets,
     })
@@ -2277,6 +2305,23 @@ impl<'a> Reader<'a> {
                 kind: ErrorKind::UnexpectedByte { expected, found },
             }),
             None => Err(self.error(ErrorKind::TruncatedByte { expected })),
+        }
+    }
+
+    fn local_zero(&mut self) -> Result<Value, Error> {
+        let offset = self.position();
+        // Preserve the original expected byte for unsupported and missing types.
+        match self.byte() {
+            Some(I32) => Ok(Value::I32(0)),
+            Some(I64) => Ok(Value::I64(0)),
+            Some(found) => Err(Error {
+                offset,
+                kind: ErrorKind::UnexpectedByte {
+                    expected: I32,
+                    found,
+                },
+            }),
+            None => Err(self.error(ErrorKind::TruncatedByte { expected: I32 })),
         }
     }
 

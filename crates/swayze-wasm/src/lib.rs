@@ -20,6 +20,8 @@
 //! `f32.const`, `f64.const`, `i32.reinterpret_f32`, `i64.reinterpret_f64`,
 //! `f32.reinterpret_i32`, `f64.reinterpret_i64`,
 //! `f32.abs`, `f32.neg`, `f32.copysign`, `f64.abs`, `f64.neg`, `f64.copysign`,
+//! `f32.ceil`, `f32.floor`, `f32.trunc`, `f32.nearest`,
+//! `f64.ceil`, `f64.floor`, `f64.trunc`, `f64.nearest`,
 //! `f32.eq`, `f32.ne`, `f32.lt`, `f32.gt`, `f32.le`, `f32.ge`,
 //! `f64.eq`, `f64.ne`, `f64.lt`, `f64.gt`, `f64.le`, `f64.ge`,
 //! `i64.eqz`, `i64.eq`, `i64.ne`, `i64.lt_s`, `i64.lt_u`, `i64.gt_s`, `i64.gt_u`,
@@ -158,15 +160,24 @@
 //! each consumes one operand and produces one of the same type. `copysign`
 //! consumes two operands of its width, taking the magnitude bits from the first
 //! (lhs) and only the sign bit from the second (rhs). Sign operations leave all
-//! non-sign bits, including NaN payloads, unchanged. For both widths, `eq`, `ne`,
+//! non-sign bits, including NaN payloads, unchanged. The arithmetic rounding ops
+//! `ceil`, `floor`, `trunc`, and `nearest` (`0x8d`–`0x90` for f32, `0x9b`–`0x9e`
+//! for f64) each consume one operand and produce a result of the same width.
+//! They round to an integral floating-point value toward positive infinity,
+//! negative infinity, zero, or the closest integer (ties to even), respectively.
+//! They preserve the input sign even when rounding to zero, and leave infinities
+//! and finite integral values unchanged. For any NaN, Swayze deterministically
+//! returns the positive canonical quiet NaN (`0x7fc00000` for f32,
+//! `0x7ff8000000000000` for f64), not the input NaN's sign or payload.
+//! For both widths, `eq`, `ne`,
 //! `lt`, `gt`, `le`, and `ge` (`0x5b`–`0x60` for f32, `0x61`–`0x66` for f64)
 //! consume two operands of their exact width in lhs, rhs order and push an i32
 //! Boolean (0 or 1). Either quiet or signaling NaN makes the pair unordered:
 //! only `ne` returns 1. Positive and negative zero compare equal; all other
 //! non-NaNs follow numeric order, including subnormals and infinities. Comparisons
 //! use raw bits without changing the input encodings. Constants, reinterpretations,
-//! sign operations, and comparisons each count as one dispatch. None uses native
-//! floating-point operations or quiets signaling NaNs. Floats are supported as
+//! sign operations, rounding, and comparisons each count as one dispatch. None
+//! uses native floating-point operations. Floats are supported as
 //! operands, private globals, locals, `block` and `if` results, and function
 //! parameters and results, including across the host boundary. Fallthrough,
 //! `return`, and branch exits preserve all result bits. Loop results and
@@ -468,6 +479,11 @@
 //! infinities, and both signs of quiet and signaling NaNs. They check exact i32
 //! Booleans, operand and result types in live and dead code, underflow precedence
 //! and polymorphic floors, shared caps, and exact fuel for each opcode.
+//! Float rounding tests check exact result encodings for all four ops on both
+//! widths, including neighbors of half ties and exponent boundaries, both zero
+//! signs, subnormals, infinities, and canonicalization of quiet and signaling
+//! NaNs. They check live and dead floor diagnostics, shared caps, and a one-dispatch
+//! charge per op at the fuel limit. The fixed vectors are evidence, not a proof.
 //! Mixed-local tests check parameter-first slot order across typed and empty
 //! groups, exact count and index bounds, full-width reads and writes, and
 //! concrete types in reachable and polymorphic code. They exercise fresh

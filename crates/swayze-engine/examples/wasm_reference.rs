@@ -1223,6 +1223,27 @@ fn float_host_fixtures() -> impl Iterator<Item = Fixture<WasmValue>> {
             args: vec![WasmValue::I64(bits as i64)],
         });
     }
+    // Exercise all four operations at both widths through the non-NaN host ABI.
+    for (opcode, input, expected) in [
+        (0x8d, -0.25_f32, -0.0_f32),
+        (0x8e, -0.25, -1.0),
+        (0x8f, -1.75, -1.0),
+        (0x90, -0.5, -0.0),
+        (0x90, 3.5, 4.0),
+    ] {
+        cases.push(Fixture {
+            expected: Outcome::F32Invocation(Ok(expected.to_bits())),
+            bytes: modules(0x7d, 0x7d, opcode),
+            export: "x",
+            args: vec![WasmValue::F32(input.to_bits())],
+        });
+        cases.push(Fixture {
+            expected: Outcome::F64Invocation(Ok(f64::from(expected).to_bits())),
+            bytes: modules(0x7c, 0x7c, opcode + 0x0e),
+            export: "x",
+            args: vec![WasmValue::F64(f64::from(input).to_bits())],
+        });
+    }
     cases.into_iter()
 }
 

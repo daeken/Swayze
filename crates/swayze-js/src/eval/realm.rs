@@ -377,10 +377,35 @@ impl ReadyScript<'_, '_> {
         Ok((target, site.span, site.role))
     }
 
-    fn put(&mut self, index: usize, value: Operand) -> Result<(), Stop> {
+    fn write_target(&self, index: usize) -> Result<(Target, Span), Stop> {
         let (target, span, Role::Write) = self.site(index)? else {
             return Err(EvalError::InvalidScript.into());
         };
+        Ok((target, span))
+    }
+
+    fn load_target(
+        &self,
+        target: Target,
+        span: Span,
+        direct_typeof: bool,
+    ) -> Result<Operand, Stop> {
+        let value = match target {
+            Target::Undefined => Value::Undefined,
+            Target::Missing if direct_typeof => Value::Undefined,
+            Target::Missing => return Err(Stop::Throw(Throw::ReferenceError { span })),
+            Target::Lexical(slot) => self
+                .realm
+                .globals
+                .get(slot)
+                .ok_or(EvalError::InvalidScript)?
+                .value
+                .ok_or(Stop::Throw(Throw::ReferenceError { span }))?,
+        };
+        Ok(Operand::Scalar(value))
+    }
+
+    fn put(&mut self, target: Target, span: Span, value: Operand) -> Result<(), Stop> {
         let cell = match target {
             // Sloppy writes to the readonly intrinsic are ignored, *after*
             // the RHS/coercion. No value escapes, including String operands.
@@ -426,19 +451,12 @@ impl Bindings for ReadyScript<'_, '_> {
 
     fn load(&self, index: usize) -> Result<Operand, Stop> {
         let (target, span, role) = self.site(index)?;
-        let value = match target {
-            Target::Undefined => Value::Undefined,
-            Target::Missing if matches!(role, Role::Typeof) => Value::Undefined,
-            Target::Missing => return Err(Stop::Throw(Throw::ReferenceError { span })),
-            Target::Lexical(slot) => self
-                .realm
-                .globals
-                .get(slot)
-                .ok_or(EvalError::InvalidScript)?
-                .value
-                .ok_or(Stop::Throw(Throw::ReferenceError { span }))?,
-        };
-        Ok(Operand::Scalar(value))
+        match role {
+            Role::Declaration(_) => Err(EvalError::InvalidScript.into()),
+            // Compound assignments share a Write site's load and store.
+            Role::Read | Role::Write => self.load_target(target, span, false),
+            Role::Typeof => self.load_target(target, span, true),
+        }
     }
 
     fn init(
@@ -464,7 +482,9 @@ impl Bindings for ReadyScript<'_, '_> {
     }
 
     fn store(&mut self, index: usize, keep: bool, stack: &mut Vec<Operand>) -> Result<(), Stop> {
-        self.put(index, store_operand(stack, keep)?)
+        let value = store_operand(stack, keep)?;
+        let (target, span) = self.write_target(index)?;
+        self.put(target, span, value)
     }
 
     fn update(
@@ -476,12 +496,18 @@ impl Bindings for ReadyScript<'_, '_> {
         max: usize,
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), Stop> {
+        let (target, span) = self.write_target(index)?;
         let old = self
-            .load(index)?
+            .load_target(target, span, false)?
             .to_number(numeric.pools, numeric.credits)?;
         let new = update_number(op, old);
-        self.put(index, Operand::Scalar(Value::Number(new)))?;
         update_result(stack, max, result, old, new)?;
+        // The checked push must succeed before the cell changes. If PutValue
+        // fails, remove the staged result; dispatch discards the frame on Stop.
+        if let Err(stop) = self.put(target, span, Operand::Scalar(Value::Number(new))) {
+            stack.pop();
+            return Err(stop);
+        }
         Ok(())
     }
 }
@@ -508,6 +534,90 @@ mod tests {
             Ok(Completion::Throw(Throw::ReferenceError { .. }))
         ));
         assert_eq!(realm.globals[0].value, Some(Value::Undefined));
+    }
+
+    #[test]
+    fn binding_operations_reject_wrong_roles_before_a_guest_read() {
+        let code = CompiledScript::compile("let lexical = 7; missing;").unwrap();
+        let mut realm = Realm::new();
+        let mut ready = realm.instantiate(&code).unwrap();
+        // A declaration site is not a read, even though its TDZ cell exists.
+        assert!(matches!(
+            ready.load(0),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::InvalidScript
+            )))
+        ));
+        let mut stack = Vec::new();
+        let scratch = EvalScratch::new();
+        let mut credits = 0;
+        // Using an ordinary missing Read site as an update is invalid, not
+        // a guest ReferenceError from GetValue.
+        assert!(matches!(
+            ready.update(
+                1,
+                Update::Increment,
+                UpdateResult::New,
+                &mut stack,
+                1,
+                UpdateNumeric {
+                    pools: scratch.pools(&[]),
+                    credits: &mut credits
+                }
+            ),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::InvalidScript
+            )))
+        ));
+        assert!(stack.is_empty());
+        assert_eq!(ready.realm.globals[0].value, None);
+    }
+
+    #[test]
+    fn update_checks_stack_before_put_and_discards_result_on_throw() {
+        let mut realm = Realm::new();
+        let seed = CompiledScript::compile("let mutable = 7; const fixed = 3;").unwrap();
+        assert_eq!(
+            realm.instantiate(&seed).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        let code = CompiledScript::compile("(mutable++); (fixed++);").unwrap();
+        let mut ready = realm.instantiate(&code).unwrap();
+        assert!(matches!(
+            ready.load(0),
+            Ok(Operand::Scalar(Value::Number(7.0)))
+        ));
+        let mut stack = vec![Operand::Scalar(Value::Null)];
+        let scratch = EvalScratch::new();
+        let mut credits = 0;
+        let mut update = |site, max| {
+            ready.update(
+                site,
+                Update::Increment,
+                UpdateResult::New,
+                &mut stack,
+                max,
+                UpdateNumeric {
+                    pools: scratch.pools(&[]),
+                    credits: &mut credits,
+                },
+            )
+        };
+        for site in [0, 1] {
+            assert!(matches!(
+                update(site, 1),
+                Err(Stop::Engine(EngineFault::Evaluation(
+                    EvalError::InvalidScript
+                )))
+            ));
+        }
+        assert!(matches!(
+            update(1, 2),
+            Err(Stop::Throw(Throw::TypeError { .. }))
+        ));
+        assert!(matches!(stack.as_slice(), [Operand::Scalar(Value::Null)]));
+        assert_eq!(ready.realm.globals[0].value, Some(Value::Number(7.0)));
+        assert_eq!(ready.realm.globals[1].value, Some(Value::Number(3.0)));
     }
 
     #[test]

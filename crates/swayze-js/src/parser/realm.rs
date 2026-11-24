@@ -7,8 +7,7 @@ use crate::{
 };
 
 use super::{
-    AccessKind, Binding, BindingPolicy, Error, Limit, Limits, Parser, QuotedDecimalEscape, Span,
-    new_parser,
+    AccessKind, BindingPolicy, Error, Limit, Limits, Parser, QuotedDecimalEscape, Span, new_parser,
 };
 
 pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError> {
@@ -22,7 +21,7 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         return Err(CompileError::SyntaxError { span });
     }
     let end = Span::at(parser.lexer.offset);
-    let declarations = parser.bindings.len();
+    let declarations = parser.realm_declarations.len();
     let count = declarations + parser.accesses.len();
     if parser.instructions.len() > MAX_INSTRUCTIONS {
         return Err(cap(CompileLimit::Instructions, end));
@@ -30,7 +29,7 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
     if declarations > MAX_DECLARATIONS {
         return Err(cap(
             CompileLimit::Declarations,
-            parser.bindings[MAX_DECLARATIONS].name,
+            parser.realm_declarations[MAX_DECLARATIONS].0,
         ));
     }
     if count > MAX_SITES {
@@ -43,19 +42,16 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         .map_err(|_| Error::limit(end, Limit::Allocation))?;
     let mut names = Vec::new();
     for index in 0..declarations {
-        let Binding { name, kind, .. } = parser.bindings[index];
-        sites.push(copy_name(
-            &mut parser,
-            &mut names,
-            name,
-            Role::Declaration(kind),
-        )?);
-        // Global conflicts are deferred, but a duplicate declaration within
-        // this single Script does not depend on a Realm. Reuse the same
-        // comparison charging as the legacy static resolver.
+        let (name, role) = parser.realm_declarations[index];
+        sites.push(copy_name(&mut parser, &mut names, name, role)?);
+        // Only a pair involving a lexical can conflict within this Script.
+        // Charge every visited occurrence, even when comparing no name bytes.
         for other in 0..index {
             parser.lexer.charge(1, name)?;
-            if parser.names_equal(name, parser.bindings[other].name)? {
+            let (candidate, other_role) = parser.realm_declarations[other];
+            if (matches!(role, Role::Declaration(_)) || matches!(other_role, Role::Declaration(_)))
+                && parser.names_equal(name, candidate)?
+            {
                 return Err(CompileError::SyntaxError { span: name });
             }
         }

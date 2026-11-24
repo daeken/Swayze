@@ -487,7 +487,6 @@ fn policies_do_not_reclassify_legacy_diagnostics_or_accept_deferred_syntax() {
         assert_eq!(parse_script_for_completion(source).unwrap_err(), first);
     }
     for source in [
-        "var x = 1;",
         "'use strict'",
         "{ let x = 1; }",
         "for (let x = 1; x;) {}",

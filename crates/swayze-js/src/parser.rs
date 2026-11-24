@@ -404,8 +404,8 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
         return Err(Error::limit(Span { start, end }, Limit::SourceBytes));
     }
     Ok(Parser {
-        policy,
         lexer: Lexer {
+            policy,
             source,
             offset: 0,
             tokens_left: limits.max_tokens,
@@ -428,6 +428,7 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
         instructions: Vec::new(),
         scopes: Vec::new(),
         bindings: Vec::new(),
+        realm_declarations: Vec::new(),
         accesses: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
@@ -581,6 +582,7 @@ enum TokenKind {
     Null,
     Identifier,
     Declaration(BindingKind),
+    Var,
     If,
     Else,
     While,
@@ -626,6 +628,7 @@ enum QuotedDecimalEscape {
 }
 
 struct Lexer<'s> {
+    policy: BindingPolicy,
     source: &'s str,
     offset: usize,
     tokens_left: usize,
@@ -892,6 +895,7 @@ impl Lexer<'_> {
         match name {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
             "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
+            "var" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Var),
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
@@ -1415,8 +1419,13 @@ struct ActiveStatement {
     scope: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationKind {
+    Lexical(BindingKind),
+    Var,
+}
+
 struct Parser<'s> {
-    policy: BindingPolicy,
     lexer: Lexer<'s>,
     // Cache the next lexer result (including EOF) while disambiguating a
     // name, a root semicolon, or an if's then-arm.
@@ -1439,6 +1448,7 @@ struct Parser<'s> {
     // Parse-only scope, declaration (in slot order), and access tables.
     scopes: Vec<Scope>,
     bindings: Vec<Binding>,
+    realm_declarations: Vec<(Span, crate::realm::Role)>,
     accesses: Vec<Access>,
     stack_depth: usize,
     max_stack_depth: usize,
@@ -1492,7 +1502,7 @@ impl Parser<'_> {
                     &self.lexer.source[span.start..span.end],
                     "'use strict'" | "\"use strict\""
                 ) {
-                    match self.policy {
+                    match self.lexer.policy {
                         BindingPolicy::Legacy => {
                             return Err(Error::unsupported(
                                 span,
@@ -1509,7 +1519,7 @@ impl Parser<'_> {
                 in_directive_prologue = false;
             }
             if delimiter.is_none() {
-                if self.policy == BindingPolicy::Realm {
+                if self.lexer.policy == BindingPolicy::Realm {
                     return Err(Error::unsupported(end, EXPRESSION_STATEMENT_SEMICOLON));
                 }
                 break ExitStack::Value;
@@ -1880,7 +1890,14 @@ impl Parser<'_> {
                 self.lexer.charge(1, init.span)?;
                 let scope = self.add_scope(Some(self.current_scope()), init.span)?;
                 self.for_header_scope = Some(scope);
-                self.parse_declaration_list(kind, DeclaratorEnd::ForHeader)?;
+                self.parse_declaration_list(
+                    DeclarationKind::Lexical(kind),
+                    DeclaratorEnd::ForHeader,
+                )?;
+            }
+            TokenKind::Var => {
+                self.lexer.charge(1, init.span)?;
+                self.parse_declaration_list(DeclarationKind::Var, DeclaratorEnd::ForHeader)?;
             }
             _ => {
                 self.parse_for_clause(init, ForClauseEnd::Init)?;
@@ -1888,7 +1905,7 @@ impl Parser<'_> {
         }
 
         // Loop back edges skip the initializer. Reentering the statement
-        // executes its InitBinding instructions again, in the same fixed slots.
+        // executes the initializer again, in the same fixed slots.
         let test = self.instructions.len();
         let first = self.require_token(TokenPosition::Operand, "expected a for test or ';'")?;
         let end = if matches!(first.kind, TokenKind::Semicolon) {
@@ -2052,7 +2069,10 @@ impl Parser<'_> {
     ) -> Result<Option<ExpressionStart>, Error> {
         match first.kind {
             TokenKind::Semicolon => {}
-            TokenKind::Declaration(kind) => self.parse_declaration(kind)?,
+            TokenKind::Declaration(kind) => {
+                self.parse_declaration(DeclarationKind::Lexical(kind))?
+            }
+            TokenKind::Var => self.parse_declaration(DeclarationKind::Var)?,
             TokenKind::OpenBrace
             | TokenKind::If
             | TokenKind::While
@@ -2288,17 +2308,22 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_declaration(&mut self, kind: BindingKind) -> Result<(), Error> {
+    fn parse_declaration(&mut self, kind: DeclarationKind) -> Result<(), Error> {
         let missing_semicolon = match kind {
-            BindingKind::Const => "const declarations require explicit semicolons",
-            BindingKind::Let => "let declarations require explicit semicolons",
+            DeclarationKind::Lexical(BindingKind::Const) => {
+                "const declarations require explicit semicolons"
+            }
+            DeclarationKind::Lexical(BindingKind::Let) => {
+                "let declarations require explicit semicolons"
+            }
+            DeclarationKind::Var => "var declarations require explicit semicolons",
         };
         self.parse_declaration_list(kind, DeclaratorEnd::Statement(missing_semicolon))
     }
 
     fn parse_declaration_list(
         &mut self,
-        kind: BindingKind,
+        kind: DeclarationKind,
         end: DeclaratorEnd,
     ) -> Result<(), Error> {
         while self.parse_declarator(kind, end)? {}
@@ -2307,9 +2332,14 @@ impl Parser<'_> {
 
     // Emit and record one binding before reading the next; true means a comma
     // was consumed and another binding name is required.
-    fn parse_declarator(&mut self, kind: BindingKind, mode: DeclaratorEnd) -> Result<bool, Error> {
+    fn parse_declarator(
+        &mut self,
+        kind: DeclarationKind,
+        mode: DeclaratorEnd,
+    ) -> Result<bool, Error> {
         let name = self.require_token(TokenPosition::Plain, "expected a binding name")?;
-        if self.policy == BindingPolicy::Realm
+        if self.lexer.policy == BindingPolicy::Realm
+            && matches!(kind, DeclarationKind::Lexical(_))
             && (self.current_scope() != 0 || matches!(mode, DeclaratorEnd::ForHeader))
         {
             return Err(Error::unsupported(
@@ -2343,7 +2373,7 @@ impl Parser<'_> {
                     "void cannot be used as a binding name",
                 ));
             }
-            TokenKind::Operator(Operator::Typeof) => {
+            TokenKind::Operator(Operator::Typeof) | TokenKind::Var => {
                 return Err(Error::unsupported(
                     name.span,
                     "reserved or excluded name is outside the subset",
@@ -2370,7 +2400,7 @@ impl Parser<'_> {
             _ => return Err(Error::malformed(name.span, "expected a binding name")),
         }
         let scope = self.current_scope();
-        if self.policy == BindingPolicy::Legacy {
+        if self.lexer.policy == BindingPolicy::Legacy {
             // The classic Script global scope cannot lexically redeclare its
             // non-configurable `undefined` property. Nested scopes can shadow it.
             if self.scopes[scope].parent.is_none() && self.is_undefined_name(name.span) {
@@ -2384,14 +2414,18 @@ impl Parser<'_> {
             }
         }
         let expected_delimiter = match kind {
-            BindingKind::Const => "expected '=' after the binding name",
-            BindingKind::Let => "expected '=', ',' or ';' after the binding name",
+            DeclarationKind::Lexical(BindingKind::Const) => "expected '=' after the binding name",
+            _ => "expected '=', ',' or ';' after the binding name",
         };
         let delimiter = self.require_token(TokenPosition::Plain, expected_delimiter)?;
         let (end, separator) = match delimiter.kind {
-            TokenKind::Comma | TokenKind::Semicolon if kind == BindingKind::Let => {
-                // A metered primitive push, not a name read or a prefilled slot.
-                self.emit(Instruction::Undefined, delimiter.span)?;
+            TokenKind::Comma | TokenKind::Semicolon
+                if kind != DeclarationKind::Lexical(BindingKind::Const) =>
+            {
+                if kind == DeclarationKind::Lexical(BindingKind::Let) {
+                    // A metered primitive push, not a name read or a prefilled slot.
+                    self.emit(Instruction::Undefined, delimiter.span)?;
+                }
                 (delimiter.span, Some(delimiter.kind))
             }
             TokenKind::Assignment(None) => {
@@ -2409,16 +2443,39 @@ impl Parser<'_> {
                 return Err(Error::malformed(delimiter.span, expected_delimiter));
             }
         };
-        let slot = self.bindings.len();
-        self.emit(Instruction::InitBinding { slot, kind }, end)?;
-        let binding = Binding {
-            name: name.span,
-            kind,
-            initialized_at: end.end,
-            previous: self.scopes[scope].last_binding,
-        };
-        try_push(&mut self.bindings, binding, name.span)?;
-        self.scopes[scope].last_binding = Some(slot);
+        if self.lexer.policy == BindingPolicy::Realm {
+            use crate::realm::Role;
+            let slot = self.realm_declarations.len();
+            let role = match kind {
+                DeclarationKind::Lexical(kind) => {
+                    self.emit(Instruction::InitBinding { slot, kind }, end)?;
+                    Role::Declaration(kind)
+                }
+                DeclarationKind::Var => {
+                    self.lexer.charge(1, name.span)?; // Also meter no-op occurrences.
+                    let initialized = matches!(delimiter.kind, TokenKind::Assignment(None));
+                    if initialized {
+                        self.emit(Instruction::StoreBinding(slot), end)?;
+                    }
+                    Role::Var { initialized }
+                }
+            };
+            try_push(&mut self.realm_declarations, (name.span, role), name.span)?;
+        } else {
+            let DeclarationKind::Lexical(kind) = kind else {
+                unreachable!("legacy lexer excludes var");
+            };
+            let slot = self.bindings.len();
+            self.emit(Instruction::InitBinding { slot, kind }, end)?;
+            let binding = Binding {
+                name: name.span,
+                kind,
+                initialized_at: end.end,
+                previous: self.scopes[scope].last_binding,
+            };
+            try_push(&mut self.bindings, binding, name.span)?;
+            self.scopes[scope].last_binding = Some(slot);
+        }
         Ok(matches!(separator, Some(TokenKind::Comma)))
     }
 
@@ -2977,7 +3034,7 @@ impl Parser<'_> {
                         "assignment expressions require a simple name followed by an assignment operator at the start of an expression group",
                     ));
                 }
-                (_, TokenKind::Declaration(_)) => {
+                (_, TokenKind::Declaration(_) | TokenKind::Var) => {
                     if !needs_operand
                         && after_line_break
                         && let Some(message) = missing_semicolon

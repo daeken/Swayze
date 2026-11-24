@@ -1158,6 +1158,11 @@ fn operands_order(
     credits_left: &mut usize,
 ) -> Result<Option<Ordering>, EvalError> {
     match (lhs, rhs) {
+        // IsLessThan completes ToPrimitive on both operands before numeric
+        // conversion. Both operand expressions have already been evaluated.
+        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
+            Err(EvalError::UnsupportedCallableConversion)
+        }
         (Operand::String(lhs), Operand::String(rhs)) => {
             let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
             let rhs = rhs.get(strings).ok_or(EvalError::InvalidScript)?;

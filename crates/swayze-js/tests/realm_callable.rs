@@ -522,4 +522,21 @@ fn frame_moves_do_not_promote_strings_and_shared_operation_caps_do_not_reset() {
         run(&mut realm, "for (i=0;i<32;i++) { num(payload()); }"),
         fault(EvalError::StringNumericConversionLimitExceeded)
     );
+
+    // The 31 conversions consume 31 * (2,049 + 6,400) of 262,144
+    // credits. ToPrimitive on the callable must fail before the String
+    // needs another 2,049 credits to begin numeric conversion.
+    let warmup = "for (i=0;i<31;i++) { num(payload()); }";
+    for expression in ["payload() < num;", "(i += 1, payload()) < (i *= 2, num);"] {
+        assert_eq!(
+            run(&mut realm, &format!("{warmup} {expression}")),
+            fault(EvalError::UnsupportedCallableConversion)
+        );
+    }
+    normal(&mut realm, "if (i !== 64) bad;");
+    // Subtraction instead performs lhs ToNumeric before rhs ToNumeric.
+    assert_eq!(
+        run(&mut realm, &format!("{warmup} payload() - num;")),
+        fault(EvalError::StringNumericConversionLimitExceeded)
+    );
 }

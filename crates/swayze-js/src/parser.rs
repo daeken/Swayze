@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::radix_integer::RadixInteger;
+use crate::{radix_integer::RadixInteger, realm::CodeMode};
 
 mod string_literal;
 use string_literal::CookedSegment;
@@ -374,7 +374,7 @@ fn parse(
     allow_empty_exit: bool,
 ) -> Result<(PreparedScript, ExitStack), Error> {
     let mut parser = new_parser(source, limits, BindingPolicy::Legacy)?;
-    let exit = parser.parse(allow_empty_exit)?;
+    let (exit, _) = parser.parse(allow_empty_exit)?;
     // Legacy resolves names on every path, at the same point and with the
     // same parser work budget as the grammar it just completed.
     parser.resolve_accesses()?;
@@ -411,6 +411,10 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
             tokens_left: limits.max_tokens,
             work_left: limits.max_work,
             string_units: Vec::new(),
+            quoted_decimal_escape: match policy {
+                BindingPolicy::Legacy => QuotedDecimalEscape::Disabled,
+                BindingPolicy::Realm => QuotedDecimalEscape::Pending,
+            },
         },
         lookahead: None,
         max_nesting_depth: limits.max_nesting_depth,
@@ -614,12 +618,20 @@ struct Token {
     after_line_break: bool,
 }
 
+// Only Realm records a witness, even before the parser knows the code mode.
+enum QuotedDecimalEscape {
+    Disabled,
+    Pending,
+    Found(Span),
+}
+
 struct Lexer<'s> {
     source: &'s str,
     offset: usize,
     tokens_left: usize,
     work_left: usize,
     string_units: Vec<u16>,
+    quoted_decimal_escape: QuotedDecimalEscape,
 }
 
 fn is_line_terminator(c: char) -> bool {
@@ -1433,8 +1445,9 @@ struct Parser<'s> {
 }
 
 impl Parser<'_> {
-    fn parse(&mut self, allow_empty_exit: bool) -> Result<ExitStack, Error> {
+    fn parse(&mut self, allow_empty_exit: bool) -> Result<(ExitStack, CodeMode), Error> {
         self.add_scope(None, Span::at(0))?;
+        let mut mode = CodeMode::Sloppy;
         let mut saw_statement = false;
         let mut in_directive_prologue = true;
         let exit = loop {
@@ -1479,10 +1492,18 @@ impl Parser<'_> {
                     &self.lexer.source[span.start..span.end],
                     "'use strict'" | "\"use strict\""
                 ) {
-                    return Err(Error::unsupported(
-                        span,
-                        "Use Strict Directives are outside the subset",
-                    ));
+                    match self.policy {
+                        BindingPolicy::Legacy => {
+                            return Err(Error::unsupported(
+                                span,
+                                "Use Strict Directives are outside the subset",
+                            ));
+                        }
+                        BindingPolicy::Realm if matches!(delimiter, Some(TokenKind::Semicolon)) => {
+                            mode = CodeMode::Strict;
+                        }
+                        BindingPolicy::Realm => {} // The explicit semicolon check below fails.
+                    }
                 }
             } else {
                 in_directive_prologue = false;
@@ -1502,7 +1523,7 @@ impl Parser<'_> {
             self.lookahead = Some(next);
             self.emit(Instruction::Discard, end)?;
         };
-        Ok(exit)
+        Ok((exit, mode))
     }
 
     fn into_program(self) -> PreparedScript {

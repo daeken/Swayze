@@ -11,10 +11,11 @@
 //! assert_eq!(realm.instantiate(&consumer).unwrap().execute(), Ok(Completion::Normal));
 //! ```
 //!
-//! No global object, host bindings, `var`, strict directives, nested lexical
-//! declarations, or persistent Strings. `undefined` is the sole intrinsic
-//! fallback. The host chooses which checked Scripts to retain; the Realm does
-//! not own or cache them. No Script results or binding handles leave the Realm.
+//! No global object, host bindings, `var`, nested lexical declarations, or
+//! persistent Strings. `undefined` is the sole intrinsic fallback. An exact
+//! Use Strict Directive in the root prologue affects only its own Script.
+//! The Realm does not own or cache checked Scripts. No Script results or
+//! binding handles leave the Realm.
 
 use std::fmt;
 
@@ -48,12 +49,19 @@ pub(crate) struct Site {
     pub(crate) role: Role,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeMode {
+    Sloppy,
+    Strict,
+}
+
 /// Immutable policy-compiled code with no source borrow or Realm dependency.
 pub struct CompiledScript {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) string_units: Vec<u16>,
     pub(crate) max_stack_depth: usize,
     pub(crate) exit: ExitStack,
+    pub(crate) mode: CodeMode,
     pub(crate) names: Vec<u8>,
     pub(crate) sites: Vec<Site>,
     pub(crate) declarations: usize,
@@ -97,7 +105,7 @@ pub enum CompileLimit {
 pub enum CompileError {
     /// Usual coarse parser diagnostic (not a typed JavaScript exception).
     Parse(Error),
-    /// A proven duplicate lexical declaration in this Script.
+    /// A duplicate lexical declaration or a quoted `\8`/`\9` in strict code.
     SyntaxError {
         span: Span,
     },
@@ -407,9 +415,14 @@ impl ReadyScript<'_, '_> {
 
     fn put(&mut self, target: Target, span: Span, value: Operand) -> Result<(), Stop> {
         let cell = match target {
-            // Sloppy writes to the readonly intrinsic are ignored, *after*
-            // the RHS/coercion. No value escapes, including String operands.
-            Target::Undefined => return Ok(()),
+            // Only reached writes get here, after RHS evaluation/coercion.
+            Target::Undefined if self.code.mode == CodeMode::Strict => {
+                return Err(Stop::Throw(Throw::TypeError { span }));
+            }
+            Target::Undefined => return Ok(()), // Sloppy readonly write, even with a String RHS.
+            Target::Missing if self.code.mode == CodeMode::Strict => {
+                return Err(Stop::Throw(Throw::ReferenceError { span }));
+            }
             Target::Missing => return Err(Stop::Engine(EngineFault::ImplicitGlobal { span })),
             Target::Lexical(slot) => self
                 .realm

@@ -1,6 +1,6 @@
 use std::{collections::TryReserveError, ops::Range};
 
-use super::{EvalError, Operand, Value};
+use super::{EvalError, Operand, Value, realm::RealmRange};
 use crate::{
     number_format,
     parser::{MAX_STRING_LITERAL_CODE_UNITS, StringRange},
@@ -17,7 +17,7 @@ type Chunk = [u16; CHUNK_UNITS];
 
 // Frozen UTF-16 spellings: no per-Script or scratch allocation. The only
 // way to refer to one in an operand is by the private, payload-free tag.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum TypeName {
     Number,
     Boolean,
@@ -98,34 +98,38 @@ impl EvalScratch {
         &self.chunks.as_flattened()[..self.used]
     }
 
-    pub(super) fn pools<'a>(&'a self, literals: &'a [u16]) -> StringPools<'a> {
-        StringPools {
+    pub(super) fn transient<'a>(&'a self, literals: &'a [u16]) -> TransientStrings<'a> {
+        TransientStrings {
             literals,
             runtime: self.runtime_units(),
         }
     }
 
+    pub(super) fn pools<'a>(&'a self, literals: &'a [u16]) -> StringPools<'a> {
+        self.transient(literals).with_retained(&[])
+    }
+
     pub(super) fn concatenate(
         &mut self,
-        literals: &[u16],
+        external: ExternalStrings<'_>,
         lhs: StringOperand,
         rhs: StringOperand,
     ) -> Result<StringOperand, EvalError> {
         // Validate both ranges against their logical pools before checking
         // limits or growing. Runtime sources keep indices, not slices.
-        let lhs = AppendSource::checked(lhs, literals, self.used)?;
-        let rhs = AppendSource::checked(rhs, literals, self.used)?;
+        let lhs = AppendSource::checked(lhs, external, self.used)?;
+        let rhs = AppendSource::checked(rhs, external, self.used)?;
         self.append_pair(lhs, rhs)
     }
 
     pub(super) fn concatenate_scalar(
         &mut self,
-        literals: &[u16],
+        external: ExternalStrings<'_>,
         string: StringOperand,
         scalar: Value,
         scalar_first: bool,
     ) -> Result<StringOperand, EvalError> {
-        let string = AppendSource::checked(string, literals, self.used)?;
+        let string = AppendSource::checked(string, external, self.used)?;
         match scalar_spelling(scalar) {
             ScalarSpelling::Units(units) => self.append_scalar(string, units, scalar_first),
             ScalarSpelling::Number(number) => self.concatenate_number(string, number, scalar_first),
@@ -194,15 +198,17 @@ impl EvalScratch {
     #[inline(never)]
     pub(super) fn append_template(
         &mut self,
-        literals: &[u16],
+        external: ExternalStrings<'_>,
         prefix: StringOperand,
         substitution: Operand,
         following: StringRange,
     ) -> Result<StringOperand, EvalError> {
-        let prefix = AppendSource::checked(prefix, literals, self.used)?;
-        let following = following.get(literals).ok_or(EvalError::InvalidScript)?;
+        let prefix = AppendSource::checked(prefix, external, self.used)?;
+        let following = following
+            .get(external.literals)
+            .ok_or(EvalError::InvalidScript)?;
         let substitution = match substitution {
-            Operand::String(string) => AppendSource::checked(string, literals, self.used)?,
+            Operand::String(string) => AppendSource::checked(string, external, self.used)?,
             Operand::Scalar(scalar) => match scalar_spelling(scalar) {
                 ScalarSpelling::Units(units) => AppendSource::Borrowed(units),
                 ScalarSpelling::Number(number) => {
@@ -323,14 +329,18 @@ pub(super) enum StringOperand {
     Literal(StringRange),
     Runtime(RuntimeRange),
     TypeName(TypeName),
+    Empty,
+    Realm(RealmRange),
 }
 
 impl StringOperand {
     pub(super) fn get(self, pools: StringPools<'_>) -> Option<&[u16]> {
         match self {
-            Self::Literal(range) => range.get(pools.literals),
-            Self::Runtime(range) => pools.runtime.get(range.indices()),
+            Self::Literal(range) => pools.transient.literal(range),
+            Self::Runtime(range) => pools.transient.runtime(range),
             Self::TypeName(name) => Some(name.units()),
+            Self::Empty => Some(&[]),
+            Self::Realm(range) => range.get(pools.retained),
         }
     }
 
@@ -338,25 +348,61 @@ impl StringOperand {
         match self {
             Self::Literal(range) => range.is_empty(),
             Self::Runtime(range) => range.start == range.end,
-            Self::TypeName(_) => false,
+            Self::Empty => true,
+            // A Realm operand has already been checked by lexical GetValue;
+            // only nonempty ranges are issued, and the prefix never shrinks.
+            Self::TypeName(_) | Self::Realm(_) => false,
+        }
+    }
+}
+
+// Sources for a binding write deliberately cannot borrow the Realm arena.
+#[derive(Clone, Copy)]
+pub(super) struct TransientStrings<'a> {
+    literals: &'a [u16],
+    runtime: &'a [u16],
+}
+
+impl<'a> TransientStrings<'a> {
+    pub(super) fn literal(self, range: StringRange) -> Option<&'a [u16]> {
+        range.get(self.literals)
+    }
+
+    pub(super) fn runtime(self, range: RuntimeRange) -> Option<&'a [u16]> {
+        self.runtime.get(range.indices())
+    }
+
+    pub(super) fn with_retained(self, retained: &'a [u16]) -> StringPools<'a> {
+        StringPools {
+            transient: self,
+            retained,
         }
     }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct StringPools<'a> {
-    literals: &'a [u16],
-    runtime: &'a [u16],
+    transient: TransientStrings<'a>,
+    retained: &'a [u16],
 }
 
 #[cfg(test)]
 impl<'a> StringPools<'a> {
     pub(super) fn literals(literals: &'a [u16]) -> Self {
-        Self {
+        TransientStrings {
             literals,
             runtime: &[],
         }
+        .with_retained(&[])
     }
+}
+
+// Unlike the short-lived read pools, this cannot borrow scratch. Append
+// plans keep checked scratch indices across reserve and borrow only afterward.
+#[derive(Clone, Copy)]
+pub(super) struct ExternalStrings<'a> {
+    pub(super) literals: &'a [u16],
+    pub(super) retained: &'a [u16],
 }
 
 enum AppendSource<'a> {
@@ -365,13 +411,22 @@ enum AppendSource<'a> {
 }
 
 impl<'a> AppendSource<'a> {
-    fn checked(string: StringOperand, literals: &'a [u16], used: usize) -> Result<Self, EvalError> {
+    fn checked(
+        string: StringOperand,
+        external: ExternalStrings<'a>,
+        used: usize,
+    ) -> Result<Self, EvalError> {
         match string {
             StringOperand::Literal(range) => range
-                .get(literals)
+                .get(external.literals)
                 .map(Self::Borrowed)
                 .ok_or(EvalError::InvalidScript),
             StringOperand::TypeName(name) => Ok(Self::Borrowed(name.units())),
+            StringOperand::Empty => Ok(Self::Borrowed(&[])),
+            StringOperand::Realm(range) => range
+                .get(external.retained)
+                .map(Self::Borrowed)
+                .ok_or(EvalError::InvalidScript),
             StringOperand::Runtime(range) => {
                 let indices = range.indices();
                 if indices.start > indices.end || indices.end > used {
@@ -402,6 +457,13 @@ impl<'a> AppendSource<'a> {
 mod tests {
     use super::*;
     use crate::{PrimitiveValue, Value, parse_script, parser::Instruction};
+
+    fn external(literals: &[u16]) -> ExternalStrings<'_> {
+        ExternalStrings {
+            literals,
+            retained: &[],
+        }
+    }
 
     #[test]
     fn template_appends_check_all_ranges_and_publish_only_after_success() {
@@ -436,7 +498,9 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                scratch.append_template(pool, prefix, sub, following).err(),
+                scratch
+                    .append_template(external(pool), prefix, sub, following)
+                    .err(),
                 Some(EvalError::InvalidScript)
             );
             assert_eq!(scratch.used, 0);
@@ -444,7 +508,7 @@ mod tests {
         }
         let output = scratch
             .append_template(
-                literals,
+                external(literals),
                 empty_literal,
                 Operand::String(empty_literal),
                 *empty,
@@ -458,8 +522,8 @@ mod tests {
             .append_pair(AppendSource::Borrowed(&text), AppendSource::Borrowed(&[]))
             .unwrap();
         let old_capacity = scratch.chunks.capacity();
-        let lhs = AppendSource::checked(old, literals, scratch.used).unwrap();
-        let rhs = AppendSource::checked(old, literals, scratch.used).unwrap();
+        let lhs = AppendSource::checked(old, external(literals), scratch.used).unwrap();
+        let rhs = AppendSource::checked(old, external(literals), scratch.used).unwrap();
         assert_eq!(
             scratch
                 .append_three(lhs, rhs, literals, |chunks, _| chunks
@@ -471,7 +535,7 @@ mod tests {
         assert_eq!(scratch.chunks.len(), 1);
         assert_eq!(scratch.runtime_units(), text);
         let out = scratch
-            .append_template(literals, old, Operand::String(old), *abc)
+            .append_template(external(literals), old, Operand::String(old), *abc)
             .unwrap();
         assert_eq!(old.get(scratch.pools(literals)), Some(&text[..]));
         let result = out.get(scratch.pools(literals)).unwrap();
@@ -490,18 +554,20 @@ mod tests {
         });
         let scalar = Operand::Scalar(Value::Number(1.0));
         assert_eq!(
-            scratch.append_template(&[], long, scalar, *empty).err(),
+            scratch
+                .append_template(external(&[]), long, scalar, *empty)
+                .err(),
             Some(EvalError::InvalidScript)
         );
         assert_eq!(
             scratch
-                .append_template(literals, long, scalar, *empty)
+                .append_template(external(literals), long, scalar, *empty)
                 .err(),
             Some(EvalError::StringConcatenationLengthLimitExceeded)
         );
         assert_eq!(
             scratch
-                .append_template(literals, empty_literal, scalar, *empty)
+                .append_template(external(literals), empty_literal, scalar, *empty)
                 .err(),
             Some(EvalError::StringConcatenationBudgetExceeded)
         );
@@ -557,7 +623,7 @@ mod tests {
         let literals = script.string_units();
         let warm = scratch
             .concatenate(
-                literals,
+                external(literals),
                 StringOperand::Literal(a),
                 StringOperand::Literal(b),
             )
@@ -596,15 +662,15 @@ mod tests {
         let literals = script.string_units();
         let a = StringOperand::Literal(*a);
         let b = StringOperand::Literal(*b);
-        let first = scratch.concatenate(literals, a, b).unwrap();
+        let first = scratch.concatenate(external(literals), a, b).unwrap();
         let before_growth = scratch.chunks.capacity();
         // Force the reserve branch for the two references into the old arena
         // on the pinned allocator; movement of the allocation is not assumed.
         assert!(before_growth < 12);
         let old_chunks = scratch.chunks.clone();
         let mut calls = 0;
-        let lhs = AppendSource::checked(first, literals, scratch.used).unwrap();
-        let rhs = AppendSource::checked(first, literals, scratch.used).unwrap();
+        let lhs = AppendSource::checked(first, external(literals), scratch.used).unwrap();
+        let rhs = AppendSource::checked(first, external(literals), scratch.used).unwrap();
         assert_eq!(
             scratch
                 .append_pair_with(lhs, rhs, |chunks, additional| {
@@ -625,10 +691,12 @@ mod tests {
             end: 3072,
         });
         assert_eq!(unpublished.get(scratch.pools(literals)), None);
-        let twice = scratch.concatenate(literals, first, first).unwrap();
+        let twice = scratch
+            .concatenate(external(literals), first, first)
+            .unwrap();
         assert!(scratch.chunks.capacity() >= 12);
-        let mixed = scratch.concatenate(literals, b, twice).unwrap();
-        let mixed = scratch.concatenate(literals, mixed, b).unwrap();
+        let mixed = scratch.concatenate(external(literals), b, twice).unwrap();
+        let mixed = scratch.concatenate(external(literals), mixed, b).unwrap();
         let block = format!("{text}b");
         let pools = scratch.pools(literals);
         assert_eq!(
@@ -658,12 +726,14 @@ mod tests {
         let mut scratch = EvalScratch::new();
         let literals = script.string_units();
         assert_eq!(
-            scratch.concatenate(literals, a, uninitialized).err(),
+            scratch
+                .concatenate(external(literals), a, uninitialized)
+                .err(),
             Some(EvalError::InvalidScript)
         );
         assert_eq!(scratch.chunks.capacity(), 0);
         assert!(scratch.chunks.is_empty());
-        let first = scratch.concatenate(literals, a, a).unwrap();
+        let first = scratch.concatenate(external(literals), a, a).unwrap();
         let old_capacity = scratch.chunks.capacity();
         for (lhs, rhs) in [
             (
@@ -676,7 +746,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                scratch.concatenate(literals, lhs, rhs).err(),
+                scratch.concatenate(external(literals), lhs, rhs).err(),
                 Some(EvalError::InvalidScript)
             );
             assert_eq!(scratch.chunks.capacity(), old_capacity);
@@ -699,7 +769,7 @@ mod tests {
         for scalar_first in [false, true] {
             assert_eq!(
                 scratch
-                    .concatenate_scalar(&literals[..1023], checked, number, scalar_first)
+                    .concatenate_scalar(external(&literals[..1023]), checked, number, scalar_first)
                     .err(),
                 Some(EvalError::InvalidScript),
             );
@@ -707,11 +777,11 @@ mod tests {
         assert_eq!(scratch.chunks.capacity(), 0);
         assert!(scratch.chunks.is_empty());
         let first = scratch
-            .concatenate_scalar(literals, checked, number, true)
+            .concatenate_scalar(external(literals), checked, number, true)
             .unwrap();
         assert!(scratch.chunks.capacity() < 9);
         let next = scratch
-            .concatenate_scalar(literals, first, number, false)
+            .concatenate_scalar(external(literals), first, number, false)
             .unwrap();
         assert!(scratch.chunks.capacity() >= 9);
         let pools = scratch.pools(literals);
@@ -735,7 +805,7 @@ mod tests {
                 assert_eq!(
                     scratch
                         .concatenate_scalar(
-                            literals,
+                            external(literals),
                             StringOperand::Runtime(range),
                             number,
                             scalar_first
@@ -900,11 +970,13 @@ mod tests {
             assert_eq!(stale.get(scratch.pools(&[])), None);
             assert_eq!(empty_past_end.get(scratch.pools(&[])), None);
             assert_eq!(
-                scratch.concatenate(&[], empty_at_end, stale).err(),
+                scratch
+                    .concatenate(external(&[]), empty_at_end, stale)
+                    .err(),
                 Some(EvalError::InvalidScript)
             );
             let empty = scratch
-                .concatenate(&[], empty_at_end, empty_at_end)
+                .concatenate(external(&[]), empty_at_end, empty_at_end)
                 .unwrap();
             assert_eq!(empty.get(scratch.pools(&[])), Some(&[][..]));
             assert_eq!(scratch.runtime_units(), [121]);

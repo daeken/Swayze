@@ -23,7 +23,7 @@ mod string_concat;
 mod string_number;
 
 pub use string_concat::EvalScratch;
-use string_concat::{StringOperand, StringPools, TypeName};
+use string_concat::{ExternalStrings, StringOperand, StringPools, TransientStrings, TypeName};
 
 /// A scalar value in the supported JavaScript subset.
 ///
@@ -56,7 +56,8 @@ pub enum PrimitiveValue<'a> {
 #[derive(Clone, Copy)]
 enum Operand {
     Scalar(Value),
-    // Literal dispatch and concatenation check ranges before creating operands.
+    // Producers check logical bounds before creating operands. Realm GetValue
+    // also checks offsets before returning them to metadata-only consumers.
     String(StringOperand),
 }
 
@@ -393,6 +394,9 @@ impl Script {
             Operand::String(StringOperand::Runtime(_)) => {
                 Err(EvalError::RuntimeStringResultRequiresScratch)
             }
+            Operand::String(StringOperand::Empty | StringOperand::Realm(_)) => {
+                Err(EvalError::InvalidScript)
+            }
         }
     }
 
@@ -419,6 +423,9 @@ impl Script {
     ) -> Result<PrimitiveValue<'a>, EvalError> {
         match self.run(scratch)? {
             Operand::Scalar(value) => Ok(PrimitiveValue::Scalar(value)),
+            Operand::String(StringOperand::Empty | StringOperand::Realm(_)) => {
+                Err(EvalError::InvalidScript)
+            }
             Operand::String(range) => range
                 .get(scratch.pools(self.string_units()))
                 .map(PrimitiveValue::String)
@@ -578,13 +585,20 @@ fn dispatch<B: Bindings>(
                 push_operand(&mut stack, max_operands, bindings.load(slot)?)?;
             }
             Instruction::InitBinding { slot, kind } => {
-                bindings.init(slot, kind, ip - 1, &mut stack)?;
+                bindings.init(
+                    slot,
+                    kind,
+                    ip - 1,
+                    &mut stack,
+                    scratch.transient(string_units),
+                )?;
             }
             Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
                 bindings.store(
                     slot,
                     matches!(op, Instruction::StoreBindingKeep(_)),
                     &mut stack,
+                    scratch.transient(string_units),
                 )?;
             }
             Instruction::UpdateBinding { slot, op, result } => {
@@ -595,7 +609,7 @@ fn dispatch<B: Bindings>(
                     &mut stack,
                     max_operands,
                     UpdateNumeric {
-                        pools: scratch.pools(string_units),
+                        source: scratch.transient(string_units),
                         credits: &mut string_conversion_credits_left,
                     },
                 )?;
@@ -608,82 +622,87 @@ fn dispatch<B: Bindings>(
                     return Err(EvalError::InvalidScript);
                 }
                 let old = lhs.to_number(
-                    scratch.pools(string_units),
+                    bindings.string_pools(scratch, string_units),
                     &mut string_conversion_credits_left,
                 )?;
                 Ok(Value::Number(update_number(op, old)))
             })?,
-            Instruction::Add => {
-                apply_binary_operand(&mut stack, |lhs, rhs| add(lhs, rhs, string_units, scratch))?
-            }
+            Instruction::Add => apply_binary_operand(&mut stack, |lhs, rhs| {
+                add(lhs, rhs, bindings.external_strings(string_units), scratch)
+            })?,
             Instruction::TemplateAppend(following) => {
-                append_template(&mut stack, string_units, scratch, following)?;
+                append_template(
+                    &mut stack,
+                    bindings.external_strings(string_units),
+                    scratch,
+                    following,
+                )?;
             }
             Instruction::Subtract => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs - rhs,
             )?,
             Instruction::Multiply => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs * rhs,
             )?,
             Instruction::Divide => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs / rhs,
             )?,
             // Floating-point `%` uses a quotient truncated toward zero, as in JS.
             Instruction::Remainder => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| lhs % rhs,
             )?,
             Instruction::Exponentiate => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 exponentiate,
             )?,
             Instruction::BitwiseAnd => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs & rhs),
             )?,
             Instruction::BitwiseXor => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs ^ rhs),
             )?,
             Instruction::BitwiseOr => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 signed_bitwise(|lhs, rhs| lhs | rhs),
             )?,
             // Rust's wrapping shifts use only the low five count bits for i32/u32.
             Instruction::ShiftLeft => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shl(number_to_uint32(rhs))),
             )?,
             Instruction::ShiftRight => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shr(number_to_uint32(rhs))),
             )?,
             Instruction::ShiftRightUnsigned => apply_numeric_binary(
                 &mut stack,
-                scratch.pools(string_units),
+                bindings.string_pools(scratch, string_units),
                 &mut string_conversion_credits_left,
                 |lhs, rhs| f64::from(number_to_uint32(lhs).wrapping_shr(number_to_uint32(rhs))),
             )?,
@@ -698,7 +717,7 @@ fn dispatch<B: Bindings>(
                         lhs,
                         rhs,
                         strict,
-                        scratch.pools(string_units),
+                        bindings.string_pools(scratch, string_units),
                         &mut string_pairs_left,
                         &mut string_conversion_credits_left,
                     )?;
@@ -713,7 +732,7 @@ fn dispatch<B: Bindings>(
                     let order = operands_order(
                         lhs,
                         rhs,
-                        scratch.pools(string_units),
+                        bindings.string_pools(scratch, string_units),
                         &mut string_pairs_left,
                         &mut string_conversion_credits_left,
                     )?;
@@ -737,7 +756,7 @@ fn dispatch<B: Bindings>(
             Instruction::Positive => {
                 apply_unary(&mut stack, |value| {
                     let number = value.to_number(
-                        scratch.pools(string_units),
+                        bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
                     Ok(Value::Number(number))
@@ -746,7 +765,7 @@ fn dispatch<B: Bindings>(
             Instruction::Negate => {
                 apply_unary(&mut stack, |value| {
                     let number = value.to_number(
-                        scratch.pools(string_units),
+                        bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
                     Ok(Value::Number(-number))
@@ -758,7 +777,7 @@ fn dispatch<B: Bindings>(
             Instruction::BitwiseNot => {
                 apply_unary(&mut stack, |value| {
                     let number = value.to_number(
-                        scratch.pools(string_units),
+                        bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
                     Ok(Value::Number(f64::from(!number_to_int32(number))))
@@ -778,7 +797,7 @@ fn dispatch<B: Bindings>(
             }
             Instruction::StringLength => {
                 apply_unary(&mut stack, |value| {
-                    string_length(value, scratch.pools(string_units))
+                    string_length(value, bindings.string_pools(scratch, string_units))
                 })?;
             }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
@@ -971,7 +990,7 @@ fn update_number(op: Update, old: f64) -> f64 {
 #[inline(never)]
 fn append_template(
     stack: &mut Vec<Operand>,
-    literals: &[u16],
+    external: ExternalStrings<'_>,
     scratch: &mut EvalScratch,
     following: crate::parser::StringRange,
 ) -> Result<(), EvalError> {
@@ -981,7 +1000,7 @@ fn append_template(
     let Operand::String(prefix) = *lhs else {
         return Err(EvalError::InvalidScript);
     };
-    *lhs = Operand::String(scratch.append_template(literals, prefix, *rhs, following)?);
+    *lhs = Operand::String(scratch.append_template(external, prefix, *rhs, following)?);
     stack.pop();
     Ok(())
 }
@@ -989,21 +1008,21 @@ fn append_template(
 fn add(
     lhs: Operand,
     rhs: Operand,
-    string_units: &[u16],
+    external: ExternalStrings<'_>,
     scratch: &mut EvalScratch,
 ) -> Result<Operand, EvalError> {
     match (lhs, rhs) {
         (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(Operand::Scalar(Value::Number(
             lhs.to_number() + rhs.to_number(),
         ))),
-        (Operand::String(lhs), Operand::String(rhs)) => scratch
-            .concatenate(string_units, lhs, rhs)
-            .map(Operand::String),
+        (Operand::String(lhs), Operand::String(rhs)) => {
+            scratch.concatenate(external, lhs, rhs).map(Operand::String)
+        }
         (Operand::String(string), Operand::Scalar(scalar)) => scratch
-            .concatenate_scalar(string_units, string, scalar, false)
+            .concatenate_scalar(external, string, scalar, false)
             .map(Operand::String),
         (Operand::Scalar(scalar), Operand::String(string)) => scratch
-            .concatenate_scalar(string_units, string, scalar, true)
+            .concatenate_scalar(external, string, scalar, true)
             .map(Operand::String),
     }
 }

@@ -1,10 +1,10 @@
 use super::{
-    BindingKind, EvalError, Operand, StringPools, Update, UpdateResult, Value, push_operand,
-    update_number,
+    BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, StringPools, TransientStrings,
+    Update, UpdateResult, Value, push_operand, update_number,
 };
 
 pub(super) struct UpdateNumeric<'pools, 'budget> {
-    pub(super) pools: StringPools<'pools>,
+    pub(super) source: TransientStrings<'pools>,
     pub(super) credits: &'budget mut usize,
 }
 
@@ -13,6 +13,27 @@ pub(super) struct UpdateNumeric<'pools, 'budget> {
 pub(super) trait Bindings {
     type Error: From<EvalError>;
 
+    fn retained_units(&self) -> &[u16] {
+        &[]
+    }
+
+    fn external_strings<'a>(&'a self, literals: &'a [u16]) -> ExternalStrings<'a> {
+        ExternalStrings {
+            literals,
+            retained: self.retained_units(),
+        }
+    }
+
+    fn string_pools<'a>(
+        &'a self,
+        scratch: &'a EvalScratch,
+        literals: &'a [u16],
+    ) -> StringPools<'a> {
+        scratch
+            .transient(literals)
+            .with_retained(self.retained_units())
+    }
+
     fn load(&self, slot: usize) -> Result<Operand, Self::Error>;
     fn init(
         &mut self,
@@ -20,12 +41,14 @@ pub(super) trait Bindings {
         kind: BindingKind,
         ip: usize,
         stack: &mut Vec<Operand>,
+        source: TransientStrings<'_>,
     ) -> Result<(), Self::Error>;
     fn store(
         &mut self,
         slot: usize,
         keep: bool,
         stack: &mut Vec<Operand>,
+        source: TransientStrings<'_>,
     ) -> Result<(), Self::Error>;
     fn update(
         &mut self,
@@ -90,6 +113,7 @@ impl Bindings for LegacyBindings {
         kind: BindingKind,
         init_at: usize,
         stack: &mut Vec<Operand>,
+        _: TransientStrings<'_>,
     ) -> Result<(), EvalError> {
         let binding = self.0.get_mut(slot).ok_or(EvalError::InvalidScript)?;
         if binding.as_ref().is_some_and(|old| old.init_at != init_at) {
@@ -108,6 +132,7 @@ impl Bindings for LegacyBindings {
         slot: usize,
         keep: bool,
         stack: &mut Vec<Operand>,
+        _: TransientStrings<'_>,
     ) -> Result<(), EvalError> {
         let value = self.writable(slot)?;
         *value = store_operand(stack, keep)?;
@@ -124,7 +149,7 @@ impl Bindings for LegacyBindings {
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), EvalError> {
         let value = self.writable(slot)?;
-        let old = value.to_number(numeric.pools, numeric.credits)?;
+        let old = value.to_number(numeric.source.with_retained(&[]), numeric.credits)?;
         let new = update_number(op, old);
         update_result(stack, max, result, old, new)?;
         *value = Operand::Scalar(Value::Number(new));

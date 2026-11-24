@@ -1,4 +1,4 @@
-//! Opt-in, bounded Script execution with persistent root lexical scalars.
+//! Opt-in, bounded Script execution with persistent root lexical primitives.
 //!
 //! ```
 //! use swayze_js::realm::{CompiledScript, Completion, Realm};
@@ -11,20 +11,30 @@
 //! assert_eq!(realm.instantiate(&consumer).unwrap().execute(), Ok(Completion::Normal));
 //! ```
 //!
-//! No global object, host bindings, `var`, nested lexical declarations, or
-//! persistent Strings. `undefined` is the sole intrinsic fallback. An exact
-//! Use Strict Directive in the root prologue affects only its own Script.
-//! The Realm does not own or cache checked Scripts. No Script results or
-//! binding handles leave the Realm.
+//! No global object, host bindings, `var`, or nested lexical declarations.
+//! `undefined` is the sole intrinsic fallback. An exact Use Strict Directive
+//! in the root prologue affects only its own Script. The host chooses which
+//! checked Scripts to retain; the Realm does not own or cache them. No Script
+//! results or binding handles leave the Realm.
+//!
+//! An allowed lexical write copies a nonempty Script-local or temporary String
+//! into the Realm. Each execution can copy up to 16,384 UTF-16 units; the Realm
+//! retains up to 32,768 copied units over its lifetime, even after overwrite.
+//! Aliasing an existing Realm String, storing a static `typeof` spelling, or
+//! storing an empty String copies nothing. These ceilings are independent of
+//! the existing per-String and evaluation ceilings.
 
-use std::fmt;
+use std::{collections::TryReserveError, fmt};
 
-use crate::{Error, Span, parser};
+use crate::{
+    Error, Span,
+    parser::{self, MAX_STRING_LITERAL_CODE_UNITS},
+};
 
 use super::{
-    BindingKind, Bindings, EvalError, EvalScratch, ExitStack, Instruction, Operand, Update,
-    UpdateNumeric, UpdateResult, Value, dispatch, init_operand, new_stack, store_operand,
-    update_number, update_result, validate_layout,
+    BindingKind, Bindings, EvalError, EvalScratch, ExitStack, Instruction, Operand, StringOperand,
+    TransientStrings, TypeName, Update, UpdateNumeric, UpdateResult, Value, dispatch, init_operand,
+    new_stack, store_operand, update_number, update_result, validate_layout,
 };
 
 pub(crate) const MAX_NAME_BYTES: usize = 256;
@@ -33,6 +43,13 @@ pub(crate) const MAX_DECLARATIONS: usize = 256;
 pub(crate) const MAX_SITES: usize = 4096;
 const MAX_GLOBALS: usize = 512;
 const PREFLIGHT_WORK: usize = 128 * 1024;
+const MAX_COPIED_UNITS: usize = 16_384;
+const MAX_RETAINED_UNITS: usize = 32_768;
+const CHUNK_UNITS: usize = 256;
+const _: () = assert!(MAX_RETAINED_UNITS <= u16::MAX as usize);
+const _: () = assert!(MAX_RETAINED_UNITS.is_multiple_of(CHUNK_UNITS));
+const _: () = assert!((MAX_RETAINED_UNITS / CHUNK_UNITS).is_power_of_two());
+type Chunk = [u16; CHUNK_UNITS];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Role {
@@ -155,21 +172,127 @@ pub enum Throw {
 #[non_exhaustive]
 pub enum EngineFault {
     Evaluation(EvalError),
-    ImplicitGlobal { span: Span },
-    PersistentString { span: Span },
+    ImplicitGlobal {
+        span: Span,
+    },
+    /// Kept for compatibility; lexical String persistence no longer emits this fault.
+    PersistentString {
+        span: Span,
+    },
+    /// This execution would copy more than 16,384 UTF-16 units.
+    StringCopyLimitExceeded {
+        span: Span,
+    },
+    /// This Realm would retain more than 32,768 UTF-16 units.
+    StringRetentionLimitExceeded {
+        span: Span,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StoredValue {
+    Scalar(Value),
+    TypeName(TypeName),
+    Empty,
+    Realm(RealmRange),
+}
+
+// Not a public handle: only successful appends issue offsets, and the private
+// operand stack and cells never cross Realm boundaries. Reborrowing uses the
+// owner's logical prefix, not initialized padding or allocator capacity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RealmRange {
+    start: u16,
+    end: u16,
+}
+
+impl RealmRange {
+    pub(super) fn get(self, retained: &[u16]) -> Option<&[u16]> {
+        let (start, end) = (usize::from(self.start), usize::from(self.end));
+        retained
+            .get(start..end)
+            .filter(|units| !units.is_empty() && units.len() <= MAX_STRING_LITERAL_CODE_UNITS)
+    }
+}
+
+#[derive(Default)]
+struct Arena {
+    chunks: Vec<Chunk>,
+    used: usize,
+}
+
+impl Arena {
+    fn units(&self) -> &[u16] {
+        &self.chunks.as_flattened()[..self.used]
+    }
+
+    #[inline(never)]
+    fn append(
+        &mut self,
+        units: &[u16],
+        copied: &mut usize,
+        span: Span,
+        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
+    ) -> Result<StoredValue, Stop> {
+        if units.is_empty() {
+            return Ok(StoredValue::Empty);
+        }
+        if units.len() > MAX_STRING_LITERAL_CODE_UNITS {
+            return Err(EvalError::InvalidScript.into());
+        }
+        let next_copied = copied
+            .checked_add(units.len())
+            .filter(|&total| total <= MAX_COPIED_UNITS)
+            .ok_or(Stop::Engine(EngineFault::StringCopyLimitExceeded { span }))?;
+        let end = self
+            .used
+            .checked_add(units.len())
+            .filter(|&end| end <= MAX_RETAINED_UNITS)
+            .ok_or(Stop::Engine(EngineFault::StringRetentionLimitExceeded {
+                span,
+            }))?;
+        let needed = end.div_ceil(CHUNK_UNITS);
+        let old = self.chunks.len();
+        if old == 0 || needed > old.next_power_of_two() {
+            // Follow logical power-of-two tiers even if the allocator supplies
+            // extra capacity. At most 128 chunks (64 KiB) requested, at most
+            // 64 old initialized chunks moved at once, 1+2+...+64 = 127
+            // across the lifetime (thus <=32,512 old units in any execute).
+            // Requested old+new overlap is <=96 KiB, or <=160 KiB with
+            // live scratch backing, excluding allocator overhead/rounding.
+            reserve(&mut self.chunks, needed.next_power_of_two() - old)
+                .map_err(|_| EvalError::AllocationFailed)?;
+        }
+        // Only initialize reached chunks, at most 16 here and 128 over the
+        // Realm lifetime. There are no fallible steps
+        // from here through publication of the new logical length and cell.
+        assert!(self.chunks.capacity() >= needed);
+        while self.chunks.len() < needed {
+            self.chunks.push([0; CHUNK_UNITS]);
+        }
+        let start = self.used;
+        self.chunks.as_flattened_mut()[start..end].copy_from_slice(units);
+        self.used = end;
+        *copied = next_copied;
+        Ok(StoredValue::Realm(RealmRange {
+            start: start as u16,
+            end: end as u16,
+        }))
+    }
 }
 
 struct Cell {
     name: Vec<u8>,
     kind: BindingKind,
-    // Only scalars can enter this field. None is the TDZ, not undefined.
-    value: Option<Value>,
+    // No Script or scratch references. None is the TDZ, not undefined.
+    value: Option<StoredValue>,
 }
 
 /// Owns one bounded lexical environment. No handles, callbacks, or reentry.
 #[derive(Default)]
 pub struct Realm {
     globals: Vec<Cell>,
+    strings: Arena,
 }
 
 impl Realm {
@@ -364,6 +487,7 @@ impl ReadyScript<'_, '_> {
             .map_err(EngineFault::Evaluation)?;
         let stack = new_stack(code.max_stack_depth).map_err(EngineFault::Evaluation)?;
         let mut scratch = EvalScratch::new();
+        let mut execution = self.execution();
         match dispatch(
             &code.instructions,
             stack,
@@ -371,7 +495,7 @@ impl ReadyScript<'_, '_> {
             &code.string_units,
             code.exit,
             &mut scratch,
-            &mut self,
+            &mut execution,
         ) {
             Ok(_) => Ok(Completion::Normal),
             Err(Stop::Throw(error)) => Ok(Completion::Throw(error)),
@@ -379,8 +503,28 @@ impl ReadyScript<'_, '_> {
         }
     }
 
+    fn execution(&mut self) -> Execution<'_, '_> {
+        Execution {
+            realm: self.realm,
+            sites: &self.code.sites,
+            links: &self.links,
+            mode: self.code.mode,
+            copied: 0,
+        }
+    }
+}
+
+struct Execution<'realm, 'code> {
+    realm: &'realm mut Realm,
+    sites: &'code [Site],
+    links: &'code [Target],
+    mode: CodeMode,
+    copied: usize,
+}
+
+impl Execution<'_, '_> {
     fn site(&self, index: usize) -> Result<(Target, Span, Role), Stop> {
-        let site = self.code.sites.get(index).ok_or(EvalError::InvalidScript)?;
+        let site = self.sites.get(index).ok_or(EvalError::InvalidScript)?;
         let target = *self.links.get(index).ok_or(EvalError::InvalidScript)?;
         Ok((target, site.span, site.role))
     }
@@ -399,8 +543,8 @@ impl ReadyScript<'_, '_> {
         direct_typeof: bool,
     ) -> Result<Operand, Stop> {
         let value = match target {
-            Target::Undefined => Value::Undefined,
-            Target::Missing if direct_typeof => Value::Undefined,
+            Target::Undefined => StoredValue::Scalar(Value::Undefined),
+            Target::Missing if direct_typeof => StoredValue::Scalar(Value::Undefined),
             Target::Missing => return Err(Stop::Throw(Throw::ReferenceError { span })),
             Target::Lexical(slot) => self
                 .realm
@@ -410,17 +554,33 @@ impl ReadyScript<'_, '_> {
                 .value
                 .ok_or(Stop::Throw(Throw::ReferenceError { span }))?,
         };
-        Ok(Operand::Scalar(value))
+        Ok(match value {
+            StoredValue::Scalar(value) => Operand::Scalar(value),
+            StoredValue::TypeName(name) => Operand::String(StringOperand::TypeName(name)),
+            StoredValue::Empty => Operand::String(StringOperand::Empty),
+            StoredValue::Realm(range) => {
+                range
+                    .get(self.retained_units())
+                    .ok_or(EvalError::InvalidScript)?;
+                Operand::String(StringOperand::Realm(range))
+            }
+        })
     }
 
-    fn put(&mut self, target: Target, span: Span, value: Operand) -> Result<(), Stop> {
+    fn put(
+        &mut self,
+        target: Target,
+        span: Span,
+        value: Operand,
+        source: TransientStrings<'_>,
+    ) -> Result<(), Stop> {
         let cell = match target {
             // Only reached writes get here, after RHS evaluation/coercion.
-            Target::Undefined if self.code.mode == CodeMode::Strict => {
+            Target::Undefined if self.mode == CodeMode::Strict => {
                 return Err(Stop::Throw(Throw::TypeError { span }));
             }
             Target::Undefined => return Ok(()), // Sloppy readonly write, even with a String RHS.
-            Target::Missing if self.code.mode == CodeMode::Strict => {
+            Target::Missing if self.mode == CodeMode::Strict => {
                 return Err(Stop::Throw(Throw::ReferenceError { span }));
             }
             Target::Missing => return Err(Stop::Engine(EngineFault::ImplicitGlobal { span })),
@@ -436,16 +596,37 @@ impl ReadyScript<'_, '_> {
         if cell.kind == BindingKind::Const {
             return Err(Stop::Throw(Throw::TypeError { span }));
         }
-        cell.value = Some(scalar(value, span)?);
+        cell.value = Some(escape(
+            value,
+            span,
+            source,
+            &mut self.realm.strings,
+            &mut self.copied,
+        )?);
         Ok(())
     }
 }
 
-fn scalar(value: Operand, span: Span) -> Result<Value, Stop> {
-    match value {
-        Operand::Scalar(value) => Ok(value),
-        Operand::String(_) => Err(Stop::Engine(EngineFault::PersistentString { span })),
+fn escape(
+    value: Operand,
+    span: Span,
+    source: TransientStrings<'_>,
+    strings: &mut Arena,
+    copied: &mut usize,
+) -> Result<StoredValue, Stop> {
+    let units = match value {
+        Operand::Scalar(value) => return Ok(StoredValue::Scalar(value)),
+        Operand::String(StringOperand::TypeName(name)) => return Ok(StoredValue::TypeName(name)),
+        Operand::String(StringOperand::Empty) => return Ok(StoredValue::Empty),
+        Operand::String(StringOperand::Realm(range)) => {
+            range.get(strings.units()).ok_or(EvalError::InvalidScript)?;
+            return Ok(StoredValue::Realm(range));
+        }
+        Operand::String(StringOperand::Literal(range)) => source.literal(range),
+        Operand::String(StringOperand::Runtime(range)) => source.runtime(range),
     }
+    .ok_or(EvalError::InvalidScript)?;
+    strings.append(units, copied, span, Vec::try_reserve_exact)
 }
 
 pub(super) enum Stop {
@@ -459,8 +640,12 @@ impl From<EvalError> for Stop {
     }
 }
 
-impl Bindings for ReadyScript<'_, '_> {
+impl Bindings for Execution<'_, '_> {
     type Error = Stop;
+
+    fn retained_units(&self) -> &[u16] {
+        self.realm.strings.units()
+    }
 
     fn load(&self, index: usize) -> Result<Operand, Stop> {
         let (target, span, role) = self.site(index)?;
@@ -478,6 +663,7 @@ impl Bindings for ReadyScript<'_, '_> {
         kind: BindingKind,
         _: usize,
         stack: &mut Vec<Operand>,
+        source: TransientStrings<'_>,
     ) -> Result<(), Stop> {
         let (Target::Lexical(slot), span, Role::Declaration(declared)) = self.site(index)? else {
             return Err(EvalError::InvalidScript.into());
@@ -490,14 +676,26 @@ impl Bindings for ReadyScript<'_, '_> {
         if declared != kind || cell.kind != kind || cell.value.is_some() {
             return Err(EvalError::InvalidScript.into());
         }
-        cell.value = Some(scalar(init_operand(stack)?, span)?);
+        cell.value = Some(escape(
+            init_operand(stack)?,
+            span,
+            source,
+            &mut self.realm.strings,
+            &mut self.copied,
+        )?);
         Ok(())
     }
 
-    fn store(&mut self, index: usize, keep: bool, stack: &mut Vec<Operand>) -> Result<(), Stop> {
+    fn store(
+        &mut self,
+        index: usize,
+        keep: bool,
+        stack: &mut Vec<Operand>,
+        source: TransientStrings<'_>,
+    ) -> Result<(), Stop> {
         let value = store_operand(stack, keep)?;
         let (target, span) = self.write_target(index)?;
-        self.put(target, span, value)
+        self.put(target, span, value, source)
     }
 
     fn update(
@@ -510,14 +708,20 @@ impl Bindings for ReadyScript<'_, '_> {
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), Stop> {
         let (target, span) = self.write_target(index)?;
-        let old = self
-            .load_target(target, span, false)?
-            .to_number(numeric.pools, numeric.credits)?;
+        let old = self.load_target(target, span, false)?.to_number(
+            numeric.source.with_retained(self.retained_units()),
+            numeric.credits,
+        )?;
         let new = update_number(op, old);
         update_result(stack, max, result, old, new)?;
         // The checked push must succeed before the cell changes. If PutValue
         // fails, remove the staged result; dispatch discards the frame on Stop.
-        if let Err(stop) = self.put(target, span, Operand::Scalar(Value::Number(new))) {
+        if let Err(stop) = self.put(
+            target,
+            span,
+            Operand::Scalar(Value::Number(new)),
+            numeric.source,
+        ) {
             stack.pop();
             return Err(stop);
         }
@@ -546,7 +750,10 @@ mod tests {
             ready.execute(),
             Ok(Completion::Throw(Throw::ReferenceError { .. }))
         ));
-        assert_eq!(realm.globals[0].value, Some(Value::Undefined));
+        assert_eq!(
+            realm.globals[0].value,
+            Some(StoredValue::Scalar(Value::Undefined))
+        );
     }
 
     #[test]
@@ -554,9 +761,10 @@ mod tests {
         let code = CompiledScript::compile("let lexical = 7; missing;").unwrap();
         let mut realm = Realm::new();
         let mut ready = realm.instantiate(&code).unwrap();
+        let mut execution = ready.execution();
         // A declaration site is not a read, even though its TDZ cell exists.
         assert!(matches!(
-            ready.load(0),
+            execution.load(0),
             Err(Stop::Engine(EngineFault::Evaluation(
                 EvalError::InvalidScript
             )))
@@ -567,14 +775,14 @@ mod tests {
         // Using an ordinary missing Read site as an update is invalid, not
         // a guest ReferenceError from GetValue.
         assert!(matches!(
-            ready.update(
+            execution.update(
                 1,
                 Update::Increment,
                 UpdateResult::New,
                 &mut stack,
                 1,
                 UpdateNumeric {
-                    pools: scratch.pools(&[]),
+                    source: scratch.transient(&[]),
                     credits: &mut credits
                 }
             ),
@@ -583,7 +791,7 @@ mod tests {
             )))
         ));
         assert!(stack.is_empty());
-        assert_eq!(ready.realm.globals[0].value, None);
+        assert_eq!(execution.realm.globals[0].value, None);
     }
 
     #[test]
@@ -596,22 +804,23 @@ mod tests {
         );
         let code = CompiledScript::compile("(mutable++); (fixed++);").unwrap();
         let mut ready = realm.instantiate(&code).unwrap();
+        let mut execution = ready.execution();
         assert!(matches!(
-            ready.load(0),
+            execution.load(0),
             Ok(Operand::Scalar(Value::Number(7.0)))
         ));
         let mut stack = vec![Operand::Scalar(Value::Null)];
         let scratch = EvalScratch::new();
         let mut credits = 0;
         let mut update = |site, max| {
-            ready.update(
+            execution.update(
                 site,
                 Update::Increment,
                 UpdateResult::New,
                 &mut stack,
                 max,
                 UpdateNumeric {
-                    pools: scratch.pools(&[]),
+                    source: scratch.transient(&[]),
                     credits: &mut credits,
                 },
             )
@@ -629,8 +838,223 @@ mod tests {
             Err(Stop::Throw(Throw::TypeError { .. }))
         ));
         assert!(matches!(stack.as_slice(), [Operand::Scalar(Value::Null)]));
-        assert_eq!(ready.realm.globals[0].value, Some(Value::Number(7.0)));
-        assert_eq!(ready.realm.globals[1].value, Some(Value::Number(3.0)));
+        assert_eq!(
+            execution.realm.globals[0].value,
+            Some(StoredValue::Scalar(Value::Number(7.0)))
+        );
+        assert_eq!(
+            execution.realm.globals[1].value,
+            Some(StoredValue::Scalar(Value::Number(3.0)))
+        );
+    }
+
+    fn run(realm: &mut Realm, source: &str) -> Result<Completion, EngineFault> {
+        let code = CompiledScript::compile(source).unwrap();
+        realm.instantiate(&code).unwrap().execute()
+    }
+
+    #[test]
+    fn only_accepted_nonempty_escapes_allocate_and_aliases_keep_their_range() {
+        let mut realm = Realm::new();
+        assert_eq!(realm.strings.chunks.capacity(), 0);
+        for source in [
+            "let scalar = 1, empty = '', runtime_empty = '' + '', static_name = typeof 0;",
+            "'unretained' + 'scratch'; false && (scalar = 'skipped');",
+            "undefined = 'ignored' + 'scratch'; const fixed = 1;",
+        ] {
+            assert_eq!(run(&mut realm, source), Ok(Completion::Normal));
+        }
+        for source in [
+            "fixed = 'rejected' + 'const';",
+            "tdz = `rejected${1}`; let tdz;",
+        ] {
+            assert!(matches!(run(&mut realm, source), Ok(Completion::Throw(_))));
+        }
+        assert!(matches!(
+            run(&mut realm, "missing = 'rejected';"),
+            Err(EngineFault::ImplicitGlobal { .. })
+        ));
+        assert_eq!(realm.strings.used, 0);
+        assert_eq!(realm.strings.chunks.capacity(), 0);
+
+        assert_eq!(
+            run(&mut realm, r"let first = '\uD800\0'; let alias = first;"),
+            Ok(Completion::Normal)
+        );
+        let first = realm
+            .globals
+            .iter()
+            .find(|c| c.name == b"first")
+            .unwrap()
+            .value;
+        let alias = realm
+            .globals
+            .iter()
+            .find(|c| c.name == b"alias")
+            .unwrap()
+            .value;
+        assert_eq!(first, alias);
+        assert_eq!(realm.strings.units(), [0xD800, 0]);
+        assert_eq!(realm.strings.chunks.len(), 1);
+    }
+
+    #[test]
+    fn invalid_ranges_cannot_enter_or_leave_a_lexical_cell() {
+        let mut realm = Realm::new();
+        assert_eq!(run(&mut realm, "let x = 'x';"), Ok(Completion::Normal));
+        assert_eq!(realm.strings.chunks.len(), 1);
+        let original = realm.globals[0].value;
+        let code = CompiledScript::compile("x; 'y';").unwrap();
+        let mut ready = realm.instantiate(&code).unwrap();
+        let mut execution = ready.execution();
+        let span = Span { start: 0, end: 1 };
+        let mut scratch = EvalScratch::new();
+        let Instruction::String(literal) = code.instructions[2] else {
+            panic!("expected literal");
+        };
+        let literal = StringOperand::Literal(literal);
+        let stale_scratch = scratch
+            .concatenate(
+                super::super::ExternalStrings {
+                    literals: &code.string_units,
+                    retained: &[],
+                },
+                literal,
+                literal,
+            )
+            .unwrap();
+        scratch.reset();
+        for invalid in [
+            literal,
+            stale_scratch,
+            StringOperand::Realm(RealmRange { start: 0, end: 2 }),
+        ] {
+            let result = execution.put(
+                Target::Lexical(0),
+                span,
+                Operand::String(invalid),
+                scratch.transient(&[]),
+            );
+            assert!(matches!(
+                result,
+                Err(Stop::Engine(EngineFault::Evaluation(
+                    EvalError::InvalidScript
+                )))
+            ));
+            assert_eq!(execution.realm.globals[0].value, original);
+            assert_eq!(execution.realm.strings.units(), [b'x' as u16]);
+            assert_eq!(execution.copied, 0);
+        }
+        for range in [
+            RealmRange { start: 0, end: 2 },
+            RealmRange { start: 1, end: 0 },
+            RealmRange { start: 1, end: 1 },
+        ] {
+            // Even a metadata-only use (such as truthiness) cannot get an
+            // operand with corrupt offsets into padding, reversed, or empty.
+            execution.realm.globals[0].value = Some(StoredValue::Realm(range));
+            assert!(matches!(
+                execution.load(0),
+                Err(Stop::Engine(EngineFault::Evaluation(
+                    EvalError::InvalidScript
+                )))
+            ));
+        }
+    }
+
+    #[test]
+    fn arena_reservation_failure_is_atomic_and_geometric_tiers_bound_old_moves() {
+        let mut arena = Arena::default();
+        let span = Span { start: 0, end: 1 };
+        let mut copied = 0;
+        let failed = |chunks: &mut Vec<Chunk>, _| chunks.try_reserve_exact(usize::MAX);
+        assert!(matches!(
+            arena.append(&[7], &mut copied, span, failed),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::AllocationFailed
+            )))
+        ));
+        assert_eq!(
+            (
+                arena.used,
+                arena.chunks.len(),
+                arena.chunks.capacity(),
+                copied
+            ),
+            (0, 0, 0, 0)
+        );
+        let mut tiers = Vec::new();
+        let mut relocated = 0;
+        for i in 0..MAX_RETAINED_UNITS {
+            if i == MAX_COPIED_UNITS {
+                copied = 0; // Model the second execute.
+            }
+            if i == CHUNK_UNITS {
+                let capacity = arena.chunks.capacity();
+                assert!(matches!(
+                    arena.append(&[8], &mut copied, span, failed),
+                    Err(Stop::Engine(EngineFault::Evaluation(
+                        EvalError::AllocationFailed
+                    )))
+                ));
+                assert_eq!(
+                    (
+                        arena.used,
+                        arena.chunks.len(),
+                        arena.chunks.capacity(),
+                        copied
+                    ),
+                    (i, 1, capacity, i)
+                );
+                assert_eq!(arena.units(), [7; CHUNK_UNITS]);
+            }
+            assert!(
+                arena
+                    .append(&[7], &mut copied, span, |chunks, additional| {
+                        tiers.push(chunks.len() + additional);
+                        relocated += chunks.len() * CHUNK_UNITS;
+                        chunks.try_reserve_exact(additional)
+                    })
+                    .is_ok()
+            );
+        }
+        assert_eq!(tiers, [1, 2, 4, 8, 16, 32, 64, 128]);
+        assert_eq!(relocated, 32_512);
+        assert_eq!(arena.used, MAX_RETAINED_UNITS);
+        assert_eq!(arena.units()[MAX_RETAINED_UNITS - 1], 7);
+    }
+
+    #[test]
+    fn const_update_converts_a_retained_string_before_const_put_rejection() {
+        let mut realm = Realm::new();
+        assert_eq!(
+            run(&mut realm, "const fixed = '42';"),
+            Ok(Completion::Normal)
+        );
+        let code = CompiledScript::compile("fixed++; ").unwrap();
+        let mut ready = realm.instantiate(&code).unwrap();
+        let mut execution = ready.execution();
+        let mut stack = Vec::new();
+        let scratch = EvalScratch::new();
+        let mut credits = 0;
+        assert!(matches!(
+            execution.update(
+                0,
+                Update::Increment,
+                UpdateResult::New,
+                &mut stack,
+                1,
+                UpdateNumeric {
+                    source: scratch.transient(&[]),
+                    credits: &mut credits
+                }
+            ),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::StringNumericConversionLimitExceeded
+            )))
+        ));
+        assert!(stack.is_empty());
+        assert_eq!(execution.copied, 0);
     }
 
     #[test]

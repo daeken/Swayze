@@ -1,4 +1,4 @@
-use super::{Error, Lexer, Limit, Span, is_line_terminator};
+use super::{Error, Lexer, Limit, QuotedDecimalEscape, Span, is_line_terminator};
 
 const MAX_STRING_LITERAL_BYTES: usize = 4096;
 // Two delimiters emit nothing; a scalar, escape or normalized line ending
@@ -162,8 +162,17 @@ impl Lexer<'_> {
             'u' => self.string_hex_digits(start, slash, 4)?,
             '0' if !self.peek().is_some_and(|next| next.is_ascii_digit()) => 0,
             // Annex B NonOctalDecimalEscapeSequence in sloppy quoted Strings only.
-            // Real strict-mode support must reject these even in earlier directives.
-            '8' | '9' if !template => u32::from(c),
+            '8' | '9' if !template => {
+                // The digit was consumed and charged above. Keep only the first
+                // escape, even if this String was lexed through lookahead.
+                if matches!(self.quoted_decimal_escape, QuotedDecimalEscape::Pending) {
+                    self.quoted_decimal_escape = QuotedDecimalEscape::Found(Span {
+                        start: slash,
+                        end: self.offset,
+                    });
+                }
+                u32::from(c)
+            }
             '0'..='9' => {
                 if c == '0'
                     && let Some(digit) = self.peek().filter(char::is_ascii_digit)

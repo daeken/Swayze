@@ -272,7 +272,7 @@ fn policies_do_not_reclassify_legacy_diagnostics_or_accept_deferred_syntax() {
     }
     for source in [
         "var x = 1;",
-        "'use strict';",
+        "'use strict'",
         "{ let x = 1; }",
         "for (let x = 1; x;) {}",
         "if (false) { const x = 1; }",

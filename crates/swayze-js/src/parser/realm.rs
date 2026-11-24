@@ -1,16 +1,26 @@
 use crate::{
     eval::MAX_INSTRUCTIONS,
     realm::{
-        CompileError, CompileLimit, CompiledScript, MAX_CODE_NAME_BYTES, MAX_DECLARATIONS,
-        MAX_NAME_BYTES, MAX_SITES, Role, Site,
+        CodeMode, CompileError, CompileLimit, CompiledScript, MAX_CODE_NAME_BYTES,
+        MAX_DECLARATIONS, MAX_NAME_BYTES, MAX_SITES, Role, Site,
     },
 };
 
-use super::{AccessKind, Binding, BindingPolicy, Error, Limit, Limits, Parser, Span, new_parser};
+use super::{
+    AccessKind, Binding, BindingPolicy, Error, Limit, Limits, Parser, QuotedDecimalEscape, Span,
+    new_parser,
+};
 
 pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError> {
     let mut parser = new_parser(source, Limits::default(), BindingPolicy::Realm)?;
-    let exit = parser.parse(true)?;
+    let (exit, mode) = parser.parse(true)?;
+    // Validate the entire body, including earlier directives and dead code,
+    // after structural diagnostics but before Realm-only caps/name lowering.
+    if mode == CodeMode::Strict
+        && let QuotedDecimalEscape::Found(span) = parser.lexer.quoted_decimal_escape
+    {
+        return Err(CompileError::SyntaxError { span });
+    }
     let end = Span::at(parser.lexer.offset);
     let declarations = parser.bindings.len();
     let count = declarations + parser.accesses.len();
@@ -74,6 +84,7 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         string_units: parser.lexer.string_units,
         max_stack_depth: parser.max_stack_depth,
         exit,
+        mode,
         names,
         sites,
         declarations,

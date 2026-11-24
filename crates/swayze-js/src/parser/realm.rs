@@ -8,7 +8,8 @@ use crate::{
 
 use super::{
     AccessKind, BindingPolicy, Error, ExpressionEnd, Instruction, Limit, Limits, ParseErrorType,
-    Parser, Pending, QuotedDecimalEscape, Span, TokenKind, TokenPosition, new_parser, try_push,
+    Parser, Pending, QuotedDecimalEscape, RealmParseLimit, Span, TokenKind, TokenPosition,
+    new_parser, try_push,
 };
 
 pub(super) struct OpenFunction {
@@ -62,10 +63,13 @@ impl Parser<'_> {
                     ));
                 }
                 if params.len() == usize::from(MAX_PARAMETERS) {
-                    return Err(Error::limit(formal.span, Limit::Parameters));
+                    return Err(Error::realm_limit(formal.span, RealmParseLimit::Parameters));
                 }
                 if formal.span.end - formal.span.start > MAX_NAME_BYTES {
-                    return Err(Error::limit(formal.span, Limit::FormalNameBytes));
+                    return Err(Error::realm_limit(
+                        formal.span,
+                        RealmParseLimit::FormalNameBytes,
+                    ));
                 }
                 for &other in &params {
                     self.lexer.charge(1, formal.span)?;
@@ -212,7 +216,15 @@ impl Parser<'_> {
 
 pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError> {
     let mut parser = new_parser(source, Limits::default(), BindingPolicy::Realm)?;
-    let (exit, mode) = parser.parse(true)?;
+    let (exit, mode) = parser.parse(true).map_err(|error| {
+        let limit = match error.realm_limit {
+            Some(RealmParseLimit::Arguments) => CompileLimit::Arguments,
+            Some(RealmParseLimit::Parameters) => CompileLimit::Parameters,
+            Some(RealmParseLimit::FormalNameBytes) => CompileLimit::NameBytes,
+            None => return CompileError::Parse(error),
+        };
+        cap(limit, error.span())
+    })?;
     // Validate the entire body, including earlier directives and dead code,
     // after structural diagnostics but before Realm-only caps/name lowering.
     let strict_witness = |mode, witness: &QuotedDecimalEscape| match (mode, witness) {

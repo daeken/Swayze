@@ -278,6 +278,29 @@ fn literals_and_scratch_cross_artifacts_without_aliasing_equal_offsets() {
 }
 
 #[test]
+fn legacy_diagnostic_enums_remain_exhaustive_for_downstream_users() {
+    fn diagnostic(kind: ErrorKind) -> &'static str {
+        match kind {
+            ErrorKind::Malformed => "malformed",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::LimitExceeded(limit) => match limit {
+                Limit::SourceBytes => "source",
+                Limit::Tokens => "tokens",
+                Limit::NestingDepth => "nesting",
+                Limit::Work => "work",
+                Limit::DecimalLiteralBytes => "decimal",
+                Limit::StringLiteralBytes => "literal bytes",
+                Limit::StringLiteralUnits => "literal units",
+                Limit::Allocation => "allocation",
+            },
+        }
+    }
+
+    let error = parse_script_for_completion("function f(){}").unwrap_err();
+    assert_eq!(diagnostic(error.kind()), "unsupported");
+}
+
+#[test]
 fn grammar_reports_exclusions_and_preserves_legacy_refusal() {
     let error = parse_script_for_completion("function f(){}").unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -344,17 +367,25 @@ fn argument_formal_depth_slot_and_dispatch_caps() {
             args(64)
         ),
     );
-    for (source, limit) in [
+    for (source, limit, at) in [
         (
             format!("function bad({}){{}}", formals(65)),
-            Limit::Parameters,
+            CompileLimit::Parameters,
+            "p64",
         ),
-        (format!("check({});", args(65)), Limit::Arguments),
+        (
+            format!("check({});", args(65)),
+            CompileLimit::Arguments,
+            ",",
+        ),
     ] {
-        let CompileError::Parse(error) = CompiledScript::compile(&source).unwrap_err() else {
-            panic!()
-        };
-        assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+        assert_eq!(
+            CompiledScript::compile(&source).unwrap_err(),
+            CompileError::LimitExceeded {
+                limit,
+                span: span(&source, at)
+            }
+        );
     }
     normal(
         &mut realm,
@@ -439,14 +470,14 @@ fn body_and_formal_name_ceiling() {
         &mut realm,
         &format!("function f({name}){{return {name};}} if (f(3) !== 3) bad;"),
     );
-    let CompileError::Parse(error) =
-        CompiledScript::compile(&format!("function f({name}b){{}}")).unwrap_err()
-    else {
-        panic!()
-    };
+    let too_long = format!("{name}b");
+    let source = format!("function f({too_long}){{}}");
     assert_eq!(
-        error.kind(),
-        ErrorKind::LimitExceeded(Limit::FormalNameBytes)
+        CompiledScript::compile(&source).unwrap_err(),
+        CompileError::LimitExceeded {
+            limit: CompileLimit::NameBytes,
+            span: span(&source, &too_long)
+        }
     );
 }
 

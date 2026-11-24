@@ -62,9 +62,6 @@ pub enum Limit {
     Tokens,
     /// The caller's expression nesting limit or the fixed statement frame cap.
     NestingDepth,
-    Arguments,
-    Parameters,
-    FormalNameBytes,
     Work,
     /// Fixed source-byte ceiling for a decimal literal with a point or exponent.
     DecimalLiteralBytes,
@@ -91,11 +88,20 @@ pub enum ParseErrorType {
     SyntaxError,
 }
 
-/// A parse diagnostic that does not retain or print the source text.
+// Realm-only caps never escape via the exhaustive Legacy diagnostic enums.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealmParseLimit {
+    Arguments,
+    Parameters,
+    FormalNameBytes,
+}
+
+/// A parse diagnostic that does not retain or print the source text.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
     parse_error_type: Option<ParseErrorType>,
+    realm_limit: Option<RealmParseLimit>,
     span: Span,
     message: &'static str,
 }
@@ -123,6 +129,7 @@ impl Error {
         Self {
             kind: ErrorKind::Malformed,
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
@@ -132,6 +139,7 @@ impl Error {
         Self {
             kind: ErrorKind::Unsupported,
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
@@ -142,9 +150,6 @@ impl Error {
             Limit::SourceBytes => "source byte ceiling exceeded",
             Limit::Tokens => "token ceiling exceeded",
             Limit::NestingDepth => "expression nesting ceiling exceeded",
-            Limit::Arguments => "call argument ceiling exceeded",
-            Limit::Parameters => "function parameter ceiling exceeded",
-            Limit::FormalNameBytes => "formal name byte ceiling exceeded",
             Limit::Work => "parse work ceiling exceeded",
             Limit::DecimalLiteralBytes => "decimal literal byte ceiling exceeded",
             Limit::StringLiteralBytes => {
@@ -158,9 +163,33 @@ impl Error {
         Self {
             kind: ErrorKind::LimitExceeded(limit),
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
+    }
+
+    fn realm_limit(span: Span, limit: RealmParseLimit) -> Self {
+        let message = match limit {
+            RealmParseLimit::Arguments => "call argument ceiling exceeded",
+            RealmParseLimit::Parameters => "function parameter ceiling exceeded",
+            RealmParseLimit::FormalNameBytes => "formal name byte ceiling exceeded",
+        };
+        Self {
+            realm_limit: Some(limit),
+            ..Self::unsupported(span, message)
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("kind", &self.kind)
+            .field("parse_error_type", &self.parse_error_type)
+            .field("span", &self.span)
+            .field("message", &self.message)
+            .finish()
     }
 }
 
@@ -3340,7 +3369,7 @@ impl Parser<'_> {
                         }
                         *completed += 1;
                         if *completed >= crate::realm::MAX_PARAMETERS {
-                            return Err(Error::limit(span, Limit::Arguments));
+                            return Err(Error::realm_limit(span, RealmParseLimit::Arguments));
                         }
                         needs_operand = true;
                         allow_assignment = true;

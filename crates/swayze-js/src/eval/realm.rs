@@ -79,6 +79,20 @@ pub(crate) struct Site {
     pub(crate) role: Role,
 }
 
+impl Site {
+    fn access_name(self, names: &[u8]) -> Option<&[u8]> {
+        if !matches!(self.role, Role::Read | Role::Typeof | Role::Write) {
+            return None;
+        }
+        self.name_in(names)
+    }
+
+    fn name_in(self, names: &[u8]) -> Option<&[u8]> {
+        let name = names.get(usize::from(self.start)..usize::from(self.end))?;
+        (!name.is_empty() && name.len() <= MAX_NAME_BYTES).then_some(name)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodeMode {
     Sloppy,
@@ -113,8 +127,7 @@ impl CompiledScript {
     }
 
     fn name(&self, site: &Site) -> Result<&[u8], InstantiateError> {
-        self.names
-            .get(usize::from(site.start)..usize::from(site.end))
+        site.name_in(&self.names)
             .ok_or(InstantiateError::InvalidScript)
     }
 }
@@ -133,6 +146,8 @@ impl fmt::Debug for CompiledScript {
 #[non_exhaustive]
 pub enum CompileLimit {
     Instructions,
+    Arguments,
+    Parameters,
     NameBytes,
     PooledNameBytes,
     Declarations,
@@ -361,11 +376,7 @@ impl Artifact {
         for body in &code.functions {
             validate_body(&body.instructions, body.max_stack_depth, ExitStack::Empty)
                 .map_err(|_| InstantiateError::InvalidScript)?;
-            if body.formals > MAX_PARAMETERS
-                || body.accesses.end > code.sites.len()
-                || body.accesses.start < code.declarations
-                || body.accesses.start > body.accesses.end
-            {
+            if body.formals > MAX_PARAMETERS {
                 return Err(InstantiateError::InvalidScript);
             }
             bodies.push(FunctionBody {
@@ -674,11 +685,23 @@ impl Realm {
                 }
                 Role::Function { .. } if !identities.is_empty() => {
                     work.charge(1)?; // Placeholder: declarations are not executable sites.
-                    Target::Missing
+                    Target::Unlinked
                 }
                 _ => return Err(InvalidScript),
             };
             links.push(target);
+        }
+        // Linking below is a merge scan. Check the sorted, disjoint ranges
+        // first, including empty bodies that the scan might never visit.
+        let mut previous_end = code.declarations;
+        for body in &code.functions {
+            work.charge(1)?;
+            let range = &body.accesses;
+            if range.start < previous_end || range.start > range.end || range.end > code.sites.len()
+            {
+                return Err(InvalidScript);
+            }
+            previous_end = range.end;
         }
         let mut bodies = code.functions.iter().peekable();
         for (offset, site) in accesses.iter().enumerate() {
@@ -692,15 +715,18 @@ impl Realm {
                 .peek()
                 .is_some_and(|body| body.accesses.contains(&index))
             {
-                // Retained code must use current Realm lookups, not Ready
-                // links from the defining Script (even for a current miss).
-                links.push(Target::Missing);
+                // Retained code must use current Realm lookups. Authenticate
+                // the site's shape but do not make a semantic Ready link.
+                match site.role {
+                    Role::Formal if (site.start, site.end) == (0, 0) => {}
+                    _ => {
+                        site.access_name(&code.names).ok_or(InvalidScript)?;
+                    }
+                }
+                links.push(Target::Unlinked);
                 continue;
             }
-            if !matches!(site.role, Role::Read | Role::Typeof | Role::Write) {
-                return Err(InvalidScript);
-            }
-            let name = code.name(site)?;
+            let name = site.access_name(&code.names).ok_or(InvalidScript)?;
             let target = if let Some(slot) = work.find(
                 name,
                 self.state
@@ -897,6 +923,7 @@ enum Target {
     Var(usize),
     Undefined,
     Missing,
+    Unlinked,
 }
 
 /// A one-shot execution guard. Dropping the guard abandons the body, but
@@ -1002,12 +1029,8 @@ impl Execution<'_, '_> {
                 return Err(EvalError::InvalidScript.into());
             }
             let site = artifact.sites.get(index).ok_or(EvalError::InvalidScript)?;
-            if !matches!(site.role, Role::Read | Role::Typeof | Role::Write) {
-                return Err(EvalError::InvalidScript.into());
-            }
-            let name = artifact
-                .names
-                .get(usize::from(site.start)..usize::from(site.end))
+            let name = site
+                .access_name(&artifact.names)
                 .ok_or(EvalError::InvalidScript)?;
             let target = self
                 .resolve_current(name)
@@ -1016,6 +1039,9 @@ impl Execution<'_, '_> {
         }
         let site = self.sites.get(index).ok_or(EvalError::InvalidScript)?;
         let target = *self.links.get(index).ok_or(EvalError::InvalidScript)?;
+        if matches!(target, Target::Unlinked) {
+            return Err(EvalError::InvalidScript.into());
+        }
         Ok((target, site.span, site.role))
     }
 
@@ -1068,6 +1094,7 @@ impl Execution<'_, '_> {
             Target::Undefined => StoredValue::Scalar(Value::Undefined),
             Target::Missing if direct_typeof => StoredValue::Scalar(Value::Undefined),
             Target::Missing => return Err(Stop::Throw(Throw::ReferenceError { span })),
+            Target::Unlinked => return Err(EvalError::InvalidScript.into()),
             Target::Lexical(slot) => self
                 .realm
                 .globals
@@ -1119,6 +1146,7 @@ impl Execution<'_, '_> {
                 return Err(Stop::Throw(Throw::ReferenceError { span }));
             }
             Target::Missing => return Err(Stop::Engine(EngineFault::ImplicitGlobal { span })),
+            Target::Unlinked => return Err(EvalError::InvalidScript.into()),
             Target::Lexical(slot) => {
                 let cell = self
                     .realm
@@ -1367,6 +1395,78 @@ mod tests {
         );
         // The test adjusted the measured total only, never the stored backing.
         realm.artifact_bytes = baseline + payload;
+    }
+
+    #[test]
+    fn root_cannot_read_an_unlinked_body_site_even_with_typeof() {
+        let mut code =
+            CompiledScript::compile("function f(){return typeof missing;} typeof absent;").unwrap();
+        code.instructions[0] = Instruction::LoadBinding(code.functions[0].accesses.start);
+        let mut realm = Realm::new();
+        assert_eq!(
+            realm.instantiate(&code).unwrap().execute(),
+            Err(EngineFault::Evaluation(EvalError::InvalidScript))
+        );
+        let probe = CompiledScript::compile("if (f() !== 'undefined') bad;").unwrap();
+        assert_eq!(
+            realm.instantiate(&probe).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_forged_body_ranges_roles_and_names() {
+        let source = "function f(x){return x + global;} function g(){return other;} function h(){}";
+        let invalid_layouts: [fn(&mut CompiledScript); 9] = [
+            |code| code.functions[0].accesses.start = code.declarations - 1,
+            |code| code.functions[1].accesses.start -= 1,
+            |code| code.functions[2].accesses = code.declarations..code.declarations,
+            |code| code.functions[2].accesses.end -= 1,
+            |code| code.functions[2].accesses.end += 1,
+            |code| code.sites[code.declarations].end = 1,
+            |code| code.sites[code.declarations + 1].role = Role::Var { initialized: false },
+            |code| {
+                let site = &mut code.sites[code.declarations + 1];
+                site.end = site.start;
+            },
+            |code| code.sites[code.declarations + 1].end = u16::MAX,
+        ];
+        let mut realm = Realm::new();
+        let seed = CompiledScript::compile("function f(){return 17;} var old = f;").unwrap();
+        assert_eq!(
+            realm.instantiate(&seed).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        let mut check = |code: &CompiledScript| {
+            assert_eq!(
+                realm.instantiate(code).unwrap_err(),
+                InstantiateError::InvalidScript
+            );
+            assert_eq!(
+                (
+                    realm.artifacts.len(),
+                    realm.functions.len(),
+                    realm.state.object.vars.len()
+                ),
+                (1, 1, 2)
+            );
+        };
+        for forge in invalid_layouts {
+            let mut code = CompiledScript::compile(source).unwrap();
+            forge(&mut code);
+            check(&code);
+        }
+        let mut code = CompiledScript::compile(source).unwrap();
+        code.names.resize(MAX_NAME_BYTES + 1, b'a');
+        let site = &mut code.sites[code.declarations + 1];
+        site.start = 0;
+        site.end = (MAX_NAME_BYTES + 1) as u16;
+        check(&code);
+        let probe = CompiledScript::compile("if (old !== f || f() !== 17) bad;").unwrap();
+        assert_eq!(
+            realm.instantiate(&probe).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
     }
 
     #[test]

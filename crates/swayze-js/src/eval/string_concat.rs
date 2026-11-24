@@ -1,6 +1,9 @@
 use std::{collections::TryReserveError, ops::Range};
 
-use super::{EvalError, Operand, Value, realm::RealmRange};
+use super::{
+    EvalError, Operand, Value,
+    realm::{Artifact, RealmRange},
+};
 use crate::{
     number_format,
     parser::{MAX_STRING_LITERAL_CODE_UNITS, StringRange},
@@ -24,6 +27,7 @@ pub(super) enum TypeName {
     String,
     Object,
     Undefined,
+    Function,
 }
 
 impl TypeName {
@@ -33,7 +37,9 @@ impl TypeName {
         static STRING: [u16; 6] = ascii_units(b"string");
         static OBJECT: [u16; 6] = ascii_units(b"object");
         static UNDEFINED: [u16; 9] = ascii_units(b"undefined");
+        static FUNCTION: [u16; 8] = ascii_units(b"function");
         match self {
+            Self::Function => &FUNCTION,
             Self::Number => &NUMBER,
             Self::Boolean => &BOOLEAN,
             Self::String => &STRING,
@@ -101,6 +107,7 @@ impl EvalScratch {
     pub(super) fn transient<'a>(&'a self, literals: &'a [u16]) -> TransientStrings<'a> {
         TransientStrings {
             literals,
+            artifacts: &[],
             runtime: self.runtime_units(),
         }
     }
@@ -204,11 +211,12 @@ impl EvalScratch {
         following: StringRange,
     ) -> Result<StringOperand, EvalError> {
         let prefix = AppendSource::checked(prefix, external, self.used)?;
-        let following = following
-            .get(external.literals)
+        let following = external
+            .literal(external.active_artifact, following)
             .ok_or(EvalError::InvalidScript)?;
         let substitution = match substitution {
             Operand::String(string) => AppendSource::checked(string, external, self.used)?,
+            Operand::Function(_) => return Err(EvalError::UnsupportedCallableConversion),
             Operand::Scalar(scalar) => match scalar_spelling(scalar) {
                 ScalarSpelling::Units(units) => AppendSource::Borrowed(units),
                 ScalarSpelling::Number(number) => {
@@ -327,6 +335,7 @@ impl RuntimeRange {
 #[derive(Clone, Copy)]
 pub(super) enum StringOperand {
     Literal(StringRange),
+    ArtifactLiteral { artifact: u8, range: StringRange },
     Runtime(RuntimeRange),
     TypeName(TypeName),
     Empty,
@@ -334,9 +343,19 @@ pub(super) enum StringOperand {
 }
 
 impl StringOperand {
+    pub(super) fn literal(artifact: Option<u8>, range: StringRange) -> Self {
+        match artifact {
+            None => Self::Literal(range),
+            Some(artifact) => Self::ArtifactLiteral { artifact, range },
+        }
+    }
+
     pub(super) fn get(self, pools: StringPools<'_>) -> Option<&[u16]> {
         match self {
             Self::Literal(range) => pools.transient.literal(range),
+            Self::ArtifactLiteral { artifact, range } => {
+                pools.transient.artifact_literal(artifact, range)
+            }
             Self::Runtime(range) => pools.transient.runtime(range),
             Self::TypeName(name) => Some(name.units()),
             Self::Empty => Some(&[]),
@@ -346,7 +365,7 @@ impl StringOperand {
 
     pub(super) fn is_empty(self) -> bool {
         match self {
-            Self::Literal(range) => range.is_empty(),
+            Self::Literal(range) | Self::ArtifactLiteral { range, .. } => range.is_empty(),
             Self::Runtime(range) => range.start == range.end,
             Self::Empty => true,
             // A Realm operand has already been checked by lexical GetValue;
@@ -360,12 +379,17 @@ impl StringOperand {
 #[derive(Clone, Copy)]
 pub(super) struct TransientStrings<'a> {
     literals: &'a [u16],
+    pub(super) artifacts: &'a [Artifact],
     runtime: &'a [u16],
 }
 
 impl<'a> TransientStrings<'a> {
     pub(super) fn literal(self, range: StringRange) -> Option<&'a [u16]> {
         range.get(self.literals)
+    }
+
+    pub(super) fn artifact_literal(self, artifact: u8, range: StringRange) -> Option<&'a [u16]> {
+        range.get(&self.artifacts.get(usize::from(artifact))?.string_units)
     }
 
     pub(super) fn runtime(self, range: RuntimeRange) -> Option<&'a [u16]> {
@@ -391,6 +415,7 @@ impl<'a> StringPools<'a> {
     pub(super) fn literals(literals: &'a [u16]) -> Self {
         TransientStrings {
             literals,
+            artifacts: &[],
             runtime: &[],
         }
         .with_retained(&[])
@@ -402,7 +427,19 @@ impl<'a> StringPools<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct ExternalStrings<'a> {
     pub(super) literals: &'a [u16],
+    pub(super) artifacts: &'a [Artifact],
+    pub(super) active_artifact: Option<u8>,
     pub(super) retained: &'a [u16],
+}
+
+impl<'a> ExternalStrings<'a> {
+    pub(super) fn literal(self, artifact: Option<u8>, range: StringRange) -> Option<&'a [u16]> {
+        let units = match artifact {
+            None => self.literals,
+            Some(id) => &self.artifacts.get(usize::from(id))?.string_units,
+        };
+        range.get(units)
+    }
 }
 
 enum AppendSource<'a> {
@@ -417,8 +454,12 @@ impl<'a> AppendSource<'a> {
         used: usize,
     ) -> Result<Self, EvalError> {
         match string {
-            StringOperand::Literal(range) => range
-                .get(external.literals)
+            StringOperand::Literal(range) => external
+                .literal(None, range)
+                .map(Self::Borrowed)
+                .ok_or(EvalError::InvalidScript),
+            StringOperand::ArtifactLiteral { artifact, range } => external
+                .literal(Some(artifact), range)
                 .map(Self::Borrowed)
                 .ok_or(EvalError::InvalidScript),
             StringOperand::TypeName(name) => Ok(Self::Borrowed(name.units())),
@@ -461,6 +502,8 @@ mod tests {
     fn external(literals: &[u16]) -> ExternalStrings<'_> {
         ExternalStrings {
             literals,
+            artifacts: &[],
+            active_artifact: None,
             retained: &[],
         }
     }

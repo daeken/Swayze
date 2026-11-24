@@ -59,6 +59,7 @@ enum Operand {
     // Producers check logical bounds before creating operands. Realm GetValue
     // also checks offsets before returning them to metadata-only consumers.
     String(StringOperand),
+    Function(realm::FunctionId),
 }
 
 impl Operand {
@@ -69,6 +70,7 @@ impl Operand {
     ) -> Result<f64, EvalError> {
         match self {
             Self::Scalar(value) => Ok(value.to_number()),
+            Self::Function(_) => Err(EvalError::UnsupportedCallableConversion),
             Self::String(range) => {
                 let units = range.get(strings).ok_or(EvalError::InvalidScript)?;
                 string_number::convert(units, credits_left)
@@ -79,6 +81,7 @@ impl Operand {
     fn to_boolean(self) -> bool {
         match self {
             Self::Scalar(value) => value.to_boolean(),
+            Self::Function(_) => true,
             Self::String(range) => !range.is_empty(),
         }
     }
@@ -185,11 +188,24 @@ pub enum EvalError {
     /// A reached `.length` receiver is not a primitive String.
     /// This is a subset error, not JavaScript `undefined` or a `TypeError`.
     UnsupportedPropertyReceiver,
+    /// Converting a callable to a primitive requires unsupported object machinery.
+    UnsupportedCallableConversion,
+    CallDepthLimitExceeded,
+    LiveSlotLimitExceeded,
+    GlobalLookupLimitExceeded,
 }
 
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::UnsupportedCallableConversion => {
+                "callable-to-primitive conversion is outside the subset"
+            }
+            Self::CallDepthLimitExceeded => "JavaScript guest frame limit exceeded",
+            Self::LiveSlotLimitExceeded => "JavaScript live frame slot limit exceeded",
+            Self::GlobalLookupLimitExceeded => {
+                "JavaScript call setup and global lookup budget exceeded"
+            }
             Self::LimitExceeded => "prepared JavaScript instruction limit exceeded",
             Self::DispatchLimitExceeded => "JavaScript evaluation dispatch limit exceeded",
             Self::InvalidScript => "invalid prepared JavaScript instruction sequence",
@@ -248,6 +264,7 @@ impl Script {
         match self.run(&mut EvalScratch::new())? {
             Operand::Scalar(value) => Ok(value),
             Operand::String(_) => Err(EvalError::NonScalarResult),
+            Operand::Function(_) => Err(EvalError::InvalidScript),
         }
     }
 
@@ -394,9 +411,12 @@ impl Script {
             Operand::String(StringOperand::Runtime(_)) => {
                 Err(EvalError::RuntimeStringResultRequiresScratch)
             }
-            Operand::String(StringOperand::Empty | StringOperand::Realm(_)) => {
-                Err(EvalError::InvalidScript)
-            }
+            Operand::Function(_)
+            | Operand::String(
+                StringOperand::Empty
+                | StringOperand::Realm(_)
+                | StringOperand::ArtifactLiteral { .. },
+            ) => Err(EvalError::InvalidScript),
         }
     }
 
@@ -426,6 +446,8 @@ impl Script {
             Operand::String(StringOperand::Empty | StringOperand::Realm(_)) => {
                 Err(EvalError::InvalidScript)
             }
+            Operand::Function(_) => Err(EvalError::InvalidScript),
+            Operand::String(StringOperand::ArtifactLiteral { .. }) => Err(EvalError::InvalidScript),
             Operand::String(range) => range
                 .get(scratch.pools(self.string_units()))
                 .map(PrimitiveValue::String)
@@ -522,22 +544,113 @@ fn evaluate(
     let stack = new_stack(max_operands)?;
     let mut bindings = LegacyBindings::new(binding_slots)?;
     dispatch(
-        ops,
+        Frame::root(ops, max_operands, exit),
         stack,
-        max_operands,
         string_units,
-        exit,
+        realm::CallableCode::default(),
         scratch,
         &mut bindings,
     )
 }
 
-fn dispatch<B: Bindings>(
-    ops: &[Instruction],
-    mut stack: Vec<Operand>,
+const MAX_GUEST_FRAMES: usize = 32;
+const MAX_LIVE_SLOTS: usize = 4096;
+const UNDEFINED: Operand = Operand::Scalar(Value::Undefined);
+
+// The active frame and suspended caller frames borrow immutable code only;
+// the VM owns every formal/temporary slot. No Rust recursion or code copies.
+struct Frame<'code> {
+    ops: &'code [Instruction],
     max_operands: usize,
-    string_units: &[u16],
     exit: ExitStack,
+    body: Option<realm::FunctionOrigin>,
+    ip: usize,
+    base: usize, // formals start here; this is also the caller's result slot
+    temps: usize,
+}
+
+impl<'code> Frame<'code> {
+    fn root(ops: &'code [Instruction], max_operands: usize, exit: ExitStack) -> Self {
+        Self {
+            ops,
+            max_operands,
+            exit,
+            body: None,
+            ip: 0,
+            base: 0,
+            temps: 0,
+        }
+    }
+}
+
+fn validate_body(
+    ops: &[Instruction],
+    max_operands: usize,
+    exit: ExitStack,
+) -> Result<(), EvalError> {
+    if ops.len() > MAX_INSTRUCTIONS {
+        return Err(EvalError::LimitExceeded);
+    }
+    // Unlike Legacy, one call can consume many operands at once. Reached
+    // operations enforce the actual frame-relative bounds and exit arities.
+    if max_operands < exit.arity() || max_operands > ops.len() || max_operands > MAX_LIVE_SLOTS {
+        return Err(EvalError::InvalidScript);
+    }
+    Ok(())
+}
+
+struct Stack<'a> {
+    slots: &'a mut Vec<Operand>,
+    base: usize,
+    temps: usize,
+}
+
+impl Stack<'_> {
+    #[cfg(test)]
+    fn root(slots: &mut Vec<Operand>) -> Stack<'_> {
+        Stack {
+            slots,
+            base: 0,
+            temps: 0,
+        }
+    }
+    fn as_slice(&self) -> &[Operand] {
+        &self.slots[self.temps..]
+    }
+    fn as_mut_slice(&mut self) -> &mut [Operand] {
+        &mut self.slots[self.temps..]
+    }
+    fn len(&self) -> usize {
+        self.slots.len() - self.temps
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn last(&self) -> Option<&Operand> {
+        self.as_slice().last()
+    }
+    fn last_mut(&mut self) -> Option<&mut Operand> {
+        self.as_mut_slice().last_mut()
+    }
+    fn pop(&mut self) -> Option<Operand> {
+        if self.is_empty() {
+            None
+        } else {
+            self.slots.pop()
+        }
+    }
+    fn formal(&mut self, slot: u8) -> Result<&mut Operand, EvalError> {
+        self.slots[self.base..self.temps]
+            .get_mut(usize::from(slot))
+            .ok_or(EvalError::InvalidScript)
+    }
+}
+
+fn dispatch<'code, B: Bindings>(
+    mut frame: Frame<'code>,
+    mut slots: Vec<Operand>,
+    string_units: &[u16],
+    callable: realm::CallableCode<'code>,
     scratch: &mut EvalScratch,
     bindings: &mut B,
 ) -> Result<Option<Operand>, B::Error> {
@@ -545,14 +658,130 @@ fn dispatch<B: Bindings>(
     let mut remaining = MAX_DISPATCHES;
     let mut string_pairs_left = MAX_STRING_COMPARISON_PAIRS;
     let mut string_conversion_credits_left = string_number::MAX_CREDITS;
-    let mut ip = 0;
-    while ip != ops.len() {
+    let mut callers = Vec::<Frame<'_>>::new();
+    loop {
+        let Frame {
+            ops,
+            max_operands,
+            body,
+            base,
+            temps,
+            exit,
+            ref mut ip,
+        } = frame;
+        let mut stack = Stack {
+            slots: &mut slots,
+            base,
+            temps,
+        };
+        if *ip == ops.len() {
+            // Frame frontier is not dispatched; ordinary body fallthrough
+            // is undefined, independent of preceding expression statements.
+            if B::CALLS && body.is_some() {
+                if !stack.is_empty() {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                frame = resume(&mut callers, &mut slots, base, UNDEFINED, bindings)?;
+                continue;
+            }
+            return match (exit, stack.as_slice()) {
+                (ExitStack::Empty, []) => Ok(None),
+                (ExitStack::Value, [value]) => Ok(Some(*value)),
+                _ => Err(EvalError::InvalidScript.into()),
+            };
+        }
         remaining = remaining
             .checked_sub(1)
             .ok_or(EvalError::DispatchLimitExceeded)?;
-        let op = *ops.get(ip).ok_or(EvalError::InvalidScript)?;
-        ip += 1;
+        let op = *ops.get(*ip).ok_or(EvalError::InvalidScript)?;
+        *ip += 1;
+        let source = bindings.transient(scratch, string_units, callable.artifacts);
         match op {
+            Instruction::Call { start, end, argc } if B::CALLS => {
+                let argc = usize::from(argc);
+                if argc > usize::from(realm::MAX_PARAMETERS) || start >= end {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                let pos = temps
+                    + stack
+                        .len()
+                        .checked_sub(argc + 1)
+                        .ok_or(EvalError::InvalidScript)?;
+                let Operand::Function(id) = slots[pos] else {
+                    return Err(bindings.non_callable(crate::Span {
+                        start: start as usize,
+                        end: end as usize,
+                    }));
+                };
+                // Only after GetValue and all argument expressions succeed.
+                let (origin, target) = callable.resolve(id)?;
+                if callers.len() == MAX_GUEST_FRAMES {
+                    return Err(EvalError::CallDepthLimitExceeded.into());
+                }
+                let formals = usize::from(target.formals);
+                let needed = pos + formals + target.max_stack_depth;
+                if needed > MAX_LIVE_SLOTS {
+                    return Err(EvalError::LiveSlotLimitExceeded.into());
+                }
+                bindings.charge_call(1 + formals)?;
+                if callers.capacity() == 0 {
+                    callers
+                        .try_reserve_exact(MAX_GUEST_FRAMES)
+                        .map_err(|_| EvalError::AllocationFailed)?;
+                }
+                if needed > slots.capacity() {
+                    // Geometric startup; at most 4096 requested slots, and
+                    // <8192 old initialized slots moved over the execution.
+                    let capacity = needed.next_power_of_two();
+                    slots
+                        .try_reserve_exact(capacity - slots.len())
+                        .map_err(|_| EvalError::AllocationFailed)?;
+                }
+                let supplied = argc.min(formals);
+                slots.copy_within(pos + 1..pos + 1 + supplied, pos);
+                slots.truncate(pos + supplied);
+                slots.resize(pos + formals, UNDEFINED);
+                let callee = Frame {
+                    ops: &target.instructions,
+                    max_operands: target.max_stack_depth,
+                    exit: ExitStack::Empty,
+                    body: Some(origin),
+                    ip: 0,
+                    base: pos,
+                    temps: pos + formals,
+                };
+                callers.push(std::mem::replace(&mut frame, callee));
+                bindings.select_body(Some(origin));
+            }
+            Instruction::Return { value } if B::CALLS => {
+                if body.is_none() || stack.len() != usize::from(value) {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                let value = stack.pop().unwrap_or(UNDEFINED);
+                frame = resume(&mut callers, &mut slots, base, value, bindings)?;
+            }
+            Instruction::LoadFormal(slot) if B::CALLS => {
+                let value = *stack.formal(slot)?;
+                push_operand(&mut stack, max_operands, value)?;
+            }
+            Instruction::StoreFormal { slot, keep } if B::CALLS => {
+                let value = store_operand(&mut stack, keep)?;
+                *stack.formal(slot)? = value;
+            }
+            Instruction::UpdateFormal { slot, op, result } if B::CALLS => {
+                let old = stack.formal(slot)?.to_number(
+                    source.with_retained(bindings.retained_units()),
+                    &mut string_conversion_credits_left,
+                )?;
+                let new = update_number(op, old);
+                update_result(&mut stack, max_operands, result, old, new)?;
+                *stack.formal(slot)? = Operand::Scalar(Value::Number(new));
+            }
+            Instruction::Call { .. }
+            | Instruction::Return { .. }
+            | Instruction::LoadFormal(_)
+            | Instruction::StoreFormal { .. }
+            | Instruction::UpdateFormal { .. } => return Err(EvalError::InvalidScript.into()),
             Instruction::Number(value) => {
                 push_operand(
                     &mut stack,
@@ -561,11 +790,15 @@ fn dispatch<B: Bindings>(
                 )?;
             }
             Instruction::String(range) => {
-                range.get(string_units).ok_or(EvalError::InvalidScript)?;
+                let artifact = body.map(|body| body.artifact);
+                bindings
+                    .external_strings(string_units)
+                    .literal(artifact, range)
+                    .ok_or(EvalError::InvalidScript)?;
                 push_operand(
                     &mut stack,
                     max_operands,
-                    Operand::String(StringOperand::Literal(range)),
+                    Operand::String(StringOperand::literal(artifact, range)),
                 )?;
             }
             Instruction::Boolean(value) => {
@@ -585,20 +818,14 @@ fn dispatch<B: Bindings>(
                 push_operand(&mut stack, max_operands, bindings.load(slot)?)?;
             }
             Instruction::InitBinding { slot, kind } => {
-                bindings.init(
-                    slot,
-                    kind,
-                    ip - 1,
-                    &mut stack,
-                    scratch.transient(string_units),
-                )?;
+                bindings.init(slot, kind, *ip - 1, &mut stack, source)?;
             }
             Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
                 bindings.store(
                     slot,
                     matches!(op, Instruction::StoreBindingKeep(_)),
                     &mut stack,
-                    scratch.transient(string_units),
+                    source,
                 )?;
             }
             Instruction::UpdateBinding { slot, op, result } => {
@@ -609,7 +836,7 @@ fn dispatch<B: Bindings>(
                     &mut stack,
                     max_operands,
                     UpdateNumeric {
-                        source: scratch.transient(string_units),
+                        source,
                         credits: &mut string_conversion_credits_left,
                     },
                 )?;
@@ -754,7 +981,7 @@ fn dispatch<B: Bindings>(
                 })?;
             }
             Instruction::Positive => {
-                apply_unary(&mut stack, |value| {
+                apply_unary(stack.as_mut_slice(), |value| {
                     let number = value.to_number(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
@@ -763,7 +990,7 @@ fn dispatch<B: Bindings>(
                 })?;
             }
             Instruction::Negate => {
-                apply_unary(&mut stack, |value| {
+                apply_unary(stack.as_mut_slice(), |value| {
                     let number = value.to_number(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
@@ -772,10 +999,12 @@ fn dispatch<B: Bindings>(
                 })?;
             }
             Instruction::Not => {
-                apply_unary(&mut stack, |value| Ok(Value::Boolean(!value.to_boolean())))?;
+                apply_unary(stack.as_mut_slice(), |value| {
+                    Ok(Value::Boolean(!value.to_boolean()))
+                })?;
             }
             Instruction::BitwiseNot => {
-                apply_unary(&mut stack, |value| {
+                apply_unary(stack.as_mut_slice(), |value| {
                     let number = value.to_number(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
@@ -783,7 +1012,7 @@ fn dispatch<B: Bindings>(
                     Ok(Value::Number(f64::from(!number_to_int32(number))))
                 })?;
             }
-            Instruction::Void => apply_unary(&mut stack, |_| Ok(Value::Undefined))?,
+            Instruction::Void => apply_unary(stack.as_mut_slice(), |_| Ok(Value::Undefined))?,
             Instruction::Typeof => {
                 let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
                 let name = match *value {
@@ -792,68 +1021,80 @@ fn dispatch<B: Bindings>(
                     Operand::Scalar(Value::Null) => TypeName::Object,
                     Operand::Scalar(Value::Undefined) => TypeName::Undefined,
                     Operand::String(_) => TypeName::String,
+                    Operand::Function(_) => TypeName::Function,
                 };
                 *value = Operand::String(StringOperand::TypeName(name));
             }
             Instruction::StringLength => {
-                apply_unary(&mut stack, |value| {
+                apply_unary(stack.as_mut_slice(), |value| {
                     string_length(value, bindings.string_pools(scratch, string_units))
                 })?;
             }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
-                let target = check_forward_target(ip, target, ops.len())?;
+                let target = check_forward_target(*ip, target, ops.len())?;
                 if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
                     return Err(EvalError::InvalidScript.into());
                 }
                 let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if !condition.to_boolean() {
-                    ip = target;
+                    *ip = target;
                 }
             }
             Instruction::ShortCircuit { target, condition } => {
-                let target = check_forward_target(ip, target, ops.len())?;
+                let target = check_forward_target(*ip, target, ops.len())?;
                 let lhs = *stack.last().ok_or(EvalError::InvalidScript)?;
                 if condition.skips_rhs(lhs) {
-                    ip = target;
+                    *ip = target;
                 } else {
                     stack.pop();
                 }
             }
             Instruction::ShortCircuitStatement { target, condition } => {
-                let target = check_forward_target(ip, target, ops.len())?;
+                let target = check_forward_target(*ip, target, ops.len())?;
                 if stack.len() != 1 {
                     return Err(EvalError::InvalidScript.into());
                 }
                 let lhs = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if condition.skips_rhs(lhs) {
-                    ip = target;
+                    *ip = target;
                 }
             }
-            Instruction::Jump(target) => ip = check_forward_target(ip, target, ops.len())?,
+            Instruction::Jump(target) => *ip = check_forward_target(*ip, target, ops.len())?,
             Instruction::JumpStatement(target) => {
                 if !stack.is_empty() {
                     return Err(EvalError::InvalidScript.into());
                 }
-                ip = check_forward_target(ip, target, ops.len())?;
+                *ip = check_forward_target(*ip, target, ops.len())?;
             }
             Instruction::LoopBack(target) => {
                 // `ip` already points past this instruction. Reject self and
                 // forward edges, and require statement depth on entry.
-                if target >= ip - 1 || !stack.is_empty() {
+                if target >= *ip - 1 || !stack.is_empty() {
                     return Err(EvalError::InvalidScript.into());
                 }
-                ip = target;
+                *ip = target;
             }
         }
     }
+}
 
-    // `ops.len()` is the join frontier. A statement exit must not leave an
-    // operand and an expression exit must leave exactly one, even if ignored.
-    match (exit, stack.as_slice()) {
-        (ExitStack::Empty, []) => Ok(None),
-        (ExitStack::Value, [value]) => Ok(Some(*value)),
-        _ => Err(EvalError::InvalidScript.into()),
-    }
+fn resume<'code, B: Bindings>(
+    callers: &mut Vec<Frame<'code>>,
+    slots: &mut Vec<Operand>,
+    base: usize,
+    result: Operand,
+    bindings: &mut B,
+) -> Result<Frame<'code>, EvalError> {
+    let caller = callers.pop().ok_or(EvalError::InvalidScript)?;
+    slots.truncate(base);
+    let mut destination = Stack {
+        slots,
+        base: caller.base,
+        temps: caller.temps,
+    };
+    push_operand(&mut destination, caller.max_operands, result)?;
+    bindings.select_body(caller.body);
+    Ok(caller)
 }
 
 fn string_length(value: Operand, pools: StringPools<'_>) -> Result<Value, EvalError> {
@@ -880,6 +1121,13 @@ fn operands_equal(
         } else {
             lhs.loosely_equals(rhs)
         }),
+        (Operand::Function(lhs), Operand::Function(rhs)) => Ok(lhs == rhs),
+        (Operand::Function(_), Operand::Scalar(Value::Null | Value::Undefined))
+        | (Operand::Scalar(Value::Null | Value::Undefined), Operand::Function(_)) => Ok(false),
+        (Operand::Function(_), _) | (_, Operand::Function(_)) if strict => Ok(false),
+        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
+            Err(EvalError::UnsupportedCallableConversion)
+        }
         (Operand::String(lhs), Operand::String(rhs)) => {
             let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
             let rhs = rhs.get(strings).ok_or(EvalError::InvalidScript)?;
@@ -941,14 +1189,14 @@ fn check_forward_target(next: usize, target: usize, exit: usize) -> Result<usize
 }
 
 fn push_operand(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     max_operands: usize,
     value: Operand,
 ) -> Result<(), EvalError> {
-    if stack.len() == max_operands {
+    if stack.len() >= max_operands || stack.slots.len() == stack.slots.capacity() {
         return Err(EvalError::InvalidScript);
     }
-    stack.push(value);
+    stack.slots.push(value);
     Ok(())
 }
 
@@ -962,14 +1210,14 @@ fn apply_unary(
 }
 
 fn apply_binary(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     op: impl FnOnce(Operand, Operand) -> Result<Value, EvalError>,
 ) -> Result<(), EvalError> {
     apply_binary_operand(stack, |lhs, rhs| op(lhs, rhs).map(Operand::Scalar))
 }
 
 fn apply_binary_operand(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     op: impl FnOnce(Operand, Operand) -> Result<Operand, EvalError>,
 ) -> Result<(), EvalError> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
@@ -989,7 +1237,7 @@ fn update_number(op: Update, old: f64) -> f64 {
 // entire substitution append succeeds. Keep this path out of dispatch.
 #[inline(never)]
 fn append_template(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     external: ExternalStrings<'_>,
     scratch: &mut EvalScratch,
     following: crate::parser::StringRange,
@@ -1012,6 +1260,9 @@ fn add(
     scratch: &mut EvalScratch,
 ) -> Result<Operand, EvalError> {
     match (lhs, rhs) {
+        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
+            Err(EvalError::UnsupportedCallableConversion)
+        }
         (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(Operand::Scalar(Value::Number(
             lhs.to_number() + rhs.to_number(),
         ))),
@@ -1028,7 +1279,7 @@ fn add(
 }
 
 fn apply_numeric_binary(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     strings: StringPools<'_>,
     credits_left: &mut usize,
     op: impl FnOnce(f64, f64) -> f64,
@@ -1105,7 +1356,9 @@ mod tests {
             &mut EvalScratch::new(),
         )? {
             Some(Operand::Scalar(value)) => Ok(value),
-            Some(Operand::String(_)) => panic!("unexpected String in scalar fixture"),
+            Some(Operand::String(_) | Operand::Function(_)) => {
+                panic!("unexpected operand in scalar fixture")
+            }
             None => panic!("missing result in scalar fixture"),
         }
     }
@@ -1449,7 +1702,7 @@ mod tests {
         for mut stack in [vec![], vec![valid]] {
             let mut credits = 261;
             assert_eq!(
-                apply_numeric_binary(&mut stack, pool, &mut credits, no_math),
+                apply_numeric_binary(&mut Stack::root(&mut stack), pool, &mut credits, no_math),
                 Err(EvalError::InvalidScript)
             );
             assert_eq!(credits, 261);
@@ -1464,7 +1717,7 @@ mod tests {
         ] {
             let mut credits = 260;
             assert_eq!(
-                apply_numeric_binary(&mut stack, pool, &mut credits, no_math),
+                apply_numeric_binary(&mut Stack::root(&mut stack), pool, &mut credits, no_math),
                 Err(expected)
             );
             assert_eq!(credits, remaining);

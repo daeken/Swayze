@@ -1,4 +1,4 @@
-//! Opt-in, bounded Script execution with persistent lexical and `var` bindings.
+//! Opt-in, bounded Script execution with persistent bindings and ordinary calls.
 //!
 //! ```
 //! use swayze_js::realm::{CompiledScript, Completion, Realm};
@@ -13,10 +13,12 @@
 //!
 //! Root lexical bindings and Script-scoped simple `var` declarations are
 //! separate private records, not a global object. No host bindings or nested
-//! lexical declarations. `undefined` is the sole intrinsic fallback. An exact Use Strict Directive
-//! in the root prologue affects only its own Script. The host chooses which
-//! checked Scripts to retain; the Realm does not own or cache them. No Script
-//! results or binding handles leave the Realm.
+//! lexical declarations. `undefined` is the sole intrinsic fallback. Ordinary
+//! functions have mutable simple formals, live Realm free names and no local
+//! declarations or receiver. Strictness comes from their definition, not the
+//! caller. The Realm retains immutable bodies for installed function identities
+//! even if the original compiled Script is dropped. No Script results or
+//! binding handles leave the Realm.
 //!
 //! An allowed binding write copies a nonempty Script-local or temporary String
 //! into the Realm. Each execution can copy up to 16,384 UTF-16 units; the Realm
@@ -33,15 +35,21 @@ use crate::{
 };
 
 use super::{
-    BindingKind, Bindings, EvalError, EvalScratch, ExitStack, Instruction, Operand, StringOperand,
-    TransientStrings, TypeName, Update, UpdateNumeric, UpdateResult, Value, dispatch, init_operand,
-    new_stack, store_operand, update_number, update_result, validate_layout,
+    BindingKind, Bindings, EvalError, EvalScratch, ExitStack, Frame, Instruction, Operand, Stack,
+    StringOperand, TransientStrings, TypeName, Update, UpdateNumeric, UpdateResult, Value,
+    dispatch, init_operand, new_stack, store_operand, update_number, update_result, validate_body,
+    validate_layout,
 };
 
 pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;
 pub(crate) const MAX_SITES: usize = 4096;
+pub(crate) const MAX_PARAMETERS: u8 = 64;
+const MAX_ARTIFACTS: usize = 16;
+const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+const MAX_FUNCTIONS: usize = 512;
+const LOOKUP_WORK: usize = 128 * 1024;
 const MAX_GLOBALS: usize = 512;
 const PREFLIGHT_WORK: usize = 128 * 1024;
 const MAX_COPIED_UNITS: usize = 16_384;
@@ -56,11 +64,14 @@ type Chunk = [u16; CHUNK_UNITS];
 pub(crate) enum Role {
     Declaration(BindingKind),
     Var { initialized: bool },
+    Function { body: u16 },
+    Formal,
     Read,
     Typeof,
     Write,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Site {
     pub(crate) span: Span,
     pub(crate) start: u16,
@@ -74,6 +85,14 @@ pub(crate) enum CodeMode {
     Strict,
 }
 
+pub(crate) struct FunctionBody {
+    pub(crate) instructions: Vec<Instruction>,
+    pub(crate) max_stack_depth: usize,
+    pub(crate) mode: CodeMode,
+    pub(crate) formals: u8,
+    pub(crate) accesses: std::ops::Range<usize>,
+}
+
 /// Immutable policy-compiled code with no source borrow or Realm dependency.
 pub struct CompiledScript {
     pub(crate) instructions: Vec<Instruction>,
@@ -84,6 +103,7 @@ pub struct CompiledScript {
     pub(crate) names: Vec<u8>,
     pub(crate) sites: Vec<Site>,
     pub(crate) declarations: usize,
+    pub(crate) functions: Vec<FunctionBody>,
 }
 
 impl CompiledScript {
@@ -148,7 +168,13 @@ pub enum InstantiateError {
     SyntaxError {
         span: Span,
     },
+    TypeError {
+        span: Span,
+    },
     BindingLimitExceeded,
+    ArtifactLimitExceeded,
+    ArtifactBytesLimitExceeded,
+    FunctionLimitExceeded,
     WorkLimitExceeded,
     AllocationFailed,
     InvalidScript,
@@ -197,6 +223,7 @@ enum StoredValue {
     TypeName(TypeName),
     Empty,
     Realm(RealmRange),
+    Function(FunctionId),
 }
 
 // Not a public handle: only successful appends issue offsets, and the private
@@ -303,9 +330,137 @@ struct ObjectBindings {
     undefined_declared: bool,
 }
 
-/// Owns two private binding records. No global object, handles, callbacks, or reentry.
+// Private append-only indices, meaningful only in the owning Realm. A cell
+// points to an identity, not directly to a code address or binding name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FunctionId(u16);
+
+#[derive(Clone, Copy)]
+pub(super) struct FunctionOrigin {
+    pub(super) artifact: u8,
+    body: u16,
+}
+
+pub(super) struct Artifact {
+    bodies: Vec<FunctionBody>,
+    pub(super) string_units: Vec<u16>,
+    names: Vec<u8>,
+    sites: Vec<Site>,
+}
+
+impl Artifact {
+    fn stage(
+        code: &CompiledScript,
+        retained: usize,
+        work: &mut Work,
+    ) -> Result<(Self, usize), InstantiateError> {
+        // Exact fresh reservations: no realloc overlap within the immutable
+        // backing. The budget includes measured capacities, including metadata.
+        let mut bytes = retained;
+        let mut bodies = reserve_code(code.functions.len(), &mut bytes, work)?;
+        for body in &code.functions {
+            validate_body(&body.instructions, body.max_stack_depth, ExitStack::Empty)
+                .map_err(|_| InstantiateError::InvalidScript)?;
+            if body.formals > MAX_PARAMETERS
+                || body.accesses.end > code.sites.len()
+                || body.accesses.start < code.declarations
+                || body.accesses.start > body.accesses.end
+            {
+                return Err(InstantiateError::InvalidScript);
+            }
+            bodies.push(FunctionBody {
+                instructions: copy_code(&body.instructions, &mut bytes, work)?,
+                max_stack_depth: body.max_stack_depth,
+                mode: body.mode,
+                formals: body.formals,
+                accesses: body.accesses.clone(),
+            });
+        }
+        let string_units = copy_code(&code.string_units, &mut bytes, work)?;
+        let names = copy_code(&code.names, &mut bytes, work)?;
+        let sites = copy_code(&code.sites, &mut bytes, work)?;
+        Ok((
+            Self {
+                bodies,
+                string_units,
+                names,
+                sites,
+            },
+            bytes,
+        ))
+    }
+}
+
+fn reserve_code<T>(
+    len: usize,
+    bytes: &mut usize,
+    work: &mut Work,
+) -> Result<Vec<T>, InstantiateError> {
+    use InstantiateError::ArtifactBytesLimitExceeded;
+    let element = std::mem::size_of::<T>();
+    let fits = |count: usize| {
+        count
+            .checked_mul(element)
+            .and_then(|size| bytes.checked_add(size))
+            .filter(|&total| total <= MAX_ARTIFACT_BYTES)
+            .ok_or(ArtifactBytesLimitExceeded)
+    };
+    fits(len)?;
+    work.charge(len)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(len)
+        .map_err(|_| InstantiateError::AllocationFailed)?;
+    *bytes = fits(result.capacity())?;
+    Ok(result)
+}
+
+fn copy_code<T: Copy>(
+    source: &[T],
+    bytes: &mut usize,
+    work: &mut Work,
+) -> Result<Vec<T>, InstantiateError> {
+    let mut result = reserve_code(source.len(), bytes, work)?;
+    result.extend_from_slice(source);
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct CallableCode<'a> {
+    pub(super) artifacts: &'a [Artifact],
+    functions: &'a [FunctionOrigin],
+}
+
+impl<'a> CallableCode<'a> {
+    pub(super) fn resolve(
+        self,
+        id: FunctionId,
+    ) -> Result<(FunctionOrigin, &'a FunctionBody), EvalError> {
+        let origin = *self
+            .functions
+            .get(usize::from(id.0))
+            .ok_or(EvalError::InvalidScript)?;
+        let (_, body) = self.body(origin).ok_or(EvalError::InvalidScript)?;
+        Ok((origin, body))
+    }
+
+    fn body(self, origin: FunctionOrigin) -> Option<(&'a Artifact, &'a FunctionBody)> {
+        let artifact = self.artifacts.get(usize::from(origin.artifact))?;
+        Some((artifact, artifact.bodies.get(usize::from(origin.body))?))
+    }
+}
+
+/// Owns two private binding records and immutable ordinary function bodies. No global object, handles, callbacks, or reentry.
 #[derive(Default)]
 pub struct Realm {
+    state: RealmState,
+    artifacts: Vec<Artifact>,
+    artifact_bytes: usize,
+    functions: Vec<FunctionOrigin>,
+}
+
+#[derive(Default)]
+struct RealmState {
     globals: Vec<Cell>,
     object: ObjectBindings,
     strings: Arena,
@@ -317,8 +472,9 @@ impl Realm {
     }
 
     /// Preflight and atomically install new lexical cells in TDZ and new `var`
-    /// cells initialized to `undefined`. A failed instantiation changes no
-    /// bindings. Missing or uninitialized uses are not rejected by this check.
+    /// cells initialized to `undefined`, and install or replace the last
+    /// function declaration per name. A failed instantiation changes no
+    /// bindings or retained code. Missing or uninitialized uses are not rejected by this check.
     pub fn instantiate<'realm, 'code>(
         &'realm mut self,
         code: &'code CompiledScript,
@@ -335,8 +491,8 @@ impl Realm {
             AllocationFailed, BindingLimitExceeded, InvalidScript, SyntaxError,
         };
         let mut work = Work(work);
-        let lexical_base = self.globals.len();
-        let var_base = self.object.vars.len();
+        let lexical_base = self.state.globals.len();
+        let var_base = self.state.object.vars.len();
         let (declarations, accesses) = code
             .sites
             .split_at_checked(code.declarations)
@@ -352,17 +508,20 @@ impl Realm {
             work.charge(1)?;
             match site.role {
                 Role::Declaration(_) => lexical_count += 1,
-                Role::Var { .. } => continue,
+                Role::Var { .. } | Role::Function { .. } => continue,
                 _ => return Err(InvalidScript),
             }
             let name = code.name(site)?;
-            let seed = self.object.undefined_declared;
+            let seed = self.state.object.undefined_declared;
             if (seed && work.equal(name, b"undefined")?)
                 || work
-                    .find(name, self.object.vars.iter().map(|c| c.name.as_slice()))?
+                    .find(
+                        name,
+                        self.state.object.vars.iter().map(|c| c.name.as_slice()),
+                    )?
                     .is_some()
                 || work
-                    .find(name, self.globals.iter().map(|c| c.name.as_slice()))?
+                    .find(name, self.state.globals.iter().map(|c| c.name.as_slice()))?
                     .is_some()
                 || (!seed && work.equal(name, b"undefined")?)
             {
@@ -373,11 +532,11 @@ impl Realm {
         if var_count != 0 {
             for site in declarations {
                 work.charge(1)?;
-                if matches!(site.role, Role::Var { .. })
+                if matches!(site.role, Role::Var { .. } | Role::Function { .. })
                     && work
                         .find(
                             code.name(site)?,
-                            self.globals.iter().map(|c| c.name.as_slice()),
+                            self.state.globals.iter().map(|c| c.name.as_slice()),
                         )?
                         .is_some()
                 {
@@ -385,8 +544,48 @@ impl Realm {
                 }
             }
         }
-        // All absent names are declarable, and existing object-side names
-        // (including readonly undefined) are reused. Dedup installation only.
+        // Check CanDeclareGlobalFunction in reverse last-occurrence order,
+        // only after all lexical and VarDeclaredNames-vs-lexical checks.
+        let mut selected = Vec::<usize>::new();
+        if !code.functions.is_empty() {
+            selected
+                .try_reserve_exact(code.functions.len())
+                .map_err(|_| AllocationFailed)?;
+            let mut next_body = code.functions.len();
+            for (index, site) in declarations.iter().enumerate().rev() {
+                work.charge(1)?;
+                let Role::Function { body } = site.role else {
+                    continue;
+                };
+                next_body = next_body.checked_sub(1).ok_or(InvalidScript)?;
+                if usize::from(body) != next_body {
+                    return Err(InvalidScript);
+                }
+                let name = code.name(site)?;
+                let mut duplicate = false;
+                for &chosen in &selected {
+                    if work.equal(name, code.name(&declarations[chosen])?)? {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if duplicate {
+                    continue;
+                }
+                // Existing declared rows are writable and enumerable. The
+                // readonly, non-configurable undefined seed is not.
+                if work.equal(name, b"undefined")? {
+                    return Err(InstantiateError::TypeError { span: site.span });
+                }
+                selected.push(index);
+            }
+            if next_body != 0 {
+                return Err(InvalidScript);
+            }
+        }
+        // Remaining CanDeclareGlobalVar checks all succeed in this Realm:
+        // absent names are declarable and any existing object-side row or
+        // readonly undefined can be declared without replacement.
         let available = MAX_GLOBALS - lexical_base - var_base;
         if lexical_count > available {
             return Err(BindingLimitExceeded);
@@ -403,6 +602,44 @@ impl Realm {
         links
             .try_reserve_exact(code.sites.len())
             .map_err(|_| AllocationFailed)?;
+        let artifact_id = self.artifacts.len();
+        let mut installs = Vec::new();
+        let mut identities = Vec::new();
+        if !selected.is_empty() {
+            if artifact_id == MAX_ARTIFACTS {
+                return Err(InstantiateError::ArtifactLimitExceeded);
+            }
+            if self.functions.len() + selected.len() > MAX_FUNCTIONS {
+                return Err(InstantiateError::FunctionLimitExceeded);
+            }
+            installs
+                .try_reserve_exact(selected.len())
+                .map_err(|_| AllocationFailed)?;
+            identities
+                .try_reserve_exact(selected.len())
+                .map_err(|_| AllocationFailed)?;
+            for index in selected.into_iter().rev() {
+                let site = &declarations[index];
+                let Role::Function { body } = site.role else {
+                    return Err(InvalidScript);
+                };
+                let name = code.name(site)?;
+                let slot = declare_var(
+                    &mut work,
+                    &self.state.object.vars,
+                    &mut vars,
+                    available - lexical_count,
+                    name,
+                )?;
+                work.charge(4)?; // stage and publish identity + replacement
+                let id = FunctionId((self.functions.len() + identities.len()) as u16);
+                identities.push(FunctionOrigin {
+                    artifact: artifact_id as u8,
+                    body,
+                });
+                installs.push((slot, id));
+            }
+        }
         for site in declarations {
             let name = code.name(site)?;
             let target = match site.role {
@@ -420,46 +657,54 @@ impl Realm {
                 Role::Var { .. } => {
                     work.charge(1)?; // Link, even on reuse.
                     if work.equal(name, b"undefined")? {
-                        if !self.object.undefined_declared && !declare_undefined {
+                        if !self.state.object.undefined_declared && !declare_undefined {
                             work.charge(2)?; // Stage and publish membership.
                             declare_undefined = true;
                         }
                         Target::Undefined
-                    } else if let Some(slot) = work.find(
-                        name,
-                        self.object
-                            .vars
-                            .iter()
-                            .chain(&vars)
-                            .map(|c| c.name.as_slice()),
-                    )? {
-                        Target::Var(slot)
                     } else {
-                        if vars.len() == available - lexical_count {
-                            return Err(BindingLimitExceeded);
-                        }
-                        let slot = var_base + vars.len();
-                        work.charge(name.len() + 2)?; // Copy, stage and publish.
-                        vars.push(VarCell {
-                            name: owned_name(name)?,
-                            value: StoredValue::Scalar(Value::Undefined),
-                        });
-                        Target::Var(slot)
+                        Target::Var(declare_var(
+                            &mut work,
+                            &self.state.object.vars,
+                            &mut vars,
+                            available - lexical_count,
+                            name,
+                        )?)
                     }
+                }
+                Role::Function { .. } if !identities.is_empty() => {
+                    work.charge(1)?; // Placeholder: declarations are not executable sites.
+                    Target::Missing
                 }
                 _ => return Err(InvalidScript),
             };
             links.push(target);
         }
-        for site in accesses {
+        let mut bodies = code.functions.iter().peekable();
+        for (offset, site) in accesses.iter().enumerate() {
             work.charge(1)?;
+            let index = code.declarations + offset;
+            while bodies.peek().is_some_and(|body| body.accesses.end <= index) {
+                work.charge(1)?;
+                bodies.next();
+            }
+            if bodies
+                .peek()
+                .is_some_and(|body| body.accesses.contains(&index))
+            {
+                // Retained code must use current Realm lookups, not Ready
+                // links from the defining Script (even for a current miss).
+                links.push(Target::Missing);
+                continue;
+            }
             if !matches!(site.role, Role::Read | Role::Typeof | Role::Write) {
                 return Err(InvalidScript);
             }
             let name = code.name(site)?;
             let target = if let Some(slot) = work.find(
                 name,
-                self.globals
+                self.state
+                    .globals
                     .iter()
                     .chain(&lexicals)
                     .map(|c| c.name.as_slice()),
@@ -469,7 +714,8 @@ impl Realm {
                 Target::Undefined
             } else if let Some(slot) = work.find(
                 name,
-                self.object
+                self.state
+                    .object
                     .vars
                     .iter()
                     .chain(&vars)
@@ -485,12 +731,39 @@ impl Realm {
         // Reserve both records before publishing either. Prepare new backing
         // separately: failed plans cannot leave speculative capacity behind
         // in one record that would weaken the joint geometric bound.
-        let lexical_growth = prepare_growth(&self.globals, lexicals.len(), &mut work)?;
-        let var_growth = prepare_growth(&self.object.vars, vars.len(), &mut work)?;
-        commit_rows(&mut self.globals, lexicals, lexical_growth);
-        commit_rows(&mut self.object.vars, vars, var_growth);
+        let lexical_growth = prepare_growth(&self.state.globals, lexicals.len(), &mut work)?;
+        let var_growth = prepare_growth(&self.state.object.vars, vars.len(), &mut work)?;
+        let artifact = if identities.is_empty() {
+            None
+        } else {
+            Some(Artifact::stage(code, self.artifact_bytes, &mut work)?)
+        };
+        // Geometrically grown descriptor tables are separately bounded by
+        // 16 artifacts and 512 identities (old + new request <= 24 and 768
+        // entries). Failed staging publishes neither contents nor capacities.
+        let artifact_growth =
+            prepare_growth(&self.artifacts, usize::from(artifact.is_some()), &mut work)?;
+        let function_growth = prepare_growth(&self.functions, identities.len(), &mut work)?;
+        commit_rows(
+            &mut self.state.globals,
+            lexicals.into_iter(),
+            lexical_growth,
+        );
+        commit_rows(&mut self.state.object.vars, vars.into_iter(), var_growth);
         if declare_undefined {
-            self.object.undefined_declared = true;
+            self.state.object.undefined_declared = true;
+        }
+        if let Some((artifact, bytes)) = artifact {
+            commit_rows(
+                &mut self.artifacts,
+                std::iter::once(artifact),
+                artifact_growth,
+            );
+            self.artifact_bytes = bytes;
+        }
+        commit_rows(&mut self.functions, identities.into_iter(), function_growth);
+        for (slot, function) in installs {
+            self.state.object.vars[slot].value = StoredValue::Function(function);
         }
         // Ready's exclusive borrow keeps these indices and misses valid
         // until this execution finishes or is abandoned.
@@ -500,6 +773,34 @@ impl Realm {
             links,
         })
     }
+}
+
+fn declare_var(
+    work: &mut Work,
+    existing: &[VarCell],
+    staged: &mut Vec<VarCell>,
+    available: usize,
+    name: &[u8],
+) -> Result<usize, InstantiateError> {
+    if let Some(slot) = work.find(
+        name,
+        existing
+            .iter()
+            .chain(staged.iter())
+            .map(|c| c.name.as_slice()),
+    )? {
+        return Ok(slot);
+    }
+    if staged.len() == available {
+        return Err(InstantiateError::BindingLimitExceeded);
+    }
+    let slot = existing.len() + staged.len();
+    work.charge(name.len() + 2)?;
+    staged.push(VarCell {
+        name: owned_name(name)?,
+        value: StoredValue::Scalar(Value::Undefined),
+    });
+    Ok(slot)
 }
 
 fn owned_name(name: &[u8]) -> Result<Vec<u8>, InstantiateError> {
@@ -531,7 +832,11 @@ fn prepare_growth<T>(
     Ok(None)
 }
 
-fn commit_rows<T>(rows: &mut Vec<T>, staged: Vec<T>, growth: Option<Vec<T>>) {
+fn commit_rows<T>(
+    rows: &mut Vec<T>,
+    staged: impl ExactSizeIterator<Item = T>,
+    growth: Option<Vec<T>>,
+) {
     if let Some(mut destination) = growth {
         assert!(destination.capacity() >= rows.len() + staged.len());
         destination.append(rows);
@@ -544,7 +849,10 @@ fn commit_rows<T>(rows: &mut Vec<T>, staged: Vec<T>, growth: Option<Vec<T>>) {
 impl fmt::Debug for Realm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Realm")
-            .field("bindings", &(self.globals.len() + self.object.vars.len()))
+            .field(
+                "bindings",
+                &(self.state.globals.len() + self.state.object.vars.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -592,7 +900,8 @@ enum Target {
 }
 
 /// A one-shot execution guard. Dropping the guard abandons the body, but
-/// leaves new lexical bindings in TDZ and new `var` bindings `undefined`.
+/// leaves lexical bindings in TDZ, new `var` bindings `undefined`, and
+/// function declarations installed.
 ///
 /// ```compile_fail
 /// use swayze_js::realm::{CompiledScript, Realm};
@@ -629,17 +938,25 @@ impl ReadyScript<'_, '_> {
     /// preserves declarations and all effects that occurred before it.
     pub fn execute(mut self) -> Result<Completion, EngineFault> {
         let code = self.code;
-        validate_layout(&code.instructions, code.max_stack_depth, code.exit)
+        let validate = if code
+            .instructions
+            .iter()
+            .any(|op| matches!(op, Instruction::Call { .. }))
+        {
+            validate_body
+        } else {
+            validate_layout
+        };
+        validate(&code.instructions, code.max_stack_depth, code.exit)
             .map_err(EngineFault::Evaluation)?;
         let stack = new_stack(code.max_stack_depth).map_err(EngineFault::Evaluation)?;
         let mut scratch = EvalScratch::new();
         let mut execution = self.execution();
         match dispatch(
-            &code.instructions,
+            Frame::root(&code.instructions, code.max_stack_depth, code.exit),
             stack,
-            code.max_stack_depth,
             &code.string_units,
-            code.exit,
+            execution.callable,
             &mut scratch,
             &mut execution,
         ) {
@@ -651,7 +968,13 @@ impl ReadyScript<'_, '_> {
 
     fn execution(&mut self) -> Execution<'_, '_> {
         Execution {
-            realm: self.realm,
+            realm: &mut self.realm.state,
+            callable: CallableCode {
+                artifacts: &self.realm.artifacts,
+                functions: &self.realm.functions,
+            },
+            active: None,
+            lookup: Work(LOOKUP_WORK),
             sites: &self.code.sites,
             links: &self.links,
             mode: self.code.mode,
@@ -661,7 +984,10 @@ impl ReadyScript<'_, '_> {
 }
 
 struct Execution<'realm, 'code> {
-    realm: &'realm mut Realm,
+    realm: &'realm mut RealmState,
+    callable: CallableCode<'realm>,
+    active: Option<FunctionOrigin>,
+    lookup: Work,
     sites: &'code [Site],
     links: &'code [Target],
     mode: CodeMode,
@@ -669,13 +995,63 @@ struct Execution<'realm, 'code> {
 }
 
 impl Execution<'_, '_> {
-    fn site(&self, index: usize) -> Result<(Target, Span, Role), Stop> {
+    fn site(&mut self, index: usize) -> Result<(Target, Span, Role), Stop> {
+        if let Some(origin) = self.active {
+            let (artifact, body) = self.callable.body(origin).ok_or(EvalError::InvalidScript)?;
+            if !body.accesses.contains(&index) {
+                return Err(EvalError::InvalidScript.into());
+            }
+            let site = artifact.sites.get(index).ok_or(EvalError::InvalidScript)?;
+            if !matches!(site.role, Role::Read | Role::Typeof | Role::Write) {
+                return Err(EvalError::InvalidScript.into());
+            }
+            let name = artifact
+                .names
+                .get(usize::from(site.start)..usize::from(site.end))
+                .ok_or(EvalError::InvalidScript)?;
+            let target = self
+                .resolve_current(name)
+                .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
+            return Ok((target, site.span, site.role));
+        }
         let site = self.sites.get(index).ok_or(EvalError::InvalidScript)?;
         let target = *self.links.get(index).ok_or(EvalError::InvalidScript)?;
         Ok((target, site.span, site.role))
     }
 
-    fn write_target(&self, index: usize) -> Result<(Target, Span), Stop> {
+    fn resolve_current(&mut self, name: &[u8]) -> Result<Target, InstantiateError> {
+        // A reached reference is resolved against the current (fixed-shape)
+        // namespace; no closure stores Ready links, even if it never missed.
+        self.lookup.charge(1)?;
+        if let Some(slot) = self
+            .lookup
+            .find(name, self.realm.globals.iter().map(|c| c.name.as_slice()))?
+        {
+            Ok(Target::Lexical(slot))
+        } else if self.lookup.equal(name, b"undefined")? {
+            Ok(Target::Undefined)
+        } else if let Some(slot) = self.lookup.find(
+            name,
+            self.realm.object.vars.iter().map(|c| c.name.as_slice()),
+        )? {
+            Ok(Target::Var(slot))
+        } else {
+            Ok(Target::Missing)
+        }
+    }
+
+    fn mode(&self) -> Result<CodeMode, EvalError> {
+        match self.active {
+            None => Ok(self.mode),
+            Some(origin) => self
+                .callable
+                .body(origin)
+                .map(|(_, body)| body.mode)
+                .ok_or(EvalError::InvalidScript),
+        }
+    }
+
+    fn write_target(&mut self, index: usize) -> Result<(Target, Span), Stop> {
         let (target, span, Role::Write) = self.site(index)? else {
             return Err(EvalError::InvalidScript.into());
         };
@@ -710,6 +1086,10 @@ impl Execution<'_, '_> {
         };
         Ok(match value {
             StoredValue::Scalar(value) => Operand::Scalar(value),
+            StoredValue::Function(id) => {
+                self.callable.resolve(id)?;
+                Operand::Function(id)
+            }
             StoredValue::TypeName(name) => Operand::String(StringOperand::TypeName(name)),
             StoredValue::Empty => Operand::String(StringOperand::Empty),
             StoredValue::Realm(range) => {
@@ -728,13 +1108,14 @@ impl Execution<'_, '_> {
         value: Operand,
         source: TransientStrings<'_>,
     ) -> Result<(), Stop> {
+        let mode = self.mode()?;
         let destination = match target {
             // Only reached writes get here, after RHS evaluation/coercion.
-            Target::Undefined if self.mode == CodeMode::Strict => {
+            Target::Undefined if mode == CodeMode::Strict => {
                 return Err(Stop::Throw(Throw::TypeError { span }));
             }
             Target::Undefined => return Ok(()), // Sloppy readonly write, even with a String RHS.
-            Target::Missing if self.mode == CodeMode::Strict => {
+            Target::Missing if mode == CodeMode::Strict => {
                 return Err(Stop::Throw(Throw::ReferenceError { span }));
             }
             Target::Missing => return Err(Stop::Engine(EngineFault::ImplicitGlobal { span })),
@@ -783,6 +1164,7 @@ fn escape(
 ) -> Result<StoredValue, Stop> {
     let units = match value {
         Operand::Scalar(value) => return Ok(StoredValue::Scalar(value)),
+        Operand::Function(id) => return Ok(StoredValue::Function(id)),
         Operand::String(StringOperand::TypeName(name)) => return Ok(StoredValue::TypeName(name)),
         Operand::String(StringOperand::Empty) => return Ok(StoredValue::Empty),
         Operand::String(StringOperand::Realm(range)) => {
@@ -790,6 +1172,9 @@ fn escape(
             return Ok(StoredValue::Realm(range));
         }
         Operand::String(StringOperand::Literal(range)) => source.literal(range),
+        Operand::String(StringOperand::ArtifactLiteral { artifact, range }) => {
+            source.artifact_literal(artifact, range)
+        }
         Operand::String(StringOperand::Runtime(range)) => source.runtime(range),
     }
     .ok_or(EvalError::InvalidScript)?;
@@ -809,15 +1194,40 @@ impl From<EvalError> for Stop {
 
 impl Bindings for Execution<'_, '_> {
     type Error = Stop;
+    const CALLS: bool = true;
 
     fn retained_units(&self) -> &[u16] {
         self.realm.strings.units()
     }
 
-    fn load(&self, index: usize) -> Result<Operand, Stop> {
+    fn artifacts(&self) -> &[Artifact] {
+        self.callable.artifacts
+    }
+
+    fn active_artifact(&self) -> Option<u8> {
+        self.active.map(|origin| origin.artifact)
+    }
+
+    fn select_body(&mut self, origin: Option<FunctionOrigin>) {
+        self.active = origin;
+    }
+
+    fn non_callable(&self, span: Span) -> Stop {
+        Stop::Throw(Throw::TypeError { span })
+    }
+
+    fn charge_call(&mut self, work: usize) -> Result<(), Stop> {
+        self.lookup
+            .charge(work)
+            .map_err(|_| EvalError::GlobalLookupLimitExceeded.into())
+    }
+
+    fn load(&mut self, index: usize) -> Result<Operand, Stop> {
         let (target, span, role) = self.site(index)?;
         match role {
-            Role::Declaration(_) | Role::Var { .. } => Err(EvalError::InvalidScript.into()),
+            Role::Declaration(_) | Role::Var { .. } | Role::Function { .. } | Role::Formal => {
+                Err(EvalError::InvalidScript.into())
+            }
             // Compound assignments share a Write site's load and store.
             Role::Read | Role::Write => self.load_target(target, span, false),
             Role::Typeof => self.load_target(target, span, true),
@@ -829,7 +1239,7 @@ impl Bindings for Execution<'_, '_> {
         index: usize,
         kind: BindingKind,
         _: usize,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         source: TransientStrings<'_>,
     ) -> Result<(), Stop> {
         let (Target::Lexical(slot), span, Role::Declaration(declared)) = self.site(index)? else {
@@ -857,7 +1267,7 @@ impl Bindings for Execution<'_, '_> {
         &mut self,
         index: usize,
         keep: bool,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         source: TransientStrings<'_>,
     ) -> Result<(), Stop> {
         let value = store_operand(stack, keep)?;
@@ -876,7 +1286,7 @@ impl Bindings for Execution<'_, '_> {
         index: usize,
         op: Update,
         result: UpdateResult,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         max: usize,
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), Stop> {
@@ -907,6 +1317,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn artifact_backing_exact_cap_and_late_gdi_failure_leave_replacement_unpublished() {
+        let mut realm = Realm::new();
+        let first = CompiledScript::compile("function f(){return 7;} var old = f;").unwrap();
+        assert_eq!(
+            realm.instantiate(&first).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        let replacement =
+            CompiledScript::compile("function f(){return 'new';} let fresh; var extra;").unwrap();
+        let (_, payload) = Artifact::stage(&replacement, 0, &mut Work(PREFLIGHT_WORK)).unwrap();
+        let baseline = realm.artifact_bytes;
+        let state = |realm: &Realm| {
+            (
+                realm.artifacts.len(),
+                realm.artifacts.capacity(),
+                realm.functions.len(),
+                realm.functions.capacity(),
+                realm.state.globals.len(),
+                realm.state.globals.capacity(),
+                realm.state.object.vars.len(),
+                realm.state.object.vars.capacity(),
+            )
+        };
+        let before = state(&realm);
+        realm.artifact_bytes = MAX_ARTIFACT_BYTES - payload + 1;
+        assert_eq!(
+            realm.instantiate(&replacement).unwrap_err(),
+            InstantiateError::ArtifactBytesLimitExceeded
+        );
+        assert_eq!(state(&realm), before);
+        assert_eq!(realm.artifact_bytes, MAX_ARTIFACT_BYTES - payload + 1);
+        let probe = CompiledScript::compile(
+            "if (old !== f || f() !== 7 || typeof(extra) !== 'undefined') bad;",
+        )
+        .unwrap();
+        assert_eq!(
+            realm.instantiate(&probe).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        realm.artifact_bytes = MAX_ARTIFACT_BYTES - payload;
+        drop(realm.instantiate(&replacement).unwrap());
+        assert_eq!(realm.artifact_bytes, MAX_ARTIFACT_BYTES);
+        let probe =
+            CompiledScript::compile("if (old === f || old() !== 7 || f() !== 'new') bad;").unwrap();
+        assert_eq!(
+            realm.instantiate(&probe).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        // The test adjusted the measured total only, never the stored backing.
+        realm.artifact_bytes = baseline + payload;
+    }
+
+    #[test]
+    fn callable_preflight_budget_is_atomic_even_at_final_table_growth() {
+        fn fresh(code: &CompiledScript) -> Realm {
+            let mut realm = Realm::new();
+            drop(realm.instantiate(code).unwrap());
+            realm
+        }
+        let first = CompiledScript::compile("function f(){return 1;}").unwrap();
+        let replacement =
+            CompiledScript::compile("function f(){return 2;} let pending; var extra;").unwrap();
+        let (mut low, mut high) = (0, PREFLIGHT_WORK);
+        // Capacity-sensitive accounting measures the allocator-visible growth
+        // boundary portably. Each probe starts at the identical Realm shape.
+        while high - low > 1 {
+            let mut realm = fresh(&first);
+            let middle = (low + high) / 2;
+            if realm.instantiate_with_work(&replacement, middle).is_ok() {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        let mut realm = fresh(&first);
+        let caps = (
+            realm.artifact_bytes,
+            realm.artifacts.capacity(),
+            realm.functions.capacity(),
+            realm.state.globals.capacity(),
+            realm.state.object.vars.capacity(),
+        );
+        assert_eq!(
+            realm
+                .instantiate_with_work(&replacement, high - 1)
+                .unwrap_err(),
+            InstantiateError::WorkLimitExceeded
+        );
+        assert_eq!(
+            caps,
+            (
+                realm.artifact_bytes,
+                realm.artifacts.capacity(),
+                realm.functions.capacity(),
+                realm.state.globals.capacity(),
+                realm.state.object.vars.capacity()
+            )
+        );
+        assert_eq!(
+            (
+                realm.artifacts.len(),
+                realm.functions.len(),
+                realm.state.globals.len(),
+                realm.state.object.vars.len()
+            ),
+            (1, 1, 0, 1)
+        );
+        assert_eq!(
+            realm.state.object.vars[0].value,
+            StoredValue::Function(FunctionId(0))
+        );
+        drop(realm.instantiate_with_work(&replacement, high).unwrap());
+        assert_eq!(
+            realm.state.object.vars[0].value,
+            StoredValue::Function(FunctionId(1))
+        );
+    }
+
+    #[test]
+    fn malformed_private_code_cannot_pop_a_caller_temporary_or_jump_to_another_body() {
+        let code = CompiledScript::compile(
+            "if (10+f() !== 11) bad; function f(){return 1;} function other(){}",
+        )
+        .unwrap();
+        let mut realm = Realm::new();
+        let root = CompiledScript::compile("if (10+f() !== 11) bad;").unwrap();
+        drop(realm.instantiate(&code).unwrap());
+        realm.artifacts[0].bodies[0].instructions[0] = Instruction::Discard;
+        let invalid = Err(EngineFault::Evaluation(EvalError::InvalidScript));
+        assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
+        realm.artifacts[0].bodies[0].instructions[0] = Instruction::Jump(3);
+        assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
+        realm.artifacts[0].bodies[0].instructions[0] = Instruction::LoadFormal(0);
+        assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
+    }
+
+    #[test]
     fn exact_work_boundary_after_staging_does_not_leave_a_tdz_cell() {
         let code = CompiledScript::compile("let planned; missing;").unwrap();
         // Declaration check: 1 row + 1 unequal-length candidate. Stage:
@@ -917,14 +1464,14 @@ mod tests {
             realm.instantiate_with_work(&code, 21).unwrap_err(),
             InstantiateError::WorkLimitExceeded
         );
-        assert!(realm.globals.is_empty());
+        assert!(realm.state.globals.is_empty());
         let ready = realm.instantiate_with_work(&code, 22).unwrap();
         assert!(matches!(
             ready.execute(),
             Ok(Completion::Throw(Throw::ReferenceError { .. }))
         ));
         assert_eq!(
-            realm.globals[0].value,
+            realm.state.globals[0].value,
             Some(StoredValue::Scalar(Value::Undefined))
         );
     }
@@ -940,7 +1487,10 @@ mod tests {
         // Lexical and var conflict passes (9 + 9), staging/linking declarations
         // (13 + 7 + 6 + 4), missing link (6), and one old row for each
         // record that must grow. Allocation may supply excess capacity.
-        let old_capacities = (realm.globals.capacity(), realm.object.vars.capacity());
+        let old_capacities = (
+            realm.state.globals.capacity(),
+            realm.state.object.vars.capacity(),
+        );
         let exact_work = 54 + usize::from(old_capacities.0 < 2) + usize::from(old_capacities.1 < 2);
         assert_eq!(
             realm
@@ -949,29 +1499,38 @@ mod tests {
             InstantiateError::WorkLimitExceeded
         );
         assert_eq!(
-            (realm.globals.capacity(), realm.object.vars.capacity()),
+            (
+                realm.state.globals.capacity(),
+                realm.state.object.vars.capacity()
+            ),
             old_capacities
         );
-        assert_eq!((realm.globals.len(), realm.object.vars.len()), (1, 1));
-        assert!(!realm.object.undefined_declared);
         assert_eq!(
-            realm.globals[0].value,
+            (realm.state.globals.len(), realm.state.object.vars.len()),
+            (1, 1)
+        );
+        assert!(!realm.state.object.undefined_declared);
+        assert_eq!(
+            realm.state.globals[0].value,
             Some(StoredValue::Scalar(Value::Number(1.0)))
         );
         assert_eq!(
-            realm.object.vars[0].value,
+            realm.state.object.vars[0].value,
             StoredValue::Scalar(Value::Number(2.0))
         );
         drop(realm.instantiate_with_work(&code, exact_work).unwrap());
-        assert!(realm.object.undefined_declared);
-        assert_eq!((realm.globals.len(), realm.object.vars.len()), (2, 2));
-        assert_eq!(realm.globals[1].value, None);
+        assert!(realm.state.object.undefined_declared);
         assert_eq!(
-            realm.object.vars[1].value,
+            (realm.state.globals.len(), realm.state.object.vars.len()),
+            (2, 2)
+        );
+        assert_eq!(realm.state.globals[1].value, None);
+        assert_eq!(
+            realm.state.object.vars[1].value,
             StoredValue::Scalar(Value::Undefined)
         );
         assert_eq!(
-            realm.object.vars[0].value,
+            realm.state.object.vars[0].value,
             StoredValue::Scalar(Value::Number(2.0))
         );
     }
@@ -987,8 +1546,8 @@ mod tests {
             realm.instantiate(&code).unwrap().execute(),
             Ok(Completion::Normal)
         );
-        assert!(realm.object.undefined_declared);
-        assert_eq!(realm.object.vars.len(), 1);
+        assert!(realm.state.object.undefined_declared);
+        assert_eq!(realm.state.object.vars.len(), 1);
     }
 
     #[test]
@@ -1021,7 +1580,7 @@ mod tests {
                 site,
                 Update::Increment,
                 UpdateResult::New,
-                &mut stack,
+                &mut Stack::root(&mut stack),
                 2,
                 UpdateNumeric {
                     source: scratch.transient(&[]),
@@ -1032,25 +1591,40 @@ mod tests {
                 site,
                 BindingKind::Let,
                 0,
-                &mut stack,
+                &mut Stack::root(&mut stack),
                 scratch.transient(&[]),
             ));
         }
-        invalid(execution.store(0, false, &mut vec![operand], scratch.transient(&[])));
-        invalid(execution.store(1, true, &mut vec![operand], scratch.transient(&[])));
+        invalid(execution.store(
+            0,
+            false,
+            &mut Stack::root(&mut vec![operand]),
+            scratch.transient(&[]),
+        ));
+        invalid(execution.store(
+            1,
+            true,
+            &mut Stack::root(&mut vec![operand]),
+            scratch.transient(&[]),
+        ));
         for target in [Target::Lexical(0), Target::Missing, Target::Var(usize::MAX)] {
             let mut wrong = ready.links.clone();
             wrong[1] = target;
             let mut execution = ready.execution();
             execution.links = &wrong;
-            invalid(execution.store(1, false, &mut vec![operand], scratch.transient(&[])));
+            invalid(execution.store(
+                1,
+                false,
+                &mut Stack::root(&mut vec![operand]),
+                scratch.transient(&[]),
+            ));
         }
         assert_eq!(
-            ready.realm.object.vars[0].value,
+            ready.realm.state.object.vars[0].value,
             StoredValue::Scalar(Value::Undefined)
         );
         assert_eq!(
-            ready.realm.object.vars[1].value,
+            ready.realm.state.object.vars[1].value,
             StoredValue::Scalar(Value::Undefined)
         );
     }
@@ -1106,7 +1680,7 @@ mod tests {
                 1,
                 Update::Increment,
                 UpdateResult::New,
-                &mut stack,
+                &mut Stack::root(&mut stack),
                 1,
                 UpdateNumeric {
                     source: scratch.transient(&[]),
@@ -1136,7 +1710,8 @@ mod tests {
             execution.load(0),
             Ok(Operand::Scalar(Value::Number(7.0)))
         ));
-        let mut stack = vec![Operand::Scalar(Value::Null)];
+        let mut stack = new_stack(2).unwrap();
+        stack.push(Operand::Scalar(Value::Null));
         let scratch = EvalScratch::new();
         let mut credits = 0;
         let mut update = |site, max| {
@@ -1144,7 +1719,7 @@ mod tests {
                 site,
                 Update::Increment,
                 UpdateResult::New,
-                &mut stack,
+                &mut Stack::root(&mut stack),
                 max,
                 UpdateNumeric {
                     source: scratch.transient(&[]),
@@ -1183,7 +1758,7 @@ mod tests {
     #[test]
     fn only_accepted_nonempty_escapes_allocate_and_aliases_keep_their_range() {
         let mut realm = Realm::new();
-        assert_eq!(realm.strings.chunks.capacity(), 0);
+        assert_eq!(realm.state.strings.chunks.capacity(), 0);
         for source in [
             "let scalar = 1, empty = '', runtime_empty = '' + '', static_name = typeof 0;",
             "'unretained' + 'scratch'; false && (scalar = 'skipped');",
@@ -1201,36 +1776,38 @@ mod tests {
             run(&mut realm, "missing = 'rejected';"),
             Err(EngineFault::ImplicitGlobal { .. })
         ));
-        assert_eq!(realm.strings.used, 0);
-        assert_eq!(realm.strings.chunks.capacity(), 0);
+        assert_eq!(realm.state.strings.used, 0);
+        assert_eq!(realm.state.strings.chunks.capacity(), 0);
 
         assert_eq!(
             run(&mut realm, r"let first = '\uD800\0'; let alias = first;"),
             Ok(Completion::Normal)
         );
         let first = realm
+            .state
             .globals
             .iter()
             .find(|c| c.name == b"first")
             .unwrap()
             .value;
         let alias = realm
+            .state
             .globals
             .iter()
             .find(|c| c.name == b"alias")
             .unwrap()
             .value;
         assert_eq!(first, alias);
-        assert_eq!(realm.strings.units(), [0xD800, 0]);
-        assert_eq!(realm.strings.chunks.len(), 1);
+        assert_eq!(realm.state.strings.units(), [0xD800, 0]);
+        assert_eq!(realm.state.strings.chunks.len(), 1);
     }
 
     #[test]
     fn invalid_ranges_cannot_enter_or_leave_a_lexical_cell() {
         let mut realm = Realm::new();
         assert_eq!(run(&mut realm, "let x = 'x';"), Ok(Completion::Normal));
-        assert_eq!(realm.strings.chunks.len(), 1);
-        let original = realm.globals[0].value;
+        assert_eq!(realm.state.strings.chunks.len(), 1);
+        let original = realm.state.globals[0].value;
         let code = CompiledScript::compile("x; 'y';").unwrap();
         let mut ready = realm.instantiate(&code).unwrap();
         let mut execution = ready.execution();
@@ -1243,6 +1820,8 @@ mod tests {
         let stale_scratch = scratch
             .concatenate(
                 super::super::ExternalStrings {
+                    artifacts: &[],
+                    active_artifact: None,
                     literals: &code.string_units,
                     retained: &[],
                 },
@@ -1369,7 +1948,7 @@ mod tests {
                 0,
                 Update::Increment,
                 UpdateResult::New,
-                &mut stack,
+                &mut Stack::root(&mut stack),
                 1,
                 UpdateNumeric {
                     source: scratch.transient(&[]),

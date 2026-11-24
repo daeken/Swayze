@@ -1,15 +1,16 @@
 use crate::{
     eval::MAX_INSTRUCTIONS,
     realm::{
-        CodeMode, CompileError, CompileLimit, CompiledScript, FunctionBody, MAX_CODE_NAME_BYTES,
-        MAX_DECLARATIONS, MAX_NAME_BYTES, MAX_PARAMETERS, MAX_SITES, Role, Site,
+        CodeMode, CompileError, CompileLimit, CompiledScript, FrameLayout, FunctionBody,
+        MAX_CODE_NAME_BYTES, MAX_DECLARATIONS, MAX_FRAME_LOCALS, MAX_NAME_BYTES, MAX_PARAMETERS,
+        MAX_SITES, Role, Site,
     },
 };
 
 use super::{
     AccessKind, BindingPolicy, Error, ExpressionEnd, Instruction, Limit, Limits, ParseErrorType,
     Parser, Pending, QuotedDecimalEscape, RealmParseLimit, Span, TokenKind, TokenPosition,
-    new_parser, try_push,
+    UNPATCHED, WriteAccess, new_parser, try_push,
 };
 
 pub(super) struct OpenFunction {
@@ -18,12 +19,14 @@ pub(super) struct OpenFunction {
     root_mode: CodeMode,
     root_witness: QuotedDecimalEscape,
     params: Vec<Span>,
+    vars: Vec<Span>,
     accesses: usize,
 }
 
 pub(super) struct ParsedFunction {
     body: FunctionBody,
-    params: Vec<Span>,
+    locals: Vec<Span>,
+    vars: Vec<Span>,
     witness: QuotedDecimalEscape,
 }
 
@@ -129,6 +132,7 @@ impl Parser<'_> {
                 QuotedDecimalEscape::Pending,
             ),
             params,
+            vars: Vec::new(),
             accesses: self.accesses.len(),
         });
         Ok(())
@@ -158,7 +162,8 @@ impl Parser<'_> {
             } else {
                 mode
             },
-            formals: function.params.len() as u8,
+            layout: FrameLayout::new(function.params.len(), function.params.len())
+                .ok_or_else(|| Error::malformed(span, "invalid formal layout"))?,
             accesses: function.accesses..self.accesses.len(),
         };
         let witness =
@@ -167,12 +172,30 @@ impl Parser<'_> {
             &mut self.functions,
             ParsedFunction {
                 body,
-                params: function.params,
+                locals: function.params,
+                vars: function.vars,
                 witness,
             },
             span,
         )?;
         Ok(function.root_mode)
+    }
+
+    pub(super) fn record_local_var(&mut self, name: Span) -> Result<(), Error> {
+        let vars = &mut self.function.as_mut().expect("open function").vars;
+        // Every occurrence consumes at least a name and a separator token.
+        // Thus the aggregate token cap bounds even duplicate/no-op backing.
+        push_span(&mut self.lexer, vars, name)
+    }
+
+    fn find_local(&mut self, locals: &[Span], name: Span) -> Result<Option<u8>, Error> {
+        for (slot, &candidate) in locals.iter().enumerate() {
+            self.lexer.charge(1, name)?;
+            if self.names_equal(name, candidate)? {
+                return Ok(Some(slot as u8));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn parse_return(&mut self, keyword: Span) -> Result<(), Error> {
@@ -212,6 +235,85 @@ impl Parser<'_> {
         let end = u32::try_from(close.end).map_err(|_| Error::limit(close, Limit::SourceBytes))?;
         self.emit(Instruction::Call { start, end, argc }, open)
     }
+}
+
+// Bound requested backing geometrically; charge both record writes and
+// potentially moving initialized spans. No name bytes are copied here.
+fn push_span(lexer: &mut super::Lexer<'_>, spans: &mut Vec<Span>, name: Span) -> Result<(), Error> {
+    lexer.charge(1, name)?;
+    let len = spans.len();
+    if len == spans.capacity() {
+        lexer.charge(len, name)?;
+        let next = (len + 1).next_power_of_two();
+        spans
+            .try_reserve_exact(next - len)
+            .map_err(|_| Error::limit(name, Limit::Allocation))?;
+    }
+    spans.push(name);
+    Ok(())
+}
+
+impl ParsedFunction {
+    fn plan_locals(&mut self, parser: &mut Parser<'_>) -> Result<(), CompileError> {
+        if self.vars.is_empty() {
+            return Ok(());
+        }
+        let formals = self.locals.len();
+        for name in std::mem::take(&mut self.vars) {
+            parser.lexer.charge(1, name)?;
+            if name.end - name.start > MAX_NAME_BYTES {
+                return Err(cap(CompileLimit::NameBytes, name));
+            }
+            if parser.find_local(&self.locals, name)?.is_none() {
+                if self.locals.len() == usize::from(MAX_FRAME_LOCALS) {
+                    return Err(cap(CompileLimit::LocalSlots, name));
+                }
+                push_span(&mut parser.lexer, &mut self.locals, name)?;
+            }
+        }
+        self.body.layout =
+            FrameLayout::new(formals, self.locals.len()).ok_or(CompileError::InvalidScript)?;
+        Ok(())
+    }
+}
+
+fn patch_local(
+    ops: &mut [Instruction],
+    access: super::Access,
+    slot: u8,
+) -> Result<(), CompileError> {
+    let op = ops
+        .get_mut(access.instruction)
+        .ok_or(CompileError::InvalidScript)?;
+    *op = match (access.kind, *op) {
+        (AccessKind::Read | AccessKind::TypeofRead, Instruction::LoadBinding(UNPATCHED)) => {
+            Instruction::LoadLocal(slot)
+        }
+        (
+            AccessKind::Write(WriteAccess { load: None, .. }),
+            Instruction::UpdateBinding {
+                slot: UNPATCHED,
+                op,
+                result,
+            },
+        ) => Instruction::UpdateLocal { slot, op, result },
+        (AccessKind::Write(_), Instruction::StoreBinding(UNPATCHED)) => {
+            Instruction::StoreLocal { slot, keep: false }
+        }
+        (AccessKind::Write(_), Instruction::StoreBindingKeep(UNPATCHED)) => {
+            Instruction::StoreLocal { slot, keep: true }
+        }
+        _ => return Err(CompileError::InvalidScript),
+    };
+    if let AccessKind::Write(write) = access.kind
+        && let Some(load) = write.load
+    {
+        let Some(op @ Instruction::LoadBinding(UNPATCHED)) = ops.get_mut(load) else {
+            return Err(CompileError::InvalidScript);
+        };
+        *op = Instruction::LoadLocal(slot);
+    }
+    Ok(())
 }
 
 pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError> {
@@ -290,7 +392,11 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
     functions
         .try_reserve_exact(parser.functions.len())
         .map_err(|_| Error::limit(end, Limit::Allocation))?;
-    let mut parsed = std::mem::take(&mut parser.functions).into_iter().peekable();
+    let mut parsed = std::mem::take(&mut parser.functions);
+    for function in &mut parsed {
+        function.plan_locals(&mut parser)?;
+    }
+    let mut parsed = parsed.into_iter().peekable();
     for index in 0..parser.accesses.len() {
         while parsed.peek().is_some_and(|f| f.body.accesses.end <= index) {
             let mut body = parsed.next().unwrap().body;
@@ -302,58 +408,23 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         let body = parsed
             .peek_mut()
             .filter(|f| f.body.accesses.contains(&index));
-        if let Some(function) = body {
-            let mut formal = None;
-            for (slot, &candidate) in function.params.iter().enumerate() {
+        if let Some(function) = body
+            && let Some(slot) = parser.find_local(&function.locals, access.name)?
+        {
+            // Keep access numbering dense and bounded. Local sites have
+            // source provenance but are never linked or looked up globally.
+            parser.lexer.charge(1, access.name)?;
+            if matches!(access.kind, AccessKind::Write(write) if write.load.is_some()) {
                 parser.lexer.charge(1, access.name)?;
-                if parser.names_equal(access.name, candidate)? {
-                    formal = Some(slot as u8);
-                    break;
-                }
             }
-            if let Some(formal) = formal {
-                // Keep access numbering dense and bounded. Formal sites have
-                // source provenance but are never linked or looked up globally.
-                parser.lexer.charge(1, access.name)?;
-                let role = Role::Formal;
-                sites.push(Site {
-                    span: access.name,
-                    start: 0,
-                    end: 0,
-                    role,
-                });
-                let ops = &mut function.body.instructions;
-                let op = ops
-                    .get_mut(access.instruction)
-                    .ok_or(CompileError::InvalidScript)?;
-                *op = match *op {
-                    Instruction::LoadBinding(_) => Instruction::LoadFormal(formal),
-                    Instruction::UpdateBinding { op, result, .. } => Instruction::UpdateFormal {
-                        slot: formal,
-                        op,
-                        result,
-                    },
-                    Instruction::StoreBinding(_) => Instruction::StoreFormal {
-                        slot: formal,
-                        keep: false,
-                    },
-                    Instruction::StoreBindingKeep(_) => Instruction::StoreFormal {
-                        slot: formal,
-                        keep: true,
-                    },
-                    _ => return Err(CompileError::InvalidScript),
-                };
-                if let AccessKind::Write(write) = access.kind
-                    && let Some(load) = write.load
-                {
-                    parser.lexer.charge(1, access.name)?;
-                    let Some(op @ Instruction::LoadBinding(_)) = ops.get_mut(load) else {
-                        return Err(CompileError::InvalidScript);
-                    };
-                    *op = Instruction::LoadFormal(formal);
-                }
-                continue;
-            }
+            patch_local(&mut function.body.instructions, access, slot)?;
+            sites.push(Site {
+                span: access.name,
+                start: 0,
+                end: 0,
+                role: Role::Local,
+            });
+            continue;
         }
         let role = match access.kind {
             AccessKind::Read => Role::Read,

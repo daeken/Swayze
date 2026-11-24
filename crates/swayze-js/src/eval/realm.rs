@@ -14,8 +14,8 @@
 //! Root lexical bindings and Script-scoped simple `var` declarations are
 //! separate private records, not a global object. No host bindings or nested
 //! lexical declarations. `undefined` is the sole intrinsic fallback. Ordinary
-//! functions have mutable simple formals, live Realm free names and no local
-//! declarations or receiver. Strictness comes from their definition, not the
+//! functions have mutable simple formals and frame-local `var` bindings,
+//! live Realm free names, and no receiver. Strictness comes from their definition, not the
 //! caller. The Realm retains immutable bodies for installed function identities
 //! even if the original compiled Script is dropped. No Script results or
 //! binding handles leave the Realm.
@@ -46,6 +46,7 @@ pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;
 pub(crate) const MAX_SITES: usize = 4096;
 pub(crate) const MAX_PARAMETERS: u8 = 64;
+pub(crate) const MAX_FRAME_LOCALS: u8 = 128;
 const MAX_ARTIFACTS: usize = 16;
 const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_FUNCTIONS: usize = 512;
@@ -65,7 +66,7 @@ pub(crate) enum Role {
     Declaration(BindingKind),
     Var { initialized: bool },
     Function { body: u16 },
-    Formal,
+    Local,
     Read,
     Typeof,
     Write,
@@ -99,11 +100,36 @@ pub(crate) enum CodeMode {
     Strict,
 }
 
+// The argument prefix and the full local region have different arities.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameLayout {
+    formals: u8,
+    locals: u8,
+}
+
+impl FrameLayout {
+    pub(crate) fn new(formals: usize, locals: usize) -> Option<Self> {
+        let layout = Self {
+            formals: formals.try_into().ok()?,
+            locals: locals.try_into().ok()?,
+        };
+        layout.counts()?;
+        Some(layout)
+    }
+
+    pub(super) fn counts(self) -> Option<(usize, usize)> {
+        (self.formals <= MAX_PARAMETERS
+            && self.formals <= self.locals
+            && self.locals <= MAX_FRAME_LOCALS)
+            .then_some((usize::from(self.formals), usize::from(self.locals)))
+    }
+}
+
 pub(crate) struct FunctionBody {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) max_stack_depth: usize,
     pub(crate) mode: CodeMode,
-    pub(crate) formals: u8,
+    pub(crate) layout: FrameLayout,
     pub(crate) accesses: std::ops::Range<usize>,
 }
 
@@ -148,6 +174,7 @@ pub enum CompileLimit {
     Instructions,
     Arguments,
     Parameters,
+    LocalSlots,
     NameBytes,
     PooledNameBytes,
     Declarations,
@@ -376,14 +403,14 @@ impl Artifact {
         for body in &code.functions {
             validate_body(&body.instructions, body.max_stack_depth, ExitStack::Empty)
                 .map_err(|_| InstantiateError::InvalidScript)?;
-            if body.formals > MAX_PARAMETERS {
+            if body.layout.counts().is_none() {
                 return Err(InstantiateError::InvalidScript);
             }
             bodies.push(FunctionBody {
                 instructions: copy_code(&body.instructions, &mut bytes, work)?,
                 max_stack_depth: body.max_stack_depth,
                 mode: body.mode,
-                formals: body.formals,
+                layout: body.layout,
                 accesses: body.accesses.clone(),
             });
         }
@@ -718,7 +745,7 @@ impl Realm {
                 // Retained code must use current Realm lookups. Authenticate
                 // the site's shape but do not make a semantic Ready link.
                 match site.role {
-                    Role::Formal if (site.start, site.end) == (0, 0) => {}
+                    Role::Local if (site.start, site.end) == (0, 0) => {}
                     _ => {
                         site.access_name(&code.names).ok_or(InvalidScript)?;
                     }
@@ -1253,7 +1280,7 @@ impl Bindings for Execution<'_, '_> {
     fn load(&mut self, index: usize) -> Result<Operand, Stop> {
         let (target, span, role) = self.site(index)?;
         match role {
-            Role::Declaration(_) | Role::Var { .. } | Role::Function { .. } | Role::Formal => {
+            Role::Declaration(_) | Role::Var { .. } | Role::Function { .. } | Role::Local => {
                 Err(EvalError::InvalidScript.into())
             }
             // Compound assignments share a Write site's load and store.
@@ -1416,8 +1443,11 @@ mod tests {
 
     #[test]
     fn preflight_rejects_forged_body_ranges_roles_and_names() {
-        let source = "function f(x){return x + global;} function g(){return other;} function h(){}";
-        let invalid_layouts: [fn(&mut CompiledScript); 9] = [
+        let source = "function f(x){return loc + global; var loc;} function g(){return other;} function h(){}";
+        let invalid_layouts: [fn(&mut CompiledScript); 12] = [
+            |code| code.functions[0].layout.formals = 3,
+            |code| code.functions[0].layout.formals = MAX_PARAMETERS + 1,
+            |code| code.functions[0].layout.locals = MAX_FRAME_LOCALS + 1,
             |code| code.functions[0].accesses.start = code.declarations - 1,
             |code| code.functions[1].accesses.start -= 1,
             |code| code.functions[2].accesses = code.declarations..code.declarations,
@@ -1536,6 +1566,53 @@ mod tests {
     }
 
     #[test]
+    fn local_slots_do_not_add_declarations_or_sites_for_noop_occurrences() {
+        let code = CompiledScript::compile(
+            "function f(p){ var p, loc; p++; var loc = p; return loc; var loc, noOp; }",
+        )
+        .unwrap();
+        let body = &code.functions[0];
+        assert_eq!(body.layout.counts(), Some((1, 3)));
+        assert_eq!(code.declarations, 1);
+        assert_eq!(code.names, b"f");
+        assert_eq!(body.accesses, 1..5);
+        assert!(
+            code.sites[body.accesses.clone()].iter().all(|site| {
+                matches!(site.role, Role::Local) && (site.start, site.end) == (0, 0)
+            })
+        );
+        assert!(body.instructions.iter().any(|op| matches!(
+            op,
+            Instruction::StoreLocal {
+                slot: 1,
+                keep: false
+            }
+        )));
+        let mut realm = Realm::new();
+        let ready = realm.instantiate(&code).unwrap();
+        assert!(
+            ready.links[body.accesses.clone()]
+                .iter()
+                .all(|link| matches!(link, Target::Unlinked))
+        );
+        drop(ready);
+        assert_eq!(realm.state.object.vars.len(), 1);
+        assert!(realm.state.globals.is_empty());
+        let root = CompiledScript::compile("if (f(2) !== 3) bad;").unwrap();
+        assert_eq!(
+            realm.instantiate(&root).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        // Forged post-import layout cannot enter a frame with a formal
+        // prefix longer than the whole local region.
+        realm.artifacts[0].bodies[0].layout.locals = 0;
+        assert_eq!(
+            realm.instantiate(&root).unwrap().execute(),
+            Err(EngineFault::Evaluation(EvalError::InvalidScript))
+        );
+    }
+
+    #[test]
     fn malformed_private_code_cannot_pop_a_caller_temporary_or_jump_to_another_body() {
         let code = CompiledScript::compile(
             "if (10+f() !== 11) bad; function f(){return 1;} function other(){}",
@@ -1549,7 +1626,7 @@ mod tests {
         assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
         realm.artifacts[0].bodies[0].instructions[0] = Instruction::Jump(3);
         assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
-        realm.artifacts[0].bodies[0].instructions[0] = Instruction::LoadFormal(0);
+        realm.artifacts[0].bodies[0].instructions[0] = Instruction::LoadLocal(0);
         assert_eq!(realm.instantiate(&root).unwrap().execute(), invalid);
     }
 

@@ -558,14 +558,14 @@ const MAX_LIVE_SLOTS: usize = 4096;
 const UNDEFINED: Operand = Operand::Scalar(Value::Undefined);
 
 // The active frame and suspended caller frames borrow immutable code only;
-// the VM owns every formal/temporary slot. No Rust recursion or code copies.
+// the VM owns every local/temporary slot. No Rust recursion or code copies.
 struct Frame<'code> {
     ops: &'code [Instruction],
     max_operands: usize,
     exit: ExitStack,
     body: Option<realm::FunctionOrigin>,
     ip: usize,
-    base: usize, // formals start here; this is also the caller's result slot
+    base: usize, // locals start here; this is also the caller's result slot
     temps: usize,
 }
 
@@ -639,7 +639,7 @@ impl Stack<'_> {
             self.slots.pop()
         }
     }
-    fn formal(&mut self, slot: u8) -> Result<&mut Operand, EvalError> {
+    fn local(&mut self, slot: u8) -> Result<&mut Operand, EvalError> {
         self.slots[self.base..self.temps]
             .get_mut(usize::from(slot))
             .ok_or(EvalError::InvalidScript)
@@ -718,12 +718,13 @@ fn dispatch<'code, B: Bindings>(
                 if callers.len() == MAX_GUEST_FRAMES {
                     return Err(EvalError::CallDepthLimitExceeded.into());
                 }
-                let formals = usize::from(target.formals);
-                let needed = pos + formals + target.max_stack_depth;
-                if needed > MAX_LIVE_SLOTS {
-                    return Err(EvalError::LiveSlotLimitExceeded.into());
-                }
-                bindings.charge_call(1 + formals)?;
+                let (formals, locals) = target.layout.counts().ok_or(EvalError::InvalidScript)?;
+                let local_end = pos + locals;
+                let needed = local_end
+                    .checked_add(target.max_stack_depth)
+                    .filter(|&needed| needed <= MAX_LIVE_SLOTS)
+                    .ok_or(EvalError::LiveSlotLimitExceeded)?;
+                bindings.charge_call(1 + locals)?;
                 if callers.capacity() == 0 {
                     callers
                         .try_reserve_exact(MAX_GUEST_FRAMES)
@@ -740,7 +741,9 @@ fn dispatch<'code, B: Bindings>(
                 let supplied = argc.min(formals);
                 slots.copy_within(pos + 1..pos + 1 + supplied, pos);
                 slots.truncate(pos + supplied);
-                slots.resize(pos + formals, UNDEFINED);
+                // Extra arguments are never local initializers. Fill the
+                // missing formal prefix and var-only tail on every entry.
+                slots.resize(local_end, UNDEFINED);
                 let callee = Frame {
                     ops: &target.instructions,
                     max_operands: target.max_stack_depth,
@@ -748,7 +751,7 @@ fn dispatch<'code, B: Bindings>(
                     body: Some(origin),
                     ip: 0,
                     base: pos,
-                    temps: pos + formals,
+                    temps: local_end,
                 };
                 callers.push(std::mem::replace(&mut frame, callee));
                 bindings.select_body(Some(origin));
@@ -760,28 +763,28 @@ fn dispatch<'code, B: Bindings>(
                 let value = stack.pop().unwrap_or(UNDEFINED);
                 frame = resume(&mut callers, &mut slots, base, value, bindings)?;
             }
-            Instruction::LoadFormal(slot) if B::CALLS => {
-                let value = *stack.formal(slot)?;
+            Instruction::LoadLocal(slot) if B::CALLS => {
+                let value = *stack.local(slot)?;
                 push_operand(&mut stack, max_operands, value)?;
             }
-            Instruction::StoreFormal { slot, keep } if B::CALLS => {
+            Instruction::StoreLocal { slot, keep } if B::CALLS => {
                 let value = store_operand(&mut stack, keep)?;
-                *stack.formal(slot)? = value;
+                *stack.local(slot)? = value;
             }
-            Instruction::UpdateFormal { slot, op, result } if B::CALLS => {
-                let old = stack.formal(slot)?.to_number(
+            Instruction::UpdateLocal { slot, op, result } if B::CALLS => {
+                let old = stack.local(slot)?.to_number(
                     source.with_retained(bindings.retained_units()),
                     &mut string_conversion_credits_left,
                 )?;
                 let new = update_number(op, old);
                 update_result(&mut stack, max_operands, result, old, new)?;
-                *stack.formal(slot)? = Operand::Scalar(Value::Number(new));
+                *stack.local(slot)? = Operand::Scalar(Value::Number(new));
             }
             Instruction::Call { .. }
             | Instruction::Return { .. }
-            | Instruction::LoadFormal(_)
-            | Instruction::StoreFormal { .. }
-            | Instruction::UpdateFormal { .. } => return Err(EvalError::InvalidScript.into()),
+            | Instruction::LoadLocal(_)
+            | Instruction::StoreLocal { .. }
+            | Instruction::UpdateLocal { .. } => return Err(EvalError::InvalidScript.into()),
             Instruction::Number(value) => {
                 push_operand(
                     &mut stack,

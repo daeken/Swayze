@@ -327,12 +327,12 @@ pub(crate) enum Instruction {
     Return {
         value: bool,
     },
-    LoadFormal(u8),
-    StoreFormal {
+    LoadLocal(u8),
+    StoreLocal {
         slot: u8,
         keep: bool,
     },
-    UpdateFormal {
+    UpdateLocal {
         slot: u8,
         op: Update,
         result: UpdateResult,
@@ -2447,7 +2447,7 @@ impl Parser<'_> {
         kind: DeclarationKind,
         end: DeclaratorEnd,
     ) -> Result<(), Error> {
-        if self.function.is_some() {
+        if self.function.is_some() && matches!(kind, DeclarationKind::Lexical(_)) {
             return Err(Error::unsupported(
                 Span::at(self.lexer.offset),
                 "function-local declarations are outside the subset",
@@ -2577,6 +2577,14 @@ impl Parser<'_> {
                 DeclarationKind::Lexical(kind) => {
                     self.emit(Instruction::InitBinding { slot, kind }, end)?;
                     Role::Declaration(kind)
+                }
+                DeclarationKind::Var if self.function.is_some() => {
+                    self.record_local_var(name.span)?;
+                    if matches!(delimiter.kind, TokenKind::Assignment(None)) {
+                        let access = self.begin_write(name.span, delimiter.span, false)?;
+                        self.finish_write(access, end, false)?;
+                    }
+                    return Ok(matches!(separator, Some(TokenKind::Comma)));
                 }
                 DeclarationKind::Var => {
                     self.lexer.charge(1, name.span)?; // Also meter no-op occurrences.
@@ -3895,8 +3903,8 @@ impl Parser<'_> {
             | Instruction::Null
             | Instruction::Undefined
             | Instruction::LoadBinding(_)
-            | Instruction::LoadFormal(_)
-            | Instruction::UpdateFormal { .. }
+            | Instruction::LoadLocal(_)
+            | Instruction::UpdateLocal { .. }
             | Instruction::UpdateBinding { .. } => (0, 1),
             Instruction::Call { argc, .. } => (usize::from(argc) + 1, 1),
             Instruction::Return { value } if self.stack_depth == usize::from(value) => {
@@ -3905,7 +3913,7 @@ impl Parser<'_> {
             Instruction::Return { .. } => {
                 return Err(Error::malformed(span, "invalid return operand count"));
             }
-            Instruction::StoreFormal { keep, .. } => (1, usize::from(keep)),
+            Instruction::StoreLocal { keep, .. } => (1, usize::from(keep)),
             Instruction::JumpIfFalseStatement(_) | Instruction::ShortCircuitStatement { .. }
                 if self.stack_depth != 1 =>
             {

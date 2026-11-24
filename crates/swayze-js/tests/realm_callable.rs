@@ -330,8 +330,8 @@ fn grammar_reports_exclusions_and_preserves_legacy_refusal() {
         "if (false) function f(){}",
         "{function f(){}}",
         "function *f(){}",
-        "function f(){var x;}",
-        "function f(){for (var i;;){}}",
+        "function f(){var x}",
+        "function f(){for (var i;;) var x;}",
         "function f(){if (false) {let x;}}",
         "function f(){this;}",
         "function f(){new f;}",
@@ -340,7 +340,7 @@ fn grammar_reports_exclusions_and_preserves_legacy_refusal() {
         "function f(){((f.length))();}",
         "function f(){f.x;}",
         "function f(){break outside;}",
-        "function f(){return; var dead;}",
+        "function f(){return; var dead = function(){};}",
     ] {
         assert!(
             matches!(CompiledScript::compile(source), Err(CompileError::Parse(_))),

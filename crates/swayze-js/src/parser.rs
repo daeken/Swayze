@@ -88,11 +88,20 @@ pub enum ParseErrorType {
     SyntaxError,
 }
 
-/// A parse diagnostic that does not retain or print the source text.
+// Realm-only caps never escape via the exhaustive Legacy diagnostic enums.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealmParseLimit {
+    Arguments,
+    Parameters,
+    FormalNameBytes,
+}
+
+/// A parse diagnostic that does not retain or print the source text.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
     parse_error_type: Option<ParseErrorType>,
+    realm_limit: Option<RealmParseLimit>,
     span: Span,
     message: &'static str,
 }
@@ -120,6 +129,7 @@ impl Error {
         Self {
             kind: ErrorKind::Malformed,
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
@@ -129,6 +139,7 @@ impl Error {
         Self {
             kind: ErrorKind::Unsupported,
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
@@ -152,9 +163,33 @@ impl Error {
         Self {
             kind: ErrorKind::LimitExceeded(limit),
             parse_error_type: None,
+            realm_limit: None,
             span,
             message,
         }
+    }
+
+    fn realm_limit(span: Span, limit: RealmParseLimit) -> Self {
+        let message = match limit {
+            RealmParseLimit::Arguments => "call argument ceiling exceeded",
+            RealmParseLimit::Parameters => "function parameter ceiling exceeded",
+            RealmParseLimit::FormalNameBytes => "formal name byte ceiling exceeded",
+        };
+        Self {
+            realm_limit: Some(limit),
+            ..Self::unsupported(span, message)
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("kind", &self.kind)
+            .field("parse_error_type", &self.parse_error_type)
+            .field("span", &self.span)
+            .field("message", &self.message)
+            .finish()
     }
 }
 
@@ -281,6 +316,24 @@ pub(crate) enum Instruction {
     StoreBindingKeep(usize),
     UpdateBinding {
         slot: usize,
+        op: Update,
+        result: UpdateResult,
+    },
+    Call {
+        start: u32,
+        end: u32,
+        argc: u8,
+    },
+    Return {
+        value: bool,
+    },
+    LoadFormal(u8),
+    StoreFormal {
+        slot: u8,
+        keep: bool,
+    },
+    UpdateFormal {
+        slot: u8,
         op: Update,
         result: UpdateResult,
     },
@@ -429,6 +482,8 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
         scopes: Vec::new(),
         bindings: Vec::new(),
         realm_declarations: Vec::new(),
+        functions: Vec::new(),
+        function: None,
         accesses: Vec::new(),
         stack_depth: 0,
         max_stack_depth: 0,
@@ -583,6 +638,8 @@ enum TokenKind {
     Identifier,
     Declaration(BindingKind),
     Var,
+    Function,
+    Return,
     If,
     Else,
     While,
@@ -896,6 +953,8 @@ impl Lexer<'_> {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
             "let" => Ok(TokenKind::Declaration(BindingKind::Let)),
             "var" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Var),
+            "function" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Function),
+            "return" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Return),
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
@@ -1214,6 +1273,10 @@ enum Pending {
         join_depth: usize,
     },
     StatementTest,
+    Call {
+        base: usize,
+        completed: u8,
+    },
     Group {
         preserves_reference: bool,
     },
@@ -1284,6 +1347,12 @@ struct WriteAccess {
     load: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum DirectReference {
+    Name(usize),
+    StringLength,
+}
+
 enum ExpressionStart {
     Token(Token),
     // Statement or for-clause dispatch checked the update and read its continuation.
@@ -1311,6 +1380,7 @@ enum LeadingUpdate {
 enum ExpressionEnd {
     Script,
     ExpressionStatement,
+    Return,
     // A bare assignment RHS ends at the first outer comma or semicolon.
     StatementStore,
     // Subsequent comma operands use expression rules but still require ';'.
@@ -1450,6 +1520,8 @@ struct Parser<'s> {
     bindings: Vec<Binding>,
     realm_declarations: Vec<(Span, crate::realm::Role)>,
     accesses: Vec<Access>,
+    functions: Vec<realm::ParsedFunction>,
+    function: Option<realm::OpenFunction>,
     stack_depth: usize,
     max_stack_depth: usize,
 }
@@ -1467,6 +1539,12 @@ impl Parser<'_> {
             }
             let Some(first) = self.next_token(TokenPosition::Operand)? else {
                 let eof = Span::at(self.lexer.offset);
+                if self.function.is_some() {
+                    return Err(Error::malformed(
+                        eof,
+                        "expected '}' to close the function body",
+                    ));
+                }
                 if allow_empty_exit {
                     self.check_statement_boundary(eof)?;
                     break ExitStack::Empty;
@@ -1481,6 +1559,18 @@ impl Parser<'_> {
                 ));
             };
             self.check_statement_boundary(first.span)?;
+            if self.function.is_some() && matches!(first.kind, TokenKind::CloseBrace) {
+                mode = self.close_function(mode, first.span)?;
+                in_directive_prologue = false;
+                continue;
+            }
+            if self.function.is_none() && matches!(first.kind, TokenKind::Function) {
+                self.open_function(mode, first.span)?;
+                mode = CodeMode::Sloppy;
+                in_directive_prologue = true;
+                saw_statement = true;
+                continue;
+            }
             // Reaching this loop's EOF check again means a statement was parsed,
             // even if it emitted nothing. The final expression exits the loop.
             saw_statement = true;
@@ -1491,13 +1581,33 @@ impl Parser<'_> {
                 continue;
             };
             let before = self.instructions.len();
-            let (end, delimiter) = self.parse_expression(start, ExpressionEnd::Script)?;
+            let realm_bare_string =
+                if directive.is_some() && self.lexer.policy == BindingPolicy::Realm {
+                    let next = self.next_token(TokenPosition::AfterPrimary)?;
+                    let bare = next
+                        .as_ref()
+                        .is_some_and(|t| matches!(t.kind, TokenKind::Semicolon));
+                    self.lookahead = Some(next);
+                    bare
+                } else {
+                    false
+                };
+            let end_kind = if self.function.is_some() {
+                ExpressionEnd::ExpressionStatement
+            } else {
+                ExpressionEnd::Script
+            };
+            let (end, delimiter) = self.parse_expression(start, end_kind)?;
             // Only a bare quoted String can be a directive; a Template cannot.
             // A bare literal emits one instruction. Any expression that STARTS
             // with that token and continues (even across a newline) emits more;
             // an expression that starts with a group doesn't qualify at all.
             // Use the raw spelling, not the decoded UTF-16, for Use Strict.
-            if let Some(span) = directive.filter(|_| self.instructions.len() - before == 1) {
+            if let Some(span) = directive.filter(|_| {
+                realm_bare_string
+                    || (self.lexer.policy == BindingPolicy::Legacy
+                        && self.instructions.len() - before == 1)
+            }) {
                 if matches!(
                     &self.lexer.source[span.start..span.end],
                     "'use strict'" | "\"use strict\""
@@ -1523,6 +1633,10 @@ impl Parser<'_> {
                     return Err(Error::unsupported(end, EXPRESSION_STATEMENT_SEMICOLON));
                 }
                 break ExitStack::Value;
+            }
+            if self.function.is_some() {
+                self.emit(Instruction::Discard, end)?;
+                continue;
             }
             // A root semicolon terminates the final expression only at EOF.
             // Otherwise discard the completed value and resume with the cached token.
@@ -2069,6 +2183,13 @@ impl Parser<'_> {
     ) -> Result<Option<ExpressionStart>, Error> {
         match first.kind {
             TokenKind::Semicolon => {}
+            TokenKind::Function => {
+                return Err(Error::unsupported(
+                    first.span,
+                    "ordinary function declarations must be at the Script root",
+                ));
+            }
+            TokenKind::Return => self.parse_return(first.span)?,
             TokenKind::Declaration(kind) => {
                 self.parse_declaration(DeclarationKind::Lexical(kind))?
             }
@@ -2326,6 +2447,12 @@ impl Parser<'_> {
         kind: DeclarationKind,
         end: DeclaratorEnd,
     ) -> Result<(), Error> {
+        if self.function.is_some() {
+            return Err(Error::unsupported(
+                Span::at(self.lexer.offset),
+                "function-local declarations are outside the subset",
+            ));
+        }
         while self.parse_declarator(kind, end)? {}
         Ok(())
     }
@@ -2874,11 +3001,15 @@ impl Parser<'_> {
     }
 
     fn patch_access(&mut self, access: Access, slot: Option<usize>) -> Result<(), Error> {
-        match (
-            access.kind,
-            slot,
-            self.instructions.get_mut(access.instruction),
-        ) {
+        Self::patch_access_in(&mut self.instructions, access, slot)
+    }
+
+    fn patch_access_in(
+        instructions: &mut [Instruction],
+        access: Access,
+        slot: Option<usize>,
+    ) -> Result<(), Error> {
+        match (access.kind, slot, instructions.get_mut(access.instruction)) {
             (
                 AccessKind::Read | AccessKind::TypeofRead,
                 _,
@@ -2904,8 +3035,7 @@ impl Parser<'_> {
             ) => {
                 *binding = slot;
                 if let Some(load) = write.load {
-                    let Some(op @ Instruction::LoadBinding(UNPATCHED)) =
-                        self.instructions.get_mut(load)
+                    let Some(op @ Instruction::LoadBinding(UNPATCHED)) = instructions.get_mut(load)
                     else {
                         return Err(Error::malformed(
                             access.name,
@@ -2948,6 +3078,7 @@ impl Parser<'_> {
         };
         let missing_semicolon = match end_kind {
             ExpressionEnd::ExpressionStatement => Some(EXPRESSION_STATEMENT_SEMICOLON),
+            ExpressionEnd::Return => Some("return requires an explicit semicolon"),
             ExpressionEnd::StatementStore => Some(ASSIGNMENT_STATEMENT_SEMICOLON),
             ExpressionEnd::StatementStoreSuffix(message)
             | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
@@ -2982,6 +3113,7 @@ impl Parser<'_> {
             || matches!(
                 end_kind,
                 ExpressionEnd::ForTest
+                    | ExpressionEnd::Return
                     | ExpressionEnd::Declarator(_)
                     | ExpressionEnd::StatementStore
                     | ExpressionEnd::StatementStoreSuffix(_)
@@ -2989,11 +3121,13 @@ impl Parser<'_> {
                     | ExpressionEnd::ForClause(_)
             );
         // Only the most recent operand can be the direct argument of a pending
-        // prefix. Track its read-access index, not the shape of emitted code.
-        let mut direct_read = None;
+        // prefix or a direct member reference. Track that syntactically, not
+        // from the shape of emitted code.
+        let mut reference = None;
         // Keep the legacy brace diagnostics outside templates without searching
         // pending entries. Only the reducer can authorize raw continuation.
         let mut template_depth = 0;
+        let mut callable_primary = false;
         let (end, delimiter) = loop {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
@@ -3013,7 +3147,7 @@ impl Parser<'_> {
             let group_start =
                 after_open && matches!(self.pending.last(), Some((Pending::Group { .. }, _)));
             if needs_operand {
-                direct_read = None;
+                reference = None;
             }
             // Operand completeness is not sufficient: a name update or a
             // read that already took a suffix cannot take another dot.
@@ -3039,7 +3173,7 @@ impl Parser<'_> {
                         && after_line_break
                         && let Some(message) = missing_semicolon
                     {
-                        self.reduce_expression(span, &mut direct_read)?;
+                        self.reduce_expression(span, &mut reference)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(span, message));
                         }
@@ -3071,7 +3205,7 @@ impl Parser<'_> {
                     ));
                 }
                 (false, TokenKind::CloseBrace) if template_depth != 0 => {
-                    needs_operand = self.finish_template_substitution(span, &mut direct_read)?;
+                    needs_operand = self.finish_template_substitution(span, &mut reference)?;
                     if !needs_operand {
                         template_depth -= 1;
                         allow_dot = true;
@@ -3095,7 +3229,7 @@ impl Parser<'_> {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
                 (false, TokenKind::LengthSuffix) => {
-                    direct_read = None;
+                    reference = Some(DirectReference::StringLength);
                     self.emit(Instruction::StringLength, span)?;
                 }
                 (true, TokenKind::String(range) | TokenKind::Template(range)) => {
@@ -3154,7 +3288,9 @@ impl Parser<'_> {
                         }
                         following => {
                             self.lookahead = Some(following);
-                            direct_read = Some(self.record_access(span, AccessKind::Read)?);
+                            reference = Some(DirectReference::Name(
+                                self.record_access(span, AccessKind::Read)?,
+                            ));
                             self.emit_charged(Instruction::LoadBinding(UNPATCHED), span)?;
                             allow_dot = true;
                         }
@@ -3189,6 +3325,14 @@ impl Parser<'_> {
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Pending::Op(prefix), span)?;
                 }
+                (true, TokenKind::Close)
+                    if after_open
+                        && matches!(self.pending.last(), Some((Pending::Call { .. }, _))) =>
+                {
+                    self.finish_call(span, false)?;
+                    needs_operand = false;
+                    allow_dot = true;
+                }
                 (true, TokenKind::Close) if after_open => {
                     if matches!(self.pending.last(), Some((Pending::StatementTest, _))) {
                         return Err(Error::malformed(
@@ -3217,8 +3361,22 @@ impl Parser<'_> {
                 (false, TokenKind::Comma) => {
                     // Comma is looser than ?: and =. Finish pending subexpressions
                     // before deciding which surrounding production owns the comma.
-                    self.reduce_expression(span, &mut direct_read)?;
+                    self.reduce_expression(span, &mut reference)?;
                     self.finish_group_assignment(span)?;
+                    if let Some((Pending::Call { base, completed }, _)) = self.pending.last_mut() {
+                        if self.stack_depth != *base + usize::from(*completed) + 1 {
+                            return Err(Error::malformed(span, "expected one call argument"));
+                        }
+                        *completed += 1;
+                        if *completed >= crate::realm::MAX_PARAMETERS {
+                            return Err(Error::realm_limit(span, RealmParseLimit::Arguments));
+                        }
+                        needs_operand = true;
+                        allow_assignment = true;
+                        after_open = false;
+                        next = self.next_token(TokenPosition::Operand)?;
+                        continue;
+                    }
                     match self.pending.last() {
                         Some((Pending::Consequent { .. }, _)) => {
                             return Err(Error::malformed(span, "expected ':' before ','"));
@@ -3241,6 +3399,7 @@ impl Parser<'_> {
                         None if matches!(
                             end_kind,
                             ExpressionEnd::Script
+                                | ExpressionEnd::Return
                                 | ExpressionEnd::ExpressionStatement
                                 | ExpressionEnd::StatementStoreSuffix(_)
                                 | ExpressionEnd::ForTest
@@ -3267,6 +3426,18 @@ impl Parser<'_> {
                     self.emit(Instruction::Discard, span)?;
                     needs_operand = true;
                 }
+                (_, TokenKind::Function) => {
+                    return Err(Error::unsupported(
+                        span,
+                        "function expressions are outside the subset",
+                    ));
+                }
+                (_, TokenKind::Return) => {
+                    return Err(Error::malformed(
+                        span,
+                        "unexpected return keyword in expression",
+                    ));
+                }
                 (true, _) => return Err(Error::malformed(span, "expected an operand")),
                 (false, TokenKind::Operator(Operator::Not)) => {
                     return Err(Error::unsupported(
@@ -3283,7 +3454,7 @@ impl Parser<'_> {
                 (false, TokenKind::Question) => {
                     // Lower precedence than every operator here, but do not close an
                     // enclosing conditional: this one starts within that arm.
-                    self.reduce_operators(0, &mut direct_read)?;
+                    self.reduce_operators(0, &mut reference)?;
                     let branch = self.instructions.len();
                     self.emit(Instruction::JumpIfFalse(UNPATCHED), span)?;
                     self.open_pending(
@@ -3296,12 +3467,20 @@ impl Parser<'_> {
                     needs_operand = true;
                 }
                 (false, TokenKind::Colon) => {
-                    self.start_alternate(span, &mut direct_read)?;
+                    self.start_alternate(span, &mut reference)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Close) => {
-                    self.reduce_expression(span, &mut direct_read)?;
+                    self.reduce_expression(span, &mut reference)?;
                     self.finish_group_assignment(span)?;
+                    if matches!(self.pending.last(), Some((Pending::Call { .. }, _))) {
+                        self.finish_call(span, true)?;
+                        reference = None;
+                        callable_primary = true;
+                        after_open = false;
+                        next = self.next_token(TokenPosition::AfterPrimary)?;
+                        continue;
+                    }
                     match self.pending.pop() {
                         Some((Pending::StatementTest, _)) => {
                             self.nesting_depth -= 1;
@@ -3315,7 +3494,7 @@ impl Parser<'_> {
                             _,
                         )) => {
                             if !preserves_reference {
-                                direct_read = None;
+                                reference = None;
                             }
                             self.nesting_depth -= 1;
                             allow_dot = true;
@@ -3342,6 +3521,35 @@ impl Parser<'_> {
                         end: span.start + 1,
                     }));
                 }
+                (false, TokenKind::Open)
+                    if self.lexer.policy == BindingPolicy::Realm
+                        && callable_primary
+                        && !matches!(reference, Some(DirectReference::StringLength)) =>
+                {
+                    if self.stack_depth == 0 {
+                        return Err(Error::malformed(span, "missing callee"));
+                    }
+                    // GetValue has already been emitted. A call is never a
+                    // direct typeof reference, and its arguments cannot leak one.
+                    reference = None;
+                    self.open_pending(
+                        Pending::Call {
+                            base: self.stack_depth,
+                            completed: 0,
+                        },
+                        span,
+                    )?;
+                    needs_operand = true;
+                }
+                (false, TokenKind::Open)
+                    if self.lexer.policy == BindingPolicy::Realm
+                        && matches!(reference, Some(DirectReference::StringLength)) =>
+                {
+                    return Err(Error::unsupported(
+                        span,
+                        "member calls are outside the subset",
+                    ));
+                }
                 (false, TokenKind::Open) => {
                     return Err(Error::unsupported(
                         span,
@@ -3358,7 +3566,7 @@ impl Parser<'_> {
                     | TokenKind::Operator(Operator::Void | Operator::Typeof),
                 ) => {
                     if after_line_break && for_delimiter.is_none() {
-                        self.reduce_expression(span, &mut direct_read)?;
+                        self.reduce_expression(span, &mut reference)?;
                         if self.pending.is_empty() {
                             return Err(Error::unsupported(
                                 span,
@@ -3369,7 +3577,7 @@ impl Parser<'_> {
                     return Err(Error::malformed(span, "expected a binary operator"));
                 }
                 (false, TokenKind::Operator(op)) => {
-                    self.push_infix(op, span, &mut direct_read)?;
+                    self.push_infix(op, span, &mut reference)?;
                     needs_operand = true;
                 }
                 (false, TokenKind::Semicolon) if for_update => {
@@ -3377,6 +3585,7 @@ impl Parser<'_> {
                 }
                 (false, TokenKind::Semicolon) => break (span, Some(kind)),
             }
+            callable_primary = allow_dot;
             after_open = matches!(kind, TokenKind::Open);
             // A head or middle starts a fresh substitution expression; a
             // comma that emitted Discard starts another sequence operand.
@@ -3388,7 +3597,10 @@ impl Parser<'_> {
                         | TokenKind::Comma
                         | TokenKind::TemplateHead(_)
                         | TokenKind::CloseBrace
-                );
+                )
+                || (needs_operand
+                    && after_open
+                    && matches!(self.pending.last(), Some((Pending::Call { .. }, _))));
             next = self.next_token(if needs_operand {
                 TokenPosition::Operand
             } else if allow_dot {
@@ -3398,17 +3610,21 @@ impl Parser<'_> {
             })?;
         };
         let at_eof = delimiter.is_none();
-        self.reduce_expression(end, &mut direct_read)?;
+        self.reduce_expression(end, &mut reference)?;
         if let Some((pending, _)) = self.pending.last() {
             let message = match pending {
-                Pending::Group { .. } | Pending::StatementTest | Pending::AssignmentGroup(_)
+                Pending::Group { .. }
+                | Pending::StatementTest
+                | Pending::AssignmentGroup(_)
+                | Pending::Call { .. }
                     if at_eof =>
                 {
                     "expected a closing parenthesis before end of source"
                 }
-                Pending::Group { .. } | Pending::StatementTest | Pending::AssignmentGroup(_) => {
-                    "semicolon inside a parenthesized expression"
-                }
+                Pending::Group { .. }
+                | Pending::StatementTest
+                | Pending::AssignmentGroup(_)
+                | Pending::Call { .. } => "semicolon inside a parenthesized expression",
                 Pending::Template { .. } if at_eof => {
                     "expected '}' before end of template substitution"
                 }
@@ -3436,9 +3652,9 @@ impl Parser<'_> {
     fn finish_template_substitution(
         &mut self,
         brace: Span,
-        direct_read: &mut Option<usize>,
+        reference: &mut Option<DirectReference>,
     ) -> Result<bool, Error> {
-        self.reduce_expression(brace, direct_read)?;
+        self.reduce_expression(brace, reference)?;
         let prefix_depth = match self.pending.last() {
             Some((Pending::Template { prefix_depth }, _)) => *prefix_depth,
             Some((Pending::Consequent { .. }, _)) => {
@@ -3466,7 +3682,7 @@ impl Parser<'_> {
                 end: self.lexer.offset,
             },
         )?;
-        *direct_read = None;
+        *reference = None;
         if !middle {
             self.pending.pop();
             self.nesting_depth -= 1;
@@ -3479,14 +3695,14 @@ impl Parser<'_> {
         &mut self,
         op: Operator,
         span: Span,
-        direct_read: &mut Option<usize>,
+        reference: &mut Option<DirectReference>,
     ) -> Result<(), Error> {
         let pending = if let branch @ Instruction::ShortCircuit { .. } = op.instruction() {
             // Reduce the tighter operators (starting at bitwise OR precedence)
             // to expose the closest pending short circuit without reducing it.
             // All earlier short circuits in this region have already agreed on
             // the family. A Group or conditional arm marker ends the region.
-            self.reduce_operators(Operator::BitwiseOr.precedence(), direct_read)?;
+            self.reduce_operators(Operator::BitwiseOr.precedence(), reference)?;
             if let Some((Pending::ShortCircuit { op: previous, .. }, _)) = self.pending.last()
                 && matches!(previous, Operator::Coalesce) != matches!(op, Operator::Coalesce)
             {
@@ -3497,7 +3713,7 @@ impl Parser<'_> {
             }
             // Equal precedence reduces first; a preceding branch joins before
             // this operator consumes its left operand.
-            self.reduce_operators(op.precedence(), direct_read)?;
+            self.reduce_operators(op.precedence(), reference)?;
             let jump = self.instructions.len();
             let join_depth = self.stack_depth; // LHS stays on the taken path.
             self.emit(branch, span)?; // Track the fallthrough path, which pops the LHS.
@@ -3520,7 +3736,7 @@ impl Parser<'_> {
             // Keep equal precedence pending: `**` associates to the right.
             Pending::Op(op)
         } else {
-            self.reduce_operators(op.precedence(), direct_read)?;
+            self.reduce_operators(op.precedence(), reference)?;
             Pending::Op(op)
         };
         self.push_pending(pending, span)
@@ -3547,14 +3763,14 @@ impl Parser<'_> {
     fn reduce_operators(
         &mut self,
         min_precedence: u8,
-        direct_read: &mut Option<usize>,
+        reference: &mut Option<DirectReference>,
     ) -> Result<(), Error> {
         while let Some(&(pending, span)) = self.pending.last() {
             match pending {
                 Pending::Op(op) if op.precedence() >= min_precedence => {
                     self.emit(op.instruction(), span)?;
                     if matches!(op, Operator::Typeof)
-                        && let Some(index) = *direct_read
+                        && let Some(DirectReference::Name(index)) = *reference
                     {
                         self.accesses[index].kind = AccessKind::TypeofRead;
                     }
@@ -3574,7 +3790,7 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
-            *direct_read = None; // Any reduction here produces a value, not a reference.
+            *reference = None; // Any reduction here produces a value, not a reference.
             self.pending.pop();
         }
         Ok(())
@@ -3591,9 +3807,9 @@ impl Parser<'_> {
     fn reduce_expression(
         &mut self,
         end: Span,
-        direct_read: &mut Option<usize>,
+        reference: &mut Option<DirectReference>,
     ) -> Result<(), Error> {
-        self.reduce_operators(0, direct_read)?;
+        self.reduce_operators(0, reference)?;
         while let Some(&(pending, span)) = self.pending.last() {
             match pending {
                 Pending::Alternate { jump, join_depth } => {
@@ -3612,7 +3828,7 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
-            *direct_read = None; // Any reduction here produces a value, not a reference.
+            *reference = None; // Any reduction here produces a value, not a reference.
             self.pending.pop();
         }
         Ok(())
@@ -3621,9 +3837,9 @@ impl Parser<'_> {
     fn start_alternate(
         &mut self,
         span: Span,
-        direct_read: &mut Option<usize>,
+        reference: &mut Option<DirectReference>,
     ) -> Result<(), Error> {
-        self.reduce_expression(span, direct_read)?;
+        self.reduce_expression(span, reference)?;
         let Some((Pending::Consequent { branch, base_depth }, _)) = self.pending.pop() else {
             return Err(Error::malformed(span, "':' without a matching '?'"));
         };
@@ -3679,7 +3895,17 @@ impl Parser<'_> {
             | Instruction::Null
             | Instruction::Undefined
             | Instruction::LoadBinding(_)
+            | Instruction::LoadFormal(_)
+            | Instruction::UpdateFormal { .. }
             | Instruction::UpdateBinding { .. } => (0, 1),
+            Instruction::Call { argc, .. } => (usize::from(argc) + 1, 1),
+            Instruction::Return { value } if self.stack_depth == usize::from(value) => {
+                (usize::from(value), 0)
+            }
+            Instruction::Return { .. } => {
+                return Err(Error::malformed(span, "invalid return operand count"));
+            }
+            Instruction::StoreFormal { keep, .. } => (1, usize::from(keep)),
             Instruction::JumpIfFalseStatement(_) | Instruction::ShortCircuitStatement { .. }
                 if self.stack_depth != 1 =>
             {

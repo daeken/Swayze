@@ -1,6 +1,8 @@
 use super::{
-    BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, StringPools, TransientStrings,
-    Update, UpdateResult, Value, push_operand, update_number,
+    BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
+    TransientStrings, Update, UpdateResult, Value, push_operand,
+    realm::{Artifact, FunctionOrigin},
+    update_number,
 };
 
 pub(super) struct UpdateNumeric<'pools, 'budget> {
@@ -12,14 +14,46 @@ pub(super) struct UpdateNumeric<'pools, 'budget> {
 // coercions, control, and accounting remain shared.
 pub(super) trait Bindings {
     type Error: From<EvalError>;
+    const CALLS: bool = false;
 
     fn retained_units(&self) -> &[u16] {
         &[]
     }
 
+    fn artifacts(&self) -> &[Artifact] {
+        &[]
+    }
+
+    fn active_artifact(&self) -> Option<u8> {
+        None
+    }
+
+    fn select_body(&mut self, _: Option<FunctionOrigin>) {}
+
+    fn non_callable(&self, _: crate::Span) -> Self::Error {
+        EvalError::InvalidScript.into()
+    }
+
+    fn charge_call(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn transient<'a>(
+        &self,
+        scratch: &'a EvalScratch,
+        literals: &'a [u16],
+        artifacts: &'a [Artifact],
+    ) -> TransientStrings<'a> {
+        let mut source = scratch.transient(literals);
+        source.artifacts = artifacts;
+        source
+    }
+
     fn external_strings<'a>(&'a self, literals: &'a [u16]) -> ExternalStrings<'a> {
         ExternalStrings {
             literals,
+            artifacts: self.artifacts(),
+            active_artifact: self.active_artifact(),
             retained: self.retained_units(),
         }
     }
@@ -29,25 +63,24 @@ pub(super) trait Bindings {
         scratch: &'a EvalScratch,
         literals: &'a [u16],
     ) -> StringPools<'a> {
-        scratch
-            .transient(literals)
+        self.transient(scratch, literals, self.artifacts())
             .with_retained(self.retained_units())
     }
 
-    fn load(&self, slot: usize) -> Result<Operand, Self::Error>;
+    fn load(&mut self, slot: usize) -> Result<Operand, Self::Error>;
     fn init(
         &mut self,
         slot: usize,
         kind: BindingKind,
         ip: usize,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         source: TransientStrings<'_>,
     ) -> Result<(), Self::Error>;
     fn store(
         &mut self,
         slot: usize,
         keep: bool,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         source: TransientStrings<'_>,
     ) -> Result<(), Self::Error>;
     fn update(
@@ -55,7 +88,7 @@ pub(super) trait Bindings {
         slot: usize,
         op: Update,
         result: UpdateResult,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         max: usize,
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), Self::Error>;
@@ -99,7 +132,7 @@ impl LegacyBindings {
 impl Bindings for LegacyBindings {
     type Error = EvalError;
 
-    fn load(&self, slot: usize) -> Result<Operand, EvalError> {
+    fn load(&mut self, slot: usize) -> Result<Operand, EvalError> {
         self.0
             .get(slot)
             .and_then(Option::as_ref)
@@ -112,7 +145,7 @@ impl Bindings for LegacyBindings {
         slot: usize,
         kind: BindingKind,
         init_at: usize,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         _: TransientStrings<'_>,
     ) -> Result<(), EvalError> {
         let binding = self.0.get_mut(slot).ok_or(EvalError::InvalidScript)?;
@@ -131,7 +164,7 @@ impl Bindings for LegacyBindings {
         &mut self,
         slot: usize,
         keep: bool,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         _: TransientStrings<'_>,
     ) -> Result<(), EvalError> {
         let value = self.writable(slot)?;
@@ -144,7 +177,7 @@ impl Bindings for LegacyBindings {
         slot: usize,
         op: Update,
         result: UpdateResult,
-        stack: &mut Vec<Operand>,
+        stack: &mut Stack<'_>,
         max: usize,
         numeric: UpdateNumeric<'_, '_>,
     ) -> Result<(), EvalError> {
@@ -157,14 +190,14 @@ impl Bindings for LegacyBindings {
     }
 }
 
-pub(super) fn init_operand(stack: &mut Vec<Operand>) -> Result<Operand, EvalError> {
+pub(super) fn init_operand(stack: &mut Stack<'_>) -> Result<Operand, EvalError> {
     if stack.len() != 1 {
         return Err(EvalError::InvalidScript);
     }
     stack.pop().ok_or(EvalError::InvalidScript)
 }
 
-pub(super) fn store_operand(stack: &mut Vec<Operand>, keep: bool) -> Result<Operand, EvalError> {
+pub(super) fn store_operand(stack: &mut Stack<'_>, keep: bool) -> Result<Operand, EvalError> {
     if keep {
         stack.last().copied().ok_or(EvalError::InvalidScript)
     } else {
@@ -173,7 +206,7 @@ pub(super) fn store_operand(stack: &mut Vec<Operand>, keep: bool) -> Result<Oper
 }
 
 pub(super) fn update_result(
-    stack: &mut Vec<Operand>,
+    stack: &mut Stack<'_>,
     max: usize,
     result: UpdateResult,
     old: f64,

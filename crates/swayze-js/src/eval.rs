@@ -9,9 +9,15 @@ use crate::{
 };
 
 // Fixed evaluation ceilings, independent of custom parse limits.
-const MAX_INSTRUCTIONS: usize = 4096;
+pub(crate) const MAX_INSTRUCTIONS: usize = 4096;
 const MAX_DISPATCHES: usize = 16_384;
 const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
+
+mod bindings;
+pub mod realm;
+use bindings::{
+    Bindings, LegacyBindings, UpdateNumeric, init_operand, store_operand, update_result,
+};
 
 mod string_concat;
 mod string_number;
@@ -466,10 +472,30 @@ impl PreparedScript {
     }
 }
 
-struct Slot {
-    init_at: usize,
-    kind: BindingKind,
-    value: Operand,
+fn validate_layout(
+    ops: &[Instruction],
+    max_operands: usize,
+    exit: ExitStack,
+) -> Result<(), EvalError> {
+    if ops.len() > MAX_INSTRUCTIONS {
+        return Err(EvalError::LimitExceeded);
+    }
+    // Back edges require an empty stack. A path to the peak needs that many
+    // distinct pushes and at least peak - exit_arity distinct pops to finish
+    // or reach a back edge.
+    let exit_arity = exit.arity();
+    if max_operands < exit_arity || max_operands > (ops.len() + exit_arity) / 2 {
+        return Err(EvalError::InvalidScript);
+    }
+    Ok(())
+}
+
+fn new_stack(max_operands: usize) -> Result<Vec<Operand>, EvalError> {
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(max_operands)
+        .map_err(|_| EvalError::AllocationFailed)?;
+    Ok(stack)
 }
 
 fn evaluate(
@@ -480,38 +506,34 @@ fn evaluate(
     exit: ExitStack,
     scratch: &mut EvalScratch,
 ) -> Result<Option<Operand>, EvalError> {
-    if ops.len() > MAX_INSTRUCTIONS {
-        return Err(EvalError::LimitExceeded);
-    }
-    // Back edges require an empty stack. A path to the peak needs that many
-    // distinct pushes and at least peak - exit_arity distinct pops to finish
-    // or reach a back edge. Each binding has its own initializer and operand
-    // producer, separate from any instruction that produces a final result.
-    let exit_arity = exit.arity();
-    if max_operands < exit_arity
-        || max_operands > (ops.len() + exit_arity) / 2
-        || binding_slots > ops.len().saturating_sub(exit_arity) / 2
-    {
+    validate_layout(ops, max_operands, exit)?;
+    // Each legacy slot has a producer and initializer, independent of the
+    // final result. This check is not an assumption about global metadata.
+    if binding_slots > ops.len().saturating_sub(exit.arity()) / 2 {
         return Err(EvalError::InvalidScript);
     }
+    let stack = new_stack(max_operands)?;
+    let mut bindings = LegacyBindings::new(binding_slots)?;
+    dispatch(
+        ops,
+        stack,
+        max_operands,
+        string_units,
+        exit,
+        scratch,
+        &mut bindings,
+    )
+}
 
-    let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(max_operands)
-        .map_err(|_| EvalError::AllocationFailed)?;
-
-    // Each declaration has its own slot, local to this evaluation. Slots in
-    // untaken paths may remain empty. Only an initializer can reset a const.
-    // No clearing on scope exit is needed: the parser emits references only
-    // within the declaration's scope after its initializer. A jump can skip a
-    // block or leave it, but cannot enter a suffix from outside the block.
-    // Loop back edges restart at a test, an update, or the start of a do body.
-    let mut bindings = Vec::<Option<Slot>>::new();
-    bindings
-        .try_reserve_exact(binding_slots)
-        .map_err(|_| EvalError::AllocationFailed)?;
-    bindings.resize_with(binding_slots, || None);
-
+fn dispatch<B: Bindings>(
+    ops: &[Instruction],
+    mut stack: Vec<Operand>,
+    max_operands: usize,
+    string_units: &[u16],
+    exit: ExitStack,
+    scratch: &mut EvalScratch,
+    bindings: &mut B,
+) -> Result<Option<Operand>, B::Error> {
     // `ops.len()` denotes exit, which is not a dispatch and needs no fuel.
     let mut remaining = MAX_DISPATCHES;
     let mut string_pairs_left = MAX_STRING_COMPARISON_PAIRS;
@@ -553,53 +575,30 @@ fn evaluate(
                 push_operand(&mut stack, max_operands, Operand::Scalar(Value::Undefined))?
             }
             Instruction::LoadBinding(slot) => {
-                let binding = bindings
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .ok_or(EvalError::InvalidScript)?;
-                push_operand(&mut stack, max_operands, binding.value)?;
+                push_operand(&mut stack, max_operands, bindings.load(slot)?)?;
             }
             Instruction::InitBinding { slot, kind } => {
-                let binding = bindings.get_mut(slot).ok_or(EvalError::InvalidScript)?;
-                let init_at = ip - 1;
-                if stack.len() != 1 || binding.as_ref().is_some_and(|old| old.init_at != init_at) {
-                    return Err(EvalError::InvalidScript);
-                }
-                let value = stack.pop().ok_or(EvalError::InvalidScript)?;
-                *binding = Some(Slot {
-                    init_at,
-                    kind,
-                    value,
-                });
+                bindings.init(slot, kind, ip - 1, &mut stack)?;
             }
             Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
-                let value = writable_binding(&mut bindings, slot)?;
-                *value = if matches!(op, Instruction::StoreBindingKeep(_)) {
-                    *stack.last().ok_or(EvalError::InvalidScript)?
-                } else {
-                    if stack.len() != 1 {
-                        return Err(EvalError::InvalidScript);
-                    }
-                    stack.pop().ok_or(EvalError::InvalidScript)?
-                };
+                bindings.store(
+                    slot,
+                    matches!(op, Instruction::StoreBindingKeep(_)),
+                    &mut stack,
+                )?;
             }
             Instruction::UpdateBinding { slot, op, result } => {
-                let value = writable_binding(&mut bindings, slot)?;
-                let old = value.to_number(
-                    scratch.pools(string_units),
-                    &mut string_conversion_credits_left,
-                )?;
-                let new = update_number(op, old);
-                let result = match result {
-                    UpdateResult::New => new,
-                    UpdateResult::Old => old,
-                };
-                push_operand(
+                bindings.update(
+                    slot,
+                    op,
+                    result,
                     &mut stack,
                     max_operands,
-                    Operand::Scalar(Value::Number(result)),
+                    UpdateNumeric {
+                        pools: scratch.pools(string_units),
+                        credits: &mut string_conversion_credits_left,
+                    },
                 )?;
-                *value = Operand::Scalar(Value::Number(new));
             }
             Instruction::Discard => {
                 stack.pop().ok_or(EvalError::InvalidScript)?;
@@ -785,7 +784,7 @@ fn evaluate(
             Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
-                    return Err(EvalError::InvalidScript);
+                    return Err(EvalError::InvalidScript.into());
                 }
                 let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if !condition.to_boolean() {
@@ -804,7 +803,7 @@ fn evaluate(
             Instruction::ShortCircuitStatement { target, condition } => {
                 let target = check_forward_target(ip, target, ops.len())?;
                 if stack.len() != 1 {
-                    return Err(EvalError::InvalidScript);
+                    return Err(EvalError::InvalidScript.into());
                 }
                 let lhs = stack.pop().ok_or(EvalError::InvalidScript)?;
                 if condition.skips_rhs(lhs) {
@@ -814,7 +813,7 @@ fn evaluate(
             Instruction::Jump(target) => ip = check_forward_target(ip, target, ops.len())?,
             Instruction::JumpStatement(target) => {
                 if !stack.is_empty() {
-                    return Err(EvalError::InvalidScript);
+                    return Err(EvalError::InvalidScript.into());
                 }
                 ip = check_forward_target(ip, target, ops.len())?;
             }
@@ -822,7 +821,7 @@ fn evaluate(
                 // `ip` already points past this instruction. Reject self and
                 // forward edges, and require statement depth on entry.
                 if target >= ip - 1 || !stack.is_empty() {
-                    return Err(EvalError::InvalidScript);
+                    return Err(EvalError::InvalidScript.into());
                 }
                 ip = target;
             }
@@ -834,7 +833,7 @@ fn evaluate(
     match (exit, stack.as_slice()) {
         (ExitStack::Empty, []) => Ok(None),
         (ExitStack::Value, [value]) => Ok(Some(*value)),
-        _ => Err(EvalError::InvalidScript),
+        _ => Err(EvalError::InvalidScript.into()),
     }
 }
 
@@ -912,17 +911,6 @@ fn charge_string_pairs(remaining: &mut usize, pairs: usize) -> Result<(), EvalEr
         .checked_sub(pairs)
         .ok_or(EvalError::StringComparisonLimitExceeded)?;
     Ok(())
-}
-
-fn writable_binding(bindings: &mut [Option<Slot>], slot: usize) -> Result<&mut Operand, EvalError> {
-    match bindings.get_mut(slot) {
-        Some(Some(Slot {
-            kind: BindingKind::Let,
-            value,
-            ..
-        })) => Ok(value),
-        _ => Err(EvalError::InvalidScript),
-    }
 }
 
 fn check_forward_target(next: usize, target: usize, exit: usize) -> Result<usize, EvalError> {

@@ -8,6 +8,7 @@ mod number_format;
 mod parser;
 mod radix_integer;
 
+pub use eval::realm;
 pub use eval::{EvalError, EvalScratch, PrimitiveValue, Value};
 pub use parser::{
     CompletionScript, Error, ErrorKind, Limit, Limits, ParseErrorType, Script, Span, parse_script,

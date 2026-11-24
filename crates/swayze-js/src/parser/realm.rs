@@ -237,8 +237,9 @@ impl Parser<'_> {
     }
 }
 
-// Bound requested backing geometrically; charge both record writes and
-// potentially moving initialized spans. No name bytes are copied here.
+// Bound requested backing (not allocator rounding or overhead) geometrically.
+// Charge the record write and any move of initialized spans before reserving.
+// No name bytes are copied here.
 fn push_span(lexer: &mut super::Lexer<'_>, spans: &mut Vec<Span>, name: Span) -> Result<(), Error> {
     lexer.charge(1, name)?;
     let len = spans.len();

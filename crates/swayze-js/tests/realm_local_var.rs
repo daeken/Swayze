@@ -92,6 +92,25 @@ fn formals_and_var_share_slots_and_noop_reentry_is_not_a_write() {
 }
 
 #[test]
+fn self_initializer_reads_the_fresh_slot_or_supplied_formal() {
+    let mut realm = Realm::new();
+    normal(
+        &mut realm,
+        r#"
+        const x = 91;
+        function shadow(seed) {
+            if (seed) { x = seed; }
+            var x = x;
+            return x;
+        }
+        function alias(x) { var x = x; return x; }
+        if (shadow(7) !== 7 || shadow() !== void 0 || x !== 91) bad;
+        if (alias(8) !== 8 || alias() !== void 0) bad;
+    "#,
+    );
+}
+
+#[test]
 fn strictness_and_free_names_stay_definition_local_and_live() {
     let mut realm = Realm::new();
     normal(
@@ -289,22 +308,54 @@ fn shared_call_setup_charges_all_slots_after_argument_effects() {
     normal(
         &mut realm,
         &format!(
-            "var effect = 0; function wide(){{var {};}} function tail(){{var {};}} function one(){{}}",
+            r#"
+            var effect = 0, entered = 0;
+            function wide() {{ var {}; }}
+            function tail() {{ var {}, loc = 1; loc++; }}
+            function shortTail() {{ var {}; }}
+            function empty() {{}}
+            function abortOnEntry() {{ (0)(); }}
+            function one() {{ entered = 1; }}
+            "#,
             names('a', 128),
-            names('b', 7)
+            names('b', 6),
+            names('b', 6)
         ),
     );
-    // 1016 * (1 + 128) + (1 + 7) = 131072 credits. No free lookups inside.
+    // 1016 * (1 + 128) + (1 + 7) = 131072 credits. The local accesses
+    // in tail don't charge that meter.
     let exact = "for (var i=0; i<1016; i++) { wide(); } tail(effect = 1);";
     normal(&mut realm, exact);
-    let over = format!("{exact} one(effect = 2);");
+    // Unlike a free name write, the body's TypeError would not itself
+    // require lookup credits; the setup failure must happen before entry.
+    assert!(matches!(
+        run(&mut realm, "abortOnEntry();"),
+        Ok(Completion::Throw(Throw::TypeError { .. }))
+    ));
+    let over = format!("{exact} abortOnEntry(effect = 2);");
     assert_eq!(
         run(&mut realm, &over),
         Err(EngineFault::Evaluation(
             EvalError::GlobalLookupLimitExceeded
         ))
     );
-    normal(&mut realm, "if (effect !== 2) bad; wide();");
+    normal(
+        &mut realm,
+        "if (effect !== 2) bad; one(); if (entered !== 1) bad;",
+    );
+
+    // The remaining credit pays for one no-local call. The empty body
+    // succeeds; the body with a reached free put needs more credits.
+    normal(&mut realm, "entered = 0;");
+    let almost = "for (i=0; i<1016; i++) { wide(); } shortTail();";
+    normal(&mut realm, &format!("{almost} empty();"));
+    assert_eq!(
+        run(&mut realm, &format!("{almost} one();")),
+        Err(EngineFault::Evaluation(
+            EvalError::GlobalLookupLimitExceeded
+        ))
+    );
+    normal(&mut realm, "if (entered !== 0) bad;");
 }
 
 #[test]

@@ -104,7 +104,7 @@ pub(crate) enum CodeMode {
 #[derive(Clone, Copy)]
 pub(crate) struct FrameLayout {
     formals: u8,
-    locals: u8,
+    locals: u8, // Total slots, including the formal prefix.
 }
 
 impl FrameLayout {

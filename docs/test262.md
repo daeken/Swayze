@@ -86,7 +86,7 @@ cases with nested substitutions. The template cases were first reproduced as
 unsupported and then promoted to required after the fix. A required variant becoming
 unsupported, a wrong result, or no required passes exits 1; infrastructure
 errors exit 2. An unsupported frontier case alone does not fail the run.
-Two adapted `noStrict` frontier cases exercise the Annex B quoted escapes
+Two required adapted `noStrict` cases exercise the Annex B quoted escapes
 `\8` and `\9`. They do not exercise strict strings or template escapes.
 Review any additions to [`tools/test262-cases.tsv`](../tools/test262-cases.tsv)
 against the full pinned blob. Reproduce a frontier result before changing the

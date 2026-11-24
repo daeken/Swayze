@@ -20,5 +20,5 @@ required	raw-negative	test/language/comments/hashbang/preceding-whitespace.js
 required	raw-negative	test/language/comments/hashbang/preceding-line-comment.js
 required	raw-negative	test/language/comments/hashbang/preceding-multi-line-comment.js
 required	raw-negative	test/language/comments/hashbang/preceding-hashbang.js
-frontier	adapted	test/language/literals/string/legacy-non-octal-escape-sequence-8-non-strict.js	518:546	535:539	541:544
-frontier	adapted	test/language/literals/string/legacy-non-octal-escape-sequence-9-non-strict.js	518:546	535:539	541:544
+required	adapted	test/language/literals/string/legacy-non-octal-escape-sequence-8-non-strict.js	518:546	535:539	541:544
+required	adapted	test/language/literals/string/legacy-non-octal-escape-sequence-9-non-strict.js	518:546	535:539	541:544

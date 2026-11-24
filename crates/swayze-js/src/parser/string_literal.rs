@@ -161,6 +161,9 @@ impl Lexer<'_> {
             'u' if self.peek() == Some('{') => self.string_braced_point(start, slash)?,
             'u' => self.string_hex_digits(start, slash, 4)?,
             '0' if !self.peek().is_some_and(|next| next.is_ascii_digit()) => 0,
+            // Annex B NonOctalDecimalEscapeSequence in sloppy quoted Strings only.
+            // Real strict-mode support must reject these even in earlier directives.
+            '8' | '9' if !template => u32::from(c),
             '0'..='9' => {
                 if c == '0'
                     && let Some(digit) = self.peek().filter(char::is_ascii_digit)

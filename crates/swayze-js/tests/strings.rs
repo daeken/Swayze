@@ -1,6 +1,6 @@
 use swayze_js::{
     ErrorKind, EvalError, Limit, Limits, PrimitiveValue, Span, Value, parse_script,
-    parse_script_with_limits,
+    parse_script_for_completion_with_limits, parse_script_with_limits,
 };
 
 fn assert_units(source: &str, expected: &[u16]) {
@@ -75,6 +75,61 @@ fn exact_utf16_and_borrowed_primitive_result() {
 }
 
 #[test]
+fn sloppy_quoted_non_octal_decimal_escapes_emit_one_digit_each() {
+    assert_units(r"'\8\9'", &[0x38, 0x39]);
+    assert_units(r#""\89\90""#, &[0x38, 0x39, 0x39, 0x30]);
+    assert_units(r"'\\8\\9'", &[0x5c, 0x38, 0x5c, 0x39]);
+    assert_units(
+        "\"é\\8９\u{2028}\\\r\n\\9😀\u{2029}\"",
+        &[0xe9, 0x38, 0xff19, 0x2028, 0x39, 0xd83d, 0xde00, 0x2029],
+    );
+}
+
+#[test]
+fn non_octal_decimal_escape_token_and_work_charges() {
+    let source = r"'\8\9'";
+    let exact = Limits {
+        max_source_bytes: source.len(),
+        max_tokens: 1,
+        max_nesting_depth: 0,
+        max_work: source.len() + 2 + 1, // source bytes, units, instruction
+    };
+    let script = parse_script_with_limits(source, exact).unwrap();
+    assert_eq!(script.instruction_count(), 1);
+    assert_eq!(
+        script.evaluate_primitive(),
+        Ok(PrimitiveValue::String(&[0x38, 0x39]))
+    );
+    let no_tokens = parse_script_with_limits(
+        source,
+        Limits {
+            max_tokens: 0,
+            ..exact
+        },
+    )
+    .unwrap_err();
+    assert_eq!(no_tokens.kind(), ErrorKind::LimitExceeded(Limit::Tokens));
+    assert_eq!(no_tokens.span(), Span { start: 0, end: 1 });
+    for (work, start, end) in [
+        (2, 2, 3),                             // digit after backslash
+        (3, 1, 3),                             // append first decoded unit
+        (6, 3, 5),                             // append second decoded unit
+        (exact.max_work - 1, 0, source.len()), // instruction
+    ] {
+        let error = parse_script_with_limits(
+            source,
+            Limits {
+                max_work: work,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded(Limit::Work));
+        assert_eq!(error.span(), Span { start, end });
+    }
+}
+
+#[test]
 fn malformed_and_annex_b_escape_spans_are_utf8_boundaries() {
     for (source, start, end) in [
         ("'é", 0, 3),
@@ -92,10 +147,77 @@ fn malformed_and_annex_b_escape_spans_are_utf8_boundaries() {
     ] {
         assert_error(source, ErrorKind::Malformed, start, end);
     }
-    for body in [r"\1", r"\77", r"\8", r"\9", r"\00", r"\08", r"\09"] {
+    for body in [r"\1", r"\77", r"\00", r"\08", r"\09"] {
         let source = format!("'é{body}'");
         let end = if body.starts_with(r"\0") { 6 } else { 5 };
         assert_error(&source, ErrorKind::Unsupported, 3, end);
+    }
+}
+
+#[test]
+fn zero_followed_by_eight_or_nine_still_charges_and_rejects_both_digits() {
+    for source in [r"'\08'", r#""\09""#] {
+        for (max_work, kind, start) in [
+            (3, ErrorKind::LimitExceeded(Limit::Work), 3),
+            (4, ErrorKind::Unsupported, 1),
+        ] {
+            let limits = Limits {
+                max_work,
+                ..Limits::default()
+            };
+            let error = parse_script_with_limits(source, limits).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.span(), Span { start, end: 4 });
+            if kind == ErrorKind::Unsupported {
+                assert_eq!(
+                    error.message(),
+                    "Annex B decimal and octal string escapes are outside the subset"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn non_octal_decimal_escapes_do_not_change_directive_recognition() {
+    for (prefix, directive_start, max_tokens, extra_work) in [
+        ("'use strict';", 0, 2, 11),
+        (r#"'\8'; "use strict";"#, 6, 4, 14),
+    ] {
+        // Fit exactly the prologue's bytes, units and instructions, not the body.
+        let limits = Limits {
+            max_tokens,
+            max_work: prefix.len() + extra_work,
+            ..Limits::default()
+        };
+        let source = format!(r"{prefix} '\9\xg'");
+        let error = parse_script_with_limits(&source, limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.span(),
+            Span {
+                start: directive_start,
+                end: directive_start + 12
+            }
+        );
+        assert_eq!(
+            error.message(),
+            "Use Strict Directives are outside the subset"
+        );
+        assert_eq!(
+            parse_script_for_completion_with_limits(&source, limits).unwrap_err(),
+            error
+        );
+    }
+    for prefix in [
+        r"'use\x20strict';",
+        "('use strict');",
+        "'use strict'\n || '';",
+        "'use strict'.length;",
+        "0; 'use strict';",
+        "{ 'use strict'; }",
+    ] {
+        assert_units(&format!(r"{prefix} '\8\9'"), &[0x38, 0x39]);
     }
 }
 
@@ -181,6 +303,11 @@ fn literal_byte_cap_includes_quotes_and_cannot_split_utf8() {
     let leading_zeros = format!("'\\u{{{}41}}'", "0".repeat(4088));
     assert_eq!(leading_zeros.len(), 4096);
     assert_units(&leading_zeros, &[65]);
+    let non_octal = format!(r"'{}\8'", "a".repeat(4092));
+    let mut expected = vec![97; 4092];
+    expected.push(0x38);
+    assert_units(&non_octal, &expected);
+    assert_error(&format!(r"'{}\9'", "a".repeat(4094)), limit, 4096, 4097);
     assert_error(
         &format!("'{}", "a".repeat(4095)),
         ErrorKind::Malformed,
@@ -202,6 +329,17 @@ fn unit_cap_is_aggregate_inclusive_and_counts_skipped_literals() {
         &[49, 50, 51, 52, 53, 54, 0xd83d, 0xde00],
     );
     assert_units(&format!("{prefix}'123456😀', ''"), &[]);
+    // Each of these escapes contributes one unit to the same aggregate pool.
+    assert_units(
+        &format!(r"{prefix}'123456\8\9'"),
+        &[49, 50, 51, 52, 53, 54, 0x38, 0x39],
+    );
+    assert_error(
+        &format!(r"{prefix}'1234567\8\9'"),
+        limit,
+        prefix.len() + 10,
+        prefix.len() + 12,
+    );
     let escaped = format!("{prefix}'1234567\\u{{10000}}'");
     assert_error(&escaped, limit, prefix.len() + 8, prefix.len() + 17);
     let over = format!("{prefix}'123456😀z'");

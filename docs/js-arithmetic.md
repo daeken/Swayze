@@ -227,9 +227,11 @@ to ECMAScript Script completion values and does not add ASI. The existing
 Single- and double-quoted literals decode to exact UTF-16 during parsing,
 including raw Unicode, `\xHH`, `\uHHHH`, `\u{…}`, lone escaped surrogates,
 and NUL. Backslash line continuations add no units; raw CR or LF is malformed
-inside a literal. Legacy decimal and octal escapes and root `use strict`
-directives are outside the subset. Source ingress and diagnostic offsets
-remain UTF-8; a Script does not retain source text.
+inside a literal. In sloppy quoted strings, `\8` and `\9` each cook to one
+ASCII digit without consuming any following digit. Legacy octal escapes
+(including `\08` and `\09`) and root `use strict` directives remain outside
+the subset. Source ingress and diagnostic offsets remain UTF-8; a Script
+does not retain source text.
 
 An untagged backtick literal produces a cooked UTF-16 String. Raw CR and
 CRLF normalize to LF; raw LF, LS and PS are retained. Backslash line

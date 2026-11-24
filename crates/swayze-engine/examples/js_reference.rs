@@ -625,6 +625,12 @@ fn fixtures() -> Vec<String> {
             "let n = 0; if (true) do { ++n; } while (n < 3); else n = 9; n",
             "let n = 0; a: b: if (true) if (true) break a; else n = 9; n",
             "let n = 0; for (; n < 4; ++n) { if (n < 3) continue; break; } n",
+            r"'\8\9'",
+            r#""\89\90""#,
+            r"'\0\9'",
+            r"('use strict'); '\8'",
+            r"'\8'; 'use\x20strict'; '\9'",
+            r"`digits ${'\8\9'}`",
         ]
         .map(str::to_owned),
     );

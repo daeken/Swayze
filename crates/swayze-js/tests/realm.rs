@@ -204,35 +204,243 @@ fn readonly_undefined_ignores_writes_not_rhs_and_preserves_update_values() {
 }
 
 #[test]
-fn local_strings_do_not_escape_and_engine_stops_preserve_earlier_state() {
+fn lossless_strings_outlive_detached_code_and_scratch() {
+    let check = CompiledScript::compile(
+        r"if (literal !== '\uD800\0a' || literal.length !== 3 || !literal ||
+            !(literal < '\uD800\u0001') || joined !== '\uD800\0a\uDC00' ||
+            pair !== '𐀀' || pair.length !== 2 || composed === 'é' ||
+            made !== '\0\uD80042\uDC00' || typename !== 'boolean' || typeof made !== 'string' ||
+            empty || empty.length !== 0 || empty !== '' || (empty ?? bad) !== '' ||
+            (empty || joined) !== joined || (joined && empty) !== '') { bad; }",
+    )
+    .unwrap();
     let mut realm = Realm::new();
+    {
+        let source = String::from(
+            r"const literal = '\uD800\0a', joined = literal + '\uDC00';
+              const pair = '\uD800' + '\uDC00', composed = `e${'\u0301'}`;
+              let made = `\0${'\uD800' + 42}\uDC00`, typename = typeof true, empty = '' + '';",
+        );
+        let producer = CompiledScript::compile(&source).unwrap();
+        drop(source);
+        assert_eq!(
+            realm.instantiate(&producer).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+    }
+    normal(&mut realm, "'unrelated' + 'scratch'; `ignore ${88}`;");
+    assert_eq!(
+        realm.instantiate(&check).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    normal(
+        &mut Realm::new(),
+        "if (typeof literal !== 'undefined') { bad; }",
+    );
+}
+
+#[test]
+fn realm_string_operators_share_coercion_and_update_order() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x = ' 41 ', y = '-0'; const fixed = '5';");
     normal(
         &mut realm,
-        r"let x = +('4' + '1'), y = '\uD800'.length; if (x !== 41 || y !== 1) { bad; }",
+        "let saved = x; if (x != 41 || x === 41 || !(x < 42) || !(x < '9') ||
+         +x !== 41 || x - 1 !== 40 || 2 * x !== 82 || (x & 7) !== 1 ||
+         1 / y++ !== -1 / 0 || y !== 1 || x++ !== 41 || x !== 42 ||
+         --x !== 41 || saved !== ' 41 ' || '>' + saved !== '> 41 ' ||
+         saved + false !== ' 41 false' || 3 + saved !== '3 41 ' ||
+         saved + ('4' + '2') !== ' 41 42' || ('4' + '2') + saved !== '42 41 ') { bad; }",
     );
-    normal(&mut realm, "'a' + 'b'; false && (x = 'unreached');");
-    let source = "y = 2; x = `a${y}`;";
+    immutable(&mut realm, "fixed++;", "fixed");
+    normal(&mut realm, "if (fixed !== '5') { bad; }");
+}
+
+#[test]
+fn saved_realm_and_transient_values_survive_nested_puts_and_growth() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x = 'old'; const alias = x;");
+    // The right-hand assignment grows the Realm while the old LHS is on
+    // the operand stack. The assignment's result still comes from scratch.
+    let long = "z".repeat(300);
+    normal(&mut realm, &format!("x += (x = '{long}' + '!');"));
+    normal(
+        &mut realm,
+        &format!("if (x !== 'old{long}!' || alias !== 'old') {{ bad; }}"),
+    );
+    normal(
+        &mut realm,
+        "x = 'A'; let rendered = `${x}:${`${x}${(x = 'B' + 'C')}${x}`}:${x}`;
+         let both = ('L' + x) + (x = 'R' + 'S');
+         if (rendered !== 'A:ABCBC:BC' || both !== 'LBCRS' || x !== 'RS') { bad; }",
+    );
+    normal(
+        &mut realm,
+        "if (rendered !== 'A:ABCBC:BC' || both !== 'LBCRS' || alias !== 'old') { bad; }",
+    );
+    assert_eq!(
+        run(&mut realm, "x = 'written'; while (true) {}"),
+        Err(EngineFault::Evaluation(EvalError::DispatchLimitExceeded))
+    );
+    normal(&mut realm, "if (x !== 'written') { bad; }");
+}
+
+#[test]
+fn per_execute_copy_limit_is_inclusive_and_failed_init_leaves_tdz() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x, i, effect = 0;");
+    let text = "a".repeat(2048);
+    // Eight copies total exactly 16,384; overwrite each time. All are
+    // scratch Strings, so the older append budget is not the limiting one.
+    let exact = format!("i = 0; while (i < 8) {{ x = '{text}' + ''; i++; }}");
+    let source = format!("{exact} let failed = (effect = 1, 'z'), next = 9;");
+    assert_eq!(
+        run(&mut realm, &source),
+        Err(EngineFault::StringCopyLimitExceeded {
+            span: span(&source, "failed")
+        })
+    );
+    reference(&mut realm, "failed;", "failed");
+    reference(&mut realm, "next;", "next");
+    normal(
+        &mut realm,
+        "if (x.length !== 2048 || i !== 8 || effect !== 1) { bad; } x = 'fresh execution';",
+    );
+    normal(&mut Realm::new(), "let x = 'fresh Realm';");
+}
+
+#[test]
+fn failed_compound_put_preserves_rhs_assignment_and_old_alias() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x = 'a', fill, i = 0; const alias = x;");
+    let text = "z".repeat(2048);
+    // 7 * 2048 + 2047 + 1 = 16384. The RHS PutValue succeeds, then
+    // the compound put of old 'a' + current 'b' fails its copy check.
+    let source = format!(
+        "while (i < 7) {{ fill = '{text}'; i++; }} fill = '{}'; x += (x = 'b');",
+        &text[..2047]
+    );
+    let at = source.find("x +=").unwrap();
+    assert_eq!(
+        run(&mut realm, &source),
+        Err(EngineFault::StringCopyLimitExceeded {
+            span: Span {
+                start: at,
+                end: at + 1
+            }
+        })
+    );
+    normal(
+        &mut realm,
+        "if (x !== 'b' || alias !== 'a' || fill.length !== 2047 || i !== 7) { bad; }",
+    );
+}
+
+#[test]
+fn lifetime_retention_limit_is_inclusive_and_not_reset_by_overwrite_or_failure() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x, i, effect; const fixed = 7;");
+    let text = "a".repeat(2048);
+    let exact = format!("i = 0; while (i < 8) {{ x = '{text}'; i++; }}");
+    normal(&mut realm, &exact);
+    normal(&mut realm, &exact); // 32,768 committed in two runs.
+    normal(
+        &mut realm,
+        "let alias = x, name = typeof x, empty = '' + ''; x = 0;",
+    );
+    for effect in [1, 2] {
+        let source = format!("x = (effect = {effect}, 'z');");
+        assert_eq!(
+            run(&mut realm, &source),
+            Err(EngineFault::StringRetentionLimitExceeded {
+                span: span(&source, "x")
+            })
+        );
+        normal(
+            &mut realm,
+            &format!("if (x !== 0 || effect !== {effect}) {{ bad; }}"),
+        );
+    }
+    normal(
+        &mut realm,
+        "x = alias; if (x.length !== 2048 || x !== alias || name !== 'string' || empty !== '') { bad; }",
+    );
+    normal(
+        &mut realm,
+        "undefined = 'ignored' + 'temporary'; fixed ||= 'skipped'; false && (x = 'skipped');",
+    );
+    immutable(&mut realm, "fixed = 'discarded';", "fixed");
+    assert_eq!(
+        run(&mut realm, "later = 'discarded'; let later;"),
+        Ok(Completion::Throw(Throw::ReferenceError {
+            span: Span { start: 0, end: 5 },
+        }))
+    );
+    normal(&mut Realm::new(), "let x = 'still possible';");
+}
+
+#[test]
+fn assignment_keep_charges_each_copy_and_copy_wins_if_both_caps_are_full() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "let x, y, i;");
+    let text = "c".repeat(2048);
+    let exact = format!("i = 0; while (i < 4) {{ x = y = '{text}'; i++; }}");
+    normal(&mut realm, &exact);
+    let source = format!("{exact} x = 'z';");
+    assert_eq!(
+        run(&mut realm, &source),
+        Err(EngineFault::StringCopyLimitExceeded {
+            span: span(&source, "x")
+        })
+    );
+    normal(
+        &mut realm,
+        "if (x.length !== 2048 || x !== y || i !== 4) { bad; }",
+    );
+    let source = "x = 'z';";
     assert_eq!(
         run(&mut realm, source),
-        Err(EngineFault::PersistentString {
+        Err(EngineFault::StringRetentionLimitExceeded {
             span: span(source, "x")
         })
     );
-    normal(&mut realm, "if (x !== 41 || y !== 2) { bad; }");
-    let source = "let text = typeof x, next = 9;";
+}
+
+#[test]
+fn existing_compare_convert_and_append_budgets_still_stop_realm_reads() {
+    let mut realm = Realm::new();
+    let text = " ".repeat(4093);
+    normal(&mut realm, &format!("const long = '{text}1'; let i;"));
+    normal(&mut realm, "i = 0; while (i < 16) { long === long; i++; }");
     assert_eq!(
-        run(&mut realm, source),
-        Err(EngineFault::PersistentString {
-            span: span(source, "text")
-        })
+        run(&mut realm, "i = 0; while (i < 17) { long === long; i++; }"),
+        Err(EngineFault::Evaluation(
+            EvalError::StringComparisonLimitExceeded
+        ))
     );
-    reference(&mut realm, "text;", "text");
-    reference(&mut realm, "next;", "next");
     assert_eq!(
-        run(&mut realm, "x = 42; while (true) {}"),
-        Err(EngineFault::Evaluation(EvalError::DispatchLimitExceeded))
+        run(&mut realm, "i = 0; while (i < 100) { +long; i++; }"),
+        Err(EngineFault::Evaluation(
+            EvalError::StringNumericConversionLimitExceeded
+        ))
     );
-    normal(&mut realm, "if (x !== 42) { bad; }");
+    // Length checking still happens during +, not during the rejected store.
+    assert_eq!(
+        run(&mut realm, "long = long + '!';"),
+        Err(EngineFault::Evaluation(
+            EvalError::StringConcatenationLengthLimitExceeded
+        ))
+    );
+    assert_eq!(
+        run(&mut realm, "i = 0; while (i < 9) { long + ''; i++; }"),
+        Err(EngineFault::Evaluation(
+            EvalError::StringConcatenationBudgetExceeded
+        ))
+    );
+    normal(
+        &mut realm,
+        "if (i !== 8 || long.length !== 4094 || +long !== 1) { bad; }",
+    );
 }
 
 #[test]

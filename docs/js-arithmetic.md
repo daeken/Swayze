@@ -442,14 +442,23 @@ than guessing a value; unsupported callable conversion keeps its own fault.
 
 ### Lifetime, work, and backing
 
-- Dot metadata has one immutable occurrence per spelling, separate from name
-  linking: at most 4,096 occurrences, 256 UTF-16 units in a key and 16,384
-  pooled key units per Script. Parse work includes scanning and storing the
-  key. Root and body layout and all property packet edges are checked before
-  publication, including untaken paths and roots with no calls or artifact.
-  Site checks use the owning code's validated table. These checks, artifact
-  copies and hoisted object setup share the 131,072-credit instantiation
-  ledger; work exhaustion, allocation failure and invalid code are distinct.
+- Dot metadata has one immutable site per syntactic dot occurrence (even when
+  keys repeat), separate from name linking: at most 4,096 sites, 256 UTF-16
+  units per key and 16,384 pooled key units per Script. Parse work includes
+  scanning and storing each key.
+- For an artifact-free root, instantiation replaces Ready's former call probe
+  with a bounded discriminator of at most 4,096 instruction visits. It does
+  not depend on dot metadata being present. A property-free root pays no added
+  preflight debit for this scan; a property-bearing root is charged one credit
+  per instruction after discovery, then pays for validation. When an artifact
+  is staged, discovery uses the existing charged instruction scans.
+- Before publication, property-bearing roots and bodies get layout-bounds and
+  packet opener, owner and edge checks, including untaken paths and roots with
+  no calls or artifact. Site checks use the owning code's validated table.
+  This is not a full stack-height or arity verifier; reached checks still
+  apply. These checks, artifact copies and hoisted object setup share the
+  131,072-credit instantiation ledger. Work exhaustion, allocation failure
+  and invalid code are distinct.
 - There are at most 16 retained artifacts, 512 KiB of accounted immutable
   artifact backing, and 512 user function identities per Realm. The artifact
   budget includes dot metadata, the original literal prefix and the validated
@@ -467,8 +476,9 @@ than guessing a value; unsupported callable conversion keeps its own fault.
   maxima are simultaneously reachable.
 - Each execution has 131,072 property-work credits shared across all its calls,
   separate from the existing 131,072-credit call/setup/name-lookup ledger
-  and the dispatch and String budgets. A descriptor lookup charges one per visited node and row, plus
-  compared UTF-16 pairs for equal-length keys up to and including the first
+  and the dispatch and String budgets. A descriptor lookup charges one per
+  visited node and row, plus compared UTF-16 pairs for equal-length keys up to
+  and including the first
   mismatch. A pending assignment or member-call record costs one plus any
   moved records. Field replacement costs two; insertion costs four; both add
   any moved rows and copied key/value units. Reached creation charges initial

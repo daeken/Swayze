@@ -1258,9 +1258,11 @@ impl Realm {
         let lexical_growth = prepare_growth(&self.state.globals, lexicals.len(), &mut work)?;
         let var_growth = prepare_growth(&self.state.object.vars, vars.len(), &mut work)?;
         code.dot.validate(code.functions.len(), &mut work)?;
-        // Discover independently of table presence. For artifact imports the
-        // existing charged creator scan does this; otherwise replace Ready's
-        // bare-call scan and retain the resulting layout choice.
+        // Discover independently of table presence. Artifact staging uses its
+        // existing charged instruction scans. For an artifact-free root, this
+        // bounded discriminator replaces Ready's call probe with no added
+        // preflight debit unless it finds a property op: then charge N visits
+        // on the same ledger before metering the property shape checks.
         let mut root_validator = None;
         if code.functions.is_empty() {
             if code.instructions.len() > super::MAX_INSTRUCTIONS {

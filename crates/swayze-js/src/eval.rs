@@ -439,9 +439,9 @@ impl Script {
                 .get(self.string_units())
                 .map(PrimitiveValue::String)
                 .ok_or(EvalError::InvalidScript),
-            Operand::String(StringOperand::StaticText(
-                StaticText::ObjectName | StaticText::FunctionName,
-            )) => Err(EvalError::InvalidScript),
+            Operand::String(StringOperand::StaticText(name)) if name.is_realm_only() => {
+                Err(EvalError::InvalidScript)
+            }
             Operand::String(StringOperand::StaticText(name)) => {
                 Ok(PrimitiveValue::String(name.units()))
             }
@@ -486,10 +486,10 @@ impl Script {
                 StringOperand::Empty | StringOperand::Realm(_) | StringOperand::CodeName(_),
             ) => Err(EvalError::InvalidScript),
             Operand::Function(_) | Operand::Object(_) => Err(EvalError::InvalidScript),
-            Operand::String(
-                StringOperand::ArtifactLiteral { .. }
-                | StringOperand::StaticText(StaticText::ObjectName | StaticText::FunctionName),
-            ) => Err(EvalError::InvalidScript),
+            Operand::String(StringOperand::ArtifactLiteral { .. }) => Err(EvalError::InvalidScript),
+            Operand::String(StringOperand::StaticText(name)) if name.is_realm_only() => {
+                Err(EvalError::InvalidScript)
+            }
             Operand::String(range) => range
                 .get(scratch.pools(self.string_units()))
                 .map(PrimitiveValue::String)

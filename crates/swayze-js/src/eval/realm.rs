@@ -46,7 +46,8 @@ mod object_heap;
 #[path = "realm/property_tests.rs"]
 mod property_tests;
 use object_heap::{
-    Creation, Descriptor, FunctionRecord, HEAP_REQUEST_BYTES, Heap, Lookup, PROPERTY_WORK,
+    Creation, Descriptor, ErrorCreation, ErrorKind, FunctionRecord, HEAP_REQUEST_BYTES, Heap,
+    Lookup, PROPERTY_WORK,
 };
 pub(super) use object_heap::{Intrinsic, ObjectId};
 
@@ -1903,6 +1904,22 @@ fn creation_stop(error: InstantiateError) -> Stop {
     }
 }
 
+// Stage the execute-wide heap debits without touching the live ledger.
+fn creation_debits(
+    mut property_work: Work,
+    heap_requests: usize,
+    work: usize,
+    bytes: usize,
+) -> Result<(Work, usize), Stop> {
+    property_work
+        .charge(work)
+        .map_err(|_| Stop::Engine(EngineFault::PropertyWorkLimitExceeded))?;
+    let requests = heap_requests
+        .checked_sub(bytes)
+        .ok_or(EvalError::AllocationFailed)?;
+    Ok((property_work, requests))
+}
+
 fn property_stop(error: InstantiateError, span: Span) -> Stop {
     match error {
         InstantiateError::PropertyLimitExceeded => {
@@ -2072,6 +2089,32 @@ impl Properties for Execution<'_, '_> {
 }
 
 impl Execution<'_, '_> {
+    // Do not invoke from existing diagnostic producers: nothing becomes a
+    // retained Error until an observable value consumer is integrated.
+    #[allow(
+        dead_code,
+        reason = "private Error heap checkpoint; not yet guest-reachable"
+    )]
+    fn materialize_error(
+        &mut self,
+        kind: ErrorKind,
+        span: Span,
+        reserve: impl FnMut(usize) -> Result<(), InstantiateError>,
+    ) -> Result<Operand, Stop> {
+        let fail = |e| property_stop(e, span);
+        let plan = ErrorCreation::plan(self.heap, self.functions.len(), kind).map_err(fail)?;
+        let (property_work, requests) = creation_debits(
+            self.property_work,
+            self.heap_requests,
+            plan.heap_work(),
+            plan.request_bytes(),
+        )?;
+        let id = plan.reserve_with(reserve).map_err(fail)?.publish();
+        self.property_work = property_work;
+        self.heap_requests = requests;
+        Ok(Operand::Object(id))
+    }
+
     fn put_dot_with(
         &mut self,
         site: DotSite,
@@ -2206,16 +2249,22 @@ impl Bindings for Execution<'_, '_> {
             FunctionId::Intrinsic(Intrinsic::FunctionPrototype) => {
                 Ok(CallTarget::FunctionPrototype)
             }
-            FunctionId::Intrinsic(tag) => {
-                Err(Stop::Engine(EngineFault::UnsupportedIntrinsicCall {
-                    span,
-                    intrinsic: match tag {
-                        Intrinsic::ObjectConstructor => IntrinsicCall::Object,
-                        Intrinsic::FunctionConstructor => IntrinsicCall::Function,
-                        Intrinsic::FunctionPrototype => unreachable!(),
-                    },
-                }))
+            FunctionId::Intrinsic(Intrinsic::NativeErrorConstructor(_)) => {
+                // Real callable identity, unsupported [[Call]] and [[Construct]].
+                // The private checkpoint has no way to pass this ID to guest
+                // dispatch; crossing that boundary is invalid, not a JS throw.
+                Err(EvalError::InvalidScript.into())
             }
+            FunctionId::Intrinsic(
+                tag @ (Intrinsic::ObjectConstructor | Intrinsic::FunctionConstructor),
+            ) => Err(Stop::Engine(EngineFault::UnsupportedIntrinsicCall {
+                span,
+                intrinsic: if tag == Intrinsic::ObjectConstructor {
+                    IntrinsicCall::Object
+                } else {
+                    IntrinsicCall::Function
+                },
+            })),
         }
     }
 
@@ -2238,20 +2287,18 @@ impl Bindings for Execution<'_, '_> {
         )
         .map_err(creation_stop)?;
         let mut lookup = self.lookup;
-        let mut property_work = self.property_work;
         // Preserve the origin write/move debit in the existing call setup
         // budget. Initial shape also debits the ledger shared with property
         // packets, lookups and writes.
         lookup
             .charge(1 + plan.function_moves())
             .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
-        property_work
-            .charge(plan.heap_work())
-            .map_err(|_| Stop::Engine(EngineFault::PropertyWorkLimitExceeded))?;
-        let requests = self
-            .heap_requests
-            .checked_sub(plan.request_bytes())
-            .ok_or(EvalError::AllocationFailed)?;
+        let (property_work, requests) = creation_debits(
+            self.property_work,
+            self.heap_requests,
+            plan.heap_work(),
+            plan.request_bytes(),
+        )?;
         let id = plan.reserve().map_err(creation_stop)?.publish();
         self.lookup = lookup;
         self.property_work = property_work;

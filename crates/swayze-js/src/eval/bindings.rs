@@ -1,7 +1,7 @@
 use super::{
-    BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
+    BindingKind, Conversion, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
     TransientStrings, Update, UpdateResult, Value, push_operand,
-    realm::{Artifact, FunctionId, FunctionOrigin},
+    realm::{Artifact, CodeMode, FunctionId, FunctionOrigin},
     update_number,
 };
 
@@ -10,10 +10,49 @@ pub(super) struct UpdateNumeric<'pools, 'budget> {
     pub(super) credits: &'budget mut usize,
 }
 
-// Only binding instructions enter this policy. The dispatcher and all
-// coercions, control, and accounting remain shared.
+pub(super) enum CallTarget {
+    User(FunctionOrigin),
+    FunctionPrototype,
+}
+
+// A copied occurrence, authenticated for the active frame before any hook
+// that can read/write guest values. No borrowed key or receiver storage.
+#[derive(Clone, Copy)]
+pub(super) struct DotSite {
+    pub(super) owner: Option<FunctionOrigin>,
+    pub(super) index: u16,
+    pub(super) span: crate::Span,
+    pub(super) mode: CodeMode,
+}
+
+pub(super) trait Properties {
+    type Error;
+
+    // Pure metadata check (index, owner, key range, span and definition mode).
+    fn dot_metadata(
+        &self,
+        owner: Option<FunctionOrigin>,
+        index: u16,
+    ) -> Result<(crate::Span, CodeMode), Self::Error>;
+    fn charge_packets(&mut self, work: usize) -> Result<(), Self::Error>;
+    fn get_dot(
+        &mut self,
+        site: DotSite,
+        receiver: Operand,
+        source: TransientStrings<'_>,
+    ) -> Result<Operand, Self::Error>;
+    fn put_dot(
+        &mut self,
+        site: DotSite,
+        receiver: Operand,
+        rhs: Operand,
+        source: TransientStrings<'_>,
+    ) -> Result<(), Self::Error>;
+}
+
+// The dispatcher and all operand, control, and slot checks remain shared.
 pub(super) trait Bindings {
-    type Error: From<EvalError>;
+    type Error: From<EvalError> + From<Conversion>;
     const CALLS: bool = false;
 
     fn retained_units(&self) -> &[u16] {
@@ -32,6 +71,16 @@ pub(super) trait Bindings {
 
     fn function_origin(&self, _: FunctionId) -> Result<FunctionOrigin, Self::Error> {
         Err(EvalError::InvalidScript.into())
+    }
+
+    // A reached unsupported intrinsic reports its specific engine stop here,
+    // at the call span, after arguments. Non-callables never enter this hook.
+    fn classify_callable(&self, id: FunctionId, _: crate::Span) -> Result<CallTarget, Self::Error> {
+        self.function_origin(id).map(CallTarget::User)
+    }
+
+    fn properties(&mut self) -> Option<&mut dyn Properties<Error = Self::Error>> {
+        None
     }
 
     fn create_function(&mut self, _: u16) -> Result<FunctionId, Self::Error> {

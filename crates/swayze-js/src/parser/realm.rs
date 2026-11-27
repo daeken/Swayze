@@ -1,21 +1,22 @@
 use crate::{
     eval::MAX_INSTRUCTIONS,
     realm::{
-        BodyKind, CodeMode, CompileError, CompileLimit, CompiledScript, FrameLayout, FunctionBody,
-        MAX_CODE_NAME_BYTES, MAX_DECLARATIONS, MAX_FRAME_LOCALS, MAX_NAME_BYTES, MAX_PARAMETERS,
-        MAX_SITES, NameRange, Role, Site,
+        BodyKind, CodeMode, CompileError, CompileLimit, CompiledScript, DOT_ROOT, DotCode,
+        DotOccurrence, FrameLayout, FunctionBody, MAX_CODE_NAME_BYTES, MAX_DECLARATIONS,
+        MAX_DOT_CODE_UNITS, MAX_DOT_KEY_UNITS, MAX_DOT_SITES, MAX_FRAME_LOCALS, MAX_NAME_BYTES,
+        MAX_PARAMETERS, MAX_SITES, NameRange, Role, Site,
     },
 };
 
 use super::{
-    AccessKind, ActiveStatement, AfterExpression, BindingPolicy, DirectReference, Error,
+    AccessKind, ActiveStatement, AfterExpression, BindingPolicy, DirectReference, DotName, Error,
     ExpressionEnd, ExpressionInput, ExpressionResume, Follow, Instruction, Limit, Limits, Operator,
     ParseAction, ParseErrorType, ParseOwner, Parser, Pending, QuotedDecimalEscape, RealmParseLimit,
     Span, Token, TokenKind, TokenPosition, UNPATCHED, WriteAccess, new_parser, try_push,
 };
 
-// Shared source, cursor, fuel, literal pool, access numbering and scope
-// allocation remain live. Only the active code-owner state is exchanged.
+// Shared source, cursor, fuel, literal and dot pools, access numbering and
+// scope allocation remain live. Only the active code-owner state is exchanged.
 pub(super) struct OpenFunction {
     root_ops: Vec<Instruction>,
     root_peak: usize,
@@ -353,8 +354,86 @@ impl Parser<'_> {
         ))
     }
 
+    pub(super) fn record_dot(&mut self, key: DotName, dot: Span) -> Result<u16, Error> {
+        debug_assert!(self.lexer.policy == BindingPolicy::Realm);
+        let key_span = Span {
+            start: key.start as usize,
+            end: key.end as usize,
+        };
+        let bytes = self
+            .lexer
+            .source
+            .as_bytes()
+            .get(key_span.start..key_span.end)
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or_else(|| Error::malformed(dot, "invalid dot key range"))?;
+        if bytes.len() > MAX_DOT_KEY_UNITS {
+            return Err(Error::realm_limit(key_span, RealmParseLimit::DotKeyUnits));
+        }
+        let sites = self.dot.sites.len();
+        if sites == MAX_DOT_SITES {
+            return Err(Error::realm_limit(dot, RealmParseLimit::DotSites));
+        }
+        let start = self.dot.keys.len();
+        let end = start + bytes.len();
+        if end > MAX_DOT_CODE_UNITS {
+            return Err(Error::realm_limit(dot, RealmParseLimit::PooledDotKeyUnits));
+        }
+        let pack_key =
+            |index| u16::try_from(index).map_err(|_| Error::limit(dot, Limit::Allocation));
+        let pack_dot =
+            |index| u32::try_from(index).map_err(|_| Error::limit(dot, Limit::SourceBytes));
+        let occurrence = DotOccurrence {
+            owner: self
+                .function
+                .as_ref()
+                .map_or(DOT_ROOT, |function| function.body),
+            key_start: pack_key(start)?,
+            key_end: pack_key(end)?,
+            dot_start: pack_dot(dot.start)?,
+            dot_end: pack_dot(dot.end)?,
+        };
+        let site = pack_key(sites)?;
+        self.lexer.charge(1 + bytes.len(), dot)?;
+        grow_dot_pool(&mut self.lexer, &mut self.dot.sites, sites + 1, dot)?;
+        grow_dot_pool(&mut self.lexer, &mut self.dot.keys, end, dot)?;
+        // The scanner already authenticated the ASCII IdentifierName. Store
+        // one immutable range per occurrence, not a binding or a cache entry.
+        self.dot.keys.extend(bytes.iter().copied().map(u16::from));
+        self.dot.sites.push(occurrence);
+        Ok(site)
+    }
+
+    pub(super) fn patch_dot(
+        &mut self,
+        site: u16,
+        instruction: usize,
+        replacement: Instruction,
+        span: Span,
+    ) -> Result<(), Error> {
+        if self.stack_depth != 0
+            && self.instructions.len().checked_sub(1) == Some(instruction)
+            && self.instructions[instruction] == Instruction::GetDot(site)
+        {
+            // Retain the Get's emission charge and ordinal, including when a
+            // group closes without having emitted any converting instructions.
+            self.instructions[instruction] = replacement;
+            Ok(())
+        } else {
+            Err(Error::malformed(span, "invalid terminal dot reference"))
+        }
+    }
+
     pub(super) fn finish_call(&mut self, close: Span, last: bool) -> Result<(), Error> {
-        let Some((Pending::Call { base, completed }, open)) = self.pending.pop() else {
+        let Some((
+            Pending::Call {
+                base,
+                completed,
+                member,
+            },
+            open,
+        )) = self.pending.pop()
+        else {
             return Err(Error::malformed(close, "unmatched call delimiter"));
         };
         let argc = completed + u8::from(last);
@@ -365,8 +444,34 @@ impl Parser<'_> {
         let start =
             u32::try_from(open.start).map_err(|_| Error::limit(open, Limit::SourceBytes))?;
         let end = u32::try_from(close.end).map_err(|_| Error::limit(close, Limit::SourceBytes))?;
-        self.emit(Instruction::Call { start, end, argc }, open)
+        self.emit(
+            Instruction::Call {
+                start,
+                end,
+                argc,
+                member,
+            },
+            open,
+        )
     }
+}
+
+// Logical tiers are inferred from the initialized length. Debit possible
+// moves even if the allocator donated spare space; no key is removed. The
+// two limits are powers of two, so no request can round up beyond its cap.
+fn grow_dot_pool<T>(
+    lexer: &mut super::Lexer<'_>,
+    pool: &mut Vec<T>,
+    needed: usize,
+    span: Span,
+) -> Result<(), Error> {
+    let len = pool.len();
+    if len == 0 || needed > len.next_power_of_two() {
+        lexer.charge(len, span)?;
+        pool.try_reserve_exact(needed.next_power_of_two() - len)
+            .map_err(|_| Error::limit(span, Limit::Allocation))?;
+    }
+    Ok(())
 }
 
 // Bound requested backing (not allocator rounding or overhead) geometrically.
@@ -456,12 +561,15 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
             Some(RealmParseLimit::Arguments) => CompileLimit::Arguments,
             Some(RealmParseLimit::Parameters) => CompileLimit::Parameters,
             Some(RealmParseLimit::FormalNameBytes) => CompileLimit::NameBytes,
+            Some(RealmParseLimit::DotSites) => CompileLimit::DotSites,
+            Some(RealmParseLimit::DotKeyUnits) => CompileLimit::DotKeyUnits,
+            Some(RealmParseLimit::PooledDotKeyUnits) => CompileLimit::PooledDotKeyUnits,
             None => return CompileError::Parse(error),
         };
         cap(limit, error.span())
     })?;
     // Validate the entire body, including earlier directives and dead code,
-    // after structural diagnostics but before Realm-only caps/name lowering.
+    // after parsing (including streaming limits) but before final lowering.
     let strict_witness = |mode, witness: &QuotedDecimalEscape| match (mode, witness) {
         (CodeMode::Strict, QuotedDecimalEscape::Found(span)) => Some(*span),
         _ => None,
@@ -598,6 +706,13 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         sites,
         declarations,
         functions,
+        dot: DotCode {
+            source_len: source
+                .len()
+                .try_into()
+                .map_err(|_| CompileError::InvalidScript)?,
+            ..parser.dot
+        },
     })
 }
 
@@ -650,4 +765,579 @@ fn copy_name_range(
 
 fn cap(limit: CompileLimit, span: Span) -> CompileError {
     CompileError::LimitExceeded { limit, span }
+}
+
+#[cfg(test)]
+mod dot_lowering_tests {
+    use super::*;
+    use crate::{ErrorKind, parser::BARE_CALL};
+    use Instruction::*;
+
+    fn one_byte(start: usize) -> Span {
+        Span {
+            start,
+            end: start + 1,
+        }
+    }
+
+    fn call(source: &str, text: &str, argc: u8, member: u16) -> Instruction {
+        let start = source.find(text).unwrap() as u32;
+        Call {
+            start,
+            end: start + text.len() as u32,
+            argc,
+            member,
+        }
+    }
+
+    fn key(dot: &DotCode, site: &DotOccurrence) -> std::string::String {
+        std::string::String::from_utf16(
+            &dot.keys[usize::from(site.key_start)..usize::from(site.key_end)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_chained_get_put_and_prepared_call_ir() {
+        let source = "a. /*é*/if.b = c.d = (e.m)(a, q.n()).z;";
+        let code = compile_realm(source).unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                LoadBinding(0),
+                GetDot(0),
+                FormDot(1),
+                LoadBinding(1),
+                FormDot(2),
+                LoadBinding(2),
+                PrepareDotCall(3),
+                LoadBinding(3),
+                LoadBinding(4),
+                PrepareDotCall(4),
+                call(source, "()", 0, 4),
+                call(source, "(a, q.n())", 2, 3),
+                GetDot(5),
+                PutDot(2),
+                PutDot(1),
+            ]
+        );
+        assert_eq!(code.max_stack_depth, 3);
+        assert_eq!(code.exit, crate::parser::ExitStack::Value);
+        assert_eq!(code.names, b"aceaq");
+        assert_eq!(code.sites.len(), 5);
+        assert!(
+            code.sites
+                .iter()
+                .all(|site| matches!(site.role, Role::Read))
+        );
+        assert!(code.string_units.is_empty());
+        assert_eq!(code.dot.source_len as usize, source.len());
+        let offsets = source.match_indices('.').map(|(i, _)| i as u32);
+        let mut key_start = 0;
+        for ((site, offset), expected) in code
+            .dot
+            .sites
+            .iter()
+            .zip(offsets)
+            .zip(["if", "b", "d", "m", "n", "z"])
+        {
+            assert_eq!(key(&code.dot, site), expected);
+            assert_eq!(
+                (site.owner, site.key_start, site.dot_start, site.dot_end),
+                (DOT_ROOT, key_start, offset, offset + 1)
+            );
+            key_start += expected.len() as u16;
+            assert_eq!(site.key_end, key_start);
+        }
+        assert_eq!(code.dot.sites.len(), 6);
+        assert_eq!(code.dot.keys.len(), usize::from(key_start));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Instruction>(), 16);
+        assert_eq!(std::mem::size_of::<DotOccurrence>(), 16);
+    }
+
+    #[test]
+    fn put_keeps_its_rhs_slot_across_an_expression_join() {
+        let code = compile_realm("a.p = true ? b.q = 1 : c.r = 2;").unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                LoadBinding(0),
+                FormDot(0),
+                Boolean(true),
+                JumpIfFalse(9),
+                LoadBinding(1),
+                FormDot(1),
+                Number(1.0),
+                PutDot(1),
+                Jump(13),
+                LoadBinding(2),
+                FormDot(2),
+                Number(2.0),
+                PutDot(2),
+                PutDot(0),
+            ]
+        );
+        assert_eq!(code.max_stack_depth, 1);
+        assert!(code.functions.is_empty());
+    }
+
+    #[test]
+    fn both_call_closes_continue_into_dot_and_call_suffixes() {
+        for (source, prefix, close, argc) in [
+            ("f()().x.m();", "()()", 2, 0),
+            ("f(1)(2).x.m(3);", "(1)(2)", 3, 1),
+        ] {
+            let code = compile_realm(source).unwrap();
+            let mut expected = vec![LoadBinding(0)];
+            for i in 0..2 {
+                let start = 1 + i * close;
+                if argc != 0 {
+                    expected.push(Number(f64::from(i + 1)));
+                }
+                expected.push(Call {
+                    start,
+                    end: start + close,
+                    argc,
+                    member: BARE_CALL,
+                });
+            }
+            assert_eq!(&source[1..1 + 2 * close as usize], prefix);
+            expected.extend([GetDot(0), PrepareDotCall(1)]);
+            let final_pair = &source[source.rfind('(').unwrap()..source.len() - 1];
+            if argc != 0 {
+                expected.push(Number(3.0));
+            }
+            expected.push(Call {
+                start: source.rfind('(').unwrap() as u32,
+                end: source.len() as u32 - 1,
+                argc,
+                member: 1,
+            });
+            assert_eq!(final_pair.len(), close as usize);
+            assert_eq!(code.instructions, expected);
+            assert_eq!(code.max_stack_depth, 1 + usize::from(argc));
+        }
+    }
+
+    #[test]
+    fn member_arguments_share_the_bare_call_ceiling() {
+        let prefix = format!("f.m({}1", "1,".repeat(usize::from(MAX_PARAMETERS) - 1));
+        let source = format!("{prefix});");
+        let code = compile_realm(&source).unwrap();
+        assert_eq!(code.instructions[1], PrepareDotCall(0));
+        assert_eq!(code.max_stack_depth, usize::from(MAX_PARAMETERS) + 1);
+        assert_eq!(
+            code.instructions.last(),
+            Some(&call(
+                &source,
+                &source[3..source.len() - 1],
+                MAX_PARAMETERS,
+                0
+            ))
+        );
+        assert_eq!(
+            compile_realm(&format!("{prefix},1);")).unwrap_err(),
+            cap(CompileLimit::Arguments, one_byte(prefix.len()))
+        );
+    }
+
+    #[test]
+    fn grouping_preserves_only_unconverted_property_references() {
+        for source in ["(f.p)();", "(((f.p)))();", "(0, f).p();", "(f.p, f.p).p();"] {
+            let code = compile_realm(source).unwrap();
+            let member = code.dot.sites.len() as u16 - 1;
+            assert!(
+                code.instructions
+                    .ends_with(&[PrepareDotCall(member), call(source, "()", 0, member)]),
+                "{source}"
+            );
+        }
+        for source in [
+            "(0, f.p)();",
+            "(true && f.p)();",
+            "(false || f.p)();",
+            "(null ?? f.p)();",
+            "(true ? g.p : f.p)();",
+            "(v = f.p)();",
+            "(v ||= f.p)();",
+            "(g.p = f.p)();",
+            "(+f.p)();",
+            "(typeof f.p)();",
+        ] {
+            let code = compile_realm(source).unwrap();
+            assert!(
+                code.instructions
+                    .ends_with(&[call(source, "()", 0, BARE_CALL)]),
+                "{source}"
+            );
+            assert!(
+                !code
+                    .instructions
+                    .iter()
+                    .any(|op| matches!(op, PrepareDotCall(_))),
+                "{source}"
+            );
+        }
+        let code = compile_realm("typeof (missing.p);").unwrap();
+        assert_eq!(code.instructions, [LoadBinding(0), GetDot(0), Typeof]);
+        assert!(matches!(code.sites[0].role, Role::Read));
+        let code = compile_realm("typeof (missing).p();").unwrap();
+        assert!(matches!(code.sites[0].role, Role::Read));
+        assert_eq!(code.instructions[1], PrepareDotCall(0));
+    }
+
+    #[test]
+    fn property_lhs_precedence_and_delimiter_ownership() {
+        for source in [
+            "a+f.p=x;",
+            "a||f.p=x;",
+            "a&&f.p=x;",
+            "a??(f.p)=x;",
+            "+(f.p)=x;",
+            "typeof f.p=x;",
+        ] {
+            let CompileError::Parse(err) = compile_realm(source).unwrap_err() else {
+                panic!("{source}");
+            };
+            assert_eq!(err.kind(), ErrorKind::Malformed, "{source}");
+            assert_eq!(err.span(), one_byte(source.find('=').unwrap()));
+        }
+        for source in [
+            "(0, f.p)=x;",
+            "(a?b:f.p)=x;",
+            "(a||f.p)=x;",
+            "(a=f.p)=x;",
+            "f.p()=x;",
+            "(f.p=x)=y;",
+        ] {
+            assert!(compile_realm(source).is_err(), "{source}");
+        }
+        for (source, puts) in [
+            ("(f.p)=x;", 1),
+            ("(+x).p=y;", 1),
+            ("(0, f.p=x);", 1),
+            ("a || (f.p=x);", 1),
+            ("a?f.p=x:g.p=y;", 2),
+            ("f.p = a? x : y;", 1),
+            ("f.p = v = x;", 1),
+            ("v = f.p = x;", 1),
+            ("f.p = x, g.p = y;", 2),
+            ("if (f.p = x, g.p = y) f.q = z;", 3),
+            ("while (f.p=x) { f.q=y; }", 2),
+            ("f.m(g.p=x, h.p=y);", 2),
+            ("let a=f.p=x, b=g.q=y;", 2),
+            ("for (f.p=x; f.q=y; f.r=z, f.s=x) { f.t=y; }", 5),
+            ("for (var a=f.p=x, b=g.q=y; f.r=x; f.s=y) {}", 4),
+        ] {
+            let code = compile_realm(source).unwrap_or_else(|e| panic!("{source}: {e:?}"));
+            assert_eq!(
+                code.instructions
+                    .iter()
+                    .filter(|op| matches!(op, PutDot(_)))
+                    .count(),
+                puts,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parked_put_call_and_template_keep_actual_body_owners_and_stack_peaks() {
+        let source = "function d(p){ var v=p.if; return (v.m)(); }\n\
+            a.p = function(q){ 'use strict'; return q.return; }.b;\n\
+            a.m(`L${function(){return z.x;}.k}R`).z;";
+        let code = compile_realm(source).unwrap();
+        let keys_and_owners: Vec<_> = code
+            .dot
+            .sites
+            .iter()
+            .map(|site| (key(&code.dot, site), site.owner))
+            .collect();
+        let expected = [
+            ("if", 0),
+            ("m", 0),
+            ("p", DOT_ROOT),
+            ("return", 1),
+            ("b", DOT_ROOT),
+            ("m", DOT_ROOT),
+            ("x", 2),
+            ("k", DOT_ROOT),
+            ("z", DOT_ROOT),
+        ];
+        assert_eq!(
+            keys_and_owners,
+            expected.map(|(key, owner)| (key.to_owned(), owner))
+        );
+        assert_eq!(code.functions.len(), 3);
+        assert_eq!(
+            code.functions[0].instructions,
+            [
+                LoadLocal(0),
+                GetDot(0),
+                StoreLocal {
+                    slot: 1,
+                    keep: false
+                },
+                LoadLocal(1),
+                PrepareDotCall(1),
+                call(source, "()", 0, 1),
+                Return { value: true }
+            ]
+        );
+        assert_eq!(code.functions[0].max_stack_depth, 1);
+        assert!(code.functions[1].mode == CodeMode::Strict);
+        assert!(code.functions[1].instructions.ends_with(&[
+            LoadLocal(0),
+            GetDot(3),
+            Return { value: true }
+        ]));
+        assert!(code.functions[2].mode == CodeMode::Sloppy);
+        assert!(
+            code.functions[2]
+                .instructions
+                .ends_with(&[GetDot(6), Return { value: true }])
+        );
+        assert_eq!(
+            &code.instructions[..6],
+            [
+                LoadBinding(4),
+                FormDot(2),
+                CreateFunction(1),
+                GetDot(4),
+                PutDot(2),
+                Discard
+            ]
+        );
+        assert!(matches!(
+            &code.instructions[6..],
+            [
+                LoadBinding(_),
+                PrepareDotCall(5),
+                String(_),
+                CreateFunction(2),
+                GetDot(7),
+                TemplateAppend(_),
+                Call {
+                    argc: 1,
+                    member: 5,
+                    ..
+                },
+                GetDot(8)
+            ]
+        ));
+        assert_eq!(code.max_stack_depth, 3);
+    }
+
+    #[test]
+    fn name_inference_and_strict_witnesses_follow_existing_owners() {
+        let code = compile_realm(
+            "let a=(function(){}), b=function(){}.p; a.p=(function(){}); \
+            a.p = v = function(){}; v = a.p = function(){}; \
+            v=(0,function(){}); v=function(){}();",
+        )
+        .unwrap();
+        let names: Vec<_> =
+            code.functions
+                .iter()
+                .map(|f| match f.kind {
+                    BodyKind::Expression(name) => name
+                        .map(|range| &code.names[usize::from(range.start)..usize::from(range.end)]),
+                    BodyKind::Declaration => panic!("expected an anonymous definition"),
+                })
+                .collect();
+        assert_eq!(
+            names,
+            [
+                Some(b"a".as_slice()),
+                None,
+                None,
+                Some(b"v".as_slice()),
+                None,
+                None,
+                None
+            ]
+        );
+
+        for (source, first) in [
+            (
+                r"'use strict'; f.m('\8'.p, function(){ return '\9'.p; });",
+                r"\8",
+            ),
+            (
+                r"f.p = function(){ 'use strict'; return '\9'.p; }; '\8'.p;",
+                r"\9",
+            ),
+            (
+                r"'use strict'; f.p = function(){ return x.p; }; '\8'.p;",
+                r"\8",
+            ),
+        ] {
+            let start = source.find(first).unwrap();
+            assert_eq!(
+                compile_realm(source).unwrap_err(),
+                CompileError::SyntaxError {
+                    span: Span {
+                        start,
+                        end: start + 2
+                    }
+                }
+            );
+        }
+        let code = compile_realm(
+            r"'use strict' /* cache */ .if; f.p = function(){return '\9'.p;}; '\8'.p;",
+        )
+        .unwrap();
+        assert!(code.mode == CodeMode::Sloppy);
+        assert!(code.functions[0].mode == CodeMode::Sloppy);
+    }
+
+    #[test]
+    fn requested_pool_sizes_token_and_work_debits_are_exact() {
+        let source = "f. /*é*/ab.c = g();";
+        // Two loads, two dot emissions (one patched in place), two markers,
+        // call and Put. Two occurrence records, three copied units, and one
+        // site + two initialized key units moved on the second append.
+        let work = source.len() + 8 + 2 + 3 + 1 + 2;
+        let limits = Limits {
+            max_tokens: 10,
+            max_work: work,
+            ..Limits::default()
+        };
+        let mut parser = new_parser(source, limits, BindingPolicy::Realm).unwrap();
+        parser.parse(true).unwrap();
+        assert_eq!((parser.lexer.tokens_left, parser.lexer.work_left), (0, 0));
+        for (max_tokens, max_work, limit) in [(9, work, Limit::Tokens), (10, work - 1, Limit::Work)]
+        {
+            let mut parser = new_parser(
+                source,
+                Limits {
+                    max_tokens,
+                    max_work,
+                    ..limits
+                },
+                BindingPolicy::Realm,
+            )
+            .unwrap();
+            let error = parser.parse(true).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded(limit));
+            assert_eq!(error.span(), one_byte(source.len() - 1));
+        }
+    }
+
+    #[test]
+    fn key_site_and_parked_nesting_caps_are_inclusive() {
+        let key = "k".repeat(MAX_DOT_KEY_UNITS);
+        let code = compile_realm(&format!("f.{key};")).unwrap();
+        assert_eq!(code.dot.keys.len(), MAX_DOT_KEY_UNITS);
+        let source = format!("f.{key}x;");
+        assert_eq!(
+            compile_realm(&source).unwrap_err(),
+            cap(
+                CompileLimit::DotKeyUnits,
+                Span {
+                    start: 2,
+                    end: source.len() - 1
+                }
+            )
+        );
+
+        let full = format!(
+            "f{}",
+            format!(".{key}").repeat(MAX_DOT_CODE_UNITS / MAX_DOT_KEY_UNITS)
+        );
+        let code = compile_realm(&format!("{full};")).unwrap();
+        assert_eq!(code.dot.keys.len(), MAX_DOT_CODE_UNITS);
+        assert_eq!(
+            compile_realm(&format!("{full}.x;")).unwrap_err(),
+            cap(CompileLimit::PooledDotKeyUnits, one_byte(full.len()))
+        );
+
+        // At least two tokens per dot means the default token cap wins.
+        // Raise only that ceiling on the private parser to reach all site ids.
+        let limits = Limits {
+            max_tokens: 2 * MAX_DOT_SITES + 4,
+            ..Limits::default()
+        };
+        let full = format!("f{}", ".p".repeat(MAX_DOT_SITES));
+        let source = format!("{full};");
+        let mut parser = new_parser(&source, limits, BindingPolicy::Realm).unwrap();
+        parser.parse(true).unwrap();
+        assert_eq!(parser.dot.sites.len(), MAX_DOT_SITES);
+        assert_eq!(
+            parser.instructions.last(),
+            Some(&GetDot(MAX_DOT_SITES as u16 - 1))
+        );
+        let source = format!("{full}.p;");
+        let err = new_parser(&source, limits, BindingPolicy::Realm)
+            .unwrap()
+            .parse(true)
+            .err()
+            .unwrap();
+        assert_eq!(err.realm_limit, Some(RealmParseLimit::DotSites));
+        assert_eq!(err.span(), one_byte(full.len()));
+
+        for (prefix, suffix) in [
+            ("f.p = function(){return ", " ;};"),
+            ("f.m(function(){return ", " ;});"),
+        ] {
+            let make = |n| format!("{prefix}{}f.p{}{suffix}", "(".repeat(n), ")".repeat(n));
+            // One parked property assignment/call + one parked creator.
+            compile_realm(&make(126)).unwrap();
+            let CompileError::Parse(err) = compile_realm(&make(127)).unwrap_err() else {
+                panic!();
+            };
+            assert_eq!(err.kind(), ErrorKind::LimitExceeded(Limit::NestingDepth));
+            assert_eq!(err.span(), one_byte(prefix.len() + 126));
+        }
+    }
+
+    #[test]
+    fn unsupported_suffixes_fail_in_the_right_grammar_and_legacy_is_unchanged() {
+        for source in [
+            "f.;",
+            "f[0];",
+            "f?.x;",
+            "f?.();",
+            "f.x++;",
+            "++f.x;",
+            "f.x += 1;",
+            "f.x ||= 1;",
+            "f.#x;",
+            "f.é;",
+            r"f.if\u0061;",
+            "f.x`tagged`;",
+            "1..if;",
+            "f.5;",
+            "f.x(;",
+            "f.x = ;",
+        ] {
+            assert!(
+                matches!(compile_realm(source), Err(CompileError::Parse(_))),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            compile_realm("(1).if;").unwrap().instructions,
+            [Number(1.0), GetDot(0)]
+        );
+        assert_eq!(compile_realm(".5;").unwrap().instructions, [Number(0.5)]);
+        let mut legacy =
+            new_parser("'a'.length;", Limits::default(), BindingPolicy::Legacy).unwrap();
+        legacy.parse(false).unwrap();
+        assert!(matches!(
+            &legacy.instructions[..],
+            [String(_), StringLength]
+        ));
+        assert!(legacy.dot.keys.is_empty() && legacy.dot.sites.is_empty());
+        for (source, start) in [("f.if;", 1), ("f. /* gap */ if;", 1), ("f.length.x;", 8)] {
+            let err = new_parser(source, Limits::default(), BindingPolicy::Legacy)
+                .unwrap()
+                .parse(false)
+                .err()
+                .unwrap();
+            assert_eq!(err.kind(), ErrorKind::Unsupported);
+            assert_eq!(err.span(), one_byte(start));
+        }
+    }
 }

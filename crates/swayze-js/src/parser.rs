@@ -94,6 +94,9 @@ enum RealmParseLimit {
     Arguments,
     Parameters,
     FormalNameBytes,
+    DotSites,
+    DotKeyUnits,
+    PooledDotKeyUnits,
 }
 
 /// A parse diagnostic that does not retain or print the source text.
@@ -174,6 +177,9 @@ impl Error {
             RealmParseLimit::Arguments => "call argument ceiling exceeded",
             RealmParseLimit::Parameters => "function parameter ceiling exceeded",
             RealmParseLimit::FormalNameBytes => "formal name byte ceiling exceeded",
+            RealmParseLimit::DotSites => "dot occurrence ceiling exceeded",
+            RealmParseLimit::DotKeyUnits => "dot key unit ceiling exceeded",
+            RealmParseLimit::PooledDotKeyUnits => "pooled dot key unit ceiling exceeded",
         };
         Self {
             realm_limit: Some(limit),
@@ -298,6 +304,8 @@ pub(crate) enum ShortCircuitCondition {
     NonNullish,
 }
 
+pub(crate) const BARE_CALL: u16 = u16::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
@@ -320,10 +328,15 @@ pub(crate) enum Instruction {
         result: UpdateResult,
     },
     CreateFunction(u16),
+    GetDot(u16),
+    FormDot(u16),
+    PutDot(u16),
+    PrepareDotCall(u16),
     Call {
         start: u32,
         end: u32,
         argc: u8,
+        member: u16,
     },
     Return {
         value: bool,
@@ -487,6 +500,7 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
         function: None,
         accesses: Vec::new(),
         stack_depth: 0,
+        dot: crate::realm::DotCode::default(),
         max_stack_depth: 0,
     })
 }
@@ -657,6 +671,7 @@ enum TokenKind {
     CloseBrace,
     Question,
     LengthSuffix,
+    DotSuffix(DotName),
     Colon,
     Comma,
     Semicolon,
@@ -668,7 +683,7 @@ enum TokenPosition {
     Plain,
     // Starts a statement or operand, so a backtick can open an untagged template.
     Operand,
-    // May lex a `.length` continuation, but never a tagged template.
+    // May lex a property continuation (Legacy only `.length`), never a tagged template.
     AfterPrimary,
 }
 
@@ -676,6 +691,13 @@ struct Token {
     kind: TokenKind,
     span: Span,
     after_line_break: bool,
+}
+
+// The enclosing token will keep the dot's span and preceding line-break bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DotName {
+    start: u32,
+    end: u32,
 }
 
 // Only Realm records a witness, even before the parser knows the code mode.
@@ -844,11 +866,16 @@ impl Lexer<'_> {
             '0'..='9' => self.number(c, start)?,
             '.' if matches!(self.peek(), Some('0'..='9')) => self.number(c, start)?,
             '.' if position == TokenPosition::AfterPrimary => {
-                self.consume_length(first)?;
-                // Lookahead after a name may cache the complete suffix. Use
-                // the dot span for emission, not a span including trivia.
+                let kind = if self.policy == BindingPolicy::Realm {
+                    TokenKind::DotSuffix(self.consume_dot_name(first)?)
+                } else {
+                    self.consume_length(first)?;
+                    TokenKind::LengthSuffix
+                };
+                // Lookahead can cache the complete suffix. Its span belongs
+                // to the dot, not the key or intervening trivia.
                 return Ok(Some(Token {
-                    kind: TokenKind::LengthSuffix,
+                    kind,
                     span: first,
                     after_line_break,
                 }));
@@ -937,11 +964,31 @@ impl Lexer<'_> {
         Ok(())
     }
 
-    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
-        while let Some(c) = self.peek().filter(|&c| is_identifier_continue(c)) {
-            self.consume(c)?;
-        }
-        // Don't mistake the ASCII prefix of a Unicode or escaped name for a keyword.
+    // The AfterPrimary arm has ruled out a leading-dot number and already
+    // charged and consumed the dot itself.
+    fn consume_dot_name(&mut self, dot: Span) -> Result<DotName, Error> {
+        debug_assert!(self.policy == BindingPolicy::Realm);
+        self.skip_trivia()?;
+        let start = self.offset;
+        let Some(c) = self.peek().filter(|&c| is_identifier_start(c)) else {
+            self.reject_non_ascii_identifier()?;
+            return Err(unsupported_token(dot));
+        };
+        self.charge_token(Span {
+            start,
+            end: start + 1,
+        })?;
+        self.consume(c)?;
+        self.consume_identifier_tail()?;
+        let pack =
+            |offset| u32::try_from(offset).map_err(|_| Error::limit(dot, Limit::SourceBytes));
+        Ok(DotName {
+            start: pack(start)?,
+            end: pack(self.offset)?,
+        })
+    }
+
+    fn reject_non_ascii_identifier(&mut self) -> Result<(), Error> {
         if let Some(c) = self.peek().filter(|&c| is_outside_ascii_name(c)) {
             let span = self.consume(c)?;
             return Err(Error::unsupported(
@@ -949,6 +996,19 @@ impl Lexer<'_> {
                 "Unicode and escaped identifiers are outside the subset",
             ));
         }
+        Ok(())
+    }
+
+    fn consume_identifier_tail(&mut self) -> Result<(), Error> {
+        while let Some(c) = self.peek().filter(|&c| is_identifier_continue(c)) {
+            self.consume(c)?;
+        }
+        // Don't accept the ASCII prefix of a Unicode or escaped name.
+        self.reject_non_ascii_identifier()
+    }
+
+    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
+        self.consume_identifier_tail()?;
         let name = &self.source[start..self.offset];
         match name {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
@@ -1277,6 +1337,7 @@ enum Pending {
     Call {
         base: usize,
         completed: u8,
+        member: u16,
     },
     Group {
         preserves_reference: bool,
@@ -1286,6 +1347,10 @@ enum Pending {
     },
     AssignmentGroup(ExpressionAssignment),
     Assignment(ExpressionAssignment),
+    DotAssignment {
+        site: u16,
+        rhs_base_depth: usize,
+    },
     Consequent {
         branch: usize,
         base_depth: usize,
@@ -1351,7 +1416,7 @@ struct WriteAccess {
 #[derive(Clone, Copy)]
 enum DirectReference {
     Name(usize),
-    StringLength,
+    Property { site: u16, instruction: usize },
     AnonymousDefinition(usize), // ordinal of the whole definition's CreateFunction
 }
 
@@ -1651,6 +1716,7 @@ struct Parser<'s> {
     accesses: Vec<Access>,
     functions: Vec<realm::ParsedFunction>,
     function: Option<realm::OpenFunction>,
+    dot: crate::realm::DotCode,
     stack_depth: usize,
     max_stack_depth: usize,
 }
@@ -1970,7 +2036,10 @@ impl Parser<'_> {
         match self.lookahead.take() {
             Some(Some(token))
                 if position != TokenPosition::AfterPrimary
-                    && matches!(token.kind, TokenKind::LengthSuffix) =>
+                    && matches!(
+                        token.kind,
+                        TokenKind::LengthSuffix | TokenKind::DotSuffix(_)
+                    ) =>
             {
                 Err(unsupported_token(token.span))
             }
@@ -3553,8 +3622,8 @@ impl Parser<'_> {
             if needs_operand {
                 reference = None;
             }
-            // Operand completeness is not sufficient: a name update or a
-            // read that already took a suffix cannot take another dot.
+            // Only primaries and suffix results can take another suffix;
+            // a bare name update (and Legacy's `.length`) cannot.
             let mut allow_dot = false;
             match (needs_operand, kind) {
                 (true, TokenKind::Update(op)) => {
@@ -3565,6 +3634,38 @@ impl Parser<'_> {
                 }
                 (false, TokenKind::Update(_)) => {
                     return Err(Error::unsupported(span, UPDATE_TARGET_REQUIRED));
+                }
+                (false, TokenKind::Assignment(op))
+                    if let Some(DirectReference::Property { site, instruction }) = reference =>
+                {
+                    if op.is_some() {
+                        return Err(Error::unsupported(
+                            span,
+                            "compound property assignments are outside the subset",
+                        ));
+                    }
+                    // A direct member can be the pending operator's operand
+                    // (and still take a member call), not the whole LHS of '='.
+                    // A group, argument, substitution, arm or RHS is a fresh
+                    // assignment production; only operators on *this* level
+                    // disqualify it.
+                    if matches!(
+                        self.pending.last(),
+                        Some((Pending::Op(_) | Pending::ShortCircuit { .. }, _))
+                    ) {
+                        return Err(Error::malformed(span, "invalid property assignment target"));
+                    }
+                    self.patch_dot(site, instruction, Instruction::FormDot(site), span)?;
+                    self.stack_depth -= 1;
+                    self.open_pending(
+                        Pending::DotAssignment {
+                            site,
+                            rhs_base_depth: self.stack_depth,
+                        },
+                        span,
+                    )?;
+                    reference = None;
+                    needs_operand = true;
                 }
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
@@ -3633,8 +3734,15 @@ impl Parser<'_> {
                     return Err(Error::unsupported(span, "braces are not expression tokens"));
                 }
                 (false, TokenKind::LengthSuffix) => {
-                    reference = Some(DirectReference::StringLength);
+                    reference = None;
                     self.emit(Instruction::StringLength, span)?;
+                }
+                (false, TokenKind::DotSuffix(key)) => {
+                    let site = self.record_dot(key, span)?;
+                    let instruction = self.instructions.len();
+                    self.emit(Instruction::GetDot(site), span)?;
+                    reference = Some(DirectReference::Property { site, instruction });
+                    allow_dot = true;
                 }
                 (true, TokenKind::String(range) | TokenKind::Template(range)) => {
                     self.emit(Instruction::String(range), span)?;
@@ -3767,7 +3875,13 @@ impl Parser<'_> {
                     // before deciding which surrounding production owns the comma.
                     self.reduce_expression(span, &mut reference)?;
                     self.finish_group_assignment(span, &mut reference)?;
-                    if let Some((Pending::Call { base, completed }, _)) = self.pending.last_mut() {
+                    if let Some((
+                        Pending::Call {
+                            base, completed, ..
+                        },
+                        _,
+                    )) = self.pending.last_mut()
+                    {
                         if self.stack_depth != *base + usize::from(*completed) + 1 {
                             return Err(Error::malformed(span, "expected one call argument"));
                         }
@@ -3943,33 +4057,34 @@ impl Parser<'_> {
                     }));
                 }
                 (false, TokenKind::Open)
-                    if self.lexer.policy == BindingPolicy::Realm
-                        && callable_primary
-                        && !matches!(reference, Some(DirectReference::StringLength)) =>
+                    if self.lexer.policy == BindingPolicy::Realm && callable_primary =>
                 {
                     if self.stack_depth == 0 {
                         return Err(Error::malformed(span, "missing callee"));
                     }
-                    // GetValue has already been emitted. A call is never a
-                    // direct typeof reference, and its arguments cannot leak one.
-                    reference = None;
+                    // A direct member snapshots the callee and its receiver
+                    // before any argument. Other callees already have a value.
+                    let member = match reference.take() {
+                        Some(DirectReference::Property { site, instruction }) => {
+                            self.patch_dot(
+                                site,
+                                instruction,
+                                Instruction::PrepareDotCall(site),
+                                span,
+                            )?;
+                            site
+                        }
+                        _ => BARE_CALL,
+                    };
                     self.open_pending(
                         Pending::Call {
                             base: self.stack_depth,
                             completed: 0,
+                            member,
                         },
                         span,
                     )?;
                     needs_operand = true;
-                }
-                (false, TokenKind::Open)
-                    if self.lexer.policy == BindingPolicy::Realm
-                        && matches!(reference, Some(DirectReference::StringLength)) =>
-                {
-                    return Err(Error::unsupported(
-                        span,
-                        "member calls are outside the subset",
-                    ));
                 }
                 (false, TokenKind::Open) => {
                     return Err(Error::unsupported(
@@ -4016,6 +4131,7 @@ impl Parser<'_> {
                     TokenKind::Question
                         | TokenKind::Colon
                         | TokenKind::Comma
+                        | TokenKind::Assignment(None)
                         | TokenKind::TemplateHead(_)
                         | TokenKind::CloseBrace
                 )
@@ -4244,6 +4360,20 @@ impl Parser<'_> {
                     self.patch_jump(jump, span)?;
                     self.nesting_depth -= 1;
                 }
+                Pending::DotAssignment {
+                    site,
+                    rhs_base_depth,
+                } => {
+                    if self.stack_depth.checked_sub(rhs_base_depth) != Some(1) {
+                        return Err(Error::malformed(
+                            end,
+                            "assignment value must leave one result",
+                        ));
+                    }
+                    // Unlike a name assignment, Put does not infer a name.
+                    self.emit(Instruction::PutDot(site), end)?;
+                    self.nesting_depth -= 1;
+                }
                 Pending::Assignment(assignment) => {
                     self.finish_expression_assignment(assignment, span, end, reference.take())?;
                     self.nesting_depth -= 1;
@@ -4322,6 +4452,10 @@ impl Parser<'_> {
             | Instruction::UpdateLocal { .. }
             | Instruction::UpdateBinding { .. } => (0, 1),
             Instruction::Call { argc, .. } => (usize::from(argc) + 1, 1),
+            Instruction::GetDot(_) | Instruction::PutDot(_) | Instruction::PrepareDotCall(_) => {
+                (1, 1)
+            }
+            Instruction::FormDot(_) => (1, 0),
             Instruction::Return { value } if self.stack_depth == usize::from(value) => {
                 (usize::from(value), 0)
             }
@@ -4405,4 +4539,188 @@ fn try_push<T>(vec: &mut Vec<T>, item: T, span: Span) -> Result<(), Error> {
         .map_err(|_| Error::limit(span, Limit::Allocation))?;
     vec.push(item);
     Ok(())
+}
+
+#[cfg(test)]
+mod dot_name_tests {
+    use super::*;
+
+    const DOT: Span = Span { start: 0, end: 1 };
+
+    fn lexer(source: &str, limits: Limits) -> Lexer<'_> {
+        new_parser(source, limits, BindingPolicy::Realm)
+            .unwrap()
+            .lexer
+    }
+
+    fn scan(lexer: &mut Lexer<'_>) -> Result<DotName, Error> {
+        assert_eq!(lexer.peek(), Some('.'));
+        lexer.charge_token(DOT)?;
+        let dot = lexer.consume('.')?;
+        lexer.consume_dot_name(dot)
+    }
+
+    #[test]
+    fn scans_identifier_names_without_classifying_or_combining_tokens() {
+        assert_eq!(std::mem::size_of::<DotName>(), 8);
+        let trivia = "./* é\r\n */ // line\u{2028}\u{feff}";
+        let keys = [
+            "length",
+            "$x_09",
+            "_",
+            "if",
+            "function",
+            "null",
+            "arguments",
+            "await",
+        ];
+        for (i, key) in keys.into_iter().enumerate() {
+            let tail = if i == 0 { "\u{2028}" } else { "/* gap */other" };
+            let source = format!("{trivia}{key}{tail}");
+            let mut lexer = lexer(&source, Limits::default());
+            let range = scan(&mut lexer).unwrap();
+            assert_eq!(range.start as usize, trivia.len());
+            assert_eq!(&source[range.start as usize..range.end as usize], key);
+            assert_eq!(lexer.offset, range.end as usize);
+            assert_eq!(lexer.rest(), tail);
+            assert_eq!(lexer.tokens_left, Limits::default().max_tokens - 2);
+            assert_eq!(lexer.work_left, Limits::default().max_work - lexer.offset);
+            assert!(lexer.string_units.is_empty());
+            assert!(matches!(
+                lexer.quoted_decimal_escape,
+                QuotedDecimalEscape::Pending
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_escapes_before_returning_even_a_keyword_prefix() {
+        for (source, start, end) in [
+            (r".\u0061", 1, 2),
+            (r".if\u0061", 3, 4),
+            (r".if\8", 3, 4),
+            (".é", 1, 3),
+            (".ifé", 3, 5),
+            (".if\u{200c}", 3, 6),
+        ] {
+            let mut lexer = lexer(source, Limits::default());
+            let err = scan(&mut lexer).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Unsupported, "{source}");
+            assert_eq!(err.span(), Span { start, end }, "{source}");
+            assert_eq!(lexer.offset, end);
+            assert!(matches!(
+                lexer.quoted_decimal_escape,
+                QuotedDecimalEscape::Pending
+            ));
+        }
+    }
+
+    #[test]
+    fn accounts_for_dot_name_and_trivia_at_exact_limits() {
+        let source = ". /*é*/if;";
+        let at_cap = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 2,
+            max_work: 10,
+            max_nesting_depth: 0,
+        };
+        let mut exact = lexer(source, at_cap);
+        assert_eq!(scan(&mut exact), Ok(DotName { start: 8, end: 10 }));
+        assert_eq!(
+            (exact.tokens_left, exact.work_left, exact.peek()),
+            (0, 0, Some(';'))
+        );
+        for (max_tokens, max_work, limit, start, end) in [
+            (0, 0, Limit::Tokens, 0, 1),
+            (2, 0, Limit::Work, 0, 1),
+            (2, 5, Limit::Work, 4, 6), // one byte left, not enough for é
+            (1, 8, Limit::Tokens, 8, 9),
+            (2, 8, Limit::Work, 8, 9),
+            (2, 9, Limit::Work, 9, 10),
+        ] {
+            let limits = Limits {
+                max_tokens,
+                max_work,
+                ..at_cap
+            };
+            let err = scan(&mut lexer(source, limits)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::LimitExceeded(limit));
+            assert_eq!(err.span(), Span { start, end });
+        }
+        let limits = Limits {
+            max_source_bytes: 5,
+            ..at_cap
+        };
+        let err = new_parser(source, limits, BindingPolicy::Realm)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded(Limit::SourceBytes));
+        assert_eq!(err.span(), Span { start: 4, end: 6 });
+    }
+
+    #[test]
+    fn reports_missing_keys_at_the_dot_and_incomplete_trivia_at_the_comment() {
+        for source in [".", ". /* done */", ". // EOF", ".'x'", ".#private"] {
+            let mut lexer = lexer(source, Limits::default());
+            assert_eq!(scan(&mut lexer), Err(unsupported_token(DOT)), "{source}");
+            assert_eq!(lexer.tokens_left, Limits::default().max_tokens - 1);
+        }
+        let err = scan(&mut lexer(". /*", Limits::default())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Malformed);
+        assert_eq!(err.span(), Span { start: 2, end: 4 });
+        assert_eq!(err.message(), "unterminated block comment");
+    }
+
+    #[test]
+    fn real_dispatch_keeps_existing_numeric_backtick_and_dot_positions() {
+        for policy in [BindingPolicy::Legacy, BindingPolicy::Realm] {
+            for position in [
+                TokenPosition::Plain,
+                TokenPosition::Operand,
+                TokenPosition::AfterPrimary,
+            ] {
+                let lex = |source| new_parser(source, Limits::default(), policy).unwrap().lexer;
+                let fraction = lex(".5").next(position).unwrap().unwrap();
+                assert!(matches!(fraction.kind, TokenKind::Number(n) if n == 0.5));
+                assert_eq!(fraction.span, Span { start: 0, end: 2 });
+                let err = lex("1..length").next(position).err().unwrap();
+                assert_eq!(err.span(), Span { start: 2, end: 3 });
+                if policy == BindingPolicy::Realm && position == TokenPosition::AfterPrimary {
+                    let token = lex("\n. /*gap*/if").next(position).unwrap().unwrap();
+                    assert!(matches!(
+                        token.kind,
+                        TokenKind::DotSuffix(DotName { start: 10, end: 12 })
+                    ));
+                    assert_eq!(token.span, Span { start: 1, end: 2 });
+                    assert!(token.after_line_break);
+                } else {
+                    let err = lex(".if").next(position).err().unwrap();
+                    assert_eq!(err, unsupported_token(DOT));
+                }
+                if position != TokenPosition::AfterPrimary {
+                    let err = lex("./*").next(position).err().unwrap();
+                    assert_eq!(err, unsupported_token(DOT));
+                }
+                if position != TokenPosition::Operand {
+                    let err = lex("`unterminated").next(position).err().unwrap();
+                    assert_eq!(err, unsupported_token(DOT));
+                }
+            }
+            for source in ["++s./*", "s++./*", "if (true)./*"] {
+                let dot = source.find('.').unwrap();
+                let err = new_parser(source, Limits::default(), policy)
+                    .unwrap()
+                    .parse(true)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    err,
+                    unsupported_token(Span {
+                        start: dot,
+                        end: dot + 1
+                    })
+                );
+            }
+        }
+    }
 }

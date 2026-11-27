@@ -181,9 +181,9 @@ fn opaque_identity_has_only_supported_value_operations() {
             "{source}"
         );
     }
-    assert_eq!(
-        run(&mut realm, "one.length;"),
-        fault(EvalError::UnsupportedPropertyReceiver)
+    normal(
+        &mut realm,
+        "if (one.length !== 0 || one.name !== 'one') bad;",
     );
 }
 
@@ -336,9 +336,6 @@ fn grammar_reports_exclusions_and_preserves_legacy_refusal() {
         "function f(){this;}",
         "function f(){new f;}",
         "function f(){arguments;}",
-        "function f(){f.length();}",
-        "function f(){((f.length))();}",
-        "function f(){f.x;}",
         "function f(){break outside;}",
         "function f(){return; var dead = function(){};}",
     ] {
@@ -673,7 +670,6 @@ fn anonymous_body_eligibility_and_decimal_witnesses_are_lexically_owned() {
         "function f(){ return; (function () {}); }",
         "(function(t,t){});",
         "(function () { return this; })();",
-        "(function () {}).name;",
         "new (function () {});",
     ] {
         assert!(
@@ -784,17 +780,16 @@ fn excluded_generator_headers_keep_the_function_keyword_diagnostic() {
 }
 
 #[test]
-fn anonymous_primaries_resume_the_primitive_length_suffix_only() {
-    for rhs in ["function () {}.length", "(function () {}).length"] {
-        normal(&mut Realm::new(), &format!("false && {rhs};"));
-        assert_eq!(
-            run(&mut Realm::new(), &format!("var x = {rhs};")),
-            fault(EvalError::UnsupportedPropertyReceiver)
-        );
-    }
-    for rhs in ["function () {}.name", "(function () {}).name"] {
-        assert!(
-            matches!(CompiledScript::compile(&format!("false && {rhs};")), Err(CompileError::Parse(err)) if err.kind() == ErrorKind::Unsupported)
+fn anonymous_primaries_resume_dot_suffix_without_inferred_name() {
+    for (rhs, want) in [
+        ("function () {}.length", "0"),
+        ("(function () {}).length", "0"),
+        ("function () {}.name", "''"),
+        ("(function () {}).name", "''"),
+    ] {
+        normal(
+            &mut Realm::new(),
+            &format!("false && {rhs}; var x = {rhs}; if (x !== {want}) bad;"),
         );
     }
 }

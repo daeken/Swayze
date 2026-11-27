@@ -3,8 +3,8 @@ use std::{cmp::Ordering, fmt};
 use crate::{
     CompletionScript, Script,
     parser::{
-        BindingKind, ExitStack, Instruction, PreparedScript, ShortCircuitCondition, Update,
-        UpdateResult,
+        BARE_CALL, BindingKind, ExitStack, Instruction, PreparedScript, ShortCircuitCondition,
+        Update, UpdateResult,
     },
 };
 
@@ -16,7 +16,8 @@ const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
 mod bindings;
 pub mod realm;
 use bindings::{
-    Bindings, LegacyBindings, UpdateNumeric, init_operand, store_operand, update_result,
+    Bindings, CallTarget, DotSite, LegacyBindings, Properties, UpdateNumeric, init_operand,
+    store_operand, update_result,
 };
 
 mod string_concat;
@@ -557,30 +558,172 @@ fn evaluate(
 
 const MAX_GUEST_FRAMES: usize = 32;
 const MAX_LIVE_SLOTS: usize = 4096;
+const MAX_DOT_SITES: usize = 4096;
 const UNDEFINED: Operand = Operand::Scalar(Value::Undefined);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PacketKind {
+    Form,
+    PreparedCall,
+}
+
+#[derive(Clone, Copy)]
+struct Packet {
+    captured: Operand,
+    site: u16,
+    anchor: u16,
+    kind: PacketKind,
+}
+
+#[derive(Default)]
+struct Packets {
+    rows: Vec<Packet>,
+    tier: usize,
+}
+
+impl Packets {
+    fn top(&self, fence: usize) -> Result<Option<Packet>, EvalError> {
+        match self.rows.get(fence..) {
+            Some(local) => Ok(local.last().copied()),
+            None => Err(EvalError::InvalidScript),
+        }
+    }
+
+    fn floor(&self, fence: usize, temps: usize, len: usize) -> Result<usize, EvalError> {
+        let Some(packet) = self.top(fence)? else {
+            return Ok(temps);
+        };
+        let anchor = usize::from(packet.anchor);
+        let floor = anchor + usize::from(packet.kind == PacketKind::PreparedCall);
+        if anchor < temps || floor > len {
+            return Err(EvalError::InvalidScript);
+        }
+        Ok(floor)
+    }
+
+    fn matching(
+        &self,
+        fence: usize,
+        kind: PacketKind,
+        site: u16,
+        anchor: usize,
+    ) -> Result<Packet, EvalError> {
+        self.top(fence)?
+            .filter(|p| p.kind == kind && p.site == site && usize::from(p.anchor) == anchor)
+            .ok_or(EvalError::InvalidScript)
+    }
+
+    fn reserve_push<E: From<EvalError>>(
+        &mut self,
+        temps: usize,
+        peak: usize,
+        receivers: usize,
+        properties: &mut dyn Properties<Error = E>,
+    ) -> Result<(), E> {
+        let next = self.rows.len() + 1;
+        check_live_slots(temps, peak, next, receivers)?;
+        let grow = next > self.tier;
+        // Debit the record and potentially moved initialized records, before
+        // reserve or Get. Removal is covered by the consuming opcode dispatch.
+        properties.charge_packets(1 + if grow { self.rows.len() } else { 0 })?;
+        if grow {
+            // Requested logical tiers, not allocator capacity/rounding: at
+            // most 4096 records, or 2048+4096 during a reallocation. Never shrink.
+            let tier = next.next_power_of_two();
+            self.rows
+                .try_reserve_exact(tier - self.rows.len())
+                .map_err(|_| EvalError::AllocationFailed)?;
+            self.tier = tier;
+        }
+        Ok(())
+    }
+}
+
+fn check_live_slots(
+    temps: usize,
+    peak: usize,
+    packets: usize,
+    receivers: usize,
+) -> Result<usize, EvalError> {
+    let operands = temps
+        .checked_add(peak)
+        .ok_or(EvalError::LiveSlotLimitExceeded)?;
+    operands
+        .checked_add(packets)
+        .and_then(|used| used.checked_add(receivers))
+        .filter(|&used| used <= MAX_LIVE_SLOTS)
+        .ok_or(EvalError::LiveSlotLimitExceeded)?;
+    Ok(operands)
+}
+
+fn check_dot_index(site: u16) -> Result<(), EvalError> {
+    if usize::from(site) >= MAX_DOT_SITES {
+        return Err(EvalError::InvalidScript);
+    }
+    Ok(())
+}
+
+fn authenticate_dot<E: From<EvalError>>(
+    properties: &dyn Properties<Error = E>,
+    owner: Option<realm::FunctionOrigin>,
+    index: u16,
+) -> Result<DotSite, E> {
+    check_dot_index(index)?;
+    let (span, mode) = properties.dot_metadata(owner, index)?;
+    if span.start >= span.end {
+        return Err(EvalError::InvalidScript.into());
+    }
+    Ok(DotSite {
+        owner,
+        index,
+        span,
+        mode,
+    })
+}
+
+fn ends_packet_scope(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::JumpIfFalseStatement(_)
+            | Instruction::ShortCircuitStatement { .. }
+            | Instruction::JumpStatement(_)
+            | Instruction::LoopBack(_)
+            | Instruction::Return { .. }
+            | Instruction::InitBinding { .. }
+            | Instruction::StoreBinding(_)
+            | Instruction::StoreLocal { keep: false, .. }
+    )
+}
 
 // The active frame and suspended caller frames borrow immutable code only;
 // the VM owns every local/temporary slot. No Rust recursion or code copies.
+// Compact bounded offsets leave room for receiver/fence without increasing
+// the requested backing on the shipped bare-call path.
 struct Frame<'code> {
     ops: &'code [Instruction],
-    max_operands: usize,
+    max_operands: u16,
     exit: ExitStack,
     body: Option<realm::FunctionOrigin>,
     ip: usize,
-    base: usize, // locals start here; this is also the caller's result slot
-    temps: usize,
+    base: u16, // locals start here; this is also the caller's result slot
+    temps: u16,
+    fence: u16,
+    receiver: Option<Operand>, // bare undefined is implicit
 }
 
 impl<'code> Frame<'code> {
     fn root(ops: &'code [Instruction], max_operands: usize, exit: ExitStack) -> Self {
         Self {
             ops,
-            max_operands,
+            // Both root layout validators bound this by MAX_INSTRUCTIONS.
+            max_operands: max_operands as u16,
             exit,
             body: None,
             ip: 0,
             base: 0,
             temps: 0,
+            fence: 0,
+            receiver: None,
         }
     }
 }
@@ -601,10 +744,115 @@ fn validate_body(
     Ok(())
 }
 
+// Remove the allowance when Realm instantiation invokes this for property
+// roots (including artifact-free roots) and every property-bearing body.
+// The caller must run this before publication, with its own bounded Work and
+// frame-specific occurrence table. This is a packet-shape check, not a value
+// verifier, and walks even statically untaken instructions and edges.
+#[allow(dead_code)]
+fn validate_property_shape<E: From<EvalError>>(
+    ops: &[Instruction],
+    max_operands: usize,
+    exit: ExitStack,
+    mut charge: impl FnMut(usize) -> Result<(), E>,
+    mut check_site: impl FnMut(u16) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_body(ops, max_operands, exit)?;
+    // Charge before allocating one signature per opcode plus the exit. The
+    // signature names the innermost lexical opener (ordinal + 1, zero empty).
+    // Its parent is the signature at that opener; no second opener table.
+    charge(ops.len() + 1)?;
+    let mut before = Vec::new();
+    before
+        .try_reserve_exact(ops.len() + 1)
+        .map_err(|_| EvalError::AllocationFailed)?;
+    let mut signature = 0u16;
+    for (at, &op) in ops.iter().enumerate() {
+        before.push(signature);
+        if signature != 0 && ends_packet_scope(op) {
+            return Err(EvalError::InvalidScript.into());
+        }
+        let index = match op {
+            Instruction::GetDot(site)
+            | Instruction::FormDot(site)
+            | Instruction::PutDot(site)
+            | Instruction::PrepareDotCall(site) => site,
+            Instruction::Call { member, .. } if member != BARE_CALL => member,
+            _ => continue,
+        };
+        check_dot_index(index)?;
+        check_site(index)?;
+        let expected = match op {
+            Instruction::FormDot(_) | Instruction::PrepareDotCall(_) => {
+                signature = (at + 1) as u16; // validated <= MAX_INSTRUCTIONS
+                continue;
+            }
+            Instruction::PutDot(_) => Instruction::FormDot(index),
+            Instruction::Call { .. } => Instruction::PrepareDotCall(index),
+            _ => continue,
+        };
+        let opener = usize::from(signature)
+            .checked_sub(1)
+            .ok_or(EvalError::InvalidScript)?;
+        if ops[opener] != expected {
+            return Err(EvalError::InvalidScript.into());
+        }
+        signature = before[opener];
+    }
+    if signature != 0 {
+        return Err(EvalError::InvalidScript.into());
+    }
+    before.push(signature);
+
+    for (at, &op) in ops.iter().enumerate() {
+        charge(1)?; // instruction visited, regardless of number of successors
+        let next = at + 1;
+        let incoming = before[at];
+        let outgoing = match op {
+            Instruction::FormDot(_) | Instruction::PrepareDotCall(_) => next as u16,
+            // Pass one proved these consumers match an existing opener.
+            Instruction::PutDot(_) => before[usize::from(incoming) - 1],
+            Instruction::Call { member, .. } if member != BARE_CALL => {
+                before[usize::from(incoming) - 1]
+            }
+            _ => incoming,
+        };
+        let mut edge = |target: usize| -> Result<(), E> {
+            charge(1)?;
+            if before[target] != outgoing {
+                return Err(EvalError::InvalidScript.into());
+            }
+            Ok(())
+        };
+        match op {
+            Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfFalseStatement(target)
+            | Instruction::ShortCircuit { target, .. }
+            | Instruction::ShortCircuitStatement { target, .. } => {
+                edge(check_forward_target(next, target, ops.len())?)?;
+                edge(next)?;
+            }
+            Instruction::Jump(target) | Instruction::JumpStatement(target) => {
+                edge(check_forward_target(next, target, ops.len())?)?;
+            }
+            Instruction::LoopBack(target) => {
+                if target >= at {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                edge(target)?;
+            }
+            Instruction::Return { .. } => {}
+            _ => edge(next)?,
+        }
+    }
+    Ok(())
+}
+
 struct Stack<'a> {
     slots: &'a mut Vec<Operand>,
     base: usize,
     temps: usize,
+    floor: usize, // absolute boundary for ordinary operand access, not peak accounting
 }
 
 impl Stack<'_> {
@@ -614,13 +862,14 @@ impl Stack<'_> {
             slots,
             base: 0,
             temps: 0,
+            floor: 0,
         }
     }
     fn as_slice(&self) -> &[Operand] {
-        &self.slots[self.temps..]
+        &self.slots[self.floor..]
     }
     fn as_mut_slice(&mut self) -> &mut [Operand] {
-        &mut self.slots[self.temps..]
+        &mut self.slots[self.floor..]
     }
     fn len(&self) -> usize {
         self.slots.len() - self.temps
@@ -635,7 +884,7 @@ impl Stack<'_> {
         self.as_mut_slice().last_mut()
     }
     fn pop(&mut self) -> Option<Operand> {
-        if self.is_empty() {
+        if self.slots.len() == self.floor {
             None
         } else {
             self.slots.pop()
@@ -661,6 +910,8 @@ fn dispatch<'code, B: Bindings>(
     let mut string_pairs_left = MAX_STRING_COMPARISON_PAIRS;
     let mut string_conversion_credits_left = string_number::MAX_CREDITS;
     let mut callers = Vec::<Frame<'_>>::new();
+    let mut packets = Packets::default();
+    let mut receivers = 0;
     loop {
         let Frame {
             ops,
@@ -669,21 +920,42 @@ fn dispatch<'code, B: Bindings>(
             base,
             temps,
             exit,
+            fence,
+            receiver,
             ref mut ip,
         } = frame;
+        let (max_operands, base, temps, fence) = (
+            usize::from(max_operands),
+            usize::from(base),
+            usize::from(temps),
+            usize::from(fence),
+        );
+        let floor = packets.floor(fence, temps, slots.len())?;
         let mut stack = Stack {
             slots: &mut slots,
             base,
             temps,
+            floor,
         };
         if *ip == ops.len() {
+            if packets.rows.len() != fence {
+                return Err(EvalError::InvalidScript.into());
+            }
             // Frame frontier is not dispatched; ordinary body fallthrough
             // is undefined, independent of preceding expression statements.
             if B::CALLS && body.is_some() {
                 if !stack.is_empty() {
                     return Err(EvalError::InvalidScript.into());
                 }
-                frame = resume(&mut callers, &mut slots, base, UNDEFINED, bindings)?;
+                receivers -= usize::from(receiver.is_some());
+                frame = resume(
+                    &mut callers,
+                    &mut slots,
+                    &packets,
+                    base,
+                    UNDEFINED,
+                    bindings,
+                )?;
                 continue;
             }
             return match (exit, stack.as_slice()) {
@@ -698,6 +970,9 @@ fn dispatch<'code, B: Bindings>(
         let op = *ops.get(*ip).ok_or(EvalError::InvalidScript)?;
         *ip += 1;
         let source = bindings.transient(scratch, string_units, callable.artifacts);
+        if packets.rows.len() != fence && ends_packet_scope(op) {
+            return Err(EvalError::InvalidScript.into());
+        }
         match op {
             Instruction::CreateFunction(template) if B::CALLS => {
                 // Do not allocate an identity unless the root can hold the
@@ -711,34 +986,111 @@ fn dispatch<'code, B: Bindings>(
                 let id = bindings.create_function(template)?;
                 push_operand(&mut stack, max_operands, Operand::Function(id))?;
             }
-            Instruction::Call { start, end, argc } if B::CALLS => {
+            Instruction::GetDot(site)
+            | Instruction::FormDot(site)
+            | Instruction::PrepareDotCall(site)
+                if B::CALLS =>
+            {
+                let captured = *stack.last().ok_or(EvalError::InvalidScript)?;
+                let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
+                let checked = authenticate_dot(properties, body, site)?;
+                if matches!(op, Instruction::GetDot(_)) {
+                    *stack.last_mut().ok_or(EvalError::InvalidScript)? =
+                        properties.get_dot(checked, captured, source)?;
+                } else {
+                    let anchor = u16::try_from(stack.slots.len() - 1)
+                        .map_err(|_| EvalError::InvalidScript)?;
+                    packets.reserve_push(temps, max_operands, receivers, properties)?;
+                    let kind = if matches!(op, Instruction::FormDot(_)) {
+                        stack.pop(); // Formation does not inspect the receiver.
+                        PacketKind::Form
+                    } else {
+                        let callee = properties.get_dot(checked, captured, source)?;
+                        stack.slots[usize::from(anchor)] = callee;
+                        PacketKind::PreparedCall
+                    };
+                    packets.rows.push(Packet {
+                        captured,
+                        site,
+                        anchor,
+                        kind,
+                    });
+                }
+            }
+            Instruction::PutDot(site) if B::CALLS => {
+                let rhs = *stack.last().ok_or(EvalError::InvalidScript)?;
+                let anchor = stack.slots.len() - 1;
+                let packet = packets.matching(fence, PacketKind::Form, site, anchor)?;
+                let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
+                let checked = authenticate_dot(properties, body, site)?;
+                properties.put_dot(checked, packet.captured, rhs, source)?;
+                packets.rows.pop();
+            }
+            Instruction::Call {
+                start,
+                end,
+                argc,
+                member,
+            } if B::CALLS => {
                 let argc = usize::from(argc);
                 if argc > usize::from(realm::MAX_PARAMETERS) || start >= end {
                     return Err(EvalError::InvalidScript.into());
                 }
-                let pos = temps
-                    + stack
-                        .len()
-                        .checked_sub(argc + 1)
-                        .ok_or(EvalError::InvalidScript)?;
+                let pos = stack
+                    .slots
+                    .len()
+                    .checked_sub(argc + 1)
+                    .ok_or(EvalError::InvalidScript)?;
+                let raw_receiver = if member == BARE_CALL {
+                    if pos < floor {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    None
+                } else {
+                    let packet = packets.matching(fence, PacketKind::PreparedCall, member, pos)?;
+                    let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
+                    authenticate_dot(properties, body, member)?;
+                    Some(packet.captured)
+                };
+                let transfer = usize::from(raw_receiver.is_some());
+                if !packets.rows.is_empty() || receivers != 0 {
+                    // Include extra arguments before the slot-moving ABI removes them.
+                    check_live_slots(stack.slots.len(), 0, packets.rows.len(), receivers)?;
+                }
+                let span = crate::Span {
+                    start: start as usize,
+                    end: end as usize,
+                };
                 let Operand::Function(id) = slots[pos] else {
-                    return Err(bindings.non_callable(crate::Span {
-                        start: start as usize,
-                        end: end as usize,
-                    }));
+                    return Err(bindings.non_callable(span));
                 };
                 // Only after GetValue and all argument expressions succeed.
-                let origin = bindings.function_origin(id)?;
+                let origin = match bindings.classify_callable(id, span)? {
+                    CallTarget::User(origin) => origin,
+                    CallTarget::FunctionPrototype => {
+                        // Exact [[Call]]: discard evaluated args, replace the callee.
+                        // No user-frame check, receiver slot, reserve or setup charge.
+                        if transfer != 0 {
+                            packets.rows.pop();
+                        }
+                        slots.truncate(pos + 1);
+                        slots[pos] = UNDEFINED;
+                        continue;
+                    }
+                };
                 let (_, target) = callable.body(origin).ok_or(EvalError::InvalidScript)?;
                 if callers.len() == MAX_GUEST_FRAMES {
                     return Err(EvalError::CallDepthLimitExceeded.into());
                 }
                 let (formals, locals) = target.layout.counts().ok_or(EvalError::InvalidScript)?;
                 let local_end = pos + locals;
-                let needed = local_end
-                    .checked_add(target.max_stack_depth)
-                    .filter(|&needed| needed <= MAX_LIVE_SLOTS)
-                    .ok_or(EvalError::LiveSlotLimitExceeded)?;
+                let next_receivers = receivers + transfer;
+                let needed = check_live_slots(
+                    local_end,
+                    target.max_stack_depth,
+                    packets.rows.len() - transfer,
+                    next_receivers,
+                )?;
                 bindings.charge_call(1 + locals)?;
                 if callers.capacity() == 0 {
                     callers
@@ -753,6 +1105,10 @@ fn dispatch<'code, B: Bindings>(
                         .try_reserve_exact(capacity - slots.len())
                         .map_err(|_| EvalError::AllocationFailed)?;
                 }
+                if transfer != 0 {
+                    packets.rows.pop();
+                }
+                receivers = next_receivers;
                 let supplied = argc.min(formals);
                 slots.copy_within(pos + 1..pos + 1 + supplied, pos);
                 slots.truncate(pos + supplied);
@@ -761,12 +1117,15 @@ fn dispatch<'code, B: Bindings>(
                 slots.resize(local_end, UNDEFINED);
                 let callee = Frame {
                     ops: &target.instructions,
-                    max_operands: target.max_stack_depth,
+                    // All four offsets are bounded by the successful slot check.
+                    max_operands: target.max_stack_depth as u16,
                     exit: ExitStack::Empty,
                     body: Some(origin),
                     ip: 0,
-                    base: pos,
-                    temps: local_end,
+                    base: pos as u16,
+                    temps: local_end as u16,
+                    fence: packets.rows.len() as u16,
+                    receiver: raw_receiver,
                 };
                 callers.push(std::mem::replace(&mut frame, callee));
                 bindings.select_body(Some(origin));
@@ -776,7 +1135,8 @@ fn dispatch<'code, B: Bindings>(
                     return Err(EvalError::InvalidScript.into());
                 }
                 let value = stack.pop().unwrap_or(UNDEFINED);
-                frame = resume(&mut callers, &mut slots, base, value, bindings)?;
+                receivers -= usize::from(receiver.is_some());
+                frame = resume(&mut callers, &mut slots, &packets, base, value, bindings)?;
             }
             Instruction::LoadLocal(slot) if B::CALLS => {
                 let value = *stack.local(slot)?;
@@ -797,6 +1157,10 @@ fn dispatch<'code, B: Bindings>(
             }
             Instruction::CreateFunction(_)
             | Instruction::Call { .. }
+            | Instruction::GetDot(_)
+            | Instruction::FormDot(_)
+            | Instruction::PutDot(_)
+            | Instruction::PrepareDotCall(_)
             | Instruction::Return { .. }
             | Instruction::LoadLocal(_)
             | Instruction::StoreLocal { .. }
@@ -1100,18 +1464,22 @@ fn dispatch<'code, B: Bindings>(
 fn resume<'code, B: Bindings>(
     callers: &mut Vec<Frame<'code>>,
     slots: &mut Vec<Operand>,
+    packets: &Packets,
     base: usize,
     result: Operand,
     bindings: &mut B,
 ) -> Result<Frame<'code>, EvalError> {
     let caller = callers.pop().ok_or(EvalError::InvalidScript)?;
+    let temps = usize::from(caller.temps);
+    let floor = packets.floor(usize::from(caller.fence), temps, base)?;
     slots.truncate(base);
     let mut destination = Stack {
         slots,
-        base: caller.base,
-        temps: caller.temps,
+        base: usize::from(caller.base),
+        temps,
+        floor,
     };
-    push_operand(&mut destination, caller.max_operands, result)?;
+    push_operand(&mut destination, usize::from(caller.max_operands), result)?;
     bindings.select_body(caller.body);
     Ok(caller)
 }

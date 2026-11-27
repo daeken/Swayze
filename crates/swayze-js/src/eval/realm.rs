@@ -1694,6 +1694,934 @@ impl Bindings for Execution<'_, '_> {
 mod tests {
     use super::*;
 
+    mod packet_checkpoint {
+        use super::*;
+        use crate::{
+            eval::{
+                bindings::{CallTarget, DotSite, Properties},
+                validate_property_shape,
+            },
+            parser::{BARE_CALL, ShortCircuitCondition},
+        };
+        use Instruction::*;
+
+        const CALL_SPAN: Span = Span { start: 10, end: 12 };
+        const DOT_SPAN: Span = Span { start: 3, end: 5 };
+        // These are scripted classifications at the adapter boundary, not
+        // objects, descriptors, or claims about the retained identity table.
+        const IMMEDIATE: FunctionId = FunctionId(512);
+        const OBJECT: FunctionId = FunctionId(513);
+        const FUNCTION: FunctionId = FunctionId(514);
+
+        #[derive(Debug, PartialEq)]
+        enum Fault {
+            Eval(EvalError),
+            Get,
+            Argument,
+            PacketWork,
+            NonCallable(Span),
+            ObjectCall(Span),
+            FunctionCall(Span),
+        }
+
+        impl From<EvalError> for Fault {
+            fn from(error: EvalError) -> Self {
+                Self::Eval(error)
+            }
+        }
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Debit(usize),
+            Get(f64),
+            Argument,
+            Put(f64, f64),
+            Setup(usize),
+            Store,
+        }
+
+        // A transcript seam, not even a simulated property table. Genuine
+        // user-call bytecode uses the existing FunctionOrigin/Artifact ABI.
+        struct Trace<'a> {
+            code: CallableCode<'a>,
+            events: Vec<Event>,
+            read: Operand,
+            replace_read_on_arg: Option<Operand>,
+            reject_get: bool,
+            reject_arg: bool,
+            first_visit: bool,
+            credits: usize,
+        }
+
+        fn scalar(value: f64) -> Operand {
+            Operand::Scalar(Value::Number(value))
+        }
+
+        fn number(value: Operand) -> f64 {
+            let Operand::Scalar(Value::Number(number)) = value else {
+                panic!("not a Number")
+            };
+            number
+        }
+
+        impl<'a> Trace<'a> {
+            fn new(artifacts: &'a [Artifact]) -> Self {
+                Self {
+                    code: CallableCode { artifacts },
+                    events: Vec::new(),
+                    read: scalar(22.0),
+                    replace_read_on_arg: None,
+                    reject_get: false,
+                    reject_arg: false,
+                    first_visit: true,
+                    credits: 128 * 1024,
+                }
+            }
+
+            fn run(&mut self, ops: &[Instruction], peak: usize) -> Result<Operand, Fault> {
+                dispatch(
+                    Frame::root(ops, peak, ExitStack::Value),
+                    new_stack(peak)?,
+                    &[],
+                    self.code,
+                    &mut EvalScratch::new(),
+                    self,
+                )?
+                .ok_or(EvalError::InvalidScript.into())
+            }
+        }
+
+        impl Properties for Trace<'_> {
+            type Error = Fault;
+
+            fn dot_metadata(
+                &self,
+                owner: Option<FunctionOrigin>,
+                index: u16,
+            ) -> Result<(Span, CodeMode), Fault> {
+                if index != owner.map_or(0, |origin| origin.body + 1) {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                Ok((
+                    DOT_SPAN,
+                    owner.map_or(CodeMode::Sloppy, |origin| {
+                        self.code.body(origin).unwrap().1.mode
+                    }),
+                ))
+            }
+
+            fn charge_packets(&mut self, work: usize) -> Result<(), Fault> {
+                self.events.push(Event::Debit(work));
+                self.credits = self.credits.checked_sub(work).ok_or(Fault::PacketWork)?;
+                Ok(())
+            }
+
+            fn get_dot(
+                &mut self,
+                site: DotSite,
+                recv: Operand,
+                _: TransientStrings<'_>,
+            ) -> Result<Operand, Fault> {
+                assert_eq!(site.span, DOT_SPAN);
+                assert_eq!(site.index, site.owner.map_or(0, |origin| origin.body + 1));
+                assert!(
+                    site.mode
+                        == if site.owner.is_some() {
+                            CodeMode::Strict
+                        } else {
+                            CodeMode::Sloppy
+                        }
+                );
+                self.events.push(Event::Get(number(recv)));
+                if self.reject_get {
+                    Err(Fault::Get)
+                } else {
+                    Ok(self.read)
+                }
+            }
+
+            fn put_dot(
+                &mut self,
+                site: DotSite,
+                recv: Operand,
+                rhs: Operand,
+                _: TransientStrings<'_>,
+            ) -> Result<(), Fault> {
+                assert_eq!(site.span, DOT_SPAN);
+                assert_eq!(site.index, site.owner.map_or(0, |origin| origin.body + 1));
+                assert!(
+                    site.mode
+                        == if site.owner.is_some() {
+                            CodeMode::Strict
+                        } else {
+                            CodeMode::Sloppy
+                        }
+                );
+                self.events.push(Event::Put(number(recv), number(rhs)));
+                Ok(())
+            }
+        }
+
+        impl Bindings for Trace<'_> {
+            type Error = Fault;
+            const CALLS: bool = true;
+
+            fn properties(&mut self) -> Option<&mut dyn Properties<Error = Fault>> {
+                Some(self)
+            }
+            fn non_callable(&self, span: Span) -> Fault {
+                Fault::NonCallable(span)
+            }
+            fn classify_callable(&self, id: FunctionId, span: Span) -> Result<CallTarget, Fault> {
+                match id {
+                    IMMEDIATE => Ok(CallTarget::FunctionPrototype),
+                    OBJECT => Err(Fault::ObjectCall(span)),
+                    FUNCTION => Err(Fault::FunctionCall(span)),
+                    _ => Ok(CallTarget::User(self.function_origin(id)?)),
+                }
+            }
+            fn function_origin(&self, id: FunctionId) -> Result<FunctionOrigin, Fault> {
+                let origin = FunctionOrigin {
+                    artifact: 0,
+                    body: id.0,
+                };
+                self.code.body(origin).ok_or(EvalError::InvalidScript)?;
+                Ok(origin)
+            }
+            fn charge_call(&mut self, work: usize) -> Result<(), Fault> {
+                self.events.push(Event::Setup(work));
+                Ok(())
+            }
+            fn load(&mut self, slot: usize) -> Result<Operand, Fault> {
+                match slot {
+                    0 => Ok(Operand::Function(FunctionId(0))),
+                    1 => {
+                        self.events.push(Event::Argument);
+                        if let Some(value) = self.replace_read_on_arg {
+                            self.read = value;
+                        }
+                        if self.reject_arg {
+                            Err(Fault::Argument)
+                        } else {
+                            Ok(scalar(9.0))
+                        }
+                    }
+                    2 => Ok(Operand::Function(FunctionId(1))),
+                    3 => Ok(Operand::Scalar(Value::Boolean(std::mem::take(
+                        &mut self.first_visit,
+                    )))),
+                    _ => Err(EvalError::InvalidScript.into()),
+                }
+            }
+            fn init(
+                &mut self,
+                _: usize,
+                _: BindingKind,
+                _: usize,
+                _: &mut Stack<'_>,
+                _: TransientStrings<'_>,
+            ) -> Result<(), Fault> {
+                self.events.push(Event::Store);
+                Err(EvalError::InvalidScript.into())
+            }
+            fn store(
+                &mut self,
+                _: usize,
+                keep: bool,
+                stack: &mut Stack<'_>,
+                _: TransientStrings<'_>,
+            ) -> Result<(), Fault> {
+                store_operand(stack, keep)?;
+                self.events.push(Event::Store);
+                Ok(())
+            }
+            fn update(
+                &mut self,
+                _: usize,
+                _: Update,
+                _: UpdateResult,
+                _: &mut Stack<'_>,
+                _: usize,
+                _: UpdateNumeric<'_, '_>,
+            ) -> Result<(), Fault> {
+                Err(EvalError::InvalidScript.into())
+            }
+        }
+
+        fn call(member: u16, argc: u8) -> Instruction {
+            Call {
+                start: CALL_SPAN.start as u32,
+                end: CALL_SPAN.end as u32,
+                member,
+                argc,
+            }
+        }
+
+        fn body(ops: Vec<Instruction>, peak: usize, formals: usize, locals: usize) -> FunctionBody {
+            FunctionBody {
+                kind: BodyKind::Declaration,
+                instructions: ops,
+                max_stack_depth: peak,
+                mode: CodeMode::Strict,
+                layout: FrameLayout::new(formals, locals).unwrap(),
+                accesses: 0..0,
+            }
+        }
+
+        fn artifact(bodies: Vec<FunctionBody>) -> [Artifact; 1] {
+            [Artifact {
+                bodies,
+                string_units: vec![],
+                names: vec![],
+                sites: vec![],
+            }]
+        }
+
+        fn shape(ops: &[Instruction], peak: usize, credits: &mut usize) -> Result<(), Fault> {
+            validate_property_shape(
+                ops,
+                peak,
+                ExitStack::Value,
+                |work| {
+                    *credits = credits.checked_sub(work).ok_or(Fault::PacketWork)?;
+                    Ok(())
+                },
+                |site| {
+                    if site == 0 {
+                        Ok(())
+                    } else {
+                        Err(EvalError::InvalidScript.into())
+                    }
+                },
+            )
+        }
+
+        #[test]
+        fn layout_and_requested_frame_backing_stay_compact() {
+            use crate::eval::{MAX_GUEST_FRAMES, Packet};
+            assert_eq!(size_of::<Instruction>(), 16);
+            assert_eq!(size_of::<Operand>(), 16);
+            assert_eq!(size_of::<StoredValue>(), 16);
+            assert_eq!(size_of::<Packet>(), 24);
+            assert_eq!(size_of::<Frame<'_>>(), 56);
+            assert_eq!(MAX_GUEST_FRAMES * size_of::<Frame<'_>>(), 1792);
+        }
+
+        #[test]
+        fn lexical_shape_checks_opener_identity_and_untaken_edges() {
+            // The two packets have identical depth, site and kind, but the
+            // branch lands inside the other opener. The true path runs fine
+            // if a private test bypasses shape validation.
+            let mut ops = [
+                Number(4.0),
+                FormDot(0),
+                Boolean(true),
+                JumpIfFalse(9),
+                Number(1.0),
+                PutDot(0),
+                Discard,
+                Number(2.0),
+                FormDot(0),
+                Number(9.0),
+                PutDot(0),
+            ];
+            assert_eq!(
+                shape(&ops, 1, &mut 100),
+                Err(EvalError::InvalidScript.into())
+            );
+            assert_eq!(number(Trace::new(&[]).run(&ops, 1).unwrap()), 9.0);
+            ops[2] = Boolean(false);
+            // A reached-only check cannot distinguish openers at identical
+            // height/kind/site; it will write to the original captured base.
+            let mut trace = Trace::new(&[]);
+            assert_eq!(number(trace.run(&ops, 1).unwrap()), 9.0);
+            assert_eq!(trace.events, [Event::Debit(1), Event::Put(4.0, 9.0)]);
+
+            let skip_opener = [Jump(3), Number(4.0), FormDot(0), Number(9.0), PutDot(0)];
+            assert_eq!(
+                shape(&skip_opener, 1, &mut 100),
+                Err(EvalError::InvalidScript.into())
+            );
+            assert!(matches!(
+                Trace::new(&[]).run(&skip_opener, 1),
+                Err(Fault::Eval(EvalError::InvalidScript))
+            ));
+
+            for cond in [false, true] {
+                let conditional = [
+                    Number(4.0),
+                    FormDot(0),
+                    Boolean(cond),
+                    JumpIfFalse(6),
+                    Number(1.0),
+                    Jump(7),
+                    Number(2.0),
+                    PutDot(0),
+                ];
+                assert_eq!(shape(&conditional, 1, &mut 26), Ok(())); // 9 + 8 + 9
+                assert_eq!(shape(&conditional, 1, &mut 25), Err(Fault::PacketWork));
+                let result = Trace::new(&[]).run(&conditional, 1).unwrap();
+                assert_eq!(number(result), if cond { 1.0 } else { 2.0 });
+
+                let short = [
+                    Number(4.0),
+                    FormDot(0),
+                    Number(if cond { 1.0 } else { 0.0 }),
+                    ShortCircuit {
+                        target: 5,
+                        condition: ShortCircuitCondition::Truthy,
+                    },
+                    LoadBinding(1),
+                    PutDot(0),
+                ];
+                assert_eq!(shape(&short, 1, &mut 20), Ok(())); // 7 + 6 + 7
+                let mut trace = Trace::new(&[]);
+                assert_eq!(
+                    number(trace.run(&short, 1).unwrap()),
+                    if cond { 1.0 } else { 9.0 }
+                );
+                assert_eq!(trace.events.contains(&Event::Argument), !cond);
+            }
+            let bad_short = [
+                Number(4.0),
+                FormDot(0),
+                Boolean(false),
+                ShortCircuit {
+                    target: 6,
+                    condition: ShortCircuitCondition::Truthy,
+                },
+                Number(9.0),
+                PutDot(0),
+            ];
+            assert_eq!(
+                shape(&bad_short, 1, &mut 100),
+                Err(EvalError::InvalidScript.into())
+            );
+            assert!(Trace::new(&[]).run(&bad_short, 1).is_ok());
+        }
+
+        #[test]
+        fn property_layout_and_metadata_are_checked_even_without_artifact_or_call() {
+            let ops = [
+                Number(5.0),
+                Number(6.0),
+                FormDot(0),
+                Add,
+                Number(7.0),
+                PutDot(0),
+            ];
+            // An invalid operand consumer isn't a structural/shape rejection.
+            assert_eq!(shape(&ops, 2, &mut 100), Ok(()));
+            assert!(matches!(
+                Trace::new(&[]).run(&ops, 2),
+                Err(Fault::Eval(EvalError::InvalidScript))
+            ));
+            let peak = [
+                Number(0.0),
+                Number(1.0),
+                Number(2.0),
+                Number(3.0),
+                GetDot(0),
+                Jump(6),
+            ];
+            assert_eq!(
+                validate_layout(&peak, 4, ExitStack::Value),
+                Err(EvalError::InvalidScript)
+            );
+            assert_eq!(shape(&peak, 4, &mut 100), Ok(()));
+            let simple = [Number(4.0), FormDot(0), Number(9.0), PutDot(0)];
+            assert_eq!(shape(&simple, 1, &mut 100), Ok(()));
+            assert_eq!(number(Trace::new(&[]).run(&simple, 1).unwrap()), 9.0);
+            let mut trace = Trace::new(&[]);
+            for site in [1, crate::eval::MAX_DOT_SITES as u16, BARE_CALL] {
+                let ops = [Number(7.0), GetDot(site)];
+                assert_eq!(
+                    shape(&ops, 1, &mut 100),
+                    Err(EvalError::InvalidScript.into())
+                );
+                assert!(matches!(
+                    trace.run(&ops, 1),
+                    Err(Fault::Eval(EvalError::InvalidScript))
+                ));
+            }
+            assert!(trace.events.is_empty());
+        }
+
+        #[test]
+        fn prepared_callee_is_pinned_and_abrupt_outcomes_are_ordered() {
+            let artifacts = artifact(vec![
+                body(vec![LoadLocal(0), Return { value: true }], 1, 1, 1),
+                body(vec![Number(76.0), Return { value: true }], 1, 0, 0),
+            ]);
+            let ops = [Number(4.0), PrepareDotCall(0), LoadBinding(1), call(0, 1)];
+            let mut trace = Trace::new(&artifacts);
+            trace.read = Operand::Function(FunctionId(0));
+            trace.replace_read_on_arg = Some(Operand::Function(FunctionId(1)));
+            assert_eq!(number(trace.run(&ops, 2).unwrap()), 9.0);
+            assert_eq!(
+                trace.events,
+                [
+                    Event::Debit(1),
+                    Event::Get(4.0),
+                    Event::Argument,
+                    Event::Setup(2)
+                ]
+            );
+
+            for (value, failure) in [
+                (scalar(2.0), Some(Fault::NonCallable(CALL_SPAN))),
+                (
+                    Operand::Function(OBJECT),
+                    Some(Fault::ObjectCall(CALL_SPAN)),
+                ),
+                (
+                    Operand::Function(FUNCTION),
+                    Some(Fault::FunctionCall(CALL_SPAN)),
+                ),
+                (Operand::Function(IMMEDIATE), None),
+            ] {
+                let mut trace = Trace::new(&[]);
+                trace.read = value;
+                match failure {
+                    Some(failure) => assert_eq!(trace.run(&ops, 2).err(), Some(failure)),
+                    None => assert!(matches!(
+                        trace.run(&ops, 2),
+                        Ok(Operand::Scalar(Value::Undefined))
+                    )),
+                }
+                assert_eq!(
+                    trace.events,
+                    [Event::Debit(1), Event::Get(4.0), Event::Argument]
+                );
+                trace.events.clear();
+                trace.reject_arg = true;
+                assert_eq!(trace.run(&ops, 2).err(), Some(Fault::Argument));
+                assert_eq!(
+                    trace.events,
+                    [Event::Debit(1), Event::Get(4.0), Event::Argument]
+                );
+                trace.events.clear();
+                trace.reject_get = true;
+                assert_eq!(trace.run(&ops, 2).err(), Some(Fault::Get));
+                assert_eq!(trace.events, [Event::Debit(1), Event::Get(4.0)]);
+            }
+            let mut trace = Trace::new(&[]);
+            trace.credits = 0;
+            assert_eq!(trace.run(&ops, 2).err(), Some(Fault::PacketWork));
+            assert_eq!(trace.events, [Event::Debit(1)]); // no early Get on work failure
+
+            let put = [Number(4.0), FormDot(0), LoadBinding(1), PutDot(0)];
+            let mut trace = Trace::new(&[]);
+            trace.reject_arg = true;
+            assert_eq!(trace.run(&put, 1).err(), Some(Fault::Argument));
+            assert_eq!(trace.events, [Event::Debit(1), Event::Argument]);
+            trace.events.clear();
+            trace.reject_arg = false;
+            assert_eq!(number(trace.run(&put, 1).unwrap()), 9.0);
+            assert_eq!(
+                trace.events,
+                [Event::Debit(1), Event::Argument, Event::Put(4.0, 9.0)]
+            );
+        }
+
+        #[test]
+        fn ordinary_mutators_and_entire_frame_operations_respect_the_floor() {
+            for (op, operand) in [
+                (Discard, None),
+                (Void, None),
+                (Typeof, None),
+                (StoreBindingKeep(7), None),
+                (Add, Some(Number(1.0))),
+                (call(BARE_CALL, 0), None),
+                (call(BARE_CALL, 1), Some(Number(1.0))),
+                (PutDot(0), Some(Number(1.0))),
+                (call(1, 0), None),
+                (call(0, 1), None),
+                (call(0, 0), Some(Number(1.0))),
+            ] {
+                let mut ops = vec![Number(4.0), PrepareDotCall(0)];
+                ops.extend(operand);
+                ops.push(op);
+                let mut trace = Trace::new(&[]);
+                trace.read = Operand::Function(IMMEDIATE);
+                assert_eq!(
+                    trace.run(&ops, 2).err(),
+                    Some(EvalError::InvalidScript.into()),
+                    "{op:?}"
+                );
+                assert_eq!(trace.events, [Event::Debit(1), Event::Get(4.0)]);
+            }
+            for op in [
+                JumpStatement(4),
+                LoopBack(0),
+                JumpIfFalseStatement(4),
+                ShortCircuitStatement {
+                    target: 4,
+                    condition: ShortCircuitCondition::Truthy,
+                },
+                StoreBinding(7),
+                InitBinding {
+                    slot: 7,
+                    kind: BindingKind::Let,
+                },
+                Return { value: true },
+                StoreLocal {
+                    slot: 0,
+                    keep: false,
+                },
+            ] {
+                let ops = [Number(4.0), FormDot(0), Number(9.0), op];
+                let mut trace = Trace::new(&[]);
+                assert_eq!(
+                    shape(&ops, 1, &mut 100),
+                    Err(EvalError::InvalidScript.into())
+                );
+                assert_eq!(
+                    trace.run(&ops, 1).err(),
+                    Some(EvalError::InvalidScript.into())
+                );
+                assert_eq!(trace.events, [Event::Debit(1)]);
+            }
+            let mut trace = Trace::new(&[]);
+            for ops in [
+                &[Number(4.0), FormDot(0), Number(9.0)][..],
+                &[Number(4.0), PrepareDotCall(0)][..],
+                &[Number(4.0), call(0, 0)][..],
+            ] {
+                assert_eq!(
+                    trace.run(ops, 1).err(),
+                    Some(EvalError::InvalidScript.into())
+                );
+            }
+            // Discard as comma can consume an operand above the pinned callee.
+            trace.read = Operand::Function(IMMEDIATE);
+            let ops = [
+                Number(4.0),
+                PrepareDotCall(0),
+                Number(9.0),
+                Discard,
+                Number(11.0),
+                call(0, 1),
+            ];
+            assert!(matches!(
+                trace.run(&ops, 2),
+                Ok(Operand::Scalar(Value::Undefined))
+            ));
+        }
+
+        #[test]
+        fn recursive_callee_cannot_steal_same_body_site_and_absolute_anchor() {
+            for steal in [false, true] {
+                let mut ops = vec![
+                    LoadBinding(3),
+                    JumpIfFalse(8),
+                    Number(4.0),
+                    FormDot(1),
+                    LoadBinding(0),
+                    call(BARE_CALL, 0),
+                    PutDot(1),
+                    Return { value: true },
+                    Number(9.0),
+                ];
+                if steal {
+                    ops.push(PutDot(1));
+                }
+                ops.push(Return { value: true });
+                let artifacts = artifact(vec![body(ops, 1, 0, 0)]);
+                let mut trace = Trace::new(&artifacts);
+                let result = trace.run(&[LoadBinding(0), call(BARE_CALL, 0)], 1);
+                if steal {
+                    assert_eq!(result.err(), Some(EvalError::InvalidScript.into()));
+                    assert!(!trace.events.iter().any(|e| matches!(e, Event::Put(..))));
+                } else {
+                    assert_eq!(number(result.unwrap()), 9.0);
+                    assert!(trace.events.contains(&Event::Put(4.0, 9.0)));
+                }
+            }
+            for suffix in [vec![], vec![Return { value: false }]] {
+                let mut ops = vec![Number(4.0), FormDot(1)];
+                ops.extend(suffix);
+                let artifacts = artifact(vec![body(ops, 1, 0, 0)]);
+                assert_eq!(
+                    Trace::new(&artifacts)
+                        .run(&[LoadBinding(0), call(BARE_CALL, 0)], 1)
+                        .err(),
+                    Some(EvalError::InvalidScript.into())
+                );
+            }
+        }
+
+        #[test]
+        fn slot_frontier_includes_both_packet_kinds_and_entered_receiver() {
+            // 31 recursive frames * 128 locals + root/caller prefix + 3 peak.
+            let wide = || {
+                body(
+                    vec![
+                        LoadLocal(0),
+                        JumpIfFalse(8),
+                        LoadBinding(0),
+                        LoadLocal(0),
+                        Number(1.0),
+                        Subtract,
+                        call(BARE_CALL, 1),
+                        Return { value: true },
+                        Number(9.0),
+                        Return { value: true },
+                    ],
+                    3,
+                    1,
+                    128,
+                )
+            };
+            for padding in [124, 125] {
+                let fit = padding == 124;
+                for opener in [FormDot(0), PrepareDotCall(0)] {
+                    let artifacts = artifact(vec![wide()]);
+                    let mut trace = Trace::new(&artifacts);
+                    trace.read = Operand::Function(IMMEDIATE);
+                    let prepared = matches!(opener, PrepareDotCall(_));
+                    let filler = padding - usize::from(prepared);
+                    let mut ops = vec![Number(4.0), opener];
+                    ops.extend(std::iter::repeat_n(Number(0.0), filler));
+                    ops.extend([LoadBinding(0), Number(30.0), call(BARE_CALL, 1)]);
+                    ops.extend(std::iter::repeat_n(Discard, filler + 1));
+                    ops.extend(if prepared {
+                        vec![call(0, 0)]
+                    } else {
+                        vec![Number(9.0), PutDot(0)]
+                    });
+                    assert_eq!(
+                        trace.run(&ops, padding + 2).err(),
+                        (!fit).then_some(EvalError::LiveSlotLimitExceeded.into())
+                    );
+                }
+                let mut caller = vec![Number(0.0); padding];
+                caller.extend([LoadBinding(0), Number(30.0), call(BARE_CALL, 1)]);
+                caller.extend(std::iter::repeat_n(Discard, padding + 1));
+                caller.push(Return { value: false });
+                let artifacts = artifact(vec![wide(), body(caller, padding + 2, 0, 0)]);
+                let mut trace = Trace::new(&artifacts);
+                trace.read = Operand::Function(FunctionId(1));
+                let ops = [Number(4.0), PrepareDotCall(0), call(0, 0)];
+                assert_eq!(
+                    trace.run(&ops, 1).err(),
+                    (!fit).then_some(EvalError::LiveSlotLimitExceeded.into())
+                );
+                // Same activation and peak, with a bare call (no explicit receiver).
+                let ops = [LoadBinding(2), call(BARE_CALL, 0)];
+                assert!(trace.run(&ops, 1).is_ok());
+            }
+        }
+
+        #[test]
+        fn property_free_policies_do_not_execute_dots_or_treat_member_calls_as_bare() {
+            for op in [
+                GetDot(0),
+                FormDot(0),
+                PrepareDotCall(0),
+                PutDot(0),
+                call(0, 0),
+            ] {
+                let ops = [Number(4.0), op];
+                let mut scratch = EvalScratch::new();
+                assert!(matches!(
+                    crate::eval::evaluate(&ops, 1, 0, &[], ExitStack::Value, &mut scratch),
+                    Err(EvalError::InvalidScript)
+                ));
+                let mut code = CompiledScript::compile("1;").unwrap();
+                code.instructions = ops.to_vec();
+                assert_eq!(
+                    Realm::new().instantiate(&code).unwrap().execute(),
+                    Err(EngineFault::Evaluation(EvalError::InvalidScript))
+                );
+            }
+            let ops = [Jump(2), GetDot(0), Number(4.0)];
+            let result =
+                crate::eval::evaluate(&ops, 1, 0, &[], ExitStack::Value, &mut EvalScratch::new());
+            assert!(matches!(
+                result,
+                Ok(Some(Operand::Scalar(Value::Number(4.0))))
+            ));
+        }
+
+        #[test]
+        fn prepare_slot_fit_is_checked_before_debit_or_early_get() {
+            let wide = body(
+                vec![
+                    LoadLocal(0),
+                    JumpIfFalse(8),
+                    LoadBinding(0),
+                    LoadLocal(0),
+                    Number(1.0),
+                    Subtract,
+                    call(BARE_CALL, 1),
+                    Return { value: true },
+                    Number(4.0),
+                    PrepareDotCall(1),
+                    call(1, 0),
+                    Return { value: true },
+                ],
+                3,
+                1,
+                128,
+            );
+            let artifacts = artifact(vec![wide]);
+            for padding in [124, 125] {
+                let mut trace = Trace::new(&artifacts);
+                trace.read = Operand::Function(IMMEDIATE);
+                let mut ops = vec![Number(0.0); padding];
+                ops.extend([LoadBinding(0), Number(30.0), call(BARE_CALL, 1)]);
+                ops.extend(std::iter::repeat_n(Discard, padding + 1));
+                ops.push(Number(9.0));
+                let fit = padding == 124;
+                assert_eq!(
+                    trace.run(&ops, padding + 2).err(),
+                    (!fit).then_some(EvalError::LiveSlotLimitExceeded.into())
+                );
+                assert_eq!(trace.events.contains(&Event::Debit(1)), fit);
+                assert_eq!(trace.events.contains(&Event::Get(4.0)), fit);
+            }
+        }
+
+        #[test]
+        fn receiver_is_released_on_return_and_fallthrough() {
+            let wide = || {
+                body(
+                    vec![
+                        LoadLocal(0),
+                        JumpIfFalse(8),
+                        LoadBinding(0),
+                        LoadLocal(0),
+                        Number(1.0),
+                        Subtract,
+                        call(BARE_CALL, 1),
+                        Return { value: true },
+                        Number(9.0),
+                        Return { value: true },
+                    ],
+                    3,
+                    1,
+                    128,
+                )
+            };
+            let mut ops = vec![Number(4.0), PrepareDotCall(0), call(0, 0), Discard];
+            ops.extend(std::iter::repeat_n(Number(0.0), 125));
+            ops.extend([LoadBinding(0), Number(30.0), call(BARE_CALL, 1)]);
+            ops.extend(std::iter::repeat_n(Discard, 126));
+            ops.push(Number(9.0));
+            // The second call exactly fills the 4096 frontier, so a leaked
+            // receiver from either completion form would make it fail.
+            for member in [vec![], vec![Return { value: false }]] {
+                let artifacts = artifact(vec![wide(), body(member, 0, 0, 0)]);
+                let mut trace = Trace::new(&artifacts);
+                trace.read = Operand::Function(FunctionId(1));
+                assert_eq!(number(trace.run(&ops, 127).unwrap()), 9.0);
+            }
+        }
+
+        #[test]
+        fn immediate_intrinsic_does_not_use_a_user_frame_at_the_depth_limit() {
+            let recursive = body(
+                vec![
+                    LoadLocal(0),
+                    JumpIfFalse(8),
+                    LoadBinding(0),
+                    LoadLocal(0),
+                    Number(1.0),
+                    Subtract,
+                    call(BARE_CALL, 1),
+                    Return { value: true },
+                    Number(4.0),
+                    PrepareDotCall(1),
+                    call(1, 0),
+                    Return { value: true },
+                ],
+                3,
+                1,
+                1,
+            );
+            let artifacts = artifact(vec![recursive]);
+            let ops = [LoadBinding(0), Number(31.0), call(BARE_CALL, 1)];
+            let mut trace = Trace::new(&artifacts);
+            trace.read = Operand::Function(IMMEDIATE);
+            assert!(matches!(
+                trace.run(&ops, 2),
+                Ok(Operand::Scalar(Value::Undefined))
+            ));
+            assert_eq!(
+                trace
+                    .events
+                    .iter()
+                    .filter(|e| **e == Event::Setup(2))
+                    .count(),
+                32
+            );
+            trace.read = Operand::Function(FunctionId(0));
+            assert_eq!(
+                trace.run(&ops, 2).err(),
+                Some(EvalError::CallDepthLimitExceeded.into())
+            );
+        }
+
+        #[test]
+        fn requested_packet_tiers_charge_moves_but_reuse_after_removal() {
+            use crate::eval::{Packet, PacketKind, Packets};
+            let mut trace = Trace::new(&[]);
+            let mut packets = Packets::default();
+            let mut largest_overlap = 0;
+            for at in 0..4096 {
+                let old = packets.tier;
+                packets.reserve_push(0, 0, 0, &mut trace).unwrap();
+                if old != packets.tier {
+                    largest_overlap = largest_overlap.max(old + packets.tier);
+                }
+                packets.rows.push(Packet {
+                    captured: scalar(4.0),
+                    site: 0,
+                    anchor: at,
+                    kind: PacketKind::Form,
+                });
+            }
+            assert_eq!((packets.tier, largest_overlap), (4096, 6144));
+            assert_eq!(trace.credits, 128 * 1024 - (4096 + 4095));
+            let events = trace.events.len();
+            assert_eq!(
+                packets.reserve_push(0, 0, 0, &mut trace),
+                Err(EvalError::LiveSlotLimitExceeded.into())
+            );
+            assert_eq!(trace.events.len(), events);
+            packets.rows.pop();
+            packets.reserve_push(0, 0, 0, &mut trace).unwrap();
+            assert_eq!(trace.events.last(), Some(&Event::Debit(1)));
+            assert_eq!(packets.tier, 4096);
+
+            // Reach both kinds on one LIFO stack, removing Prepare on the
+            // immediate path then Form without spending more backing.
+            let ops = [
+                Number(4.0),
+                FormDot(0),
+                Number(6.0),
+                PrepareDotCall(0),
+                call(0, 0),
+                Discard,
+                Number(9.0),
+                PutDot(0),
+            ];
+            let mut trace = Trace::new(&[]);
+            trace.read = Operand::Function(IMMEDIATE);
+            assert_eq!(number(trace.run(&ops, 1).unwrap()), 9.0);
+            assert_eq!(
+                trace.events,
+                [
+                    Event::Debit(1),
+                    Event::Debit(2),
+                    Event::Get(6.0),
+                    Event::Put(4.0, 9.0)
+                ]
+            );
+        }
+    }
+
     #[test]
     fn initial_names_belong_to_creators_not_result_values_or_stores() {
         let source = "

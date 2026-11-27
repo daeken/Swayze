@@ -55,6 +55,8 @@ const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_FUNCTIONS: usize = 512;
 const LOOKUP_WORK: usize = 128 * 1024;
 const MAX_GLOBALS: usize = 512;
+// One Script-instantiation budget: callable imports pay for name provenance
+// and selected initial object/descriptor construction here, not on first call.
 const PREFLIGHT_WORK: usize = 128 * 1024;
 const MAX_COPIED_UNITS: usize = 16_384;
 const MAX_RETAINED_UNITS: usize = 32_768;
@@ -242,6 +244,8 @@ pub enum InstantiateError {
     ArtifactLimitExceeded,
     ArtifactBytesLimitExceeded,
     FunctionLimitExceeded,
+    /// Instantiation would exceed 131,072 work credits, including callable
+    /// metadata, initial heap construction, and any table moves.
     WorkLimitExceeded,
     AllocationFailed,
     InvalidScript,
@@ -2098,6 +2102,63 @@ mod tests {
         assert_eq!(
             realm.instantiate(&probe).unwrap().execute(),
             Ok(Completion::Normal)
+        );
+    }
+
+    #[test]
+    fn callable_initial_heap_moves_the_production_preflight_boundary() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for i in 0..158 {
+            write!(source, "function f{i:03}(){{}}").unwrap();
+        }
+        source.push_str(&"1;".repeat(171));
+        let at_limit = CompiledScript::compile(&format!("{source}+1;")).unwrap();
+        let over_limit = CompiledScript::compile(&format!("{source}+ +1;")).unwrap();
+        assert_eq!(
+            (at_limit.instructions.len(), over_limit.instructions.len()),
+            (344, 345)
+        );
+        assert!(
+            at_limit
+                .functions
+                .iter()
+                .all(|body| body.instructions.is_empty())
+        );
+
+        // A fresh Realm avoids allocator-dependent old-table moves. For n
+        // distinct four-byte names, selection and binding lookup each compare
+        // n(n−1)/2 candidates at 5 credits. Other old work is 24n plus the
+        // root instruction scan. Name provenance adds 6n (range table, site
+        // walk, and ASCII validation); the heap adds 12n + 62 (two writes per
+        // initial object or row). This moves the old 128,166/128,167 pair to
+        // exactly 131,072/131,073 without changing the budget itself.
+        let mut realm = Realm::new();
+        assert_eq!(
+            realm.instantiate(&over_limit).unwrap_err(),
+            InstantiateError::WorkLimitExceeded
+        );
+        assert_eq!(
+            (
+                realm.artifact_bytes,
+                realm.artifacts.len(),
+                realm.functions.len(),
+                realm.state.object.vars.len()
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            realm.instantiate(&at_limit).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        assert_eq!(
+            (
+                realm.artifacts.len(),
+                realm.functions.len(),
+                realm.state.object.vars.len()
+            ),
+            (1, 158, 158)
         );
     }
 

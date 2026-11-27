@@ -1,26 +1,54 @@
 use crate::{
     eval::MAX_INSTRUCTIONS,
     realm::{
-        CodeMode, CompileError, CompileLimit, CompiledScript, FrameLayout, FunctionBody,
+        BodyKind, CodeMode, CompileError, CompileLimit, CompiledScript, FrameLayout, FunctionBody,
         MAX_CODE_NAME_BYTES, MAX_DECLARATIONS, MAX_FRAME_LOCALS, MAX_NAME_BYTES, MAX_PARAMETERS,
-        MAX_SITES, Role, Site,
+        MAX_SITES, NameRange, Role, Site,
     },
 };
 
 use super::{
-    AccessKind, BindingPolicy, Error, ExpressionEnd, Instruction, Limit, Limits, ParseErrorType,
-    Parser, Pending, QuotedDecimalEscape, RealmParseLimit, Span, TokenKind, TokenPosition,
-    UNPATCHED, WriteAccess, new_parser, try_push,
+    AccessKind, ActiveStatement, AfterExpression, BindingPolicy, DirectReference, Error,
+    ExpressionEnd, ExpressionInput, ExpressionResume, Follow, Instruction, Limit, Limits, Operator,
+    ParseAction, ParseErrorType, ParseOwner, Parser, Pending, QuotedDecimalEscape, RealmParseLimit,
+    Span, Token, TokenKind, TokenPosition, UNPATCHED, WriteAccess, new_parser, try_push,
 };
 
+// Shared source, cursor, fuel, literal pool, access numbering and scope
+// allocation remain live. Only the active code-owner state is exchanged.
 pub(super) struct OpenFunction {
     root_ops: Vec<Instruction>,
     root_peak: usize,
-    root_mode: CodeMode,
+    root_stack: usize,
+    root_owner: ParseOwner,
     root_witness: QuotedDecimalEscape,
+    root_pending: Vec<(Pending, Span)>,
+    root_statement_frames: Vec<ActiveStatement>,
+    root_labels: Vec<Span>,
+    root_innermost_loop: Option<usize>,
+    root_innermost_target: Option<usize>,
+    root_header_scope: Option<usize>,
+    root_lookahead: Option<Option<Token>>,
+    pub(super) root_depth: usize,
+    expression: Option<ExpressionContinuation>,
+    body: u16,
     params: Vec<Span>,
     vars: Vec<Span>,
     accesses: usize,
+}
+
+impl OpenFunction {
+    pub(super) fn parked_statement_count(&self) -> usize {
+        self.root_statement_frames.len()
+    }
+}
+
+pub(super) struct ExpressionContinuation {
+    pub(super) end: ExpressionEnd,
+    pub(super) after: AfterExpression,
+    pub(super) keyword: Span,
+    pub(super) base_depth: usize,
+    pub(super) template_depth: usize,
 }
 
 pub(super) struct ParsedFunction {
@@ -28,31 +56,55 @@ pub(super) struct ParsedFunction {
     locals: Vec<Span>,
     vars: Vec<Span>,
     witness: QuotedDecimalEscape,
+    initial_name: Option<Span>,
 }
 
 impl Parser<'_> {
     pub(super) fn open_function(
         &mut self,
-        root_mode: CodeMode,
+        root_owner: ParseOwner,
         keyword: Span,
+        expression: Option<ExpressionContinuation>,
     ) -> Result<(), Error> {
-        let name =
-            self.require_token(TokenPosition::Plain, "expected an ordinary function name")?;
-        if !matches!(name.kind, TokenKind::Identifier) {
-            return Err(Error::unsupported(
-                name.span,
-                "expected a simple ordinary function name",
-            ));
-        }
+        let name = if expression.is_none() {
+            let name =
+                self.require_token(TokenPosition::Plain, "expected an ordinary function name")?;
+            if !matches!(name.kind, TokenKind::Identifier) {
+                return Err(Error::unsupported(
+                    name.span,
+                    "expected a simple ordinary function name",
+                ));
+            }
+            Some(name.span)
+        } else {
+            None
+        };
         let open = self.require_token(
             TokenPosition::Plain,
             "expected '(' before formal parameters",
         )?;
-        if !matches!(open.kind, TokenKind::Open) {
-            return Err(Error::malformed(
-                open.span,
-                "expected '(' before formal parameters",
+        if expression.is_some() && matches!(open.kind, TokenKind::Operator(Operator::Multiply)) {
+            return Err(Error::unsupported(
+                keyword,
+                "generator function expressions are outside the subset",
             ));
+        }
+        if !matches!(open.kind, TokenKind::Open) {
+            return Err(
+                if expression.is_some() && matches!(open.kind, TokenKind::Identifier) {
+                    Error::unsupported(
+                        open.span,
+                        "named function expressions are outside the subset",
+                    )
+                } else {
+                    Error::malformed(open.span, "expected '(' before formal parameters")
+                },
+            );
+        }
+        // The boundary and any nested body delimiters spend from the
+        // Script's nesting limit, without sharing its pendings or targets.
+        if expression.is_some() {
+            self.enter_nesting(keyword)?;
         }
         let mut params = Vec::new();
         let mut formal =
@@ -118,19 +170,35 @@ impl Parser<'_> {
         // is ample under the aggregate token and declaration ceilings.
         let body = u16::try_from(self.functions.len())
             .map_err(|_| Error::limit(keyword, Limit::Allocation))?;
-        try_push(
-            &mut self.realm_declarations,
-            (name.span, Role::Function { body }),
-            name.span,
-        )?;
+        if let Some(name) = name {
+            try_push(
+                &mut self.realm_declarations,
+                (name, Role::Function { body }),
+                name,
+            )?;
+        }
+        // Nothing can peek into the body before '{'. The lexer cursor and
+        // aggregate ledgers are shared (no relex); lookahead is owner-local.
+        debug_assert!(self.lookahead.is_none());
         self.function = Some(OpenFunction {
             root_ops: std::mem::take(&mut self.instructions),
             root_peak: std::mem::take(&mut self.max_stack_depth),
-            root_mode,
+            root_stack: std::mem::take(&mut self.stack_depth),
+            root_owner,
             root_witness: std::mem::replace(
                 &mut self.lexer.quoted_decimal_escape,
                 QuotedDecimalEscape::Pending,
             ),
+            root_pending: std::mem::take(&mut self.pending),
+            root_statement_frames: std::mem::take(&mut self.statement_frames),
+            root_labels: std::mem::take(&mut self.labels),
+            root_innermost_loop: self.innermost_loop.take(),
+            root_innermost_target: self.innermost_target.take(),
+            root_header_scope: self.for_header_scope.take(),
+            root_lookahead: self.lookahead.take(),
+            root_depth: std::mem::take(&mut self.nesting_depth),
+            expression,
+            body,
             params,
             vars: Vec::new(),
             accesses: self.accesses.len(),
@@ -138,33 +206,44 @@ impl Parser<'_> {
         Ok(())
     }
 
-    pub(super) fn close_function(&mut self, mode: CodeMode, span: Span) -> Result<CodeMode, Error> {
+    pub(super) fn close_function(
+        &mut self,
+        owner: &mut ParseOwner,
+        span: Span,
+    ) -> Result<ParseAction, Error> {
         let function = self
             .function
             .take()
             .ok_or_else(|| Error::malformed(span, "invalid function boundary"))?;
-        // Only this outer loop consumes the body's closing brace. An if-tail
-        // can peek at that brace, never beyond it. No quoted token can be
-        // decoded across either boundary under this grammar.
+        // A body if-tail can peek at its closing brace, never beyond it.
+        // Thus the lexer witness before/after either fence is unambiguous.
         debug_assert!(
             self.lookahead.is_none()
                 && self.statement_frames.is_empty()
+                && self.pending.is_empty()
+                && self.stack_depth == 0
                 && self.labels.is_empty()
                 && self.for_header_scope.is_none()
                 && self.innermost_target.is_none()
                 && self.innermost_loop.is_none()
+                && self.nesting_depth == 0
         );
         let body = FunctionBody {
             instructions: std::mem::replace(&mut self.instructions, function.root_ops),
             max_stack_depth: std::mem::replace(&mut self.max_stack_depth, function.root_peak),
-            mode: if function.root_mode == CodeMode::Strict {
+            mode: if function.root_owner.mode == CodeMode::Strict {
                 CodeMode::Strict
             } else {
-                mode
+                owner.mode
             },
             layout: FrameLayout::new(function.params.len(), function.params.len())
                 .ok_or_else(|| Error::malformed(span, "invalid formal layout"))?,
             accesses: function.accesses..self.accesses.len(),
+            kind: if function.expression.is_some() {
+                BodyKind::Expression(None)
+            } else {
+                BodyKind::Declaration
+            },
         };
         let witness =
             std::mem::replace(&mut self.lexer.quoted_decimal_escape, function.root_witness);
@@ -175,10 +254,56 @@ impl Parser<'_> {
                 locals: function.params,
                 vars: function.vars,
                 witness,
+                initial_name: None,
             },
             span,
         )?;
-        Ok(function.root_mode)
+        *owner = function.root_owner;
+        self.stack_depth = function.root_stack;
+        self.nesting_depth = function.root_depth;
+        self.pending = function.root_pending;
+        self.statement_frames = function.root_statement_frames;
+        self.labels = function.root_labels;
+        self.innermost_loop = function.root_innermost_loop;
+        self.innermost_target = function.root_innermost_target;
+        self.for_header_scope = function.root_header_scope;
+        self.lookahead = function.root_lookahead;
+        if let Some(saved) = function.expression {
+            self.nesting_depth -= 1;
+            let creator = self.instructions.len();
+            self.emit(Instruction::CreateFunction(function.body), saved.keyword)?;
+            Ok(ParseAction::Expression {
+                input: ExpressionInput::Resume(ExpressionResume {
+                    base_depth: saved.base_depth,
+                    template_depth: saved.template_depth,
+                    creator,
+                }),
+                end: saved.end,
+                after: saved.after,
+            })
+        } else {
+            Ok(ParseAction::Item)
+        }
+    }
+
+    pub(super) fn infer_function_name(
+        &mut self,
+        reference: Option<DirectReference>,
+        name: Span,
+    ) -> Result<(), Error> {
+        let Some(DirectReference::AnonymousDefinition(creator)) = reference else {
+            return Ok(());
+        };
+        self.lexer.charge(1, name)?;
+        if let Some(Instruction::CreateFunction(body)) = self.instructions.get(creator)
+            && let Some(function) = self.functions.get_mut(usize::from(*body))
+            && matches!(function.body.kind, BodyKind::Expression(None))
+            && function.initial_name.is_none()
+        {
+            function.initial_name = Some(name);
+            return Ok(());
+        }
+        Err(Error::malformed(name, "invalid anonymous function creator"))
     }
 
     pub(super) fn record_local_var(&mut self, name: Span) -> Result<(), Error> {
@@ -198,7 +323,7 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    pub(super) fn parse_return(&mut self, keyword: Span) -> Result<(), Error> {
+    pub(super) fn parse_return(&mut self, keyword: Span) -> Result<ParseAction, Error> {
         if self.function.is_none() {
             let mut error = Error::malformed(keyword, "return is not allowed in Script code");
             error.parse_error_type = Some(ParseErrorType::SyntaxError);
@@ -209,7 +334,11 @@ impl Parser<'_> {
             "return requires an explicit semicolon",
         )?;
         if matches!(first.kind, TokenKind::Semicolon) {
-            return self.emit(Instruction::Return { value: false }, keyword);
+            self.emit(Instruction::Return { value: false }, keyword)?;
+            return Ok(ParseAction::Follow(
+                Follow::Item,
+                Span::at(self.lexer.offset),
+            ));
         }
         if first.after_line_break {
             return Err(Error::unsupported(
@@ -217,8 +346,11 @@ impl Parser<'_> {
                 "line-separated return requires an explicit semicolon before the next statement",
             ));
         }
-        self.parse_expression(first.into(), ExpressionEnd::Return)?;
-        self.emit(Instruction::Return { value: true }, keyword)
+        Ok(ParseAction::expression(
+            first.into(),
+            ExpressionEnd::Return,
+            AfterExpression::Return(keyword),
+        ))
     }
 
     pub(super) fn finish_call(&mut self, close: Span, last: bool) -> Result<(), Error> {
@@ -396,6 +528,10 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
     let mut parsed = std::mem::take(&mut parser.functions);
     for function in &mut parsed {
         function.plan_locals(&mut parser)?;
+        if let Some(span) = function.initial_name {
+            function.body.kind =
+                BodyKind::Expression(Some(copy_name_range(&mut parser, &mut names, span)?));
+        }
     }
     let mut parsed = parsed.into_iter().peekable();
     for index in 0..parser.accesses.len() {
@@ -471,6 +607,20 @@ fn copy_name(
     span: Span,
     role: Role,
 ) -> Result<Site, CompileError> {
+    let NameRange { start, end } = copy_name_range(parser, names, span)?;
+    Ok(Site {
+        span,
+        start,
+        end,
+        role,
+    })
+}
+
+fn copy_name_range(
+    parser: &mut Parser<'_>,
+    names: &mut Vec<u8>,
+    span: Span,
+) -> Result<NameRange, CompileError> {
     let source = parser.lexer.source;
     let name = source
         .as_bytes()
@@ -492,11 +642,9 @@ fn copy_name(
             .map_err(|_| Error::limit(span, Limit::Allocation))?;
     }
     names.extend_from_slice(name);
-    Ok(Site {
-        span,
+    Ok(NameRange {
         start: u16::try_from(start).map_err(|_| CompileError::InvalidScript)?,
         end: u16::try_from(end).map_err(|_| CompileError::InvalidScript)?,
-        role,
     })
 }
 

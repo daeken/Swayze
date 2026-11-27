@@ -191,6 +191,7 @@ pub enum EvalError {
     /// Converting a callable to a primitive requires unsupported object machinery.
     UnsupportedCallableConversion,
     CallDepthLimitExceeded,
+    FunctionLimitExceeded,
     LiveSlotLimitExceeded,
     GlobalLookupLimitExceeded,
 }
@@ -201,6 +202,7 @@ impl fmt::Display for EvalError {
             Self::UnsupportedCallableConversion => {
                 "callable-to-primitive conversion is outside the subset"
             }
+            Self::FunctionLimitExceeded => "JavaScript Realm function identity limit exceeded",
             Self::CallDepthLimitExceeded => "JavaScript guest frame limit exceeded",
             Self::LiveSlotLimitExceeded => "JavaScript live frame slot limit exceeded",
             Self::GlobalLookupLimitExceeded => {
@@ -697,6 +699,18 @@ fn dispatch<'code, B: Bindings>(
         *ip += 1;
         let source = bindings.transient(scratch, string_units, callable.artifacts);
         match op {
+            Instruction::CreateFunction(template) if B::CALLS => {
+                // Do not allocate an identity unless the root can hold the
+                // result; the active frame's operand reservation already exists.
+                if body.is_some()
+                    || stack.len() >= max_operands
+                    || stack.slots.len() == stack.slots.capacity()
+                {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                let id = bindings.create_function(template)?;
+                push_operand(&mut stack, max_operands, Operand::Function(id))?;
+            }
             Instruction::Call { start, end, argc } if B::CALLS => {
                 let argc = usize::from(argc);
                 if argc > usize::from(realm::MAX_PARAMETERS) || start >= end {
@@ -714,7 +728,8 @@ fn dispatch<'code, B: Bindings>(
                     }));
                 };
                 // Only after GetValue and all argument expressions succeed.
-                let (origin, target) = callable.resolve(id)?;
+                let origin = bindings.function_origin(id)?;
+                let (_, target) = callable.body(origin).ok_or(EvalError::InvalidScript)?;
                 if callers.len() == MAX_GUEST_FRAMES {
                     return Err(EvalError::CallDepthLimitExceeded.into());
                 }
@@ -780,7 +795,8 @@ fn dispatch<'code, B: Bindings>(
                 update_result(&mut stack, max_operands, result, old, new)?;
                 *stack.local(slot)? = Operand::Scalar(Value::Number(new));
             }
-            Instruction::Call { .. }
+            Instruction::CreateFunction(_)
+            | Instruction::Call { .. }
             | Instruction::Return { .. }
             | Instruction::LoadLocal(_)
             | Instruction::StoreLocal { .. }
@@ -793,7 +809,7 @@ fn dispatch<'code, B: Bindings>(
                 )?;
             }
             Instruction::String(range) => {
-                let artifact = body.map(|body| body.artifact);
+                let artifact = bindings.active_artifact();
                 bindings
                     .external_strings(string_units)
                     .literal(artifact, range)

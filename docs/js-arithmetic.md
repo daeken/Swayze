@@ -343,3 +343,51 @@ synthetic fixtures in debug and release, comparing value tags, Boolean values,
 String UTF-16 code units, and Number bits except for NaN payloads. It does not
 execute Test262 or user-supplied code and is
 not required by the normal merge gate.
+
+## Opt-in Realm: anonymous ordinary functions
+
+`realm::CompiledScript` admits anonymous `function (...) { ... }` primaries in
+Script expressions, including in blocks, control tests and classic `var` loop
+headers. Use parentheses to start an expression statement. A statement starting
+with `function` is still a declaration (Script root only). Named expressions,
+function forms inside a function body, and non-global lexical captures are
+excluded. Realm lexical declarations remain Script-root only. The arithmetic
+API and the default engine front door do not opt into this grammar.
+
+The parser drives one statement/expression continuation at a time. At a function
+primary it parks the Script's code, operands, pending reducers, statement frames,
+labels, loop/header state, delimiter continuation, lookahead and directive
+state. The same lexer (cursor and aggregate resource ledgers unchanged) and
+body compiler handle formals, local `var`, and statements. Closing the body
+restores the Script at the completed primary, before its suffix. A single
+parked owner is enough because nested functions are excluded. Parked and
+active frames count toward the same 128-statement-frame ceiling; delimiter
+depth is independently capped at 128 across both owners. Body strictness and
+quoted escape witnesses are definition-site and per owner.
+
+Instantiation stages one immutable artifact whenever the Script has any
+callable body. It owns the body code, sites, names and UTF-16 literals; the
+root instructions and layout stay borrowed from immutable Ready code. Before
+publication, callable preflight additionally charges one credit per root
+instruction and per body template for the creator-to-template scan. This scan
+does not run on Scripts without callable bodies. Publication is atomic with
+declaration instantiation. Dropping a Ready Script,
+or executing one that skips all its function expressions, can still retain its
+artifact. Skips and abandonment create no *expression* identities. Each
+reached creation makes a fresh identity in the same Realm-owned append-only
+arena as hoisted functions. A failed later store doesn't undo creation. The VM
+checks the artifact, body kind, initial-name range and operand room before
+append, and meters the identity write and any old rows moved during geometric
+growth. The existing limits are 16 artifacts, 512 KiB of artifact backing and
+512 identities per Realm, with a 768-row requested peak for identity-table
+backing during growth (excluding separately staged declarations). The evaluator
+still uses 32 guest frames, 4,096 aggregate live slots, 16,384 dispatches and
+one shared call/setup/lookup budget and one String scratch per execution.
+
+An expression's private initial name comes only from a direct identifier
+initializer, assignment, or reached logical assignment. Grouping the anonymous
+RHS preserves it; value operators, sequences, conditionals, calls and assignment
+results do not. The name isn't a property or a self binding. An escaped function
+consults the Realm's current global records for free names, not the producer's
+Ready links or caller slots. There is no `.name` API, general property or
+receiver support, host callback, or public function handle in this increment.

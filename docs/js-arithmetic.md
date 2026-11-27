@@ -453,8 +453,8 @@ than guessing a value; unsupported callable conversion keeps its own fault.
   131,072-credit instantiation ledger. For roots without callable bodies, a
   bounded scan of up to 4,096 instructions replaces the former Ready call
   probe. The scan is debited after discovery for property-bearing roots;
-  property-free roots pay no new debit. Work exhaustion, allocation failure
-  and invalid code are distinct.
+  roots with neither properties nor guard opcodes pay no new debit. Work
+  exhaustion, allocation failure and invalid code are distinct.
 - There are at most 16 retained artifacts, 512 KiB of accounted immutable
   artifact backing, and 512 user function identities per Realm. The artifact
   budget includes dot metadata, the original literal prefix and the validated
@@ -464,12 +464,13 @@ than guessing a value; unsupported callable conversion keeps its own fault.
   UTF-16 units per execution and 32,768 retained per Realm, including new
   dynamic keys. Replacement does not copy a key again. Overwriting cells or
   fields does not reclaim old storage; the Realm owns it until teardown.
-- The first callable creation installs four private roots and 27 rows. Each
-  actual ordinary callable adds two objects and four initial rows. The heap
-  caps are 1,280 objects, 4,096 rows, 64 own rows per object and 32 visited
-  prototype nodes per lookup. A full row table does not prevent replacement of
-  an existing writable row. These are bounding limits, not promises that all
-  maxima are simultaneously reachable.
+- The first ordinary callable or caught automatic Error installs four private
+  base roots and 27 rows if not already present. Each actual ordinary callable
+  adds two objects and four initial rows. The heap caps are 1,280 objects,
+  4,096 rows, 64 own rows per object and 32 visited prototype nodes per lookup.
+  A full row table does not prevent replacement of an existing writable row.
+  These are bounding limits, not promises that all maxima are simultaneously
+  reachable.
 - Each execution has 131,072 property-work credits shared across all its calls,
   separate from the existing 131,072-credit call/setup/name-lookup ledger
   and the dispatch and String budgets. A descriptor lookup charges one per visited node and row, plus
@@ -500,3 +501,170 @@ This is an opt-in Script slice, not general object support. The Rust regressions
 exercise this slice; they do not show that a Test262 helper loads or runs. The
 change adds no runner or reference-helper coverage and makes no ECMAScript
 conformance claim.
+
+## Opt-in Realm: throw and catch
+
+### Syntax and phases
+
+Realm Script and admitted ordinary function bodies accept `throw Expression;`
+(including supported assignment and comma expressions) and
+`try { ... } catch (name) { ... }`. Both blocks are required. A line terminator
+between `throw` and its first operand token is a syntax error, even in comment
+trivia or before EOF; this check precedes operand decoding. Line breaks later
+in the expression follow the ordinary expression rules. The semicolon must
+be explicit: otherwise-valid ASI is unsupported, not a new syntax error.
+Optional catch bindings, binding patterns, `let` as a catch name, either form
+of `finally`, and direct labels on `try` or `throw` are outside the subset.
+Existing labeled blocks, `if` statements and loops can enclose a guard. This
+does not extend the arithmetic API or the default engine front door.
+
+Each catch entry initializes a fresh mutable cell visible only in its catch
+block. It takes precedence over formals, hoisted locals and globals;
+a nested catch of the same name shadows it only in that nested catch block.
+The cell supports reads (including `typeof`), writes and updates. Nonconflicting
+`var` declarations still hoist to the owning Script or function, including in
+unreached arms; initializers run only on reach. A `var` matching any enclosing
+catch parameter in that owner is unsupported, even in dead code. Block lexical
+declarations remain excluded in Realm, and an anonymous function expression
+that would capture an enclosing catch cell is rejected, not linked as a global.
+
+Malformed productions such as `throw;` or `catch ("x")` after a try block
+carry a parser `SyntaxError` classification inside `CompileError::Parse`.
+Unsupported forms carry no such classification (for example `throw f(1,);`
+versus the malformed `throw (1,);`). A catch is not a directive prologue.
+After structural parsing, the owner's definition-site mode determines whether
+an `eval` or `arguments` catch binding is a typed `CompileError::SyntaxError`
+(strict) or a subset exclusion (sloppy). Strict quoted-decimal-escape checks
+still apply; the earliest strict witness wins within this early-error phase.
+Compilation checks dead code too. Global declaration instantiation (GDI)
+checks declarations against the Realm before executing any statement. Its
+`InstantiateError::SyntaxError` and `InstantiateError::TypeError` (for example,
+a function declaration named `undefined`) are not catchable. A catch cell is
+neither a GDI declaration nor a globally linked name.
+
+### Control and outcomes
+
+`throw` evaluates its operand and obtains its value once. A throw or engine
+fault during that evaluation takes precedence over the explicit throw. The
+iterative dispatcher carries the value unchanged and searches live regions
+from innermost out, across ordinary call frames. Normal try exit skips catch.
+On a throw, the dispatcher restores the selected activation's operand,
+reference-packet and receiver marks, dropping intervening frames and the
+interrupted expression's temporaries while preserving older suspended frames
+and their state as well as the catcher's locals. It restores the catcher's
+code context, disarms the selected try, and initializes its catch cell before
+exceptional entry. Throws from that catch go outward unless caught by a new
+inner try. No ordinary edge enters a catch.
+
+A return expression is evaluated while still protected. Successful return
+leaves the frame and resumes its caller once; normal function fallthrough
+also returns without invoking catch. A taken `break` or `continue` drops only
+the regions it exits. No `finally` work is deferred. Throws, returns and catch
+cell moves do not copy Strings: literal provenance stays with the originating
+code, and concatenation scratch is shared by the whole execution. Promotion
+happens on a store that needs retention, under the existing copy and arena
+limits above. Earlier writes and committed declarations are not rolled back.
+
+Automatic guest throws are the reached `ReferenceError`s for missing reads,
+lexical TDZ accesses and strict unresolved writes, and `TypeError`s for const
+writes, strict read-only writes, nullish dot Get/Put and actual noncallability.
+Direct `typeof` of a missing name still yields `"undefined"`, unlike `typeof`
+in the TDZ. Callee Get precedes arguments; the noncallable check follows all
+arguments. The failing write checks follow a successful RHS. Sloppy implicit
+global creation, unsupported operations, invalid code, limits and allocation
+failures are engine faults. They bypass guest handlers.
+
+`ReadyScript::execute` is one-shot and outcome-only: `Ok(Completion::Normal)`
+discards any completion value, `Ok(Completion::Throw(...))` reports an uncaught
+language throw, and `Err(EngineFault)` reports an engine stop. Throw spans are
+half-open UTF-8 byte offsets in the issuing Script's source (including for a
+retained function body, not rebased to its body or the caller's source).
+`Throw::Explicit` covers just the `throw` keyword. `Throw::ReferenceError`
+and `Throw::TypeError` keep the producer's span: the identifier for a binding
+failure, the `.` token for a dot failure, or the range from the opening `(`
+to just after the closing `)` for a noncallable call (excluding the callee).
+An explicit rethrow reports the new keyword, even if its value was an
+automatic Error. No guest value or handle is exposed or stringified for the
+diagnostic.
+
+### Automatic Error objects
+
+Only a selected, checked handler requires an automatic Error value. Each such
+throw makes a fresh, noncallable, initially rowless object with the internal
+`[[ErrorData]]` shape and the matching `ReferenceError.prototype` or
+`TypeError.prototype`. These link to `Error.prototype`, then `Object.prototype`.
+The corresponding constructor identities are real: the native subclass
+constructors inherit from `Error`, and `Error` inherits from
+`Function.prototype`. The normal dot lookup and write rules apply; properties
+are not synthesized from the diagnostic tag.
+
+For each of the three Error types, its prototype has writable, configurable
+`constructor`, `name` and empty `message` data rows. Its constructor has
+read-only, configurable `name` and `length` (1) and a read-only,
+non-configurable link to its `prototype`. All these initial rows are
+non-enumerable. `Error.prototype.toString` is represented as a present,
+writable builtin barrier, not a callable value: Get is an unsupported-property
+engine fault, but a write can shadow an inherited writable row. The layout
+targets [ECMA-262, 16th ed. (2025), §20.5](https://262.ecma-international.org/16.0/#sec-error-objects),
+which has no `Error.isError`. There are no Error constructor globals or added
+construction syntax, and calls through the reachable constructor identities
+stop with `UnsupportedIntrinsicCall` after arguments. No descriptor reflection,
+object coercion or GC is added.
+
+### Bounds and bytecode checks
+
+- Existing source (65,536 bytes), token and instruction (4,096 each), expression
+  depth and statement frame (128 each), and parse-work (131,072) limits apply.
+  Catch names use the 256-byte name cap; catch uses count toward the 4,096
+  binding-site limit, not the declaration limit. These zero-name-range sites
+  are never linked. Ordinary binding opcodes targeting them are rejected,
+  even in dead code.
+- The 128 protected or catch-active records are shared across the execution
+  and count toward the 4,096 aggregate live slots. The first reached try
+  charges one entry credit plus 128 on the 16,384-credit dispatch ledger and
+  fallibly reserves at most 4 KiB of record backing. Later entries reuse it.
+  Normal cleanup charges per removed region. A throw search charges one per
+  visited record, including skipped active catches. Unwind also charges for
+  records above the selected guard, twice the number of abandoned frames,
+  and one for the transition. These debits precede materialization. With no
+  live regions there is no search debit or reserve. With no matching guard
+  there is no automatic Error heap allocation, only the original diagnostic.
+- The first caught automatic Error appends six intrinsic objects and 19 rows
+  plus the instance. An empty heap also needs the base roots: 11 objects
+  and 46 rows total, at a cost of 114 property-work credits and a request for
+  16 object slots and 64 row slots (2,784 bytes at the ARM64 sizes above).
+  Later instances append one object and no rows. Neither case copies Strings
+  or creates user function origins. Creation shares the object/row caps
+  (1,280/4,096), the 131,072-credit property-work ledger and the 512 KiB
+  heap-request ledger with ordinary object operations. Work includes frontier
+  checks, staging and publishing rows/nodes, and tier moves. With base roots and the pack already
+  present, an instance costs nine credits before moves. Detached reserves
+  are fallible; failure publishes neither an Error nor a catch entry.
+- Before GDI publication, guarded root and retained-body code gets two
+  metered passes over all instructions, including disconnected statement
+  paths. The checks cover region nesting and paired boundaries, catch-only
+  entry, exact outward exits, catch-slot ownership, span bounds, dot site
+  ownership and packet shape, and operand heights at edges (including the
+  full argument pop at calls). The verifier costs at most `5N + 1` work
+  credits and `8(N + 1)` requested scratch bytes for `N` instructions (at
+  most 32,776 bytes), separate from discovery (up to `N` for a body-free
+  root). Guarded artifact-free roots reject even dead function creators.
+  These are structural checks, not validation of every operand value or a
+  proof of semantics or safety. Reached checks still validate actual frames,
+  slots, operands and references; they are not a substitute for lexical
+  edge validation at admission.
+
+### Focused evidence
+
+The [Realm parser tests](../crates/swayze-js/src/parser/realm.rs) cover the
+restricted throw newline and explicit semicolon, catch-name resolution and
+hoisting, and strict witnesses across source owners. The [private bytecode
+fixtures](../crates/swayze-js/src/eval/realm/abrupt_tests.rs) cover rethrow
+spans, automatic producer ordering, retained-call unwind and packet
+restoration, and rejection of an ordinary backedge into catch entry. The
+[Error heap tests](../crates/swayze-js/src/eval/realm/object_heap/error_tests.rs)
+check Error layouts and detached-reserve failures. The [public Realm
+regressions](../crates/swayze-js/tests/realm_abrupt.rs) exercise source-level
+exception ordering and spans, retained function unwind with live caller packets,
+real Error identity, and heap exhaustion without a catch entry. These are
+synthetic regressions, not Test262 credit or a conformance claim.

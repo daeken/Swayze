@@ -580,9 +580,9 @@ fn retained_literal_and_identity_are_not_rebound_to_the_catchers_pool() {
     );
     drop(a);
 
-    let mut b = CompiledScript::compile(concat!(
+    let mut b = CompiledScript::compile(
         "function catcher(f){'b'; f();} var text; var object; text=catcher(fromA); object=catcher(fromObject);",
-    )).unwrap();
+    ).unwrap();
     let catcher = &mut b.functions[0];
     catcher.instructions = wrap(
         &catcher.instructions,

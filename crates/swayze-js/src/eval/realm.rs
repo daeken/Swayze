@@ -41,6 +41,9 @@ use super::{
     validate_layout,
 };
 
+#[cfg(test)]
+mod object_heap;
+
 pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;

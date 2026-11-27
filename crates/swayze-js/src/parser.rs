@@ -851,6 +851,31 @@ impl Lexer<'_> {
     fn next(&mut self, position: TokenPosition) -> Result<Option<Token>, Error> {
         let at_script_start = self.offset == 0;
         let after_line_break = self.skip_trivia()?;
+        self.next_after_trivia(position, at_script_start, after_line_break)
+    }
+
+    #[cfg(test)]
+    fn next_restricted_operand(&mut self) -> Result<Option<Token>, Error> {
+        debug_assert!(self.offset != 0); // Called only after a simulated keyword.
+        let after_line_break = self.skip_trivia()?;
+        if after_line_break {
+            let mut error = Error::malformed(
+                Span::at(self.offset),
+                "line terminator before a restricted operand",
+            );
+            error.parse_error_type = Some(ParseErrorType::SyntaxError);
+            return Err(error);
+        }
+        self.next_after_trivia(TokenPosition::Operand, false, after_line_break)
+    }
+
+    // `at_script_start` describes the offset before the caller scans trivia.
+    fn next_after_trivia(
+        &mut self,
+        position: TokenPosition,
+        at_script_start: bool,
+        after_line_break: bool,
+    ) -> Result<Option<Token>, Error> {
         let Some(c) = self.peek() else {
             return Ok(None);
         };
@@ -4539,6 +4564,153 @@ fn try_push<T>(vec: &mut Vec<T>, item: T, span: Span) -> Result<(), Error> {
         .map_err(|_| Error::limit(span, Limit::Allocation))?;
     vec.push(item);
     Ok(())
+}
+
+#[cfg(test)]
+mod restricted_operand_tests {
+    use super::*;
+
+    fn lexer(source: &str, policy: BindingPolicy, tokens: usize, work: usize) -> Lexer<'_> {
+        let limits = Limits {
+            max_tokens: tokens,
+            max_work: work,
+            ..Limits::default()
+        };
+        new_parser(source, limits, policy).unwrap().lexer
+    }
+
+    fn after_keyword(source: &str, tokens: usize, work: usize) -> Lexer<'_> {
+        let mut lexer = lexer(source, BindingPolicy::Realm, tokens, work);
+        let token = lexer.next(TokenPosition::Plain).unwrap().unwrap();
+        assert!(matches!(token.kind, TokenKind::Identifier)); // `x` stands in for a keyword.
+        assert_eq!(token.span, Span { start: 0, end: 1 });
+        lexer
+    }
+
+    fn assert_frontier(lexer: &Lexer<'_>, offset: usize, tokens: usize, work: usize) {
+        assert_eq!(
+            (lexer.offset, lexer.tokens_left, lexer.work_left),
+            (offset, tokens, work)
+        );
+    }
+
+    #[test]
+    fn line_break_wins_before_eof_and_operand_debit_or_decoding() {
+        for trivia in [
+            "\n",
+            "\r",
+            "\r\n",
+            "\u{2028}",
+            "\u{2029}",
+            "/*\u{2028}*/",
+            "// é\u{2029}",
+        ] {
+            for operand in ["", "[", "new", "'unterminated", "1"] {
+                let source = format!("x{trivia}{operand}");
+                let end = 1 + trivia.len();
+                for (tokens, work) in [(1, end), (2, source.len())] {
+                    let mut lexer = after_keyword(&source, tokens, work);
+                    let error = lexer.next_restricted_operand().err().unwrap();
+                    assert_eq!(error.kind(), ErrorKind::Malformed, "{source:?}");
+                    assert_eq!(error.parse_error_type(), Some(ParseErrorType::SyntaxError));
+                    assert_eq!(error.span(), Span::at(end));
+                    assert_frontier(&lexer, end, tokens - 1, work - end);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trivia_must_finish_and_no_break_uses_the_ordinary_operand_path() {
+        let mut lexer = after_keyword("x /*\u{2028}*/[", 1, 8);
+        let error = lexer.next_restricted_operand().err().unwrap();
+        assert_eq!(error, Error::limit(Span { start: 8, end: 9 }, Limit::Work));
+        assert_frontier(&lexer, 8, 0, 0);
+
+        let mut lexer = after_keyword("x /*\n", 1, 5);
+        let error = lexer.next_restricted_operand().err().unwrap();
+        assert_eq!(
+            error,
+            Error::malformed(Span { start: 2, end: 5 }, "unterminated block comment")
+        );
+
+        let source = "x /*ok*/y";
+        let span = Span { start: 8, end: 9 };
+        for (tokens, work, limit) in [(1, 8, Limit::Tokens), (2, 8, Limit::Work)] {
+            let mut lexer = after_keyword(source, tokens, work);
+            assert_eq!(
+                lexer.next_restricted_operand().err(),
+                Some(Error::limit(span, limit))
+            );
+            assert_frontier(&lexer, 8, 0, 0);
+        }
+        let mut lexer = after_keyword(source, 2, 9);
+        let token = lexer.next_restricted_operand().unwrap().unwrap();
+        assert!(matches!(token.kind, TokenKind::Identifier));
+        assert_eq!(token.span, span);
+        assert!(!token.after_line_break);
+        assert_frontier(&lexer, 9, 0, 0);
+        assert!(
+            after_keyword("x // EOF", 1, 8)
+                .next_restricted_operand()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            after_keyword("x[", 2, 2).next_restricted_operand().err(),
+            Some(unsupported_token(Span { start: 1, end: 2 }))
+        );
+    }
+
+    #[test]
+    fn ordinary_next_keeps_keyword_and_hashbang_diagnostics_at_the_same_frontiers() {
+        for policy in [BindingPolicy::Legacy, BindingPolicy::Realm] {
+            for word in ["throw", "try", "catch", "finally"] {
+                let mut lexer = lexer(word, policy, 1, word.len());
+                let error = lexer.next(TokenPosition::Plain).err().unwrap();
+                assert_eq!(
+                    error,
+                    Error::unsupported(
+                        Span {
+                            start: 0,
+                            end: word.len()
+                        },
+                        "reserved or excluded name is outside the subset"
+                    )
+                );
+                assert_frontier(&lexer, word.len(), 0, 0);
+            }
+            let mut absolute = lexer("#!é\r\nx", policy, 1, 7);
+            let token = absolute.next(TokenPosition::Plain).unwrap().unwrap();
+            assert!(matches!(token.kind, TokenKind::Identifier));
+            assert_eq!(token.span, Span { start: 6, end: 7 });
+            assert!(token.after_line_break);
+            assert_frontier(&absolute, 7, 0, 0);
+
+            let source = " /*x*/#!";
+            let span = Span { start: 6, end: 7 };
+            let mut displaced = lexer(source, policy, 1, 7);
+            let mut expected = unsupported_token(span);
+            expected.parse_error_type = Some(ParseErrorType::SyntaxError);
+            assert_eq!(displaced.next(TokenPosition::Plain).err(), Some(expected));
+            assert_frontier(&displaced, 7, 0, 0);
+            assert_eq!(
+                lexer(source, policy, 0, 6).next(TokenPosition::Plain).err(),
+                Some(Error::limit(span, Limit::Tokens))
+            );
+            assert_eq!(
+                lexer(source, policy, 1, 6).next(TokenPosition::Plain).err(),
+                Some(Error::limit(span, Limit::Work))
+            );
+
+            let mut later = lexer("x\n#!", policy, 2, 3);
+            assert!(later.next(TokenPosition::Plain).unwrap().is_some());
+            assert_eq!(
+                later.next(TokenPosition::Plain).err(),
+                Some(unsupported_token(Span { start: 2, end: 3 }))
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -484,8 +484,9 @@ than guessing a value; unsupported callable conversion keeps its own fault.
   are 14, 40, 6 and 24 bytes respectively. Old-plus-new logical tier requests
   can cover up to 2,304 object slots, 6,144 row slots and 768 origin slots,
   excluding separately staged metadata. At those record sizes, the tier sums
-  give a conservative 374,218-byte bound on cumulative object/row requests
-  and a 282,624-byte old-plus-new bound for objects, rows and origins combined.
+  give a conservative 374,218-byte bound on cumulative object/row requests.
+  The old-plus-new bound is 278,016 bytes for objects and rows, plus 4,608
+  bytes for origins, or 282,624 bytes combined.
   The retained String arena requests up to 64 KiB of backing, or 96 KiB for
   old plus new during growth. These are derived backing bounds from measured
   record sizes, not measured allocator footprint or whole-process memory bounds.

@@ -286,6 +286,37 @@ fn shared_utf16_copy_boundary_is_atomic_for_key_and_value() {
 }
 
 #[test]
+fn nested_put_stores_one_key_and_one_value_at_the_copy_frontier() {
+    let mut realm = Realm::new();
+    let piece = "a".repeat(4094);
+    normal(
+        &mut realm,
+        &format!("function f(){{}} function piece(){{return '{piece}';}} var sink;"),
+    );
+    // Four binding copies leave exactly eight units. The inner Put inserts
+    // xyz and abcde. The outer Put must recheck the row and use the already
+    // retained RHS, not reuse a plan to insert a second key or copy the value.
+    let source = format!(
+        "{}if ((f.xyz = (f.xyz = 'abcde', f.xyz)) !== 'abcde') fail; sink = 'z';",
+        "sink = piece();".repeat(4)
+    );
+    let start = source.rfind("sink =").unwrap();
+    assert_eq!(
+        run(&mut realm, &source),
+        Err(EngineFault::StringCopyLimitExceeded {
+            span: Span {
+                start,
+                end: start + 4
+            }
+        })
+    );
+    normal(
+        &mut realm,
+        "if (f.xyz !== 'abcde' || sink.length !== 4094) fail;",
+    );
+}
+
+#[test]
 fn pending_and_entered_receivers_reduce_the_exact_live_frontier() {
     let mut realm = Realm::new();
     let args = |n| vec!["1"; n].join(",");

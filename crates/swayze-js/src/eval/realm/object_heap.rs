@@ -995,6 +995,115 @@ mod tests {
     }
 
     #[test]
+    fn reached_creation_charges_the_actual_row_frontier_after_insertion() {
+        let setup = CompiledScript::compile("function f(){} f.xyz = 7;").unwrap();
+        let expression = CompiledScript::compile("(function(){});").unwrap();
+        let mut realm = Realm::new();
+        assert_eq!(
+            realm.instantiate(&setup).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        let mut ready = realm.instantiate(&expression).unwrap();
+        let mut execution = ready.execution();
+        assert_eq!(
+            (execution.heap.objects.len(), execution.heap.rows.len()),
+            (6, 32)
+        );
+        let snapshot = |execution: &crate::eval::realm::Execution<'_, '_>| {
+            let first = execution.functions[0];
+            (
+                shape(execution.heap),
+                execution.functions.len(),
+                execution.functions.capacity(),
+                first.origin,
+                first.object,
+            )
+        };
+        let before = snapshot(&execution);
+        let request = 64 * size_of::<Row>();
+        // Two nodes/four rows cost 12 writes; row growth moves all 32 old
+        // rows, not just the 31 initial rows. Object growth isn't needed;
+        // the origin write plus one moved record use the other ledger.
+        execution.lookup = Work(2);
+        execution.property_work = Work(43);
+        execution.heap_requests = request;
+        assert!(matches!(
+            execution.create_function(0),
+            Err(Stop::Engine(EngineFault::PropertyWorkLimitExceeded))
+        ));
+        assert_eq!(snapshot(&execution), before);
+        assert_eq!(
+            (
+                execution.lookup.0,
+                execution.property_work.0,
+                execution.heap_requests
+            ),
+            (2, 43, request)
+        );
+
+        execution.property_work = Work(44);
+        execution.heap_requests = request - 1;
+        assert!(matches!(
+            execution.create_function(0),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::AllocationFailed
+            )))
+        ));
+        assert_eq!(snapshot(&execution), before);
+        assert_eq!(
+            (
+                execution.lookup.0,
+                execution.property_work.0,
+                execution.heap_requests
+            ),
+            (2, 44, request - 1)
+        );
+
+        execution.lookup = Work(1);
+        execution.heap_requests = request;
+        assert!(matches!(
+            execution.create_function(0),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::GlobalLookupLimitExceeded
+            )))
+        ));
+        assert_eq!(snapshot(&execution), before);
+        assert_eq!(
+            (
+                execution.lookup.0,
+                execution.property_work.0,
+                execution.heap_requests
+            ),
+            (1, 44, request)
+        );
+
+        execution.lookup = Work(2);
+        assert_eq!(execution.create_function(0).ok(), Some(FunctionId::User(1)));
+        assert_eq!(
+            (
+                execution.lookup.0,
+                execution.property_work.0,
+                execution.heap_requests
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                execution.heap.objects.len(),
+                execution.heap.rows.len(),
+                execution.functions.len()
+            ),
+            (8, 36, 2)
+        );
+        drop(ready);
+        let observer = CompiledScript::compile("if (f.xyz !== 7) fail;").unwrap();
+        assert_eq!(
+            realm.instantiate(&observer).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+    }
+
+    #[test]
     fn creation_request_and_work_edges_are_exact_and_failed_staging_is_detached() {
         let code = CompiledScript::compile("(function(){});").unwrap();
         let mut realm = Realm::new();

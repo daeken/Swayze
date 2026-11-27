@@ -303,52 +303,152 @@ impl Arena {
         units: &[u16],
         copied: &mut usize,
         span: Span,
-        reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
     ) -> Result<StoredValue, Stop> {
         if units.is_empty() {
             return Ok(StoredValue::Empty);
         }
-        if units.len() > MAX_STRING_LITERAL_CODE_UNITS {
-            return Err(EvalError::InvalidScript.into());
+        let [range, _] = self.plan(units, &[], copied, span)?.reserve()?.publish();
+        Ok(range.map_or(StoredValue::Empty, StoredValue::Realm))
+    }
+}
+
+mod arena_append {
+    use super::{
+        Arena, CHUNK_UNITS, Chunk, EngineFault, EvalError, MAX_COPIED_UNITS, MAX_RETAINED_UNITS,
+        MAX_STRING_LITERAL_CODE_UNITS, RealmRange, Span, Stop, TryReserveError,
+    };
+
+    impl Arena {
+        #[inline]
+        pub(super) fn plan<'a, 's>(
+            &'a mut self,
+            first: &'s [u16],
+            second: &'s [u16],
+            copied: &'a mut usize,
+            span: Span,
+        ) -> Result<AppendPlan<'a, 's>, Stop> {
+            if first.len() > MAX_STRING_LITERAL_CODE_UNITS
+                || second.len() > MAX_STRING_LITERAL_CODE_UNITS
+            {
+                return Err(EvalError::InvalidScript.into());
+            }
+            let total = first.len() + second.len(); // Both lengths have been bounded.
+            let (next_copied, end) = if total == 0 {
+                (*copied, self.used)
+            } else {
+                let next_copied = copied
+                    .checked_add(total)
+                    .filter(|&total| total <= MAX_COPIED_UNITS)
+                    .ok_or(Stop::Engine(EngineFault::StringCopyLimitExceeded { span }))?;
+                let end = self
+                    .used
+                    .checked_add(total)
+                    .filter(|&end| end <= MAX_RETAINED_UNITS)
+                    .ok_or(Stop::Engine(EngineFault::StringRetentionLimitExceeded {
+                        span,
+                    }))?;
+                (next_copied, end)
+            };
+            // used <= split <= end <= MAX_RETAINED_UNITS <= u16::MAX. Both
+            // eventual ranges fit and have the validated lengths, including a
+            // length of zero for an absent slice (which will not issue a range).
+            Ok(AppendPlan {
+                split: self.used + first.len(),
+                arena: self,
+                copied,
+                first,
+                second,
+                end,
+                next_copied,
+            })
         }
-        let next_copied = copied
-            .checked_add(units.len())
-            .filter(|&total| total <= MAX_COPIED_UNITS)
-            .ok_or(Stop::Engine(EngineFault::StringCopyLimitExceeded { span }))?;
-        let end = self
-            .used
-            .checked_add(units.len())
-            .filter(|&end| end <= MAX_RETAINED_UNITS)
-            .ok_or(Stop::Engine(EngineFault::StringRetentionLimitExceeded {
-                span,
-            }))?;
-        let needed = end.div_ceil(CHUNK_UNITS);
-        let old = self.chunks.len();
-        if old == 0 || needed > old.next_power_of_two() {
-            // Follow logical power-of-two tiers even if the allocator supplies
-            // extra capacity. At most 128 chunks (64 KiB) requested, at most
-            // 64 old initialized chunks moved at once, 1+2+...+64 = 127
-            // across the lifetime (thus <=32,512 old units in any execute).
-            // Requested old+new overlap is <=96 KiB, or <=160 KiB with
-            // live scratch backing, excluding allocator overhead/rounding.
-            reserve(&mut self.chunks, needed.next_power_of_two() - old)
-                .map_err(|_| EvalError::AllocationFailed)?;
+    }
+
+    // The exclusive borrow witnesses the checked prefix and copy balance until
+    // publication. Shared source slices cannot borrow the arena being grown.
+    pub(super) struct AppendPlan<'a, 's> {
+        arena: &'a mut Arena,
+        copied: &'a mut usize,
+        first: &'s [u16],
+        second: &'s [u16],
+        split: usize,
+        end: usize,
+        next_copied: usize,
+    }
+
+    pub(super) struct ReservedAppend<'a, 's>(AppendPlan<'a, 's>);
+
+    impl<'a, 's> AppendPlan<'a, 's> {
+        #[inline]
+        pub(super) fn reserve(self) -> Result<ReservedAppend<'a, 's>, Stop> {
+            self.reserve_with(Vec::try_reserve_exact)
         }
-        // Only initialize reached chunks, at most 16 here and 128 over the
-        // Realm lifetime. There are no fallible steps
-        // from here through publication of the new logical length and cell.
-        assert!(self.chunks.capacity() >= needed);
-        while self.chunks.len() < needed {
-            self.chunks.push([0; CHUNK_UNITS]);
+
+        #[cfg(test)]
+        pub(super) fn reserve_for_test(
+            self,
+            reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
+        ) -> Result<ReservedAppend<'a, 's>, Stop> {
+            self.reserve_with(reserve)
         }
-        let start = self.used;
-        self.chunks.as_flattened_mut()[start..end].copy_from_slice(units);
-        self.used = end;
-        *copied = next_copied;
-        Ok(StoredValue::Realm(RealmRange {
-            start: start as u16,
-            end: end as u16,
-        }))
+
+        #[inline]
+        fn reserve_with(
+            self,
+            reserve: impl FnOnce(&mut Vec<Chunk>, usize) -> Result<(), TryReserveError>,
+        ) -> Result<ReservedAppend<'a, 's>, Stop> {
+            let needed = self.end.div_ceil(CHUNK_UNITS);
+            let old = self.arena.chunks.len();
+            if needed > 0 && (old == 0 || needed > old.next_power_of_two()) {
+                // Follow logical power-of-two tiers even if the allocator supplies
+                // extra capacity. At most 128 chunks (64 KiB) requested, at most
+                // 64 old initialized chunks moved at once, 1+2+...+64 = 127
+                // across the lifetime (thus <=32,512 old units in any execute).
+                // Dropping a reserved plan can leave spare capacity, but only a
+                // larger tier can relocate again. Requested old+new overlap is
+                // <=96 KiB, or <=160 KiB with live scratch backing, excluding
+                // allocator overhead/rounding.
+                reserve(&mut self.arena.chunks, needed.next_power_of_two() - old)
+                    .map_err(|_| EvalError::AllocationFailed)?;
+            }
+            assert!(self.arena.chunks.capacity() >= needed);
+            Ok(ReservedAppend(self))
+        }
+    }
+
+    impl ReservedAppend<'_, '_> {
+        #[inline]
+        pub(super) fn publish(self) -> [Option<RealmRange>; 2] {
+            let AppendPlan {
+                arena,
+                copied,
+                first,
+                second,
+                split,
+                end,
+                next_copied,
+            } = self.0;
+            // Only initialize reached chunks, at most 16 for one slice, 32
+            // for two, and 128 over the Realm lifetime. Capacity is reserved.
+            let needed = end.div_ceil(CHUNK_UNITS);
+            while arena.chunks.len() < needed {
+                arena.chunks.push([0; CHUNK_UNITS]);
+            }
+            let start = arena.used;
+            let tail = &mut arena.chunks.as_flattened_mut()[start..end];
+            let (left, right) = tail.split_at_mut(split - start);
+            left.copy_from_slice(first);
+            right.copy_from_slice(second);
+            arena.used = end;
+            *copied = next_copied;
+            let range = |start: usize, end: usize| {
+                (start < end).then_some(RealmRange {
+                    start: start as u16,
+                    end: end as u16,
+                })
+            };
+            [range(start, split), range(split, end)]
+        }
     }
 }
 
@@ -1233,7 +1333,7 @@ fn escape(
         Operand::String(StringOperand::Runtime(range)) => source.runtime(range),
     }
     .ok_or(EvalError::InvalidScript)?;
-    strings.append(units, copied, span, Vec::try_reserve_exact)
+    strings.append(units, copied, span)
 }
 
 pub(super) enum Stop {
@@ -2052,7 +2152,9 @@ mod tests {
         let mut copied = 0;
         let failed = |chunks: &mut Vec<Chunk>, _| chunks.try_reserve_exact(usize::MAX);
         assert!(matches!(
-            arena.append(&[7], &mut copied, span, failed),
+            arena
+                .plan(&[7], &[], &mut copied, span)
+                .and_then(|plan| plan.reserve_for_test(failed)),
             Err(Stop::Engine(EngineFault::Evaluation(
                 EvalError::AllocationFailed
             )))
@@ -2075,7 +2177,9 @@ mod tests {
             if i == CHUNK_UNITS {
                 let capacity = arena.chunks.capacity();
                 assert!(matches!(
-                    arena.append(&[8], &mut copied, span, failed),
+                    arena
+                        .plan(&[8], &[], &mut copied, span)
+                        .and_then(|plan| plan.reserve_for_test(failed)),
                     Err(Stop::Engine(EngineFault::Evaluation(
                         EvalError::AllocationFailed
                     )))
@@ -2093,18 +2197,191 @@ mod tests {
             }
             assert!(
                 arena
-                    .append(&[7], &mut copied, span, |chunks, additional| {
+                    .plan(&[7], &[], &mut copied, span)
+                    .ok()
+                    .unwrap()
+                    .reserve_for_test(|chunks, additional| {
                         tiers.push(chunks.len() + additional);
                         relocated += chunks.len() * CHUNK_UNITS;
                         chunks.try_reserve_exact(additional)
                     })
-                    .is_ok()
+                    .ok()
+                    .unwrap()
+                    .publish()[0]
+                    .is_some()
             );
         }
         assert_eq!(tiers, [1, 2, 4, 8, 16, 32, 64, 128]);
         assert_eq!(relocated, 32_512);
         assert_eq!(arena.used, MAX_RETAINED_UNITS);
         assert_eq!(arena.units()[MAX_RETAINED_UNITS - 1], 7);
+    }
+
+    fn arena_publish(
+        arena: &mut Arena,
+        first: &[u16],
+        second: &[u16],
+        copied: &mut usize,
+        span: Span,
+    ) -> [Option<RealmRange>; 2] {
+        arena
+            .plan(first, second, copied, span)
+            .and_then(|plan| plan.reserve())
+            .ok()
+            .unwrap()
+            .publish()
+    }
+
+    #[test]
+    fn arena_pair_only_issues_ranges_on_publish() {
+        let mut arena = Arena::default();
+        let span = Span { start: 2, end: 5 };
+        let mut copied = 0;
+        let empty = arena
+            .plan(&[], &[], &mut copied, span)
+            .ok()
+            .unwrap()
+            .reserve_for_test(|_, _| panic!("an empty plan must not reserve"))
+            .ok()
+            .unwrap()
+            .publish();
+        assert_eq!(empty, [None, None]);
+        assert_eq!(
+            (
+                arena.used,
+                arena.chunks.len(),
+                arena.chunks.capacity(),
+                copied
+            ),
+            (0, 0, 0, 0)
+        );
+        let prefix = [7; CHUNK_UNITS];
+        let old = RealmRange {
+            start: 0,
+            end: CHUNK_UNITS as u16,
+        };
+        assert_eq!(
+            arena_publish(&mut arena, &[], &prefix, &mut copied, span),
+            [None, Some(old)]
+        );
+
+        let key = [0xD800, 0];
+        let value = [0xDC00; CHUNK_UNITS - 1];
+        let capacity = arena.chunks.capacity();
+        {
+            let _unreserved = arena.plan(&key, &value, &mut copied, span).ok().unwrap();
+        }
+        assert!(matches!(
+            arena
+                .plan(&key, &value, &mut copied, span)
+                .ok()
+                .unwrap()
+                .reserve_for_test(|chunks, additional| {
+                    assert_eq!((chunks.len(), additional), (1, 3));
+                    chunks.try_reserve_exact(usize::MAX)
+                }),
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::AllocationFailed
+            )))
+        ));
+        assert_eq!(
+            (
+                arena.used,
+                arena.chunks.len(),
+                arena.chunks.capacity(),
+                copied
+            ),
+            (CHUNK_UNITS, 1, capacity, CHUNK_UNITS)
+        );
+        assert_eq!(arena.units(), prefix);
+        {
+            let _unpublished = arena
+                .plan(&key, &value, &mut copied, span)
+                .and_then(|plan| plan.reserve())
+                .ok()
+                .unwrap();
+        }
+        assert_eq!(
+            (arena.used, arena.chunks.len(), copied),
+            (CHUNK_UNITS, 1, CHUNK_UNITS)
+        );
+        assert_eq!(arena.units(), prefix);
+
+        let [Some(k), Some(v)] = arena_publish(&mut arena, &key, &value, &mut copied, span) else {
+            panic!("both slices")
+        };
+        assert_eq!(
+            k,
+            RealmRange {
+                start: old.end,
+                end: old.end + 2
+            }
+        );
+        assert_eq!(
+            v,
+            RealmRange {
+                start: k.end,
+                end: (2 * CHUNK_UNITS + 1) as u16
+            }
+        );
+        assert_eq!(old.get(arena.units()), Some(prefix.as_slice()));
+        assert_eq!(k.get(arena.units()), Some(key.as_slice()));
+        assert_eq!(v.get(arena.units()), Some(value.as_slice()));
+        assert_eq!(
+            (arena.used, arena.chunks.len(), copied),
+            (2 * CHUNK_UNITS + 1, 3, 2 * CHUNK_UNITS + 1)
+        );
+    }
+
+    #[test]
+    fn arena_pair_validates_both_slices_then_copy_then_retention() {
+        let mut arena = Arena::default();
+        let span = Span { start: 2, end: 5 };
+        let fill = [7; MAX_STRING_LITERAL_CODE_UNITS];
+        let key = [1; MAX_STRING_LITERAL_CODE_UNITS];
+        let value = [2; MAX_STRING_LITERAL_CODE_UNITS];
+        let fits = key.len() + value.len() - 1;
+        let prefix = MAX_RETAINED_UNITS - fits;
+        while arena.used < prefix {
+            let len = (prefix - arena.used).min(fill.len());
+            let mut copied = 0; // Another execute.
+            assert!(arena.append(&fill[..len], &mut copied, span).is_ok());
+        }
+        let old = (arena.used, arena.chunks.len(), arena.chunks.capacity());
+        let mut copied = MAX_COPIED_UNITS - fits;
+        let invalid = [0; MAX_STRING_LITERAL_CODE_UNITS + 1];
+        for (first, second) in [(&invalid[..], &[1][..]), (&[1][..], &invalid[..])] {
+            assert!(matches!(
+                arena.plan(first, second, &mut copied, span),
+                Err(Stop::Engine(EngineFault::Evaluation(
+                    EvalError::InvalidScript
+                )))
+            ));
+        }
+        assert!(matches!(arena.plan(&key, &value, &mut copied, span),
+            Err(Stop::Engine(EngineFault::StringCopyLimitExceeded { span: actual })) if actual == span));
+        assert_eq!(copied, MAX_COPIED_UNITS - fits);
+        copied -= 1;
+        assert!(matches!(arena.plan(&key, &value, &mut copied, span),
+            Err(Stop::Engine(EngineFault::StringRetentionLimitExceeded { span: actual })) if actual == span));
+        assert_eq!(copied, MAX_COPIED_UNITS - fits - 1);
+        assert_eq!(
+            (arena.used, arena.chunks.len(), arena.chunks.capacity()),
+            old
+        );
+        assert!(arena.units().iter().all(|&unit| unit == 7));
+
+        copied += 1;
+        let key = &key[..key.len() - 1];
+        let [Some(k), Some(v)] = arena_publish(&mut arena, key, &value, &mut copied, span) else {
+            panic!("both limits are inclusive")
+        };
+        assert_eq!(copied, MAX_COPIED_UNITS);
+        assert_eq!(arena.used, MAX_RETAINED_UNITS);
+        assert_eq!(usize::from(k.start), prefix);
+        assert_eq!(usize::from(v.end), MAX_RETAINED_UNITS);
+        assert_eq!(k.get(arena.units()), Some(key));
+        assert_eq!(v.get(arena.units()), Some(value.as_slice()));
     }
 
     #[test]

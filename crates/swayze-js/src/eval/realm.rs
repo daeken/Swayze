@@ -2256,17 +2256,33 @@ mod tests {
             (0, 0, 0, 0)
         );
         let prefix = [7; CHUNK_UNITS];
-        let old = RealmRange {
-            start: 0,
+        let first = RealmRange { start: 0, end: 1 };
+        let second = RealmRange {
+            start: first.end,
             end: CHUNK_UNITS as u16,
         };
         assert_eq!(
-            arena_publish(&mut arena, &[], &prefix, &mut copied, span),
-            [None, Some(old)]
+            arena_publish(&mut arena, &prefix[..1], &[], &mut copied, span),
+            [Some(first), None]
+        );
+        assert_eq!(
+            arena_publish(&mut arena, &[], &prefix[1..], &mut copied, span),
+            [None, Some(second)]
         );
 
         let key = [0xD800, 0];
-        let value = [0xDC00; CHUNK_UNITS - 1];
+        let mut value = [0xDC00; CHUNK_UNITS - 1];
+        // A surrogate pair straddles the chunk boundary; the other units
+        // include lone surrogates and NUL and must survive verbatim too.
+        value[CHUNK_UNITS - 3..].copy_from_slice(&[0xD83D, 0xDE00]);
+        let future_key = RealmRange {
+            start: second.end,
+            end: second.end + 2,
+        };
+        let future_value = RealmRange {
+            start: future_key.end,
+            end: (2 * CHUNK_UNITS + 1) as u16,
+        };
         let capacity = arena.chunks.capacity();
         {
             let _unreserved = arena.plan(&key, &value, &mut copied, span).ok().unwrap();
@@ -2306,27 +2322,18 @@ mod tests {
             (CHUNK_UNITS, 1, CHUNK_UNITS)
         );
         assert_eq!(arena.units(), prefix);
+        assert_eq!(future_key.get(arena.units()), None);
+        assert_eq!(future_value.get(arena.units()), None);
 
-        let [Some(k), Some(v)] = arena_publish(&mut arena, &key, &value, &mut copied, span) else {
-            panic!("both slices")
-        };
         assert_eq!(
-            k,
-            RealmRange {
-                start: old.end,
-                end: old.end + 2
-            }
+            arena_publish(&mut arena, &key, &value, &mut copied, span),
+            [Some(future_key), Some(future_value)]
         );
-        assert_eq!(
-            v,
-            RealmRange {
-                start: k.end,
-                end: (2 * CHUNK_UNITS + 1) as u16
-            }
-        );
-        assert_eq!(old.get(arena.units()), Some(prefix.as_slice()));
-        assert_eq!(k.get(arena.units()), Some(key.as_slice()));
-        assert_eq!(v.get(arena.units()), Some(value.as_slice()));
+        assert_eq!(first.get(arena.units()), Some(&prefix[..1]));
+        assert_eq!(second.get(arena.units()), Some(&prefix[1..]));
+        assert_eq!(future_key.get(arena.units()), Some(key.as_slice()));
+        assert_eq!(future_value.get(arena.units()), Some(value.as_slice()));
+        assert_eq!(&arena.units()[2 * CHUNK_UNITS - 1..], &[0xD83D, 0xDE00]);
         assert_eq!(
             (arena.used, arena.chunks.len(), copied),
             (2 * CHUNK_UNITS + 1, 3, 2 * CHUNK_UNITS + 1)
@@ -2349,8 +2356,10 @@ mod tests {
         }
         let old = (arena.used, arena.chunks.len(), arena.chunks.capacity());
         let mut copied = MAX_COPIED_UNITS - fits;
+        // These synthetic private inputs would overflow both budgets if
+        // length validation did not win. No such guest operand is needed.
         let invalid = [0; MAX_STRING_LITERAL_CODE_UNITS + 1];
-        for (first, second) in [(&invalid[..], &[1][..]), (&[1][..], &invalid[..])] {
+        for (first, second) in [(&invalid[..], &key[..]), (&key[..], &invalid[..])] {
             assert!(matches!(
                 arena.plan(first, second, &mut copied, span),
                 Err(Stop::Engine(EngineFault::Evaluation(

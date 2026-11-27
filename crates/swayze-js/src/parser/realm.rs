@@ -1,9 +1,9 @@
 use crate::{
     eval::MAX_INSTRUCTIONS,
     realm::{
-        BodyKind, CodeMode, CompileError, CompileLimit, CompiledScript, FrameLayout, FunctionBody,
-        MAX_CODE_NAME_BYTES, MAX_DECLARATIONS, MAX_FRAME_LOCALS, MAX_NAME_BYTES, MAX_PARAMETERS,
-        MAX_SITES, NameRange, Role, Site,
+        BodyKind, CodeMode, CompileError, CompileLimit, CompiledScript, DotCode, FrameLayout,
+        FunctionBody, MAX_CODE_NAME_BYTES, MAX_DECLARATIONS, MAX_FRAME_LOCALS, MAX_NAME_BYTES,
+        MAX_PARAMETERS, MAX_SITES, NameRange, Role, Site,
     },
 };
 
@@ -606,6 +606,13 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         sites,
         declarations,
         functions,
+        dot: DotCode {
+            source_len: source
+                .len()
+                .try_into()
+                .map_err(|_| CompileError::InvalidScript)?,
+            ..DotCode::default()
+        },
     })
 }
 

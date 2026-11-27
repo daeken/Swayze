@@ -558,7 +558,7 @@ fn evaluate(
 
 const MAX_GUEST_FRAMES: usize = 32;
 const MAX_LIVE_SLOTS: usize = 4096;
-const MAX_DOT_SITES: usize = 4096;
+use realm::MAX_DOT_SITES;
 const UNDEFINED: Operand = Operand::Scalar(Value::Undefined);
 
 #[derive(Clone, Copy, PartialEq, Eq)]

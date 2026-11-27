@@ -48,6 +48,37 @@ pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;
 pub(crate) const MAX_SITES: usize = 4096;
+pub(crate) const MAX_DOT_SITES: usize = 4096;
+// Removed with the first producer/consumer of the serialized ABI.
+#[allow(dead_code)]
+pub(crate) const MAX_DOT_KEY_UNITS: usize = 256;
+#[allow(dead_code)]
+pub(crate) const MAX_DOT_CODE_UNITS: usize = 16 * 1024;
+#[allow(dead_code)]
+pub(crate) const DOT_ROOT: u16 = u16::MAX;
+
+// Shared with Realm lowering. A dot instruction's index selects exactly one
+// occurrence, independently of the identifier/binding access table.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct DotOccurrence {
+    pub(crate) owner: u16, // DOT_ROOT or the actual body index
+    pub(crate) key_start: u16,
+    pub(crate) key_end: u16,
+    pub(crate) dot_start: u32,
+    pub(crate) dot_end: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DotOccurrence>() == 16);
+
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct DotCode {
+    pub(crate) source_len: u32,
+    pub(crate) sites: Vec<DotOccurrence>,
+    pub(crate) keys: Vec<u16>,
+}
+
 pub(crate) const MAX_PARAMETERS: u8 = 64;
 pub(crate) const MAX_FRAME_LOCALS: u8 = 128;
 const MAX_ARTIFACTS: usize = 16;
@@ -171,6 +202,8 @@ pub struct CompiledScript {
     pub(crate) sites: Vec<Site>,
     pub(crate) declarations: usize,
     pub(crate) functions: Vec<FunctionBody>,
+    #[allow(dead_code)]
+    pub(crate) dot: DotCode,
 }
 
 impl CompiledScript {
@@ -206,6 +239,9 @@ pub enum CompileLimit {
     PooledNameBytes,
     Declarations,
     Sites,
+    DotSites,
+    DotKeyUnits,
+    PooledDotKeyUnits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1971,6 +2007,7 @@ mod tests {
         fn artifact(bodies: Vec<FunctionBody>) -> [Artifact; 1] {
             [Artifact {
                 bodies,
+                body_names: vec![],
                 string_units: vec![],
                 names: vec![],
                 sites: vec![],

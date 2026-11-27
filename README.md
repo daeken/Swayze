@@ -1,65 +1,67 @@
 # Swayze
 
-Swayze is a Rust project for a standalone JavaScript and WebAssembly engine, designed to be embedded in Keanu, a security-first browser engine. **Status: early implementation.** JavaScript supports Number, Boolean, `null`, `undefined`, and bounded String literal values, decimal and explicit-radix Number literals with numeric separators, arithmetic, comparisons, bitwise operators, short-circuit logic and nullish coalescing, conditional expressions, `if` with braced or single-statement arms, `while`, `do…while`, and classic `for` loops, standalone blocks, optional labels on each of these forms, labeled and unlabeled jumps, explicit-semicolon expression statements, empty statements, and script- and block-scoped `const` and `let` bindings with simple, arithmetic, bitwise, and logical reassignment plus prefix and postfix increments and decrements in statements and supported expressions. JavaScript evaluations are limited to 16,384 instruction dispatches. WebAssembly can validate empty and custom-only modules, accepts empty type, import, function, code, and export vectors, and can run up to eight import-free functions. A nonempty import vector is rejected before reading any import descriptors. Each function selects one of up to eight signatures with up to four numeric parameters and an optional numeric result (`i32`, `i64`, `f32`, or `f64`). Hosts can call mixed numeric exports with `invoke_with_values`, using exact `WasmValue` tags and an explicit `WasmResultKind`. `WasmValue::F32(u32)` and `WasmValue::F64(u64)` carry raw IEEE 754 bits, including all NaN encodings; callers with exhaustive matches on either enum must handle the new float variants. The existing `i32` and void invocation methods remain available. Function bodies support mutable `i32`, `i64`, `f32`, and `f64` locals, per-instance globals of those same four types, integer arithmetic and bit operations, `nop`/`drop`/`select`, bounded `block`, `if`/`else`, and `loop` with an optional `i32`, `i64`, `f32`, or `f64` fallthrough result (branches back to a loop carry no values), direct calls, `return`, `br`, `br_if`, and `br_table` to enclosing block, loop, `if`, or function labels (up to 16 explicit entries per table, plus its default), and the `unreachable` trap. Internal `i64` operands support constants, `drop`, same-type `select`, comparisons, wrapping add/subtract/multiply, signed and unsigned division and remainder, bit operations, and conversions to and from `i32`. Internal `f32` and `f64` operands support constants, exact bit reinterpretation, `abs`, `neg`, `copysign`, comparisons, `ceil`, `floor`, `trunc`, `nearest` (ties to even), `sqrt`, `add`, `sub`, `mul`, `div`, `min`, `max`, `drop`, and same-type `select`. Rounding preserves signed zero; `min` chooses −0 and `max` chooses +0 when the zero signs differ. Rounding, square root, and min/max map NaNs to a canonical quiet NaN. Square root also maps negative nonzero inputs to that NaN, preserves signed zero, and uses at most 53 integer steps for a correctly rounded result. Numeric conversion between these widths preserves signed zeros and infinities, widens finite `f32` values exactly, and rounds narrowing to nearest, ties to even. These conversions canonicalize NaNs rather than preserving their original encoding. Signed and unsigned `i32` and `i64` operands convert to either float width with a single ties-to-even rounding step. Float-to-integer conversions truncate toward zero before checking range. NaN traps with `WasmTrap::InvalidConversionToInteger` (a new variant for exhaustive matches); infinity and out-of-range results trap with `WasmTrap::IntegerOverflow`. Addition, subtraction, multiplication, and division use integer arithmetic to round once to nearest, ties to even, including subnormal results. NaN operands and invalid combinations such as infinity minus itself, zero times infinity, zero divided by zero, and infinity divided by infinity return a canonical quiet NaN. Dividing a finite nonzero value by zero returns a signed infinity, not a trap. Modules may also declare one per-instance linear memory of at most two 64 KiB pages, with full-width loads and stores for all four numeric types, narrow integer loads and stores, `memory.size`, and `memory.grow`. A module may declare a larger legal memory32 maximum, but growth is limited by both that maximum and the two-page engine cap. Failed growth leaves the size and bytes unchanged. Modules may also define a private `funcref` table of up to 16 entries with bounded active element segments. `call_indirect` checks the selected slot and signature before entering the callee. Active element and data segments can use `i32.const` or read a defined immutable `i32` global for their offset. Global initializers still require a matching numeric literal. Instantiation checks element ranges before data ranges, then initializes each kind in source order before running the optional `() -> ()` start function. Start functions and export invocations each have their own limit of 16 live frames and 1,024 instruction dispatches. There is no JIT or browser sandbox here.
+Swayze is an early-stage JavaScript and WebAssembly engine written in Rust. It
+runs standalone today and is being designed for [Keanu](docs/design.md), a
+security-first browser engine. Our priorities are memory safety and security,
+then performance, then standards coverage.
 
-Start with the **[engine design](docs/design.md)** for the threat model, language targets, host/browser boundary and end-to-end JIT proof goal. The [GC ownership contract](docs/gc-ownership.md) explains who keeps values alive across Keanu callbacks and navigation. Working code may land before it is proven; document what works, what evidence exists and what is still unproven. The current implementation makes no security-proof claim.
+## What works today
 
-`Script::evaluate_primitive()` returns a `JsPrimitiveValue`: either an existing scalar `JsValue` or a UTF-16 slice, including any lone surrogates. Quoted String literals and cooked backtick literals without interpolation borrow Script storage; primitive `typeof` returns an immutable static spelling. Use `evaluate_primitive_with_scratch(&mut JsEvalScratch)` when the final result may come from concatenation or a cooked backtick template with primitive substitutions. Templates may nest; tags and raw access are unsupported. `evaluate_value()` remains scalar-only and `evaluate()` remains Number-only. Strings support assignment, truthiness, equality, UTF-16 code-unit ordering, and a read-only `.length` that counts UTF-16 code units within the documented subset. Unary `+`, `-`, and `~`, binary `-`, `*`, `/`, `%`, and `**`, and binary bitwise and shift operators convert Strings to Numbers within a separate work budget. That includes the corresponding compound assignments, mixed String/scalar ordering, loose equality between a String and a Number or Boolean, and name updates with `++` and `--`. `+` and `+=` concatenate when either operand is a String, spelling scalar operands as JavaScript would. Concatenations and template appends share limits of 4,094 UTF-16 units per result and 32,768 units appended per evaluation, including repeated template prefixes. Exhaustive `JsLimit` matches need two new arms for literal bytes and aggregate UTF-16 units; `JsLimits` is unchanged.
-
-A module can export its defined memory by name. `WasmInstance::read_memory()` copies a checked range into a caller buffer; it does not expose a live view or permit host writes. Unexported memory is not accessible through this method. `WasmInstance::read_global()` takes an owned snapshot of a named global's exact numeric value, without exposing a live handle or write access. `WasmInstance::table_size()` reports the logical slot count of a named table, without exposing entries or a table handle. All four export kinds share the eight-name limit. These host methods do not provide shared Wasm object identity or a complete WebAssembly JS API. Exhaustive `WasmInvokeError` matches need to handle `ExportNotFunction`.
-
-The default `validate_module` still rejects nonempty imports. Standalone embedders can explicitly opt in with `validate_module_with_global_imports`. Its separate module type exposes an ordered manifest; `instantiate_with_globals` requires a `WasmGlobalImportBinding` with the expected module name, field name, and exact numeric tag for each slot. There are at most eight globals total, including definitions, and only immutable numeric imports are supported. Names are assertions, not authorization or a resolver. Supply only data the guest is allowed to read and re-export. No shared handles, callbacks, import-dependent segment offsets, or Keanu live-page integration are provided.
-
-| Path | Responsibility today |
+| Surface | Implemented subset |
 | --- | --- |
-| `crates/swayze-engine` | Rust embedder-facing facade; `parse_script` returns a script that can be evaluated; `validate_module` returns a Wasm module that can be instantiated. |
-| `crates/swayze-js`, `crates/swayze-wasm` | Separate frontend boundaries, with no external crates. Supported subsets, limits and gaps are documented in [`swayze-js`](crates/swayze-js/README.md) and [`swayze-wasm`](crates/swayze-wasm/src/lib.rs). |
-| `vendor/test262` | Official TC39 corpus, pinned as a Git submodule. Test data only; not a build dependency. |
-| `docs/`, `tools/` | Design, corpus maintenance notes and non-executing corpus check. |
+| **JavaScript evaluator** | Primitive expressions, bounded UTF-16 strings and cooked templates, lexical bindings, conditionals, loops, and labeled control flow. `parse_script` provides the standalone entry point; primitive result APIs preserve lone surrogates. |
+| **Opt-in JavaScript Realm** | Persistent globals and lexical bindings, strict code, ordinary calls and returns, and ASCII dot reads, simple writes, and member calls. It now supports `throw Expression;` and `try { … } catch (name) { … }`, including unwinding across function calls. Automatic `ReferenceError` and `TypeError` become real Error objects when caught. Uncaught throws report a kind and source span, not a guest value; engine faults and declaration-instantiation failures are not catchable. |
+| **WebAssembly** | A bounded Core 1.0 subset with typed numeric calls, locals and globals, structured control flow, direct and indirect calls, tables, and up to two 64 KiB memory pages. Hosts can copy bytes from exported memory, snapshot exported globals, and query exported table sizes. Imports are rejected by default; a separate opt-in API accepts immutable numeric global imports by value. |
 
-## Run the first slice
+The targets are **ECMA-262 (2025, 16th edition)** and **WebAssembly Core 1.0**,
+not claims of conformance. JavaScript still lacks general object construction,
+computed property access, closures, `finally`, and the host integration needed by
+the standard Test262 harness. There is no JIT, tracing GC, or browser sandbox.
+The implementation uses explicit resource limits and forbids first-party unsafe
+Rust; neither that nor the tests constitute a security proof. Any future shipped
+JIT needs end-to-end machine-checked correctness.
+
+## Try it
+
+Install [rustup](https://rustup.rs/), then run from the repository root:
 
 ```sh
 cargo run --frozen -p swayze-engine --example first_slice
 ```
 
-This prints `JavaScript result: 11` for `let x = 2; const step = 5; x = x * step; x + 1;` and `WebAssembly result: 42` for an exported Wasm function called with `45` and `3` that subtracts its arguments. See the [JS evaluator notes](docs/js-arithmetic.md) for semantics, limits and evidence. Neither language can reach host capabilities.
+The example prints `JavaScript result: 11` and `WebAssembly result: 42`.
+The repository pins the Rust toolchain in `rust-toolchain.toml`. Cargo needs no
+registry packages, and the example does not require the Test262 submodule.
 
-## Check a checkout
-
-From the repo root, with Git and [rustup](https://rustup.rs/) installed:
+## Testing and conformance
 
 ```sh
-rustup show active-toolchain     # install/select the repo's pinned Rust toolchain
-cargo build --workspace --frozen
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --frozen -- -D warnings
+# Workspace tests without the corpus
 cargo test --workspace --frozen
-```
 
-The first toolchain installation needs network access. Cargo itself needs no registry packages for this scaffold. First-party crates inherit `forbid(unsafe_code)`; the release profile keeps overflow checks enabled. Tests cover supported arithmetic syntax and Wasm framing, as well as malformed and unsupported inputs. These are not conformance runs or security proofs.
-
-To populate and verify Test262 separately:
-
-```sh
+# Full local merge gate: corpus metadata, fmt, Clippy, debug and release tests
 git submodule update --init --depth 1 -- vendor/test262
-sh tools/check-test262.sh
-```
-
-This checks the revision and sample paths; it does **not** run JavaScript. For development, `sh tools/run-test262.sh` runs a small reviewed slice through Swayze in debug and release. It reports adapted cases separately from unmodified cases and is not a conformance run. See [Test262 development and maintenance](docs/test262.md) for the setup, isolation and how to add a regression.
-
-With Node.js on `PATH`, `sh tools/check-js-reference.sh` and `sh tools/check-wasm-reference.sh` compare generated fixtures against an independent engine. The Wasm check uses Node.js v22, compares `i64` values as BigInts, and compares copies from memory exports byte-for-byte. Neither check is required by the local merge gate.
-
-`node tools/number-format-oracle.mjs` is a separate opt-in Node.js 22 check. It uses exact BigInt arithmetic to check shortest binary64 decimal formatting on fixed synthetic inputs. `--tsv` emits the verified bit patterns and expected strings for other test tools. The oracle itself does not run the Swayze evaluator; see the [formatter notice](crates/swayze-js/third-party/RYU.md#optional-differential-check) for comparing Swayze’s Number formatter against its verified output.
-
-## Push and merge policy
-
-Push commits to their working branch by default. For a PR, run the internal gate on a clean checkout of the proposed merge with current `main`. Initialize Test262 as above, then run:
-
-```sh
 sh tools/check.sh
 ```
 
-This checks the corpus pin, formatting, Clippy and both debug and release tests. Merge and push the tested result when the gate passes; if the PR or base changes, retest the new candidate. We run this on our side, not on GitHub Actions. For untrusted PRs use a disposable environment without credentials, and review changes to the gate itself before relying on it.
+The full gate checks the Test262 pin and metadata; it **does not execute the
+corpus**. Test and publish the exact merge candidate locally. Review changes to
+the gate before relying on it, and use a credential-free disposable environment
+for untrusted PRs.
 
-Swayze is [MIT-licensed](LICENSE); third-party corpus files retain their upstream terms.
+The separate [reviewed Test262 slice](docs/test262.md) last recorded **24 passes
+per profile**: 16 adapted cases, 4 unchanged raw positives, and 4 unchanged raw
+parse negatives. Another 14 strict variants were not run. There are **zero
+standard harness passes** so far. The goal is to grow genuine coverage without
+counting adapted cases or unrun variants as standard passes. Optional Node.js
+reference checks use synthetic fixtures only, never Test262 guests.
+
+## Where to read more
+
+- [Engine design](docs/design.md) and [Keanu GC ownership contract](docs/gc-ownership.md)
+- [JavaScript semantics, limits, and evidence](docs/js-arithmetic.md)
+- [WebAssembly API and limits](crates/swayze-wasm/src/lib.rs)
+- [Embedder-facing facade](crates/swayze-engine/src/lib.rs)
+
+Swayze is [MIT-licensed](LICENSE); third-party corpus files retain their upstream
+terms.

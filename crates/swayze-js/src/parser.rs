@@ -678,6 +678,15 @@ struct Token {
     after_line_break: bool,
 }
 
+// The enclosing token will keep the dot's span and preceding line-break bit.
+// Until dispatch is wired, keep the prospective key metadata private to tests.
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct DotName {
+    start: u32,
+    end: u32,
+}
+
 // Only Realm records a witness, even before the parser knows the code mode.
 enum QuotedDecimalEscape {
     Disabled,
@@ -937,11 +946,32 @@ impl Lexer<'_> {
         Ok(())
     }
 
-    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
-        while let Some(c) = self.peek().filter(|&c| is_identifier_continue(c)) {
-            self.consume(c)?;
-        }
-        // Don't mistake the ASCII prefix of a Unicode or escaped name for a keyword.
+    // Checkpoint seam: the future Realm AfterPrimary arm calls this only after
+    // the leading-dot number check and after charging/consuming the dot itself.
+    #[cfg(test)]
+    fn consume_dot_name(&mut self, dot: Span) -> Result<DotName, Error> {
+        debug_assert!(self.policy == BindingPolicy::Realm);
+        self.skip_trivia()?;
+        let start = self.offset;
+        let Some(c) = self.peek().filter(|&c| is_identifier_start(c)) else {
+            self.reject_non_ascii_identifier()?;
+            return Err(unsupported_token(dot));
+        };
+        self.charge_token(Span {
+            start,
+            end: start + 1,
+        })?;
+        self.consume(c)?;
+        self.consume_identifier_tail()?;
+        let pack =
+            |offset| u32::try_from(offset).map_err(|_| Error::limit(dot, Limit::SourceBytes));
+        Ok(DotName {
+            start: pack(start)?,
+            end: pack(self.offset)?,
+        })
+    }
+
+    fn reject_non_ascii_identifier(&mut self) -> Result<(), Error> {
         if let Some(c) = self.peek().filter(|&c| is_outside_ascii_name(c)) {
             let span = self.consume(c)?;
             return Err(Error::unsupported(
@@ -949,6 +979,19 @@ impl Lexer<'_> {
                 "Unicode and escaped identifiers are outside the subset",
             ));
         }
+        Ok(())
+    }
+
+    fn consume_identifier_tail(&mut self) -> Result<(), Error> {
+        while let Some(c) = self.peek().filter(|&c| is_identifier_continue(c)) {
+            self.consume(c)?;
+        }
+        // Don't accept the ASCII prefix of a Unicode or escaped name.
+        self.reject_non_ascii_identifier()
+    }
+
+    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
+        self.consume_identifier_tail()?;
         let name = &self.source[start..self.offset];
         match name {
             "const" => Ok(TokenKind::Declaration(BindingKind::Const)),
@@ -4405,4 +4448,178 @@ fn try_push<T>(vec: &mut Vec<T>, item: T, span: Span) -> Result<(), Error> {
         .map_err(|_| Error::limit(span, Limit::Allocation))?;
     vec.push(item);
     Ok(())
+}
+
+#[cfg(test)]
+mod dot_name_tests {
+    use super::*;
+
+    const DOT: Span = Span { start: 0, end: 1 };
+
+    fn lexer(source: &str, limits: Limits) -> Lexer<'_> {
+        new_parser(source, limits, BindingPolicy::Realm)
+            .unwrap()
+            .lexer
+    }
+
+    fn scan(lexer: &mut Lexer<'_>) -> Result<DotName, Error> {
+        assert_eq!(lexer.peek(), Some('.'));
+        lexer.charge_token(DOT)?;
+        let dot = lexer.consume('.')?;
+        lexer.consume_dot_name(dot)
+    }
+
+    #[test]
+    fn scans_identifier_names_without_classifying_or_combining_tokens() {
+        assert_eq!(std::mem::size_of::<DotName>(), 8);
+        let trivia = "./* é\r\n */ // line\u{2028}\u{feff}";
+        let keys = [
+            "length",
+            "$x_09",
+            "_",
+            "if",
+            "function",
+            "null",
+            "arguments",
+            "await",
+        ];
+        for (i, key) in keys.into_iter().enumerate() {
+            let tail = if i == 0 { "\u{2028}" } else { "/* gap */other" };
+            let source = format!("{trivia}{key}{tail}");
+            let mut lexer = lexer(&source, Limits::default());
+            let range = scan(&mut lexer).unwrap();
+            assert_eq!(range.start as usize, trivia.len());
+            assert_eq!(&source[range.start as usize..range.end as usize], key);
+            assert_eq!(lexer.offset, range.end as usize);
+            assert_eq!(lexer.rest(), tail);
+            assert_eq!(lexer.tokens_left, Limits::default().max_tokens - 2);
+            assert_eq!(lexer.work_left, Limits::default().max_work - lexer.offset);
+            assert!(lexer.string_units.is_empty());
+            assert!(matches!(
+                lexer.quoted_decimal_escape,
+                QuotedDecimalEscape::Pending
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_escapes_before_returning_even_a_keyword_prefix() {
+        for (source, start, end) in [
+            (r".\u0061", 1, 2),
+            (r".if\u0061", 3, 4),
+            (r".if\8", 3, 4),
+            (".é", 1, 3),
+            (".ifé", 3, 5),
+            (".if\u{200c}", 3, 6),
+        ] {
+            let mut lexer = lexer(source, Limits::default());
+            let err = scan(&mut lexer).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Unsupported, "{source}");
+            assert_eq!(err.span(), Span { start, end }, "{source}");
+            assert_eq!(lexer.offset, end);
+            assert!(matches!(
+                lexer.quoted_decimal_escape,
+                QuotedDecimalEscape::Pending
+            ));
+        }
+    }
+
+    #[test]
+    fn accounts_for_dot_name_and_trivia_at_exact_limits() {
+        let source = ". /*é*/if;";
+        let at_cap = Limits {
+            max_source_bytes: source.len(),
+            max_tokens: 2,
+            max_work: 10,
+            max_nesting_depth: 0,
+        };
+        let mut exact = lexer(source, at_cap);
+        assert_eq!(scan(&mut exact), Ok(DotName { start: 8, end: 10 }));
+        assert_eq!(
+            (exact.tokens_left, exact.work_left, exact.peek()),
+            (0, 0, Some(';'))
+        );
+        for (max_tokens, max_work, limit, start, end) in [
+            (0, 0, Limit::Tokens, 0, 1),
+            (2, 0, Limit::Work, 0, 1),
+            (2, 5, Limit::Work, 4, 6), // one byte left, not enough for é
+            (1, 8, Limit::Tokens, 8, 9),
+            (2, 8, Limit::Work, 8, 9),
+            (2, 9, Limit::Work, 9, 10),
+        ] {
+            let limits = Limits {
+                max_tokens,
+                max_work,
+                ..at_cap
+            };
+            let err = scan(&mut lexer(source, limits)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::LimitExceeded(limit));
+            assert_eq!(err.span(), Span { start, end });
+        }
+        let limits = Limits {
+            max_source_bytes: 5,
+            ..at_cap
+        };
+        let err = new_parser(source, limits, BindingPolicy::Realm)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded(Limit::SourceBytes));
+        assert_eq!(err.span(), Span { start: 4, end: 6 });
+    }
+
+    #[test]
+    fn reports_missing_keys_at_the_dot_and_incomplete_trivia_at_the_comment() {
+        for source in [".", ". /* done */", ". // EOF", ".'x'", ".#private"] {
+            let mut lexer = lexer(source, Limits::default());
+            assert_eq!(scan(&mut lexer), Err(unsupported_token(DOT)), "{source}");
+            assert_eq!(lexer.tokens_left, Limits::default().max_tokens - 1);
+        }
+        let err = scan(&mut lexer(". /*", Limits::default())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Malformed);
+        assert_eq!(err.span(), Span { start: 2, end: 4 });
+        assert_eq!(err.message(), "unterminated block comment");
+    }
+
+    #[test]
+    fn real_dispatch_keeps_existing_numeric_backtick_and_dot_positions() {
+        for policy in [BindingPolicy::Legacy, BindingPolicy::Realm] {
+            for position in [
+                TokenPosition::Plain,
+                TokenPosition::Operand,
+                TokenPosition::AfterPrimary,
+            ] {
+                let lex = |source| new_parser(source, Limits::default(), policy).unwrap().lexer;
+                let fraction = lex(".5").next(position).unwrap().unwrap();
+                assert!(matches!(fraction.kind, TokenKind::Number(n) if n == 0.5));
+                assert_eq!(fraction.span, Span { start: 0, end: 2 });
+                let err = lex("1..length").next(position).err().unwrap();
+                assert_eq!(err.span(), Span { start: 2, end: 3 });
+                let err = lex(".if").next(position).err().unwrap();
+                assert_eq!(err, unsupported_token(DOT));
+                if position != TokenPosition::AfterPrimary {
+                    let err = lex("./*").next(position).err().unwrap();
+                    assert_eq!(err, unsupported_token(DOT));
+                }
+                if position != TokenPosition::Operand {
+                    let err = lex("`unterminated").next(position).err().unwrap();
+                    assert_eq!(err, unsupported_token(DOT));
+                }
+            }
+            for source in ["++s./*", "s++./*", "if (true)./*"] {
+                let dot = source.find('.').unwrap();
+                let err = new_parser(source, Limits::default(), policy)
+                    .unwrap()
+                    .parse(true)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    err,
+                    unsupported_token(Span {
+                        start: dot,
+                        end: dot + 1
+                    })
+                );
+            }
+        }
+    }
 }

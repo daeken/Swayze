@@ -365,7 +365,15 @@ impl Parser<'_> {
         let start =
             u32::try_from(open.start).map_err(|_| Error::limit(open, Limit::SourceBytes))?;
         let end = u32::try_from(close.end).map_err(|_| Error::limit(close, Limit::SourceBytes))?;
-        self.emit(Instruction::Call { start, end, argc }, open)
+        self.emit(
+            Instruction::Call {
+                start,
+                end,
+                argc,
+                member: super::BARE_CALL,
+            },
+            open,
+        )
     }
 }
 

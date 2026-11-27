@@ -298,6 +298,8 @@ pub(crate) enum ShortCircuitCondition {
     NonNullish,
 }
 
+pub(crate) const BARE_CALL: u16 = u16::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
@@ -320,10 +322,20 @@ pub(crate) enum Instruction {
         result: UpdateResult,
     },
     CreateFunction(u16),
+    // Remove these allowances when Realm dot lowering constructs the ops.
+    #[allow(dead_code)]
+    GetDot(u16),
+    #[allow(dead_code)]
+    FormDot(u16),
+    #[allow(dead_code)]
+    PutDot(u16),
+    #[allow(dead_code)]
+    PrepareDotCall(u16),
     Call {
         start: u32,
         end: u32,
         argc: u8,
+        member: u16,
     },
     Return {
         value: bool,
@@ -4322,6 +4334,10 @@ impl Parser<'_> {
             | Instruction::UpdateLocal { .. }
             | Instruction::UpdateBinding { .. } => (0, 1),
             Instruction::Call { argc, .. } => (usize::from(argc) + 1, 1),
+            Instruction::GetDot(_) | Instruction::PutDot(_) | Instruction::PrepareDotCall(_) => {
+                (1, 1)
+            }
+            Instruction::FormDot(_) => (1, 0),
             Instruction::Return { value } if self.stack_depth == usize::from(value) => {
                 (usize::from(value), 0)
             }

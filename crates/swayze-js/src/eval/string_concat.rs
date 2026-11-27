@@ -1,7 +1,8 @@
 use std::{collections::TryReserveError, ops::Range};
 
 use super::{
-    EvalError, Operand, Value,
+    Conversion, EvalError, Operand, Value,
+    realm::FunctionOrigin,
     realm::{Artifact, RealmRange},
 };
 use crate::{
@@ -21,16 +22,18 @@ type Chunk = [u16; CHUNK_UNITS];
 // Frozen UTF-16 spellings: no per-Script or scratch allocation. The only
 // way to refer to one in an operand is by the private, payload-free tag.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum TypeName {
+pub(super) enum StaticText {
     Number,
     Boolean,
     String,
     Object,
     Undefined,
     Function,
+    ObjectName,
+    FunctionName,
 }
 
-impl TypeName {
+impl StaticText {
     pub(super) fn units(self) -> &'static [u16] {
         static NUMBER: [u16; 6] = ascii_units(b"number");
         static BOOLEAN: [u16; 7] = ascii_units(b"boolean");
@@ -38,7 +41,11 @@ impl TypeName {
         static OBJECT: [u16; 6] = ascii_units(b"object");
         static UNDEFINED: [u16; 9] = ascii_units(b"undefined");
         static FUNCTION: [u16; 8] = ascii_units(b"function");
+        static OBJECT_NAME: [u16; 6] = ascii_units(b"Object");
+        static FUNCTION_NAME: [u16; 8] = ascii_units(b"Function");
         match self {
+            Self::ObjectName => &OBJECT_NAME,
+            Self::FunctionName => &FUNCTION_NAME,
             Self::Function => &FUNCTION,
             Self::Number => &NUMBER,
             Self::Boolean => &BOOLEAN,
@@ -70,7 +77,7 @@ fn scalar_spelling(value: Value) -> ScalarSpelling {
         Value::Boolean(true) => &[116, 114, 117, 101], // true
         Value::Boolean(false) => &[102, 97, 108, 115, 101], // false
         Value::Null => &[110, 117, 108, 108],          // null
-        Value::Undefined => TypeName::Undefined.units(),
+        Value::Undefined => StaticText::Undefined.units(),
         Value::Number(number) => return ScalarSpelling::Number(number),
     };
     ScalarSpelling::Units(units)
@@ -209,22 +216,23 @@ impl EvalScratch {
         prefix: StringOperand,
         substitution: Operand,
         following: StringRange,
-    ) -> Result<StringOperand, EvalError> {
+    ) -> Result<StringOperand, Conversion> {
         let prefix = AppendSource::checked(prefix, external, self.used)?;
         let following = external
             .literal(external.active_artifact, following)
             .ok_or(EvalError::InvalidScript)?;
         let substitution = match substitution {
             Operand::String(string) => AppendSource::checked(string, external, self.used)?,
-            Operand::Function(_) => return Err(EvalError::UnsupportedCallableConversion),
+            Operand::Function(_) => return Err(EvalError::UnsupportedCallableConversion.into()),
+            Operand::Object(_) => return Err(Conversion::Object),
             Operand::Scalar(scalar) => match scalar_spelling(scalar) {
                 ScalarSpelling::Units(units) => AppendSource::Borrowed(units),
                 ScalarSpelling::Number(number) => {
-                    return self.append_template_number(prefix, number, following);
+                    return Ok(self.append_template_number(prefix, number, following)?);
                 }
             },
         };
-        self.append_three(prefix, substitution, following, Vec::try_reserve_exact)
+        Ok(self.append_three(prefix, substitution, following, Vec::try_reserve_exact)?)
     }
 
     #[inline(never)]
@@ -337,7 +345,8 @@ pub(super) enum StringOperand {
     Literal(StringRange),
     ArtifactLiteral { artifact: u8, range: StringRange },
     Runtime(RuntimeRange),
-    TypeName(TypeName),
+    StaticText(StaticText),
+    CodeName(FunctionOrigin),
     Empty,
     Realm(RealmRange),
 }
@@ -357,7 +366,8 @@ impl StringOperand {
                 pools.transient.artifact_literal(artifact, range)
             }
             Self::Runtime(range) => pools.transient.runtime(range),
-            Self::TypeName(name) => Some(name.units()),
+            Self::StaticText(name) => Some(name.units()),
+            Self::CodeName(origin) => pools.transient.code_name(origin),
             Self::Empty => Some(&[]),
             Self::Realm(range) => range.get(pools.retained),
         }
@@ -370,7 +380,7 @@ impl StringOperand {
             Self::Empty => true,
             // A Realm operand has already been checked by lexical GetValue;
             // only nonempty ranges are issued, and the prefix never shrinks.
-            Self::TypeName(_) | Self::Realm(_) => false,
+            Self::StaticText(_) | Self::Realm(_) | Self::CodeName(_) => false,
         }
     }
 }
@@ -389,7 +399,13 @@ impl<'a> TransientStrings<'a> {
     }
 
     pub(super) fn artifact_literal(self, artifact: u8, range: StringRange) -> Option<&'a [u16]> {
-        range.get(&self.artifacts.get(usize::from(artifact))?.string_units)
+        range.get(self.artifacts.get(usize::from(artifact))?.literal_units())
+    }
+
+    pub(super) fn code_name(self, origin: FunctionOrigin) -> Option<&'a [u16]> {
+        self.artifacts
+            .get(usize::from(origin.artifact))?
+            .initial_name(origin.body)
     }
 
     pub(super) fn runtime(self, range: RuntimeRange) -> Option<&'a [u16]> {
@@ -436,7 +452,7 @@ impl<'a> ExternalStrings<'a> {
     pub(super) fn literal(self, artifact: Option<u8>, range: StringRange) -> Option<&'a [u16]> {
         let units = match artifact {
             None => self.literals,
-            Some(id) => &self.artifacts.get(usize::from(id))?.string_units,
+            Some(id) => self.artifacts.get(usize::from(id))?.literal_units(),
         };
         range.get(units)
     }
@@ -462,7 +478,13 @@ impl<'a> AppendSource<'a> {
                 .literal(Some(artifact), range)
                 .map(Self::Borrowed)
                 .ok_or(EvalError::InvalidScript),
-            StringOperand::TypeName(name) => Ok(Self::Borrowed(name.units())),
+            StringOperand::StaticText(name) => Ok(Self::Borrowed(name.units())),
+            StringOperand::CodeName(origin) => external
+                .artifacts
+                .get(usize::from(origin.artifact))
+                .and_then(|artifact| artifact.initial_name(origin.body))
+                .map(Self::Borrowed)
+                .ok_or(EvalError::InvalidScript),
             StringOperand::Empty => Ok(Self::Borrowed(&[])),
             StringOperand::Realm(range) => range
                 .get(external.retained)
@@ -534,8 +556,8 @@ mod tests {
                 &literals[..2],
             ),
             (
-                StringOperand::TypeName(TypeName::String),
-                Operand::String(StringOperand::TypeName(TypeName::String)),
+                StringOperand::StaticText(StaticText::String),
+                Operand::String(StringOperand::StaticText(StaticText::String)),
                 *empty,
                 &literals[..2],
             ),
@@ -544,7 +566,7 @@ mod tests {
                 scratch
                     .append_template(external(pool), prefix, sub, following)
                     .err(),
-                Some(EvalError::InvalidScript)
+                Some(EvalError::InvalidScript.into())
             );
             assert_eq!(scratch.used, 0);
             assert_eq!(scratch.chunks.capacity(), 0);
@@ -600,19 +622,19 @@ mod tests {
             scratch
                 .append_template(external(&[]), long, scalar, *empty)
                 .err(),
-            Some(EvalError::InvalidScript)
+            Some(EvalError::InvalidScript.into())
         );
         assert_eq!(
             scratch
                 .append_template(external(literals), long, scalar, *empty)
                 .err(),
-            Some(EvalError::StringConcatenationLengthLimitExceeded)
+            Some(EvalError::StringConcatenationLengthLimitExceeded.into())
         );
         assert_eq!(
             scratch
                 .append_template(external(literals), empty_literal, scalar, *empty)
                 .err(),
-            Some(EvalError::StringConcatenationBudgetExceeded)
+            Some(EvalError::StringConcatenationBudgetExceeded.into())
         );
         assert_eq!(scratch.used, MAX_APPENDED_UNITS);
     }
@@ -629,7 +651,7 @@ mod tests {
         let mut scratch = EvalScratch::new();
         assert_eq!(
             script.evaluate_primitive_with_scratch(&mut scratch),
-            Ok(PrimitiveValue::String(TypeName::Undefined.units()))
+            Ok(PrimitiveValue::String(StaticText::Undefined.units()))
         );
         assert_eq!(scratch.used, 0);
         assert_eq!(scratch.chunks.capacity(), 0);
@@ -637,14 +659,14 @@ mod tests {
         let warm = parse_script("typeof ('a' + 'b')").unwrap();
         assert_eq!(
             warm.evaluate_primitive_with_scratch(&mut scratch),
-            Ok(PrimitiveValue::String(TypeName::String.units()))
+            Ok(PrimitiveValue::String(StaticText::String.units()))
         );
         assert_eq!(scratch.used, 2); // Only the operand's concatenation appends.
         let chunks = scratch.chunks.capacity();
         assert!(chunks > 0);
         assert_eq!(
             script.evaluate_primitive_with_scratch(&mut scratch),
-            Ok(PrimitiveValue::String(TypeName::Undefined.units()))
+            Ok(PrimitiveValue::String(StaticText::Undefined.units()))
         );
         assert_eq!(scratch.used, 0);
         assert_eq!(scratch.chunks.capacity(), chunks);

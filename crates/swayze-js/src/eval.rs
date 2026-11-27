@@ -24,7 +24,7 @@ mod string_concat;
 mod string_number;
 
 pub use string_concat::EvalScratch;
-use string_concat::{ExternalStrings, StringOperand, StringPools, TransientStrings, TypeName};
+use string_concat::{ExternalStrings, StaticText, StringOperand, StringPools, TransientStrings};
 
 /// A scalar value in the supported JavaScript subset.
 ///
@@ -61,6 +61,36 @@ enum Operand {
     // also checks offsets before returning them to metadata-only consumers.
     String(StringOperand),
     Function(realm::FunctionId),
+    Object(realm::ObjectId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Conversion {
+    Evaluation(EvalError),
+    Object,
+}
+
+impl From<EvalError> for Conversion {
+    fn from(error: EvalError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+impl From<Conversion> for EvalError {
+    fn from(error: Conversion) -> Self {
+        match error {
+            Conversion::Evaluation(error) => error,
+            Conversion::Object => Self::InvalidScript,
+        }
+    }
+}
+
+fn reject_to_primitive(value: Operand) -> Result<(), Conversion> {
+    match value {
+        Operand::Object(_) => Err(Conversion::Object),
+        Operand::Function(_) => Err(EvalError::UnsupportedCallableConversion.into()),
+        _ => Ok(()),
+    }
 }
 
 impl Operand {
@@ -68,13 +98,14 @@ impl Operand {
         self,
         strings: StringPools<'_>,
         credits_left: &mut usize,
-    ) -> Result<f64, EvalError> {
+    ) -> Result<f64, Conversion> {
         match self {
             Self::Scalar(value) => Ok(value.to_number()),
-            Self::Function(_) => Err(EvalError::UnsupportedCallableConversion),
+            Self::Function(_) => Err(EvalError::UnsupportedCallableConversion.into()),
+            Self::Object(_) => Err(Conversion::Object),
             Self::String(range) => {
                 let units = range.get(strings).ok_or(EvalError::InvalidScript)?;
-                string_number::convert(units, credits_left)
+                Ok(string_number::convert(units, credits_left)?)
             }
         }
     }
@@ -82,7 +113,7 @@ impl Operand {
     fn to_boolean(self) -> bool {
         match self {
             Self::Scalar(value) => value.to_boolean(),
-            Self::Function(_) => true,
+            Self::Function(_) | Self::Object(_) => true,
             Self::String(range) => !range.is_empty(),
         }
     }
@@ -267,7 +298,7 @@ impl Script {
         match self.run(&mut EvalScratch::new())? {
             Operand::Scalar(value) => Ok(value),
             Operand::String(_) => Err(EvalError::NonScalarResult),
-            Operand::Function(_) => Err(EvalError::InvalidScript),
+            Operand::Function(_) | Operand::Object(_) => Err(EvalError::InvalidScript),
         }
     }
 
@@ -408,16 +439,21 @@ impl Script {
                 .get(self.string_units())
                 .map(PrimitiveValue::String)
                 .ok_or(EvalError::InvalidScript),
-            Operand::String(StringOperand::TypeName(name)) => {
+            Operand::String(StringOperand::StaticText(
+                StaticText::ObjectName | StaticText::FunctionName,
+            )) => Err(EvalError::InvalidScript),
+            Operand::String(StringOperand::StaticText(name)) => {
                 Ok(PrimitiveValue::String(name.units()))
             }
             Operand::String(StringOperand::Runtime(_)) => {
                 Err(EvalError::RuntimeStringResultRequiresScratch)
             }
             Operand::Function(_)
+            | Operand::Object(_)
             | Operand::String(
                 StringOperand::Empty
                 | StringOperand::Realm(_)
+                | StringOperand::CodeName(_)
                 | StringOperand::ArtifactLiteral { .. },
             ) => Err(EvalError::InvalidScript),
         }
@@ -446,11 +482,14 @@ impl Script {
     ) -> Result<PrimitiveValue<'a>, EvalError> {
         match self.run(scratch)? {
             Operand::Scalar(value) => Ok(PrimitiveValue::Scalar(value)),
-            Operand::String(StringOperand::Empty | StringOperand::Realm(_)) => {
-                Err(EvalError::InvalidScript)
-            }
-            Operand::Function(_) => Err(EvalError::InvalidScript),
-            Operand::String(StringOperand::ArtifactLiteral { .. }) => Err(EvalError::InvalidScript),
+            Operand::String(
+                StringOperand::Empty | StringOperand::Realm(_) | StringOperand::CodeName(_),
+            ) => Err(EvalError::InvalidScript),
+            Operand::Function(_) | Operand::Object(_) => Err(EvalError::InvalidScript),
+            Operand::String(
+                StringOperand::ArtifactLiteral { .. }
+                | StringOperand::StaticText(StaticText::ObjectName | StaticText::FunctionName),
+            ) => Err(EvalError::InvalidScript),
             Operand::String(range) => range
                 .get(scratch.pools(self.string_units()))
                 .map(PrimitiveValue::String)
@@ -744,12 +783,10 @@ fn validate_body(
     Ok(())
 }
 
-// Remove the allowance when Realm instantiation invokes this for property
-// roots (including artifact-free roots) and every property-bearing body.
+// Realm calls this for both root forms and every property-bearing body.
 // The caller must run this before publication, with its own bounded Work and
 // frame-specific occurrence table. This is a packet-shape check, not a value
 // verifier, and walks even statically untaken instructions and edges.
-#[allow(dead_code)]
 fn validate_property_shape<E: From<EvalError>>(
     ops: &[Instruction],
     max_operands: usize,
@@ -1229,13 +1266,13 @@ fn dispatch<'code, B: Bindings>(
             }
             Instruction::UpdateNumber(op) => apply_binary(&mut stack, |lhs, rhs| {
                 if !matches!(rhs, Operand::Scalar(Value::Number(1.0))) {
-                    return Err(EvalError::InvalidScript);
+                    return Err(EvalError::InvalidScript.into());
                 }
                 let old = lhs.to_number(
                     bindings.string_pools(scratch, string_units),
                     &mut string_conversion_credits_left,
                 )?;
-                Ok(Value::Number(update_number(op, old)))
+                Ok::<_, Conversion>(Value::Number(update_number(op, old)))
             })?,
             Instruction::Add => apply_binary_operand(&mut stack, |lhs, rhs| {
                 add(lhs, rhs, bindings.external_strings(string_units), scratch)
@@ -1331,7 +1368,7 @@ fn dispatch<'code, B: Bindings>(
                         &mut string_pairs_left,
                         &mut string_conversion_credits_left,
                     )?;
-                    Ok(Value::Boolean(equal ^ negate))
+                    Ok::<_, Conversion>(Value::Boolean(equal ^ negate))
                 })?;
             }
             Instruction::LessThan
@@ -1360,7 +1397,7 @@ fn dispatch<'code, B: Bindings>(
                         ),
                         None => false, // All four relations are false for NaN operands.
                     };
-                    Ok(Value::Boolean(result))
+                    Ok::<_, Conversion>(Value::Boolean(result))
                 })?;
             }
             Instruction::Positive => {
@@ -1369,7 +1406,7 @@ fn dispatch<'code, B: Bindings>(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
-                    Ok(Value::Number(number))
+                    Ok::<_, Conversion>(Value::Number(number))
                 })?;
             }
             Instruction::Negate => {
@@ -1378,12 +1415,12 @@ fn dispatch<'code, B: Bindings>(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
-                    Ok(Value::Number(-number))
+                    Ok::<_, Conversion>(Value::Number(-number))
                 })?;
             }
             Instruction::Not => {
                 apply_unary(stack.as_mut_slice(), |value| {
-                    Ok(Value::Boolean(!value.to_boolean()))
+                    Ok::<_, EvalError>(Value::Boolean(!value.to_boolean()))
                 })?;
             }
             Instruction::BitwiseNot => {
@@ -1392,21 +1429,24 @@ fn dispatch<'code, B: Bindings>(
                         bindings.string_pools(scratch, string_units),
                         &mut string_conversion_credits_left,
                     )?;
-                    Ok(Value::Number(f64::from(!number_to_int32(number))))
+                    Ok::<_, Conversion>(Value::Number(f64::from(!number_to_int32(number))))
                 })?;
             }
-            Instruction::Void => apply_unary(stack.as_mut_slice(), |_| Ok(Value::Undefined))?,
+            Instruction::Void => apply_unary(stack.as_mut_slice(), |_| {
+                Ok::<_, EvalError>(Value::Undefined)
+            })?,
             Instruction::Typeof => {
                 let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
                 let name = match *value {
-                    Operand::Scalar(Value::Number(_)) => TypeName::Number,
-                    Operand::Scalar(Value::Boolean(_)) => TypeName::Boolean,
-                    Operand::Scalar(Value::Null) => TypeName::Object,
-                    Operand::Scalar(Value::Undefined) => TypeName::Undefined,
-                    Operand::String(_) => TypeName::String,
-                    Operand::Function(_) => TypeName::Function,
+                    Operand::Scalar(Value::Number(_)) => StaticText::Number,
+                    Operand::Scalar(Value::Boolean(_)) => StaticText::Boolean,
+                    Operand::Scalar(Value::Null) => StaticText::Object,
+                    Operand::Scalar(Value::Undefined) => StaticText::Undefined,
+                    Operand::String(_) => StaticText::String,
+                    Operand::Function(_) => StaticText::Function,
+                    Operand::Object(_) => StaticText::Object,
                 };
-                *value = Operand::String(StringOperand::TypeName(name));
+                *value = Operand::String(StringOperand::StaticText(name));
             }
             Instruction::StringLength => {
                 apply_unary(stack.as_mut_slice(), |value| {
@@ -1501,7 +1541,7 @@ fn operands_equal(
     strings: StringPools<'_>,
     string_pairs_left: &mut usize,
     credits_left: &mut usize,
-) -> Result<bool, EvalError> {
+) -> Result<bool, Conversion> {
     match (lhs, rhs) {
         (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(if strict {
             lhs.strictly_equals(rhs)
@@ -1509,11 +1549,25 @@ fn operands_equal(
             lhs.loosely_equals(rhs)
         }),
         (Operand::Function(lhs), Operand::Function(rhs)) => Ok(lhs == rhs),
-        (Operand::Function(_), Operand::Scalar(Value::Null | Value::Undefined))
-        | (Operand::Scalar(Value::Null | Value::Undefined), Operand::Function(_)) => Ok(false),
-        (Operand::Function(_), _) | (_, Operand::Function(_)) if strict => Ok(false),
-        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
-            Err(EvalError::UnsupportedCallableConversion)
+        (Operand::Object(lhs), Operand::Object(rhs)) => Ok(lhs == rhs),
+        (Operand::Object(_), Operand::Function(_)) | (Operand::Function(_), Operand::Object(_)) => {
+            Ok(false)
+        }
+        (
+            Operand::Function(_) | Operand::Object(_),
+            Operand::Scalar(Value::Null | Value::Undefined),
+        )
+        | (
+            Operand::Scalar(Value::Null | Value::Undefined),
+            Operand::Function(_) | Operand::Object(_),
+        ) => Ok(false),
+        (Operand::Function(_) | Operand::Object(_), _)
+        | (_, Operand::Function(_) | Operand::Object(_)) => {
+            if !strict {
+                reject_to_primitive(lhs)?;
+                reject_to_primitive(rhs)?;
+            }
+            Ok(false)
         }
         (Operand::String(lhs), Operand::String(rhs)) => {
             let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
@@ -1543,13 +1597,11 @@ fn operands_order(
     strings: StringPools<'_>,
     string_pairs_left: &mut usize,
     credits_left: &mut usize,
-) -> Result<Option<Ordering>, EvalError> {
+) -> Result<Option<Ordering>, Conversion> {
+    // ToPrimitive precedes numeric conversion.
+    reject_to_primitive(lhs)?;
+    reject_to_primitive(rhs)?;
     match (lhs, rhs) {
-        // IsLessThan completes ToPrimitive on both operands before numeric
-        // conversion. Both operand expressions have already been evaluated.
-        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
-            Err(EvalError::UnsupportedCallableConversion)
-        }
         (Operand::String(lhs), Operand::String(rhs)) => {
             let lhs = lhs.get(strings).ok_or(EvalError::InvalidScript)?;
             let rhs = rhs.get(strings).ok_or(EvalError::InvalidScript)?;
@@ -1592,26 +1644,26 @@ fn push_operand(
     Ok(())
 }
 
-fn apply_unary(
+fn apply_unary<E: From<EvalError>>(
     stack: &mut [Operand],
-    op: impl FnOnce(Operand) -> Result<Value, EvalError>,
-) -> Result<(), EvalError> {
+    op: impl FnOnce(Operand) -> Result<Value, E>,
+) -> Result<(), E> {
     let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
     *value = Operand::Scalar(op(*value)?);
     Ok(())
 }
 
-fn apply_binary(
+fn apply_binary<E: From<EvalError>>(
     stack: &mut Stack<'_>,
-    op: impl FnOnce(Operand, Operand) -> Result<Value, EvalError>,
-) -> Result<(), EvalError> {
+    op: impl FnOnce(Operand, Operand) -> Result<Value, E>,
+) -> Result<(), E> {
     apply_binary_operand(stack, |lhs, rhs| op(lhs, rhs).map(Operand::Scalar))
 }
 
-fn apply_binary_operand(
+fn apply_binary_operand<E: From<EvalError>>(
     stack: &mut Stack<'_>,
-    op: impl FnOnce(Operand, Operand) -> Result<Operand, EvalError>,
-) -> Result<(), EvalError> {
+    op: impl FnOnce(Operand, Operand) -> Result<Operand, E>,
+) -> Result<(), E> {
     let rhs = stack.pop().ok_or(EvalError::InvalidScript)?;
     let lhs = stack.last_mut().ok_or(EvalError::InvalidScript)?;
     *lhs = op(*lhs, rhs)?;
@@ -1633,12 +1685,12 @@ fn append_template(
     external: ExternalStrings<'_>,
     scratch: &mut EvalScratch,
     following: crate::parser::StringRange,
-) -> Result<(), EvalError> {
+) -> Result<(), Conversion> {
     let [.., lhs, rhs] = stack.as_mut_slice() else {
-        return Err(EvalError::InvalidScript);
+        return Err(EvalError::InvalidScript.into());
     };
     let Operand::String(prefix) = *lhs else {
-        return Err(EvalError::InvalidScript);
+        return Err(EvalError::InvalidScript.into());
     };
     *lhs = Operand::String(scratch.append_template(external, prefix, *rhs, following)?);
     stack.pop();
@@ -1650,11 +1702,12 @@ fn add(
     rhs: Operand,
     external: ExternalStrings<'_>,
     scratch: &mut EvalScratch,
-) -> Result<Operand, EvalError> {
-    match (lhs, rhs) {
-        (Operand::Function(_), _) | (_, Operand::Function(_)) => {
-            Err(EvalError::UnsupportedCallableConversion)
-        }
+) -> Result<Operand, Conversion> {
+    reject_to_primitive(lhs)?;
+    reject_to_primitive(rhs)?;
+    let result = match (lhs, rhs) {
+        (Operand::Function(_) | Operand::Object(_), _)
+        | (_, Operand::Function(_) | Operand::Object(_)) => unreachable!(),
         (Operand::Scalar(lhs), Operand::Scalar(rhs)) => Ok(Operand::Scalar(Value::Number(
             lhs.to_number() + rhs.to_number(),
         ))),
@@ -1667,7 +1720,8 @@ fn add(
         (Operand::Scalar(scalar), Operand::String(string)) => scratch
             .concatenate_scalar(external, string, scalar, true)
             .map(Operand::String),
-    }
+    };
+    Ok(result?)
 }
 
 fn apply_numeric_binary(
@@ -1675,7 +1729,7 @@ fn apply_numeric_binary(
     strings: StringPools<'_>,
     credits_left: &mut usize,
     op: impl FnOnce(f64, f64) -> f64,
-) -> Result<(), EvalError> {
+) -> Result<(), Conversion> {
     // Both expressions have run; check arity before coercing left then right.
     apply_binary(stack, |lhs, rhs| {
         let lhs = lhs.to_number(strings, credits_left)?;
@@ -1748,7 +1802,7 @@ mod tests {
             &mut EvalScratch::new(),
         )? {
             Some(Operand::Scalar(value)) => Ok(value),
-            Some(Operand::String(_) | Operand::Function(_)) => {
+            Some(Operand::String(_) | Operand::Function(_) | Operand::Object(_)) => {
                 panic!("unexpected operand in scalar fixture")
             }
             None => panic!("missing result in scalar fixture"),
@@ -2056,7 +2110,7 @@ mod tests {
             assert_eq!(
                 Operand::String(StringOperand::Literal(*range))
                     .to_number(StringPools::literals(&[]), &mut 0),
-                Err(EvalError::InvalidScript),
+                Err(EvalError::InvalidScript.into()),
             );
             assert_eq!(
                 evaluate(&[*literal, op], 1, 0),
@@ -2095,7 +2149,7 @@ mod tests {
             let mut credits = 261;
             assert_eq!(
                 apply_numeric_binary(&mut Stack::root(&mut stack), pool, &mut credits, no_math),
-                Err(EvalError::InvalidScript)
+                Err(EvalError::InvalidScript.into())
             );
             assert_eq!(credits, 261);
         }
@@ -2110,7 +2164,7 @@ mod tests {
             let mut credits = 260;
             assert_eq!(
                 apply_numeric_binary(&mut Stack::root(&mut stack), pool, &mut credits, no_math),
-                Err(expected)
+                Err(expected.into())
             );
             assert_eq!(credits, remaining);
         }
@@ -2231,11 +2285,11 @@ mod tests {
         for (lhs, rhs) in [(a, b), (b, a), (b, number), (number, b)] {
             assert_eq!(
                 operands_order(lhs, rhs, short_pool, &mut 0, &mut 0),
-                Err(EvalError::InvalidScript)
+                Err(EvalError::InvalidScript.into())
             );
             assert_eq!(
                 operands_equal(lhs, rhs, false, short_pool, &mut 0, &mut 0),
-                Err(EvalError::InvalidScript)
+                Err(EvalError::InvalidScript.into())
             );
         }
     }

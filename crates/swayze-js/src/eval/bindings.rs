@@ -1,5 +1,5 @@
 use super::{
-    BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
+    BindingKind, Conversion, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
     TransientStrings, Update, UpdateResult, Value, push_operand,
     realm::{Artifact, CodeMode, FunctionId, FunctionOrigin},
     update_number,
@@ -12,8 +12,6 @@ pub(super) struct UpdateNumeric<'pools, 'budget> {
 
 pub(super) enum CallTarget {
     User(FunctionOrigin),
-    // Remove the allowance when Execution classifies genuine intrinsics.
-    #[allow(dead_code)]
     FunctionPrototype,
 }
 
@@ -21,14 +19,9 @@ pub(super) enum CallTarget {
 // that can read/write guest values. No borrowed key or receiver storage.
 #[derive(Clone, Copy)]
 pub(super) struct DotSite {
-    // Remove these allowances when Execution consumes retained occurrence data.
-    #[allow(dead_code)]
     pub(super) owner: Option<FunctionOrigin>,
-    #[allow(dead_code)]
     pub(super) index: u16,
-    #[allow(dead_code)]
     pub(super) span: crate::Span,
-    #[allow(dead_code)]
     pub(super) mode: CodeMode,
 }
 
@@ -59,7 +52,7 @@ pub(super) trait Properties {
 
 // The dispatcher and all operand, control, and slot checks remain shared.
 pub(super) trait Bindings {
-    type Error: From<EvalError>;
+    type Error: From<EvalError> + From<Conversion>;
     const CALLS: bool = false;
 
     fn retained_units(&self) -> &[u16] {

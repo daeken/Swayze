@@ -15,16 +15,16 @@
 //! separate private records, not a global object. No host bindings or nested
 //! lexical declarations. `undefined` is the sole intrinsic fallback. Ordinary
 //! functions have mutable simple formals and frame-local `var` bindings,
-//! live Realm free names, and no receiver. Strictness comes from their definition, not the
-//! caller. The Realm retains immutable bodies for installed function identities
+//! live Realm free names, and retain the raw receiver for a member call (there
+//! is no `this` expression). Strictness comes from their definition, not the caller. The Realm retains immutable bodies for installed function identities
 //! even if the original compiled Script is dropped. No Script results or
 //! binding handles leave the Realm.
 //!
-//! An allowed binding write copies a nonempty Script-local or temporary String
+//! An allowed binding or field write copies a nonempty Script-local or temporary String
 //! into the Realm. Each execution can copy up to 16,384 UTF-16 units; the Realm
 //! retains up to 32,768 copied units over its lifetime, even after overwrite.
-//! Aliasing an existing Realm String, storing a static `typeof` spelling, or
-//! storing an empty String copies nothing. These ceilings are independent of
+//! New field keys share these limits. Existing Realm strings, checked code
+//! names, static spellings and empty strings need no copy. These ceilings are independent of
 //! the existing per-String and evaluation ceilings.
 
 use std::{collections::TryReserveError, fmt};
@@ -35,32 +35,33 @@ use crate::{
 };
 
 use super::{
-    BindingKind, Bindings, EvalError, EvalScratch, ExitStack, Frame, Instruction, Operand, Stack,
-    StringOperand, TransientStrings, TypeName, Update, UpdateNumeric, UpdateResult, Value,
-    dispatch, init_operand, new_stack, store_operand, update_number, update_result, validate_body,
-    validate_layout,
+    BindingKind, Bindings, CallTarget, Conversion, DotSite, EvalError, EvalScratch, ExitStack,
+    Frame, Instruction, Operand, Properties, Stack, StaticText, StringOperand, TransientStrings,
+    Update, UpdateNumeric, UpdateResult, Value, dispatch, init_operand, new_stack, store_operand,
+    update_number, update_result, validate_body, validate_layout, validate_property_shape,
 };
 
 mod object_heap;
-use object_heap::{CREATION_REQUEST_BYTES, CREATION_WORK, Creation, FunctionRecord, Heap};
+#[cfg(test)]
+#[path = "realm/property_tests.rs"]
+mod property_tests;
+use object_heap::{
+    Creation, Descriptor, FunctionRecord, HEAP_REQUEST_BYTES, Heap, Lookup, PROPERTY_WORK,
+};
+pub(super) use object_heap::{Intrinsic, ObjectId};
 
 pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;
 pub(crate) const MAX_SITES: usize = 4096;
 pub(crate) const MAX_DOT_SITES: usize = 4096;
-// Removed with the first producer/consumer of the serialized ABI.
-#[allow(dead_code)]
 pub(crate) const MAX_DOT_KEY_UNITS: usize = 256;
-#[allow(dead_code)]
 pub(crate) const MAX_DOT_CODE_UNITS: usize = 16 * 1024;
-#[allow(dead_code)]
 pub(crate) const DOT_ROOT: u16 = u16::MAX;
 
 // Shared with Realm lowering. A dot instruction's index selects exactly one
 // occurrence, independently of the identifier/binding access table.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct DotOccurrence {
     pub(crate) owner: u16, // DOT_ROOT or the actual body index
     pub(crate) key_start: u16,
@@ -72,11 +73,114 @@ pub(crate) struct DotOccurrence {
 const _: () = assert!(std::mem::size_of::<DotOccurrence>() == 16);
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct DotCode {
     pub(crate) source_len: u32,
     pub(crate) sites: Vec<DotOccurrence>,
     pub(crate) keys: Vec<u16>,
+}
+
+impl DotCode {
+    fn occurrence(&self, owner: u16, index: u16) -> Option<(&[u16], Span)> {
+        let site = self.sites.get(usize::from(index))?;
+        if site.owner != owner
+            || site.dot_end.checked_sub(site.dot_start) != Some(1)
+            || site.dot_end > self.source_len
+        {
+            return None;
+        }
+        let key = self
+            .keys
+            .get(usize::from(site.key_start)..usize::from(site.key_end))?;
+        if key.is_empty() || key.len() > MAX_DOT_KEY_UNITS {
+            return None;
+        }
+        Some((
+            key,
+            Span {
+                start: site.dot_start as usize,
+                end: site.dot_end as usize,
+            },
+        ))
+    }
+
+    fn validate(&self, bodies: usize, work: &mut Work) -> Result<(), InstantiateError> {
+        use InstantiateError::InvalidScript;
+        if self.sites.len() > MAX_DOT_SITES || self.keys.len() > MAX_DOT_CODE_UNITS {
+            return Err(InvalidScript);
+        }
+        work.charge(self.sites.len() + self.keys.len())?;
+        let mut frontier = 0;
+        for (index, site) in self.sites.iter().enumerate() {
+            if site.owner != DOT_ROOT && usize::from(site.owner) >= bodies {
+                return Err(InvalidScript);
+            }
+            let (key, _) = self
+                .occurrence(site.owner, index as u16)
+                .ok_or(InvalidScript)?;
+            if usize::from(site.key_start) != frontier || !identifier_name(key) {
+                return Err(InvalidScript);
+            }
+            frontier = usize::from(site.key_end);
+        }
+        if frontier != self.keys.len() {
+            return Err(InvalidScript);
+        }
+        Ok(())
+    }
+
+    fn validate_ops(
+        &self,
+        owner: u16,
+        ops: &[Instruction],
+        peak: usize,
+        exit: ExitStack,
+        work: &mut Work,
+    ) -> Result<(), InstantiateError> {
+        let remaining = std::cell::Cell::new(*work);
+        let charge = |n| {
+            let mut ledger = remaining.get();
+            ledger.charge(n)?;
+            remaining.set(ledger);
+            Ok(())
+        };
+        validate_property_shape(ops, peak, exit, charge, |index| {
+            charge(1)?;
+            self.occurrence(owner, index)
+                .ok_or(InstantiateError::InvalidScript)?;
+            Ok::<(), InstantiateError>(())
+        })?;
+        *work = remaining.get();
+        Ok(())
+    }
+}
+
+fn identifier_name(key: &[u16]) -> bool {
+    let start =
+        |u| u8::try_from(u).is_ok_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'$'));
+    key.split_first().is_some_and(|(&head, tail)| {
+        start(head) && tail.iter().all(|&u| start(u) || (48..=57).contains(&u))
+    })
+}
+
+fn property_op(op: Instruction) -> bool {
+    match op {
+        Instruction::GetDot(_)
+        | Instruction::FormDot(_)
+        | Instruction::PutDot(_)
+        | Instruction::PrepareDotCall(_) => true,
+        Instruction::Call { member, .. } => member != super::BARE_CALL,
+        _ => false,
+    }
+}
+
+impl From<EvalError> for InstantiateError {
+    fn from(error: EvalError) -> Self {
+        if error == EvalError::AllocationFailed {
+            Self::AllocationFailed
+        } else {
+            Self::InvalidScript
+        }
+    }
 }
 
 pub(crate) const MAX_PARAMETERS: u8 = 64;
@@ -202,7 +306,6 @@ pub struct CompiledScript {
     pub(crate) sites: Vec<Site>,
     pub(crate) declarations: usize,
     pub(crate) functions: Vec<FunctionBody>,
-    #[allow(dead_code)]
     pub(crate) dot: DotCode,
 }
 
@@ -280,6 +383,7 @@ pub enum InstantiateError {
     ArtifactLimitExceeded,
     ArtifactBytesLimitExceeded,
     FunctionLimitExceeded,
+    PropertyLimitExceeded,
     /// Instantiation would exceed 131,072 work credits, including callable
     /// metadata, initial heap construction, and any table moves.
     WorkLimitExceeded,
@@ -310,6 +414,20 @@ pub enum EngineFault {
     ImplicitGlobal {
         span: Span,
     },
+    UnsupportedProperty {
+        span: Span,
+        cause: PropertyFault,
+    },
+    UnsupportedIntrinsicCall {
+        span: Span,
+        intrinsic: IntrinsicCall,
+    },
+    UnsupportedObjectConversion,
+    PropertyWorkLimitExceeded,
+    FunctionShapeLimitExceeded,
+    PropertyLimitExceeded {
+        span: Span,
+    },
     /// Kept for compatibility; String persistence no longer emits this fault.
     PersistentString {
         span: Span,
@@ -324,13 +442,32 @@ pub enum EngineFault {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PropertyFault {
+    PrimitiveReceiver,
+    Builtin,
+    RestrictedAccessor,
+    AnnexB,
+    IncompleteOwnShape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IntrinsicCall {
+    Object,
+    Function,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StoredValue {
     Scalar(Value),
-    TypeName(TypeName),
+    StaticText(StaticText),
     Empty,
     Realm(RealmRange),
     Function(FunctionId),
+    Object(ObjectId),
+    CodeName(FunctionOrigin),
 }
 
 // Not a public handle: only successful appends issue offsets, and the private
@@ -540,22 +677,26 @@ struct ObjectBindings {
 // Private append-only indices, meaningful only in the owning Realm. A cell
 // points to an identity, not directly to a code address or binding name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FunctionId(u16);
+pub(super) enum FunctionId {
+    User(u16),
+    Intrinsic(Intrinsic),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FunctionOrigin {
     pub(super) artifact: u8,
-    body: u16,
+    pub(super) body: u16,
 }
 
 pub(super) struct Artifact {
     bodies: Vec<FunctionBody>,
-    pub(super) string_units: Vec<u16>,
+    string_units: Vec<u16>,
+    literal_units: usize,
     names: Vec<u8>,
     sites: Vec<Site>,
-    // Body-indexed provenance into the existing name pool. No second spelling
-    // or changes to the literal pool before there is a property consumer.
+    // Body-indexed ranges into the checked UTF-16 name tail, never literals.
     body_names: Vec<Option<NameRange>>,
+    dot: DotCode,
 }
 
 impl Artifact {
@@ -571,6 +712,7 @@ impl Artifact {
             .map_err(|_| InstantiateError::InvalidScript)?;
         let mut bodies = reserve_code(code.functions.len(), &mut bytes, work)?;
         let mut body_names = reserve_code(code.functions.len(), &mut bytes, work)?;
+        let mut name_units = 0usize;
         let declarations = code
             .sites
             .get(..code.declarations)
@@ -604,6 +746,10 @@ impl Artifact {
                     .get(&code.names)
                     .ok_or(InstantiateError::InvalidScript)?;
                 work.charge(name.len())?;
+                name_units = name_units
+                    .checked_add(name.len())
+                    .filter(|&n| n <= MAX_CODE_NAME_BYTES)
+                    .ok_or(InstantiateError::InvalidScript)?;
                 let start = |b: u8| b.is_ascii_alphabetic() || matches!(b, b'_' | b'$');
                 if !start(name[0]) || !name[1..].iter().all(|&b| start(b) || b.is_ascii_digit()) {
                     return Err(InstantiateError::InvalidScript);
@@ -613,13 +759,24 @@ impl Artifact {
             validate_body(&body.instructions, body.max_stack_depth, ExitStack::Empty)
                 .map_err(|_| InstantiateError::InvalidScript)?;
             work.charge(body.instructions.len())?;
-            if body.layout.counts().is_none()
-                || body
-                    .instructions
-                    .iter()
-                    .any(|op| matches!(op, Instruction::CreateFunction(_)))
-            {
+            if body.layout.counts().is_none() {
                 return Err(InstantiateError::InvalidScript);
+            }
+            let mut has_dot = false;
+            for &op in &body.instructions {
+                if matches!(op, Instruction::CreateFunction(_)) {
+                    return Err(InstantiateError::InvalidScript);
+                }
+                has_dot |= property_op(op);
+            }
+            if has_dot {
+                code.dot.validate_ops(
+                    index as u16,
+                    &body.instructions,
+                    body.max_stack_depth,
+                    ExitStack::Empty,
+                    work,
+                )?;
             }
             bodies.push(FunctionBody {
                 kind: body.kind,
@@ -641,17 +798,46 @@ impl Artifact {
         let mut expected = bodies.iter().enumerate().filter_map(|(index, body)| {
             matches!(body.kind, BodyKind::Expression(_)).then_some(index)
         });
+        let mut root_has_dot = false;
         for &op in &code.instructions {
+            root_has_dot |= property_op(op);
             if let Instruction::CreateFunction(body) = op
                 && expected.next() != Some(usize::from(body))
             {
                 return Err(InstantiateError::InvalidScript);
             }
         }
+        if root_has_dot {
+            code.dot.validate_ops(
+                DOT_ROOT,
+                &code.instructions,
+                code.max_stack_depth,
+                code.exit,
+                work,
+            )?;
+        }
         if expected.next().is_some() {
             return Err(InstantiateError::InvalidScript);
         }
-        let string_units = copy_code(&code.string_units, &mut bytes, work)?;
+        let literal_units = code.string_units.len();
+        // Independent bounds for the original literal prefix and widened tail.
+        const MAX_LITERAL_POOL_UNITS: usize = 16 * 1024;
+        if literal_units > MAX_LITERAL_POOL_UNITS {
+            return Err(InstantiateError::InvalidScript);
+        }
+        let mut string_units = reserve_code(literal_units + name_units, &mut bytes, work)?;
+        string_units.extend_from_slice(&code.string_units);
+        for range in body_names.iter_mut().flatten() {
+            let name = range
+                .get(&code.names)
+                .ok_or(InstantiateError::InvalidScript)?;
+            let start = string_units.len() as u16;
+            string_units.extend(name.iter().copied().map(u16::from));
+            *range = NameRange {
+                start,
+                end: string_units.len() as u16,
+            };
+        }
         let names = copy_code(&code.names, &mut bytes, work)?;
         let sites = copy_code(&code.sites, &mut bytes, work)?;
         Ok((
@@ -659,23 +845,37 @@ impl Artifact {
                 bodies,
                 string_units,
                 names,
+                literal_units,
                 sites,
                 body_names,
+                dot: DotCode {
+                    source_len: code.dot.source_len,
+                    sites: copy_code(&code.dot.sites, &mut bytes, work)?,
+                    keys: copy_code(&code.dot.keys, &mut bytes, work)?,
+                },
             },
             bytes,
         ))
     }
 
-    fn initial_name(&self, body: u16) -> Option<&[u8]> {
+    pub(super) fn literal_units(&self) -> &[u16] {
+        &self.string_units[..self.literal_units]
+    }
+
+    pub(super) fn initial_name(&self, body: u16) -> Option<&[u16]> {
         let index = usize::from(body);
         let template = self.bodies.get(index)?;
         template.layout.counts()?;
         let name = *self.body_names.get(index)?;
         match (template.kind, name) {
-            (BodyKind::Declaration, None) => None,
-            (BodyKind::Expression(expected), name) if expected != name => None,
-            (_, Some(name)) => name.get(&self.names),
-            (_, None) => Some(&[]),
+            (BodyKind::Expression(None), None) => Some(&[]),
+            (BodyKind::Declaration | BodyKind::Expression(Some(_)), Some(range)) => {
+                let (start, end) = (usize::from(range.start), usize::from(range.end));
+                let name = self.string_units.get(start..end)?;
+                (start >= self.literal_units && !name.is_empty() && name.len() <= MAX_NAME_BYTES)
+                    .then_some(name)
+            }
+            _ => None,
         }
     }
 }
@@ -924,7 +1124,7 @@ impl Realm {
                     name,
                 )?;
                 work.charge(4)?; // stage and publish identity + replacement
-                let id = FunctionId((self.functions.len() + identities.len()) as u16);
+                let id = FunctionId::User((self.functions.len() + identities.len()) as u16);
                 identities.push(FunctionOrigin {
                     artifact: artifact_id as u8,
                     body,
@@ -1048,6 +1248,38 @@ impl Realm {
         // in one record that would weaken the joint geometric bound.
         let lexical_growth = prepare_growth(&self.state.globals, lexicals.len(), &mut work)?;
         let var_growth = prepare_growth(&self.state.object.vars, vars.len(), &mut work)?;
+        code.dot.validate(code.functions.len(), &mut work)?;
+        // Discover independently of table presence. For artifact imports the
+        // existing charged creator scan does this; otherwise replace Ready's
+        // bare-call scan and retain the resulting layout choice.
+        let mut root_validator = None;
+        if code.functions.is_empty() {
+            if code.instructions.len() > super::MAX_INSTRUCTIONS {
+                return Err(InvalidScript);
+            }
+            let mut has_call = false;
+            let mut has_dot = false;
+            for &op in &code.instructions {
+                has_call |= matches!(op, Instruction::Call { .. });
+                has_dot |= property_op(op);
+            }
+            if has_dot {
+                work.charge(code.instructions.len())?;
+                code.dot.validate_ops(
+                    DOT_ROOT,
+                    &code.instructions,
+                    code.max_stack_depth,
+                    code.exit,
+                    &mut work,
+                )?;
+            } else {
+                root_validator = Some(if has_call {
+                    RootLayout::Callable
+                } else {
+                    RootLayout::Ordinary
+                });
+            }
+        }
         let artifact = if code.functions.is_empty() {
             None
         } else {
@@ -1073,7 +1305,7 @@ impl Realm {
             )?;
             work.charge(plan.function_moves())?;
             work.charge(plan.heap_work())?;
-            if plan.request_bytes() > CREATION_REQUEST_BYTES {
+            if plan.request_bytes() > HEAP_REQUEST_BYTES {
                 return Err(AllocationFailed);
             }
             Some(plan.reserve()?)
@@ -1111,6 +1343,7 @@ impl Realm {
             code,
             links,
             root_artifact,
+            root_validator,
         })
     }
 }
@@ -1241,6 +1474,12 @@ enum Target {
     Unlinked,
 }
 
+#[derive(Clone, Copy)]
+enum RootLayout {
+    Ordinary,
+    Callable,
+}
+
 /// A one-shot execution guard. Dropping the guard abandons the body, but
 /// leaves lexical bindings in TDZ, new `var` bindings `undefined`, and
 /// function declarations installed.
@@ -1268,6 +1507,7 @@ pub struct ReadyScript<'realm, 'code> {
     code: &'code CompiledScript,
     links: Vec<Target>,
     root_artifact: Option<u8>,
+    root_validator: Option<RootLayout>,
 }
 
 impl fmt::Debug for ReadyScript<'_, '_> {
@@ -1281,17 +1521,12 @@ impl ReadyScript<'_, '_> {
     /// preserves declarations and all effects that occurred before it.
     pub fn execute(mut self) -> Result<Completion, EngineFault> {
         let code = self.code;
-        // Callable roots were validated by artifact staging. The instructions
-        // and root layout cannot change during Ready's immutable code borrow.
-        if self.root_artifact.is_none() {
-            let validate = if code
-                .instructions
-                .iter()
-                .any(|op| matches!(op, Instruction::Call { .. }))
-            {
-                validate_body
-            } else {
-                validate_layout
+        // Root layout was already checked for retained and property-bearing
+        // code. Ordinary/body-free roots keep the original reached validators.
+        if let Some(layout) = self.root_validator {
+            let validate = match layout {
+                RootLayout::Ordinary => validate_layout,
+                RootLayout::Callable => validate_body,
             };
             validate(&code.instructions, code.max_stack_depth, code.exit)
                 .map_err(EngineFault::Evaluation)?;
@@ -1321,12 +1556,13 @@ impl ReadyScript<'_, '_> {
             },
             functions: &mut self.realm.functions,
             heap: &mut self.realm.heap,
-            creation_work: Work(CREATION_WORK),
-            creation_requests: CREATION_REQUEST_BYTES,
+            property_work: Work(PROPERTY_WORK),
+            heap_requests: HEAP_REQUEST_BYTES,
             root_artifact: self.root_artifact,
             active: None,
             lookup: Work(LOOKUP_WORK),
             sites: &self.code.sites,
+            root_dot: &self.code.dot,
             links: &self.links,
             mode: self.code.mode,
             copied: 0,
@@ -1339,12 +1575,13 @@ struct Execution<'realm, 'code> {
     callable: CallableCode<'realm>,
     functions: &'realm mut Vec<FunctionRecord>,
     heap: &'realm mut Heap,
-    creation_work: Work,
-    creation_requests: usize,
+    property_work: Work,
+    heap_requests: usize,
     root_artifact: Option<u8>,
     active: Option<FunctionOrigin>,
     lookup: Work,
     sites: &'code [Site],
+    root_dot: &'code DotCode,
     links: &'code [Target],
     mode: CodeMode,
     copied: usize,
@@ -1440,14 +1677,34 @@ impl Execution<'_, '_> {
                     .value
             }
         };
+        self.load_value(value)
+    }
+
+    fn load_value(&self, value: StoredValue) -> Result<Operand, Stop> {
         Ok(match value {
             StoredValue::Scalar(value) => Operand::Scalar(value),
             StoredValue::Function(id) => {
-                let origin = self.function_origin(id)?;
-                self.callable.body(origin).ok_or(EvalError::InvalidScript)?;
+                self.callable_object(id)?;
                 Operand::Function(id)
             }
-            StoredValue::TypeName(name) => Operand::String(StringOperand::TypeName(name)),
+            StoredValue::Object(id) => {
+                if !self.heap.is_noncallable(id) {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                Operand::Object(id)
+            }
+            StoredValue::CodeName(origin) => {
+                let name = self
+                    .callable
+                    .body(origin)
+                    .and_then(|(artifact, _)| artifact.initial_name(origin.body))
+                    .ok_or(EvalError::InvalidScript)?;
+                if name.is_empty() {
+                    return Err(EvalError::InvalidScript.into());
+                }
+                Operand::String(StringOperand::CodeName(origin))
+            }
+            StoredValue::StaticText(name) => Operand::String(StringOperand::StaticText(name)),
             StoredValue::Empty => Operand::String(StringOperand::Empty),
             StoredValue::Realm(range) => {
                 range
@@ -1456,6 +1713,25 @@ impl Execution<'_, '_> {
                 Operand::String(StringOperand::Realm(range))
             }
         })
+    }
+
+    fn callable_object(&self, id: FunctionId) -> Result<ObjectId, Stop> {
+        if let FunctionId::User(_) = id {
+            let origin = self.function_origin(id)?;
+            self.callable.body(origin).ok_or(EvalError::InvalidScript)?;
+        }
+        self.heap
+            .callable_object(id, self.functions)
+            .ok_or(EvalError::InvalidScript.into())
+    }
+
+    fn object_receiver(&self, value: Operand) -> Result<Option<ObjectId>, Stop> {
+        match value {
+            Operand::Function(id) => Ok(Some(self.callable_object(id)?)),
+            Operand::Object(id) if self.heap.is_noncallable(id) => Ok(Some(id)),
+            Operand::Object(_) => Err(EvalError::InvalidScript.into()),
+            _ => Ok(None),
+        }
     }
 
     fn put(
@@ -1513,6 +1789,67 @@ impl Execution<'_, '_> {
     }
 }
 
+enum Escape<'a> {
+    Value(StoredValue),
+    Copy(&'a [u16]),
+}
+
+impl<'a> Escape<'a> {
+    fn check(value: Operand, source: TransientStrings<'a>, retained: &[u16]) -> Result<Self, Stop> {
+        let value = match value {
+            Operand::Scalar(value) => StoredValue::Scalar(value),
+            // All issued identity operands are checked by the producing load,
+            // descriptor Get or creator and the heap never retires identities.
+            Operand::Function(id) => StoredValue::Function(id),
+            Operand::Object(id) => StoredValue::Object(id),
+            Operand::String(StringOperand::StaticText(name)) => StoredValue::StaticText(name),
+            Operand::String(StringOperand::Empty) => StoredValue::Empty,
+            Operand::String(StringOperand::CodeName(origin)) => {
+                source
+                    .code_name(origin)
+                    .filter(|s| !s.is_empty())
+                    .ok_or(EvalError::InvalidScript)?;
+                StoredValue::CodeName(origin)
+            }
+            Operand::String(StringOperand::Realm(range)) => {
+                range.get(retained).ok_or(EvalError::InvalidScript)?;
+                StoredValue::Realm(range)
+            }
+            Operand::String(string) => {
+                let units = match string {
+                    StringOperand::Literal(range) => source.literal(range),
+                    StringOperand::ArtifactLiteral { artifact, range } => {
+                        source.artifact_literal(artifact, range)
+                    }
+                    StringOperand::Runtime(range) => source.runtime(range),
+                    _ => return Err(EvalError::InvalidScript.into()),
+                }
+                .ok_or(EvalError::InvalidScript)?;
+                return Ok(if units.is_empty() {
+                    Self::Value(StoredValue::Empty)
+                } else {
+                    Self::Copy(units)
+                });
+            }
+        };
+        Ok(Self::Value(value))
+    }
+
+    fn units(&self) -> &'a [u16] {
+        match self {
+            Self::Value(_) => &[],
+            Self::Copy(units) => units,
+        }
+    }
+
+    fn finish(self, range: Option<RealmRange>) -> StoredValue {
+        match self {
+            Self::Value(value) => value,
+            Self::Copy(_) => StoredValue::Realm(range.expect("reserved nonempty value")),
+        }
+    }
+}
+
 fn escape(
     value: Operand,
     span: Span,
@@ -1520,23 +1857,10 @@ fn escape(
     strings: &mut Arena,
     copied: &mut usize,
 ) -> Result<StoredValue, Stop> {
-    let units = match value {
-        Operand::Scalar(value) => return Ok(StoredValue::Scalar(value)),
-        Operand::Function(id) => return Ok(StoredValue::Function(id)),
-        Operand::String(StringOperand::TypeName(name)) => return Ok(StoredValue::TypeName(name)),
-        Operand::String(StringOperand::Empty) => return Ok(StoredValue::Empty),
-        Operand::String(StringOperand::Realm(range)) => {
-            range.get(strings.units()).ok_or(EvalError::InvalidScript)?;
-            return Ok(StoredValue::Realm(range));
-        }
-        Operand::String(StringOperand::Literal(range)) => source.literal(range),
-        Operand::String(StringOperand::ArtifactLiteral { artifact, range }) => {
-            source.artifact_literal(artifact, range)
-        }
-        Operand::String(StringOperand::Runtime(range)) => source.runtime(range),
+    match Escape::check(value, source, strings.units())? {
+        Escape::Value(value) => Ok(value),
+        Escape::Copy(units) => strings.append(units, copied, span),
     }
-    .ok_or(EvalError::InvalidScript)?;
-    strings.append(units, copied, span)
 }
 
 pub(super) enum Stop {
@@ -1550,11 +1874,249 @@ impl From<EvalError> for Stop {
     }
 }
 
-fn creation_eval_error(error: InstantiateError) -> EvalError {
+impl From<Conversion> for Stop {
+    fn from(error: Conversion) -> Self {
+        match error {
+            Conversion::Evaluation(error) => error.into(),
+            Conversion::Object => Self::Engine(EngineFault::UnsupportedObjectConversion),
+        }
+    }
+}
+
+fn creation_stop(error: InstantiateError) -> Stop {
     match error {
-        InstantiateError::FunctionLimitExceeded => EvalError::FunctionLimitExceeded,
-        InstantiateError::AllocationFailed => EvalError::AllocationFailed,
-        _ => EvalError::InvalidScript,
+        InstantiateError::PropertyLimitExceeded => {
+            Stop::Engine(EngineFault::FunctionShapeLimitExceeded)
+        }
+        InstantiateError::FunctionLimitExceeded => EvalError::FunctionLimitExceeded.into(),
+        InstantiateError::AllocationFailed => EvalError::AllocationFailed.into(),
+        _ => EvalError::InvalidScript.into(),
+    }
+}
+
+fn property_stop(error: InstantiateError, span: Span) -> Stop {
+    match error {
+        InstantiateError::PropertyLimitExceeded => {
+            Stop::Engine(EngineFault::PropertyLimitExceeded { span })
+        }
+        InstantiateError::WorkLimitExceeded => Stop::Engine(EngineFault::PropertyWorkLimitExceeded),
+        InstantiateError::FunctionLimitExceeded => EvalError::FunctionLimitExceeded.into(),
+        InstantiateError::AllocationFailed => EvalError::AllocationFailed.into(),
+        _ => EvalError::InvalidScript.into(),
+    }
+}
+
+fn unsupported_property(span: Span, cause: PropertyFault) -> Stop {
+    Stop::Engine(EngineFault::UnsupportedProperty { span, cause })
+}
+
+fn false_set(site: DotSite) -> Result<(), Stop> {
+    if site.mode == CodeMode::Strict {
+        Err(Stop::Throw(Throw::TypeError { span: site.span }))
+    } else {
+        Ok(())
+    }
+}
+
+fn primitive_dot(receiver: Operand, key: &[u16], span: Span) -> Result<StringOperand, Stop> {
+    match receiver {
+        Operand::Scalar(Value::Null | Value::Undefined) => {
+            Err(Stop::Throw(Throw::TypeError { span }))
+        }
+        Operand::String(string)
+            if key
+                .iter()
+                .copied()
+                .eq(b"length".iter().copied().map(u16::from)) =>
+        {
+            Ok(string)
+        }
+        Operand::Scalar(_)
+            if key
+                .iter()
+                .copied()
+                .eq(b"length".iter().copied().map(u16::from)) =>
+        {
+            Err(EvalError::UnsupportedPropertyReceiver.into())
+        }
+        _ => Err(unsupported_property(span, PropertyFault::PrimitiveReceiver)),
+    }
+}
+
+fn dot_table<'a>(
+    root: &'a DotCode,
+    callable: CallableCode<'a>,
+    active: Option<FunctionOrigin>,
+    root_mode: CodeMode,
+    owner: Option<FunctionOrigin>,
+) -> Result<(&'a DotCode, u16, CodeMode), Stop> {
+    if owner != active {
+        return Err(EvalError::InvalidScript.into());
+    }
+    match owner {
+        Some(origin) => {
+            let (artifact, body) = callable.body(origin).ok_or(EvalError::InvalidScript)?;
+            Ok((&artifact.dot, origin.body, body.mode))
+        }
+        None => Ok((root, DOT_ROOT, root_mode)),
+    }
+}
+
+impl Properties for Execution<'_, '_> {
+    type Error = Stop;
+
+    fn dot_metadata(
+        &self,
+        owner: Option<FunctionOrigin>,
+        index: u16,
+    ) -> Result<(Span, CodeMode), Stop> {
+        let (table, owner, mode) =
+            dot_table(self.root_dot, self.callable, self.active, self.mode, owner)?;
+        let (_, span) = table
+            .occurrence(owner, index)
+            .ok_or(EvalError::InvalidScript)?;
+        Ok((span, mode))
+    }
+
+    fn charge_packets(&mut self, work: usize) -> Result<(), Stop> {
+        self.property_work
+            .charge(work)
+            .map_err(|_| Stop::Engine(EngineFault::PropertyWorkLimitExceeded))
+    }
+
+    fn get_dot(
+        &mut self,
+        site: DotSite,
+        receiver: Operand,
+        source: TransientStrings<'_>,
+    ) -> Result<Operand, Stop> {
+        let object = self.object_receiver(receiver)?;
+        let table = dot_table(
+            self.root_dot,
+            self.callable,
+            self.active,
+            self.mode,
+            site.owner,
+        )?;
+        let (key, _) = table
+            .0
+            .occurrence(table.1, site.index)
+            .ok_or(EvalError::InvalidScript)?;
+        let Some(object) = object else {
+            let string = primitive_dot(receiver, key, site.span)?;
+            let units = string
+                .get(source.with_retained(self.retained_units()))
+                .ok_or(EvalError::InvalidScript)?;
+            return Ok(Operand::Scalar(Value::Number(units.len() as f64)));
+        };
+        // `key` borrows immutable compiled/retained code, not the Realm heap.
+        let mut work = self.property_work;
+        let lookup = self
+            .heap
+            .lookup(object, key, self.retained_units(), &mut work)
+            .map_err(|e| property_stop(e, site.span))?;
+        self.property_work = work;
+        match lookup {
+            Lookup::Missing => Ok(Operand::Scalar(Value::Undefined)),
+            Lookup::Found {
+                descriptor: Descriptor::Data(value, _),
+                ..
+            } => self.load_value(value),
+            Lookup::Found {
+                descriptor: Descriptor::Builtin,
+                ..
+            } => Err(unsupported_property(site.span, PropertyFault::Builtin)),
+            Lookup::Found {
+                descriptor: Descriptor::Restricted,
+                ..
+            } => Err(unsupported_property(
+                site.span,
+                PropertyFault::RestrictedAccessor,
+            )),
+            Lookup::Found {
+                descriptor: Descriptor::AnnexB,
+                ..
+            } => Err(unsupported_property(site.span, PropertyFault::AnnexB)),
+            Lookup::Incomplete => Err(unsupported_property(
+                site.span,
+                PropertyFault::IncompleteOwnShape,
+            )),
+        }
+    }
+
+    fn put_dot(
+        &mut self,
+        site: DotSite,
+        receiver: Operand,
+        rhs: Operand,
+        source: TransientStrings<'_>,
+    ) -> Result<(), Stop> {
+        let object = self.object_receiver(receiver)?;
+        let (table, owner, _) = dot_table(
+            self.root_dot,
+            self.callable,
+            self.active,
+            self.mode,
+            site.owner,
+        )?;
+        let (key, _) = table
+            .occurrence(owner, site.index)
+            .ok_or(EvalError::InvalidScript)?;
+        let Some(object) = object else {
+            primitive_dot(receiver, key, site.span)?;
+            return false_set(site);
+        };
+        let mut work = self.property_work;
+        let fail = |error| property_stop(error, site.span);
+        let lookup = self
+            .heap
+            .lookup(object, key, self.realm.strings.units(), &mut work)
+            .map_err(fail)?;
+        match lookup {
+            Lookup::Incomplete => {
+                return Err(unsupported_property(
+                    site.span,
+                    PropertyFault::IncompleteOwnShape,
+                ));
+            }
+            Lookup::Found {
+                descriptor: Descriptor::Restricted,
+                ..
+            } => {
+                return Err(unsupported_property(
+                    site.span,
+                    PropertyFault::RestrictedAccessor,
+                ));
+            }
+            Lookup::Found {
+                descriptor: Descriptor::AnnexB,
+                ..
+            } => return Err(unsupported_property(site.span, PropertyFault::AnnexB)),
+            Lookup::Found { descriptor, .. } if !descriptor.writable() => {
+                self.property_work = work;
+                return false_set(site);
+            }
+            _ => {}
+        }
+        let escape = Escape::check(rhs, source, self.realm.strings.units())?;
+        let edit = self.heap.edit(object, lookup).map_err(fail)?;
+        let key = if edit.inserts() { key } else { &[] };
+        work.charge(edit.work() + key.len() + escape.units().len())
+            .map_err(fail)?;
+        let requests = self
+            .heap_requests
+            .checked_sub(edit.request_bytes())
+            .ok_or(EvalError::AllocationFailed)?;
+        let append = self
+            .realm
+            .strings
+            .plan(key, escape.units(), &mut self.copied, site.span)?;
+        let row = edit.reserve().map_err(fail)?;
+        let [key, value] = append.reserve()?.publish();
+        row.publish(key, escape.finish(value));
+        self.property_work = work;
+        self.heap_requests = requests;
+        Ok(())
     }
 }
 
@@ -1596,6 +2158,30 @@ impl Bindings for Execution<'_, '_> {
             .ok_or(EvalError::InvalidScript.into())
     }
 
+    fn properties(&mut self) -> Option<&mut dyn Properties<Error = Stop>> {
+        Some(self)
+    }
+
+    fn classify_callable(&self, id: FunctionId, span: Span) -> Result<CallTarget, Stop> {
+        self.callable_object(id)?;
+        match id {
+            FunctionId::User(_) => self.function_origin(id).map(CallTarget::User),
+            FunctionId::Intrinsic(Intrinsic::FunctionPrototype) => {
+                Ok(CallTarget::FunctionPrototype)
+            }
+            FunctionId::Intrinsic(tag) => {
+                Err(Stop::Engine(EngineFault::UnsupportedIntrinsicCall {
+                    span,
+                    intrinsic: match tag {
+                        Intrinsic::ObjectConstructor => IntrinsicCall::Object,
+                        Intrinsic::FunctionConstructor => IntrinsicCall::Function,
+                        Intrinsic::FunctionPrototype => unreachable!(),
+                    },
+                }))
+            }
+        }
+    }
+
     fn create_function(&mut self, body: u16) -> Result<FunctionId, Stop> {
         if self.active.is_some() {
             return Err(EvalError::InvalidScript.into());
@@ -1613,26 +2199,26 @@ impl Bindings for Execution<'_, '_> {
             artifact,
             std::slice::from_ref(&origin),
         )
-        .map_err(creation_eval_error)?;
+        .map_err(creation_stop)?;
         let mut lookup = self.lookup;
-        let mut creation_work = self.creation_work;
+        let mut property_work = self.property_work;
         // Preserve the origin write/move debit in the existing call setup
-        // budget. Initial shape has a separate execute-wide debit; this
-        // constructor-only protocol cannot exhaust it at the user frontier.
+        // budget. Initial shape also debits the ledger shared with property
+        // packets, lookups and writes.
         lookup
             .charge(1 + plan.function_moves())
             .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
-        creation_work
+        property_work
             .charge(plan.heap_work())
-            .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
+            .map_err(|_| Stop::Engine(EngineFault::PropertyWorkLimitExceeded))?;
         let requests = self
-            .creation_requests
+            .heap_requests
             .checked_sub(plan.request_bytes())
             .ok_or(EvalError::AllocationFailed)?;
-        let id = plan.reserve().map_err(creation_eval_error)?.publish();
+        let id = plan.reserve().map_err(creation_stop)?.publish();
         self.lookup = lookup;
-        self.creation_work = creation_work;
-        self.creation_requests = requests;
+        self.property_work = property_work;
+        self.heap_requests = requests;
         Ok(id)
     }
 
@@ -1745,9 +2331,9 @@ mod tests {
         const DOT_SPAN: Span = Span { start: 3, end: 5 };
         // These are scripted classifications at the adapter boundary, not
         // objects, descriptors, or claims about the retained identity table.
-        const IMMEDIATE: FunctionId = FunctionId(512);
-        const OBJECT: FunctionId = FunctionId(513);
-        const FUNCTION: FunctionId = FunctionId(514);
+        const IMMEDIATE: FunctionId = FunctionId::Intrinsic(Intrinsic::FunctionPrototype);
+        const OBJECT: FunctionId = FunctionId::Intrinsic(Intrinsic::ObjectConstructor);
+        const FUNCTION: FunctionId = FunctionId::Intrinsic(Intrinsic::FunctionConstructor);
 
         #[derive(Debug, PartialEq)]
         enum Fault {
@@ -1763,6 +2349,12 @@ mod tests {
         impl From<EvalError> for Fault {
             fn from(error: EvalError) -> Self {
                 Self::Eval(error)
+            }
+        }
+
+        impl From<Conversion> for Fault {
+            fn from(error: Conversion) -> Self {
+                EvalError::from(error).into()
             }
         }
 
@@ -1919,7 +2511,10 @@ mod tests {
             fn function_origin(&self, id: FunctionId) -> Result<FunctionOrigin, Fault> {
                 let origin = FunctionOrigin {
                     artifact: 0,
-                    body: id.0,
+                    body: match id {
+                        FunctionId::User(index) => index,
+                        _ => return Err(EvalError::InvalidScript.into()),
+                    },
                 };
                 self.code.body(origin).ok_or(EvalError::InvalidScript)?;
                 Ok(origin)
@@ -1930,7 +2525,7 @@ mod tests {
             }
             fn load(&mut self, slot: usize) -> Result<Operand, Fault> {
                 match slot {
-                    0 => Ok(Operand::Function(FunctionId(0))),
+                    0 => Ok(Operand::Function(FunctionId::User(0))),
                     1 => {
                         self.events.push(Event::Argument);
                         if let Some(value) = self.replace_read_on_arg {
@@ -1942,7 +2537,7 @@ mod tests {
                             Ok(scalar(9.0))
                         }
                     }
-                    2 => Ok(Operand::Function(FunctionId(1))),
+                    2 => Ok(Operand::Function(FunctionId::User(1))),
                     3 => Ok(Operand::Scalar(Value::Boolean(std::mem::take(
                         &mut self.first_visit,
                     )))),
@@ -2008,7 +2603,9 @@ mod tests {
             [Artifact {
                 bodies,
                 body_names: vec![],
+                dot: DotCode::default(),
                 string_units: vec![],
+                literal_units: 0,
                 names: vec![],
                 sites: vec![],
             }]
@@ -2192,8 +2789,8 @@ mod tests {
             ]);
             let ops = [Number(4.0), PrepareDotCall(0), LoadBinding(1), call(0, 1)];
             let mut trace = Trace::new(&artifacts);
-            trace.read = Operand::Function(FunctionId(0));
-            trace.replace_read_on_arg = Some(Operand::Function(FunctionId(1)));
+            trace.read = Operand::Function(FunctionId::User(0));
+            trace.replace_read_on_arg = Some(Operand::Function(FunctionId::User(1)));
             assert_eq!(number(trace.run(&ops, 2).unwrap()), 9.0);
             assert_eq!(
                 trace.events,
@@ -2438,7 +3035,7 @@ mod tests {
                 caller.push(Return { value: false });
                 let artifacts = artifact(vec![wide(), body(caller, padding + 2, 0, 0)]);
                 let mut trace = Trace::new(&artifacts);
-                trace.read = Operand::Function(FunctionId(1));
+                trace.read = Operand::Function(FunctionId::User(1));
                 let ops = [Number(4.0), PrepareDotCall(0), call(0, 0)];
                 assert_eq!(
                     trace.run(&ops, 1).err(),
@@ -2468,8 +3065,8 @@ mod tests {
                 let mut code = CompiledScript::compile("1;").unwrap();
                 code.instructions = ops.to_vec();
                 assert_eq!(
-                    Realm::new().instantiate(&code).unwrap().execute(),
-                    Err(EngineFault::Evaluation(EvalError::InvalidScript))
+                    Realm::new().instantiate(&code).unwrap_err(),
+                    InstantiateError::InvalidScript
                 );
             }
             let ops = [Jump(2), GetDot(0), Number(4.0)];
@@ -2551,7 +3148,7 @@ mod tests {
             for member in [vec![], vec![Return { value: false }]] {
                 let artifacts = artifact(vec![wide(), body(member, 0, 0, 0)]);
                 let mut trace = Trace::new(&artifacts);
-                trace.read = Operand::Function(FunctionId(1));
+                trace.read = Operand::Function(FunctionId::User(1));
                 assert_eq!(number(trace.run(&ops, 127).unwrap()), 9.0);
             }
         }
@@ -2593,7 +3190,7 @@ mod tests {
                     .count(),
                 32
             );
-            trace.read = Operand::Function(FunctionId(0));
+            trace.read = Operand::Function(FunctionId::User(0));
             assert_eq!(
                 trace.run(&ops, 2).err(),
                 Some(EvalError::CallDepthLimitExceeded.into())
@@ -2723,7 +3320,7 @@ mod tests {
         assert!(code.functions[0].instructions.is_empty());
         // Scan root; reserve and visit one body; copy one site and name byte.
         // Initial name provenance adds a table entry, site walk and name check.
-        let stage_cost = code.instructions.len() + 7;
+        let stage_cost = code.instructions.len() + 8;
         assert!(matches!(
             Artifact::stage(&code, 0, &mut Work(stage_cost - 1)),
             Err(InstantiateError::WorkLimitExceeded)
@@ -2860,7 +3457,7 @@ mod tests {
                 EvalError::InvalidScript
             )))
         ));
-        assert_eq!(execution.create_function(1).ok(), Some(FunctionId(1)));
+        assert_eq!(execution.create_function(1).ok(), Some(FunctionId::User(1)));
         assert_eq!(
             (
                 execution.functions.len(),
@@ -3075,15 +3672,15 @@ mod tests {
         use std::fmt::Write as _;
 
         let mut source = String::new();
-        for i in 0..158 {
+        for i in 0..157 {
             write!(source, "function f{i:03}(){{}}").unwrap();
         }
-        source.push_str(&"1;".repeat(171));
+        source.push_str(&"1;".repeat(663));
         let at_limit = CompiledScript::compile(&format!("{source}+1;")).unwrap();
         let over_limit = CompiledScript::compile(&format!("{source}+ +1;")).unwrap();
         assert_eq!(
             (at_limit.instructions.len(), over_limit.instructions.len()),
-            (344, 345)
+            (1328, 1329)
         );
         assert!(
             at_limit
@@ -3096,9 +3693,9 @@ mod tests {
         // distinct four-byte names, selection and binding lookup each compare
         // n(n−1)/2 candidates at 5 credits. Other old work is 24n plus the
         // root instruction scan. Name provenance adds 6n (range table, site
-        // walk, and ASCII validation); the heap adds 12n + 62 (two writes per
-        // initial object or row). This moves the old 128,166/128,167 pair to
-        // exactly 131,072/131,073 without changing the budget itself.
+        // walk, and ASCII validation) plus 4n widened units. The heap adds
+        // 12n + 62 (two writes per initial object or row). The resulting
+        // pair is exactly 131,072/131,073 without changing the ceiling.
         let mut realm = Realm::new();
         assert_eq!(
             realm.instantiate(&over_limit).unwrap_err(),
@@ -3123,7 +3720,7 @@ mod tests {
                 realm.functions.len(),
                 realm.state.object.vars.len()
             ),
-            (1, 158, 158)
+            (1, 157, 157)
         );
     }
 
@@ -3184,12 +3781,12 @@ mod tests {
         );
         assert_eq!(
             realm.state.object.vars[0].value,
-            StoredValue::Function(FunctionId(0))
+            StoredValue::Function(FunctionId::User(0))
         );
         drop(realm.instantiate_with_work(&replacement, high).unwrap());
         assert_eq!(
             realm.state.object.vars[0].value,
-            StoredValue::Function(FunctionId(1))
+            StoredValue::Function(FunctionId::User(1))
         );
     }
 

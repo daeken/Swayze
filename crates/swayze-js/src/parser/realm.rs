@@ -9,7 +9,7 @@ use crate::{
 
 use super::{
     AccessKind, ActiveStatement, AfterExpression, BindingPolicy, DirectReference, Error,
-    ExpressionEnd, ExpressionInput, ExpressionResume, Follow, Instruction, Limit, Limits,
+    ExpressionEnd, ExpressionInput, ExpressionResume, Follow, Instruction, Limit, Limits, Operator,
     ParseAction, ParseErrorType, ParseOwner, Parser, Pending, QuotedDecimalEscape, RealmParseLimit,
     Span, Token, TokenKind, TokenPosition, UNPATCHED, WriteAccess, new_parser, try_push,
 };
@@ -35,6 +35,12 @@ pub(super) struct OpenFunction {
     params: Vec<Span>,
     vars: Vec<Span>,
     accesses: usize,
+}
+
+impl OpenFunction {
+    pub(super) fn parked_statement_count(&self) -> usize {
+        self.root_statement_frames.len()
+    }
 }
 
 pub(super) struct ExpressionContinuation {
@@ -77,6 +83,12 @@ impl Parser<'_> {
             TokenPosition::Plain,
             "expected '(' before formal parameters",
         )?;
+        if expression.is_some() && matches!(open.kind, TokenKind::Operator(Operator::Multiply)) {
+            return Err(Error::unsupported(
+                keyword,
+                "generator function expressions are outside the subset",
+            ));
+        }
         if !matches!(open.kind, TokenKind::Open) {
             return Err(
                 if expression.is_some() && matches!(open.kind, TokenKind::Identifier) {

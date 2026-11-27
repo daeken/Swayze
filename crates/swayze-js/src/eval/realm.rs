@@ -406,10 +406,6 @@ pub(super) struct FunctionOrigin {
 }
 
 pub(super) struct Artifact {
-    root: Vec<Instruction>,
-    root_peak: usize,
-    root_exit: ExitStack,
-    root_mode: CodeMode,
     bodies: Vec<FunctionBody>,
     pub(super) string_units: Vec<u16>,
     names: Vec<u8>,
@@ -460,9 +456,11 @@ impl Artifact {
                 accesses: body.accesses.clone(),
             });
         }
-        // A single charged merge scan authenticates each root expression
-        // creator against a distinct expression template in emission order.
+        // A merge scan authenticates each root creator against a distinct
+        // expression template in emission order. Charge both sides, including
+        // declaration templates the filter visits but does not yield.
         work.charge(code.instructions.len())?;
+        work.charge(bodies.len())?;
         let mut expected = bodies.iter().enumerate().filter_map(|(index, body)| {
             matches!(body.kind, BodyKind::Expression(_)).then_some(index)
         });
@@ -476,16 +474,11 @@ impl Artifact {
         if expected.next().is_some() {
             return Err(InstantiateError::InvalidScript);
         }
-        let root = copy_code(&code.instructions, &mut bytes, work)?;
         let string_units = copy_code(&code.string_units, &mut bytes, work)?;
         let names = copy_code(&code.names, &mut bytes, work)?;
         let sites = copy_code(&code.sites, &mut bytes, work)?;
         Ok((
             Self {
-                root,
-                root_peak: code.max_stack_depth,
-                root_exit: code.exit,
-                root_mode: code.mode,
                 bodies,
                 string_units,
                 names,
@@ -1075,40 +1068,28 @@ impl ReadyScript<'_, '_> {
     /// preserves declarations and all effects that occurred before it.
     pub fn execute(mut self) -> Result<Completion, EngineFault> {
         let code = self.code;
-        let mut execution = self.execution();
-        let (ops, units, peak, exit) =
-            if let Some(artifact) = execution.root_code().map_err(EngineFault::Evaluation)? {
-                (
-                    &artifact.root[..],
-                    &artifact.string_units[..],
-                    artifact.root_peak,
-                    artifact.root_exit,
-                )
+        // Callable roots were validated by artifact staging. The instructions
+        // and root layout cannot change during Ready's immutable code borrow.
+        if self.root_artifact.is_none() {
+            let validate = if code
+                .instructions
+                .iter()
+                .any(|op| matches!(op, Instruction::Call { .. }))
+            {
+                validate_body
             } else {
-                let validate = if code
-                    .instructions
-                    .iter()
-                    .any(|op| matches!(op, Instruction::Call { .. }))
-                {
-                    validate_body
-                } else {
-                    validate_layout
-                };
-                validate(&code.instructions, code.max_stack_depth, code.exit)
-                    .map_err(EngineFault::Evaluation)?;
-                (
-                    &code.instructions[..],
-                    &code.string_units[..],
-                    code.max_stack_depth,
-                    code.exit,
-                )
+                validate_layout
             };
-        let stack = new_stack(peak).map_err(EngineFault::Evaluation)?;
+            validate(&code.instructions, code.max_stack_depth, code.exit)
+                .map_err(EngineFault::Evaluation)?;
+        }
+        let stack = new_stack(code.max_stack_depth).map_err(EngineFault::Evaluation)?;
         let mut scratch = EvalScratch::new();
+        let mut execution = self.execution();
         match dispatch(
-            Frame::root(ops, peak, exit),
+            Frame::root(&code.instructions, code.max_stack_depth, code.exit),
             stack,
-            units,
+            &code.string_units,
             execution.callable,
             &mut scratch,
             &mut execution,
@@ -1150,18 +1131,7 @@ struct Execution<'realm, 'code> {
     copied: usize,
 }
 
-impl<'realm> Execution<'realm, '_> {
-    fn root_code(&self) -> Result<Option<&'realm Artifact>, EvalError> {
-        self.root_artifact
-            .map(|id| {
-                self.callable
-                    .artifacts
-                    .get(usize::from(id))
-                    .ok_or(EvalError::InvalidScript)
-            })
-            .transpose()
-    }
-
+impl Execution<'_, '_> {
     fn site(&mut self, index: usize) -> Result<(Target, Span, Role), Stop> {
         if let Some(origin) = self.active {
             let (artifact, body) = self.callable.body(origin).ok_or(EvalError::InvalidScript)?;
@@ -1177,10 +1147,7 @@ impl<'realm> Execution<'realm, '_> {
                 .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
             return Ok((target, site.span, site.role));
         }
-        let sites = self
-            .root_code()?
-            .map_or(self.sites, |artifact| &artifact.sites);
-        let site = sites.get(index).ok_or(EvalError::InvalidScript)?;
+        let site = self.sites.get(index).ok_or(EvalError::InvalidScript)?;
         let target = *self.links.get(index).ok_or(EvalError::InvalidScript)?;
         if matches!(target, Target::Unlinked) {
             return Err(EvalError::InvalidScript.into());
@@ -1211,9 +1178,7 @@ impl<'realm> Execution<'realm, '_> {
 
     fn mode(&self) -> Result<CodeMode, EvalError> {
         match self.active {
-            None => Ok(self
-                .root_code()?
-                .map_or(self.mode, |artifact| artifact.root_mode)),
+            None => Ok(self.mode),
             Some(origin) => self
                 .callable
                 .body(origin)
@@ -1583,6 +1548,79 @@ mod tests {
             ]
         );
         assert!(CompiledScript::compile("var x; (x) = function(){};").is_err());
+    }
+
+    #[test]
+    fn mostly_root_scripts_retain_body_data_but_not_ready_instructions() {
+        let code =
+            CompiledScript::compile(&format!("function f(){{}}{}", "1;".repeat(1800))).unwrap();
+        assert_eq!(code.instructions.len(), 3599);
+        assert_eq!(code.functions.len(), 1);
+        assert!(code.functions[0].instructions.is_empty());
+        let stage_cost = code.instructions.len() + 4; // scan root; reserve and visit one body; one site and name byte
+        assert!(matches!(
+            Artifact::stage(&code, 0, &mut Work(stage_cost - 1)),
+            Err(InstantiateError::WorkLimitExceeded)
+        ));
+        let (_, bytes) = Artifact::stage(&code, 0, &mut Work(stage_cost)).unwrap();
+        assert!(bytes * MAX_ARTIFACTS <= MAX_ARTIFACT_BYTES);
+        let old_backing = bytes + code.instructions.len() * size_of::<Instruction>();
+        assert!(old_backing * MAX_ARTIFACTS > MAX_ARTIFACT_BYTES);
+        let mut realm = Realm::new();
+        for admitted in 1..=MAX_ARTIFACTS {
+            assert_eq!(
+                realm.instantiate(&code).unwrap().execute(),
+                Ok(Completion::Normal)
+            );
+            assert_eq!(
+                (
+                    realm.artifacts.len(),
+                    realm.artifact_bytes,
+                    realm.functions.len()
+                ),
+                (admitted, admitted * bytes, admitted)
+            );
+        }
+        assert_eq!(
+            realm.instantiate(&code).unwrap_err(),
+            InstantiateError::ArtifactLimitExceeded
+        );
+        assert_eq!(
+            (
+                realm.artifacts.len(),
+                realm.artifact_bytes,
+                realm.functions.len()
+            ),
+            (MAX_ARTIFACTS, MAX_ARTIFACTS * bytes, MAX_ARTIFACTS)
+        );
+    }
+
+    #[test]
+    fn reached_forged_creator_cannot_borrow_an_unrelated_artifact() {
+        let mut realm = Realm::new();
+        assert_eq!(
+            run(&mut realm, "false && function(){};"),
+            Ok(Completion::Normal)
+        );
+        assert_eq!((realm.artifacts.len(), realm.functions.len()), (1, 0));
+        let bytes = realm.artifact_bytes;
+        let mut forged = CompiledScript::compile("1;").unwrap();
+        assert!(forged.functions.is_empty());
+        forged.instructions[0] = Instruction::CreateFunction(0);
+        let ready = realm.instantiate(&forged).unwrap();
+        assert!(ready.root_artifact.is_none());
+        assert_eq!(
+            ready.execute(),
+            Err(EngineFault::Evaluation(EvalError::InvalidScript))
+        );
+        assert_eq!(
+            (
+                realm.artifacts.len(),
+                realm.artifact_bytes,
+                realm.functions.capacity()
+            ),
+            (1, bytes, 0)
+        );
     }
 
     #[test]

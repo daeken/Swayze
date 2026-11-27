@@ -2018,7 +2018,11 @@ impl Parser<'_> {
     }
 
     fn open_statement(&mut self, first: Token, label_start: usize) -> Result<ParseAction, Error> {
-        if self.statement_frames.len() == MAX_STATEMENT_FRAMES {
+        let parked = self
+            .function
+            .as_ref()
+            .map_or(0, realm::OpenFunction::parked_statement_count);
+        if self.statement_frames.len() + parked == MAX_STATEMENT_FRAMES {
             return Err(Error {
                 message: "statement nesting ceiling exceeded",
                 ..Error::limit(
@@ -3488,7 +3492,7 @@ impl Parser<'_> {
                 template_depth = saved.template_depth;
                 callable_primary = true;
                 reference = Some(DirectReference::AnonymousDefinition(saved.creator));
-                (self.next_token(TokenPosition::Plain)?, false, false)
+                (self.next_token(TokenPosition::AfterPrimary)?, false, false)
             }
             // Statement tests receive their already checked opening parenthesis.
             // Meter it like a group, but let it own the test's close and comma

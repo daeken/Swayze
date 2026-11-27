@@ -758,6 +758,74 @@ fn expression_literals_and_names_are_owned_by_each_realm() {
 }
 
 #[test]
+fn excluded_generator_headers_keep_the_function_keyword_diagnostic() {
+    for source in [
+        "var f = function* () {};",
+        "(function* () {});",
+        "if (false) { var f = function * () {}; }",
+        "false && (function* () {});",
+    ] {
+        assert!(
+            matches!(CompiledScript::compile(source), Err(CompileError::Parse(err))
+            if err.kind() == ErrorKind::Unsupported && err.span() == span(source, "function")),
+            "{source}"
+        );
+    }
+    let source = "var f = function { };";
+    assert!(
+        matches!(CompiledScript::compile(source), Err(CompileError::Parse(err))
+        if err.kind() == ErrorKind::Malformed && err.span() == span(source, "{"))
+    );
+    let source = "function* f() {}";
+    assert!(
+        matches!(CompiledScript::compile(source), Err(CompileError::Parse(err))
+        if err.kind() == ErrorKind::Unsupported && err.span() == span(source, "*"))
+    );
+}
+
+#[test]
+fn anonymous_primaries_resume_the_primitive_length_suffix_only() {
+    for rhs in ["function () {}.length", "(function () {}).length"] {
+        normal(&mut Realm::new(), &format!("false && {rhs};"));
+        assert_eq!(
+            run(&mut Realm::new(), &format!("var x = {rhs};")),
+            fault(EvalError::UnsupportedPropertyReceiver)
+        );
+    }
+    for rhs in ["function () {}.name", "(function () {}).name"] {
+        assert!(
+            matches!(CompiledScript::compile(&format!("false && {rhs};")), Err(CompileError::Parse(err)) if err.kind() == ErrorKind::Unsupported)
+        );
+    }
+}
+
+#[test]
+fn parked_script_and_active_function_share_statement_frame_ceiling() {
+    let source = |outer: usize, inner: usize, leaf: &str| {
+        format!(
+            "{}false && (function () {{ {}{leaf}{} }});{}",
+            "{".repeat(outer),
+            "{".repeat(inner),
+            "}".repeat(inner),
+            "}".repeat(outer),
+        )
+    };
+    for (outer, inner) in [(0, 128), (1, 127), (64, 64), (127, 1), (128, 0)] {
+        // Expression delimiter depth is independent of the active statement
+        // count. The leaf need not allocate a statement frame even at cap.
+        normal(&mut Realm::new(), &source(outer, inner, "return ((1));"));
+        let over = source(outer, inner, "overflow: {}");
+        assert!(
+            matches!(CompiledScript::compile(&over), Err(CompileError::Parse(err))
+            if err.kind() == ErrorKind::LimitExceeded(Limit::NestingDepth)
+                && err.span() == span(&over, "overflow")
+                && err.message() == "statement nesting ceiling exceeded"),
+            "outer={outer}, inner={inner}"
+        );
+    }
+}
+
+#[test]
 fn anonymous_primary_and_body_delimiters_share_the_parked_nesting_limit() {
     let source = |count| {
         format!(

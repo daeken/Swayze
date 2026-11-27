@@ -360,13 +360,18 @@ labels, loop/header state, delimiter continuation, lookahead and directive
 state. The same lexer (cursor and aggregate resource ledgers unchanged) and
 body compiler handle formals, local `var`, and statements. Closing the body
 restores the Script at the completed primary, before its suffix. A single
-parked owner is enough because nested functions are excluded; its delimiter
-depth still counts toward the shared 128 limit. Body strictness and quoted
-escape witnesses are definition-site and per owner.
+parked owner is enough because nested functions are excluded. Parked and
+active frames count toward the same 128-statement-frame ceiling; delimiter
+depth is independently capped at 128 across both owners. Body strictness and
+quoted escape witnesses are definition-site and per owner.
 
 Instantiation stages one immutable artifact whenever the Script has any
-callable body. It owns the root and body code, sites, names and UTF-16 literals;
-publication is atomic with declaration instantiation. Dropping a Ready Script,
+callable body. It owns the body code, sites, names and UTF-16 literals; the
+root instructions and layout stay borrowed from immutable Ready code. Before
+publication, callable preflight additionally charges one credit per root
+instruction and per body template for the creator-to-template scan. This scan
+does not run on Scripts without callable bodies. Publication is atomic with
+declaration instantiation. Dropping a Ready Script,
 or executing one that skips all its function expressions, can still retain its
 artifact. Skips and abandonment create no *expression* identities. Each
 reached creation makes a fresh identity in the same Realm-owned append-only

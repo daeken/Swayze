@@ -263,3 +263,108 @@ fn literal_only_prefix_and_origin_selected_name_are_independent() {
     };
     assert_eq!(source.artifact_literal(0, range), None);
 }
+
+#[test]
+fn late_gdi_reserve_failures_keep_all_tables_detached() {
+    let mut realm = Realm::new();
+    let code = CompiledScript::compile("function f(){} var v; let l;").unwrap();
+    let state = snapshot(&realm);
+    let heap = realm.heap.test_snapshot();
+    for fail_at in 0..3 {
+        let mut visited = 0;
+        assert_eq!(
+            realm
+                .instantiate_with_reserve(&code, PREFLIGHT_WORK, |index| {
+                    assert_eq!(index, visited);
+                    visited += 1;
+                    if index == fail_at {
+                        Err(InstantiateError::AllocationFailed)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err(),
+            InstantiateError::AllocationFailed
+        );
+        assert_eq!(visited, fail_at + 1);
+        assert_eq!(snapshot(&realm), state);
+        assert_eq!(realm.heap.test_snapshot(), heap);
+    }
+    drop(realm.instantiate(&code).unwrap());
+    assert_eq!(realm.heap.test_snapshot()[0], 6);
+}
+
+#[test]
+fn put_reserve_failures_leave_heap_arena_and_meters_untouched() {
+    let mut realm = Realm::new();
+    let mut code = CompiledScript::compile("function f(){}").unwrap();
+    code.dot = dot_code(DOT_ROOT, "new");
+    code.dot.keys.extend("old".encode_utf16());
+    code.dot.sites.push(DotOccurrence {
+        key_start: 3,
+        key_end: 6,
+        ..code.dot.sites[0]
+    });
+    let mut ready = realm.instantiate(&code).unwrap();
+    let mut exec = ready.execution();
+    // Install row 32 before attempting a second distinct field.
+    let receiver = Operand::Function(FunctionId::User(0));
+    let scratch = EvalScratch::new();
+    let source = scratch.transient(&[]);
+    let (span, mode) = exec
+        .dot_metadata(None, 0)
+        .unwrap_or_else(|_| panic!("metadata"));
+    let site = DotSite {
+        owner: None,
+        index: 0,
+        span,
+        mode,
+    };
+    let rhs = Operand::Scalar(Value::Number(42.0));
+    let snapshot = |exec: &Execution<'_, '_>| {
+        (
+            exec.heap.test_snapshot(),
+            exec.realm.strings.used,
+            exec.realm.strings.chunks.capacity(),
+            exec.copied,
+            exec.property_work.0,
+            exec.heap_requests,
+        )
+    };
+    exec.put_dot(DotSite { index: 1, ..site }, receiver, rhs, source)
+        .unwrap_or_else(|_| panic!("first"));
+    // Keep row 32 and fill the current string chunk, so both reserves are
+    // actually needed for row 33 and its new copied field key.
+    exec.realm
+        .strings
+        .append(&[0; CHUNK_UNITS - 3], &mut exec.copied, site.span)
+        .unwrap_or_else(|_| panic!("fill"));
+    let initial = snapshot(&exec);
+    for fail_arena in [false, true] {
+        let result = exec.put_dot_with(
+            site,
+            receiver,
+            rhs,
+            source,
+            |edit| {
+                assert!(edit.request_bytes() > 0);
+                if fail_arena {
+                    edit.reserve()
+                } else {
+                    Err(InstantiateError::AllocationFailed)
+                }
+            },
+            |plan| plan.reserve_for_test(|_, _| Vec::<u16>::new().try_reserve_exact(usize::MAX)),
+        );
+        assert!(matches!(
+            result,
+            Err(Stop::Engine(EngineFault::Evaluation(
+                EvalError::AllocationFailed
+            )))
+        ));
+        assert_eq!(snapshot(&exec), initial);
+    }
+    exec.put_dot(site, receiver, rhs, source)
+        .unwrap_or_else(|_| panic!("put"));
+    assert_eq!(&exec.realm.strings.units()[CHUNK_UNITS..], [110, 101, 119]);
+}

@@ -967,6 +967,15 @@ impl Realm {
         code: &'code CompiledScript,
         work: usize,
     ) -> Result<ReadyScript<'realm, 'code>, InstantiateError> {
+        self.instantiate_with_reserve(code, work, |_| Ok(()))
+    }
+
+    fn instantiate_with_reserve<'realm, 'code>(
+        &'realm mut self,
+        code: &'code CompiledScript,
+        work: usize,
+        reserve_heap: impl FnMut(usize) -> Result<(), InstantiateError>,
+    ) -> Result<ReadyScript<'realm, 'code>, InstantiateError> {
         use InstantiateError::{
             AllocationFailed, BindingLimitExceeded, InvalidScript, SyntaxError,
         };
@@ -1308,7 +1317,7 @@ impl Realm {
             if plan.request_bytes() > HEAP_REQUEST_BYTES {
                 return Err(AllocationFailed);
             }
-            Some(plan.reserve()?)
+            Some(plan.reserve_with(reserve_heap)?)
         };
         // Publication starts only after all checks and detached reservations.
         // This plan borrows staged code, so publish the already-proven heap
@@ -2051,6 +2060,33 @@ impl Properties for Execution<'_, '_> {
         rhs: Operand,
         source: TransientStrings<'_>,
     ) -> Result<(), Stop> {
+        self.put_dot_with(
+            site,
+            receiver,
+            rhs,
+            source,
+            |edit| edit.reserve(),
+            |plan| plan.reserve(),
+        )
+    }
+}
+
+impl Execution<'_, '_> {
+    fn put_dot_with(
+        &mut self,
+        site: DotSite,
+        receiver: Operand,
+        rhs: Operand,
+        source: TransientStrings<'_>,
+        reserve_row: impl for<'a> FnOnce(
+            object_heap::RowEdit<'a>,
+        )
+            -> Result<object_heap::ReservedEdit<'a>, InstantiateError>,
+        reserve_append: impl for<'a, 's> FnOnce(
+            arena_append::AppendPlan<'a, 's>,
+        )
+            -> Result<arena_append::ReservedAppend<'a, 's>, Stop>,
+    ) -> Result<(), Stop> {
         let object = self.object_receiver(receiver)?;
         let (table, owner, _) = dot_table(
             self.root_dot,
@@ -2098,6 +2134,7 @@ impl Properties for Execution<'_, '_> {
             }
             _ => {}
         }
+        self.object_receiver(rhs)?;
         let escape = Escape::check(rhs, source, self.realm.strings.units())?;
         let edit = self.heap.edit(object, lookup).map_err(fail)?;
         let key = if edit.inserts() { key } else { &[] };
@@ -2111,8 +2148,8 @@ impl Properties for Execution<'_, '_> {
             .realm
             .strings
             .plan(key, escape.units(), &mut self.copied, site.span)?;
-        let row = edit.reserve().map_err(fail)?;
-        let [key, value] = append.reserve()?.publish();
+        let row = reserve_row(edit).map_err(fail)?;
+        let [key, value] = reserve_append(append)?.publish();
         row.publish(key, escape.finish(value));
         self.property_work = work;
         self.heap_requests = requests;

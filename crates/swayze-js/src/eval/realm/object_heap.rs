@@ -240,6 +240,16 @@ impl Heap {
             .then_some(record.origin)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_snapshot(&self) -> [usize; 4] {
+        [
+            self.objects.len(),
+            self.objects.capacity(),
+            self.rows.len(),
+            self.rows.capacity(),
+        ]
+    }
+
     pub(super) fn callable_object(
         &self,
         id: FunctionId,
@@ -717,13 +727,26 @@ impl<'a> Creation<'a> {
     }
 
     pub(super) fn reserve(self) -> Result<Reserved<'a>, InstantiateError> {
+        self.reserve_with(|_| Ok(()))
+    }
+
+    pub(super) fn reserve_with(
+        self,
+        mut before_reserve: impl FnMut(usize) -> Result<(), InstantiateError>,
+    ) -> Result<Reserved<'a>, InstantiateError> {
         // Requested old+new overlap <= 2304 Object + 6144 Row + 768
         // FunctionRecord slots. No old table is copied during preparation;
         // each destination is detached, including on a later failure.
+        before_reserve(0)?;
+        let objects = self.objects.reserve()?;
+        before_reserve(1)?;
+        let rows = self.rows.reserve()?;
+        before_reserve(2)?;
+        let records = self.records.reserve()?;
         Ok(Reserved {
-            objects: self.objects.reserve()?,
-            rows: self.rows.reserve()?,
-            records: self.records.reserve()?,
+            objects,
+            rows,
+            records,
             plan: self,
         })
     }

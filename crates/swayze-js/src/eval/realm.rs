@@ -1381,9 +1381,11 @@ impl Realm {
             }
             let mut has_call = false;
             let mut has_dot = false;
+            let mut has_creator = false;
             let mut guarded = false;
             for &op in &code.instructions {
                 guarded |= abrupt::guarded(op);
+                has_creator |= matches!(op, Instruction::CreateFunction(_));
                 if has_catch {
                     reject_catch_alias(op, &code.sites)?;
                 }
@@ -1391,8 +1393,15 @@ impl Realm {
                 has_dot |= property_op(op);
             }
             if guarded {
+                // Discovery costs at most one credit per instruction. The
+                // guarded verifier below has its own 5N + 1 bound on this ledger.
                 if !has_catch {
                     work.charge(code.instructions.len())?;
+                }
+                // Unlike an artifact-backed root, there is no creator table
+                // to authenticate here. Reject even unreachable creators.
+                if has_creator {
+                    return Err(InvalidScript);
                 }
                 code.dot.validate_guarded(
                     DOT_ROOT,

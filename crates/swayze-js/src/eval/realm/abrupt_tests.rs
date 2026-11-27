@@ -565,6 +565,135 @@ fn crossed_marker_and_stale_catch_cell_cannot_publish() {
 }
 
 #[test]
+fn body_free_guarded_root_rejects_even_a_balanced_dead_creator_before_gdi() {
+    let mut code = root(
+        wrap(&[JumpStatement(4), CreateFunction(0), Discard], &[]),
+        1,
+    );
+    assert!(code.functions.is_empty());
+    assert_eq!(code.declarations, 1);
+    reject_atomic(&code);
+
+    // Preserve legacy admission for unguarded private streams. A dead creator
+    // is skipped; a reached creator is still checked by the dispatcher.
+    code.instructions = vec![JumpStatement(3), CreateFunction(0), Discard];
+    let mut realm = Realm::new();
+    assert_eq!(
+        realm.instantiate(&code).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    code.instructions.remove(0);
+    assert_eq!(
+        realm.instantiate(&code).unwrap().execute(),
+        Err(EngineFault::Evaluation(EvalError::InvalidScript))
+    );
+}
+
+#[test]
+fn all_bare_binding_ops_reject_a_dense_catch_sentinel_even_when_dead() {
+    let mut code = CompiledScript::compile("var staged; source;").unwrap();
+    let slot = code.declarations;
+    code.sites[slot] = Site {
+        span: code.sites[slot].span,
+        start: 0,
+        end: 0,
+        role: Role::Catch,
+    };
+    code.exit = ExitStack::Empty;
+    for (operand, op, discard) in [
+        (false, LoadBinding(slot), true),
+        (true, StoreBinding(slot), false),
+        (true, StoreBindingKeep(slot), true),
+        (
+            false,
+            UpdateBinding {
+                slot,
+                op: Update::Increment,
+                result: UpdateResult::New,
+            },
+            true,
+        ),
+        (
+            true,
+            InitBinding {
+                slot,
+                kind: BindingKind::Let,
+            },
+            false,
+        ),
+    ] {
+        let target = 2 + usize::from(operand) + usize::from(discard);
+        code.instructions = vec![JumpStatement(target)];
+        code.instructions.extend(operand.then_some(Undefined));
+        code.instructions.push(op);
+        code.instructions.extend(discard.then_some(Discard));
+        reject_atomic(&code);
+    }
+}
+
+#[test]
+fn active_catch_cannot_branch_back_to_its_exceptional_entry() {
+    let mut code = root(
+        wrap(
+            &[Undefined, THROW],
+            &[Boolean(false), JumpIfFalseStatement(8), LoopBack(5)],
+        ),
+        1,
+    );
+    assert!(matches!(
+        run(&mut Realm::new().instantiate(&code).unwrap()).0,
+        Ok(None)
+    ));
+    // Height, packet, and active-arm signature are all unchanged. Only the
+    // exceptional-entry rule rejects this dead edge from the same catch arm.
+    code.instructions[7] = LoopBack(4);
+    reject_atomic(&code);
+}
+
+#[test]
+fn exact_guarded_preflight_debit_counts_dot_auth_and_extra_edges() {
+    let mut code = CompiledScript::compile("'foo'.length;").unwrap();
+    let get = code.instructions[1];
+    assert!(matches!(get, GetDot(_)));
+    code.instructions = wrap(
+        &[
+            Boolean(false),
+            JumpIfFalseStatement(6),
+            Undefined,
+            get,
+            Discard,
+        ],
+        &[],
+    );
+    code.exit = ExitStack::Empty;
+    let n = code.instructions.len();
+    // Scratch (N+1), both visits (2N), N ordinary edges plus the
+    // conditional's other edge and one synthetic exceptional edge, one dot.
+    let exact = 4 * n + 4;
+    let validate = |work: &mut Work| {
+        code.dot.validate_guarded(
+            DOT_ROOT,
+            &code.instructions,
+            code.max_stack_depth,
+            code.exit,
+            None,
+            work,
+        )
+    };
+    assert_eq!(
+        validate(&mut Work(exact - 1)),
+        Err(InstantiateError::WorkLimitExceeded)
+    );
+    let mut work = Work(exact);
+    assert_eq!(validate(&mut work), Ok(()));
+    assert_eq!(work.0, 0);
+    assert!(matches!(
+        run(&mut Realm::new().instantiate(&code).unwrap()).0,
+        Ok(None)
+    ));
+}
+
+#[test]
 fn retained_literal_and_identity_are_not_rebound_to_the_catchers_pool() {
     let mut realm = Realm::new();
     let mut a = CompiledScript::compile(

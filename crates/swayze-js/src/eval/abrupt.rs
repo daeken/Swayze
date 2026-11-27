@@ -355,6 +355,10 @@ fn opener(arm: u16) -> Result<usize, EvalError> {
         .ok_or(EvalError::InvalidScript)
 }
 
+// At most 5N + 1 preflight credits: N + 1 scratch rows, two visits per
+// instruction, and at most two successor/occurrence charges per instruction.
+// The dot-authenticating opcodes have one normal edge; none has two edges.
+// This excludes the caller's discovery scan and is not value verification.
 pub(super) fn validate<E: From<EvalError>>(
     ops: &[Instruction],
     peak: usize,

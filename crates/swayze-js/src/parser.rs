@@ -306,6 +306,13 @@ pub(crate) enum ShortCircuitCondition {
 
 pub(crate) const BARE_CALL: u16 = u16::MAX;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatchSlot {
+    pub(crate) enter: u16,
+    // One-based within the current activation, including protected ancestors.
+    pub(crate) depth: u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Instruction {
     Number(f64),
@@ -340,6 +347,48 @@ pub(crate) enum Instruction {
     },
     Return {
         value: bool,
+    },
+    // Private Realm ABI; no source producer in this checkpoint.
+    #[allow(dead_code)]
+    EnterTry {
+        catch: u16,
+        after: u16,
+    },
+    #[allow(dead_code)]
+    LeaveTry {
+        enter: u16,
+    },
+    #[allow(dead_code)]
+    EnterCatch {
+        enter: u16,
+    },
+    #[allow(dead_code)]
+    LeaveCatch {
+        enter: u16,
+    },
+    #[allow(dead_code)]
+    ThrowValue {
+        start: u32,
+        end: u32,
+    },
+    #[allow(dead_code)]
+    LoadCatch(CatchSlot),
+    #[allow(dead_code)]
+    StoreCatch {
+        slot: CatchSlot,
+        keep: bool,
+    },
+    #[allow(dead_code)]
+    UpdateCatch {
+        slot: CatchSlot,
+        op: Update,
+        result: UpdateResult,
+    },
+    #[allow(dead_code)]
+    ExitRegions {
+        target: u16,
+        pop: u8,
+        backward: bool,
     },
     LoadLocal(u8),
     StoreLocal {
@@ -396,9 +445,11 @@ pub(crate) enum Instruction {
     Jump(usize),
     // Unconditional statement transfers require an empty operand stack.
     JumpStatement(usize),
-    // The only backward edge; enter a loop test, update or body with an empty stack.
+    // Same-region backward edge to a statement boundary.
     LoopBack(usize),
 }
+
+const _: () = assert!(std::mem::size_of::<Instruction>() == 16);
 
 /// Parse a complete Script in the supported subset with default [`Limits`].
 ///
@@ -4481,6 +4532,29 @@ impl Parser<'_> {
                 (1, 1)
             }
             Instruction::FormDot(_) => (1, 0),
+            Instruction::EnterTry { .. }
+            | Instruction::LeaveTry { .. }
+            | Instruction::EnterCatch { .. }
+            | Instruction::LeaveCatch { .. }
+            | Instruction::ExitRegions { .. }
+                if self.stack_depth == 0 =>
+            {
+                (0, 0)
+            }
+            Instruction::ThrowValue { .. } if self.stack_depth == 1 => (1, 0),
+            Instruction::EnterTry { .. }
+            | Instruction::LeaveTry { .. }
+            | Instruction::EnterCatch { .. }
+            | Instruction::LeaveCatch { .. }
+            | Instruction::ExitRegions { .. }
+            | Instruction::ThrowValue { .. } => {
+                return Err(Error::malformed(
+                    span,
+                    "invalid abrupt statement operand count",
+                ));
+            }
+            Instruction::LoadCatch(_) | Instruction::UpdateCatch { .. } => (0, 1),
+            Instruction::StoreCatch { keep, .. } => (1, usize::from(keep)),
             Instruction::Return { value } if self.stack_depth == usize::from(value) => {
                 (usize::from(value), 0)
             }

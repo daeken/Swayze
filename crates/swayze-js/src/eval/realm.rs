@@ -205,9 +205,16 @@ type Chunk = [u16; CHUNK_UNITS];
 #[derive(Clone, Copy)]
 pub(crate) enum Role {
     Declaration(BindingKind),
-    Var { initialized: bool },
-    Function { body: u16 },
+    Var {
+        initialized: bool,
+    },
+    Function {
+        body: u16,
+    },
     Local,
+    // Dense zero-range access sentinel. Never a name or Ready link.
+    #[allow(dead_code)]
+    Catch,
     Read,
     Typeof,
     Write,
@@ -2309,9 +2316,11 @@ impl Bindings for Execution<'_, '_> {
     fn load(&mut self, index: usize) -> Result<Operand, Stop> {
         let (target, span, role) = self.site(index)?;
         match role {
-            Role::Declaration(_) | Role::Var { .. } | Role::Function { .. } | Role::Local => {
-                Err(EvalError::InvalidScript.into())
-            }
+            Role::Declaration(_)
+            | Role::Var { .. }
+            | Role::Function { .. }
+            | Role::Local
+            | Role::Catch => Err(EvalError::InvalidScript.into()),
             // Compound assignments share a Write site's load and store.
             Role::Read | Role::Write => self.load_target(target, span, false),
             Role::Typeof => self.load_target(target, span, true),

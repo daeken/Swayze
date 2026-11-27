@@ -1201,7 +1201,16 @@ fn dispatch<'code, B: Bindings>(
             | Instruction::Return { .. }
             | Instruction::LoadLocal(_)
             | Instruction::StoreLocal { .. }
-            | Instruction::UpdateLocal { .. } => return Err(EvalError::InvalidScript.into()),
+            | Instruction::UpdateLocal { .. }
+            | Instruction::EnterTry { .. }
+            | Instruction::LeaveTry { .. }
+            | Instruction::EnterCatch { .. }
+            | Instruction::LeaveCatch { .. }
+            | Instruction::ThrowValue { .. }
+            | Instruction::LoadCatch(_)
+            | Instruction::StoreCatch { .. }
+            | Instruction::UpdateCatch { .. }
+            | Instruction::ExitRegions { .. } => return Err(EvalError::InvalidScript.into()),
             Instruction::Number(value) => {
                 push_operand(
                     &mut stack,

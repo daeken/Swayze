@@ -9,10 +9,11 @@ use crate::{
 };
 
 use super::{
-    AccessKind, ActiveStatement, AfterExpression, BindingPolicy, DirectReference, DotName, Error,
-    ExpressionEnd, ExpressionInput, ExpressionResume, Follow, Instruction, Limit, Limits, Operator,
-    ParseAction, ParseErrorType, ParseOwner, Parser, Pending, QuotedDecimalEscape, RealmParseLimit,
-    Span, Token, TokenKind, TokenPosition, UNPATCHED, WriteAccess, new_parser, try_push,
+    AccessKind, ActiveStatement, AfterExpression, BindingPolicy, CatchBinding, CatchSlot,
+    DirectReference, DotName, Error, ExpressionEnd, ExpressionInput, ExpressionResume, Follow,
+    Instruction, Limit, Limits, Operator, ParseAction, ParseErrorType, ParseOwner, Parser, Pending,
+    QuotedDecimalEscape, RealmParseLimit, Span, StatementFrame, StatementKind, Token, TokenKind,
+    TokenPosition, UNPATCHED, WriteAccess, new_parser, try_push,
 };
 
 // Shared source, cursor, fuel, literal and dot pools, access numbering and
@@ -36,6 +37,7 @@ pub(super) struct OpenFunction {
     params: Vec<Span>,
     vars: Vec<Span>,
     accesses: usize,
+    definition_scope: usize,
 }
 
 impl OpenFunction {
@@ -57,6 +59,8 @@ pub(super) struct ParsedFunction {
     locals: Vec<Span>,
     vars: Vec<Span>,
     witness: QuotedDecimalEscape,
+    restricted_catch: Option<Span>,
+    definition_scope: usize,
     initial_name: Option<Span>,
 }
 
@@ -181,6 +185,7 @@ impl Parser<'_> {
         // Nothing can peek into the body before '{'. The lexer cursor and
         // aggregate ledgers are shared (no relex); lookahead is owner-local.
         debug_assert!(self.lookahead.is_none());
+        let definition_scope = self.current_scope();
         self.function = Some(OpenFunction {
             root_ops: std::mem::take(&mut self.instructions),
             root_peak: std::mem::take(&mut self.max_stack_depth),
@@ -203,6 +208,7 @@ impl Parser<'_> {
             params,
             vars: Vec::new(),
             accesses: self.accesses.len(),
+            definition_scope,
         });
         Ok(())
     }
@@ -255,6 +261,8 @@ impl Parser<'_> {
                 locals: function.params,
                 vars: function.vars,
                 witness,
+                restricted_catch: owner.restricted_catch,
+                definition_scope: function.definition_scope,
                 initial_name: None,
             },
             span,
@@ -354,6 +362,203 @@ impl Parser<'_> {
         ))
     }
 
+    pub(super) fn parse_throw(&mut self, keyword: Span) -> Result<ParseAction, Error> {
+        let first = self.next_throw_operand()?.ok_or_else(|| {
+            Error::syntax(Span::at(self.lexer.offset), "expected a throw operand")
+        })?;
+        if matches!(first.kind, TokenKind::Close) {
+            return Err(Error::syntax(first.span, "expected a throw operand"));
+        }
+        Ok(ParseAction::expression(
+            first.into(),
+            ExpressionEnd::Throw,
+            AfterExpression::Throw(keyword),
+        ))
+    }
+
+    pub(super) fn pack_region_target(index: usize, span: Span) -> Result<u16, Error> {
+        u16::try_from(index)
+            .ok()
+            .filter(|&index| index != u16::MAX)
+            .ok_or_else(|| Error::realm_limit(span, RealmParseLimit::RegionTarget))
+    }
+
+    pub(super) fn open_try(&mut self, keyword: Span) -> Result<(), Error> {
+        let brace = self.abrupt_token(TokenPosition::Plain, "expected '{' after try")?;
+        if !matches!(brace.kind, TokenKind::OpenBrace) {
+            return Err(Error::syntax(brace.span, "expected '{' after try"));
+        }
+        let enter = Self::pack_region_target(self.instructions.len(), keyword)?;
+        self.emit(
+            Instruction::EnterTry {
+                catch: u16::MAX,
+                after: u16::MAX,
+            },
+            keyword,
+        )?;
+        self.open_block(
+            StatementFrame {
+                kind: StatementKind::Try { enter },
+                target: None,
+            },
+            brace.span,
+        )
+    }
+
+    pub(super) fn open_catch(
+        &mut self,
+        owner: &mut ParseOwner,
+        index: usize,
+        enter: u16,
+        close: Span,
+    ) -> Result<ParseAction, Error> {
+        self.emit(Instruction::LeaveTry { enter }, close)?;
+        let clause = self.abrupt_token(TokenPosition::Plain, "expected catch after try block")?;
+        match clause.kind {
+            TokenKind::Catch => {}
+            TokenKind::Finally => return Err(Self::excluded_finally(clause.span)),
+            _ => return Err(Error::syntax(clause.span, "expected catch after try block")),
+        }
+        let open = self.abrupt_token(TokenPosition::Plain, "expected '(' after catch")?;
+        match open.kind {
+            TokenKind::Open => {}
+            TokenKind::OpenBrace => {
+                return Err(Error::unsupported(
+                    open.span,
+                    "optional catch binding is outside the subset",
+                ));
+            }
+            _ => return Err(Error::syntax(open.span, "expected '(' after catch")),
+        }
+        let name = self.abrupt_token(
+            TokenPosition::CatchParameter,
+            "expected a catch binding name",
+        )?;
+        match name.kind {
+            TokenKind::Identifier | TokenKind::RestrictedCatchName => {}
+            TokenKind::OpenBrace => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "catch binding patterns are outside the subset",
+                ));
+            }
+            TokenKind::Declaration(super::BindingKind::Let) => {
+                return Err(Error::unsupported(
+                    name.span,
+                    "let as a catch binding is outside the subset",
+                ));
+            }
+            _ => return Err(Error::syntax(name.span, "expected a catch binding name")),
+        }
+        if name.span.end - name.span.start > MAX_NAME_BYTES {
+            return Err(Error::realm_limit(
+                name.span,
+                RealmParseLimit::CatchNameBytes,
+            ));
+        }
+        let end = self.abrupt_token(TokenPosition::Plain, "expected ')' after catch binding")?;
+        if !matches!(end.kind, TokenKind::Close) {
+            return Err(Error::syntax(end.span, "expected ')' after catch binding"));
+        }
+        let brace = self.abrupt_token(TokenPosition::Plain, "expected '{' after catch binding")?;
+        if !matches!(brace.kind, TokenKind::OpenBrace) {
+            return Err(Error::syntax(
+                brace.span,
+                "expected '{' after catch binding",
+            ));
+        }
+        if matches!(name.kind, TokenKind::RestrictedCatchName) {
+            owner.restricted_catch.get_or_insert(name.span);
+        }
+        let frame = &self.statement_frames[index];
+        let parent = self.scopes[frame.scope]
+            .parent
+            .expect("braced try has a parent");
+        let slot = CatchSlot {
+            enter,
+            depth: frame.regions,
+        };
+        let marker = self.catches.len();
+        self.lexer.charge(1, name.span)?;
+        grow_parse_pool(&mut self.lexer, &mut self.catches, marker + 1, name.span)?;
+        self.catches.push(CatchBinding {
+            name: name.span,
+            slot,
+            parent: self.scopes[parent].nearest_catch,
+        });
+        // Each arm is a sibling Block. The simple parameter lives on the
+        // catch Block's parse scope (no local lexical declarations here).
+        let scope = self.push_scope(Some(parent), Some(marker), brace.span)?;
+        let catch = Self::pack_region_target(self.instructions.len(), clause.span)?;
+        self.emit(Instruction::EnterCatch { enter }, clause.span)?;
+        self.lexer.charge(1, clause.span)?;
+        let Instruction::EnterTry { catch: target, .. } =
+            &mut self.instructions[usize::from(enter)]
+        else {
+            unreachable!("try opener retained until catch");
+        };
+        *target = catch;
+        self.statement_frames[index].statement.kind = StatementKind::Catch { enter };
+        self.statement_frames[index].scope = scope;
+        Ok(ParseAction::Item)
+    }
+
+    pub(super) fn close_catch(&mut self, enter: u16, close: Span) -> Result<(), Error> {
+        self.emit(Instruction::LeaveCatch { enter }, close)?;
+        let after = Self::pack_region_target(self.instructions.len(), close)?;
+        self.lexer.charge(1, close)?;
+        let Instruction::EnterTry { after: target, .. } =
+            &mut self.instructions[usize::from(enter)]
+        else {
+            unreachable!("try opener retained until catch close");
+        };
+        *target = after;
+        let next = self.next_token(TokenPosition::Operand)?;
+        if let Some(Token {
+            kind: TokenKind::Finally,
+            span,
+            ..
+        }) = next
+        {
+            return Err(Self::excluded_finally(span));
+        }
+        self.lookahead = Some(next);
+        Ok(())
+    }
+
+    fn abrupt_token(
+        &mut self,
+        position: TokenPosition,
+        message: &'static str,
+    ) -> Result<Token, Error> {
+        self.next_token(position)?
+            .ok_or_else(|| Error::syntax(Span::at(self.lexer.offset), message))
+    }
+
+    fn excluded_finally(span: Span) -> Error {
+        Error::unsupported(span, "finally is outside the subset")
+    }
+
+    pub(super) fn find_catch(
+        &mut self,
+        mut marker: Option<usize>,
+        name: Span,
+    ) -> Result<Option<CatchSlot>, Error> {
+        while let Some(index) = marker {
+            self.lexer.charge(1, name)?;
+            let CatchBinding {
+                name: candidate,
+                slot,
+                parent,
+            } = self.catches[index];
+            if self.names_equal(name, candidate)? {
+                return Ok(Some(slot));
+            }
+            marker = parent;
+        }
+        Ok(None)
+    }
+
     pub(super) fn record_dot(&mut self, key: DotName, dot: Span) -> Result<u16, Error> {
         debug_assert!(self.lexer.policy == BindingPolicy::Realm);
         let key_span = Span {
@@ -395,8 +600,8 @@ impl Parser<'_> {
         };
         let site = pack_key(sites)?;
         self.lexer.charge(1 + bytes.len(), dot)?;
-        grow_dot_pool(&mut self.lexer, &mut self.dot.sites, sites + 1, dot)?;
-        grow_dot_pool(&mut self.lexer, &mut self.dot.keys, end, dot)?;
+        grow_parse_pool(&mut self.lexer, &mut self.dot.sites, sites + 1, dot)?;
+        grow_parse_pool(&mut self.lexer, &mut self.dot.keys, end, dot)?;
         // The scanner already authenticated the ASCII IdentifierName. Store
         // one immutable range per occurrence, not a binding or a cache entry.
         self.dot.keys.extend(bytes.iter().copied().map(u16::from));
@@ -458,8 +663,9 @@ impl Parser<'_> {
 
 // Logical tiers are inferred from the initialized length. Debit possible
 // moves even if the allocator donated spare space; no key is removed. The
-// two limits are powers of two, so no request can round up beyond its cap.
-fn grow_dot_pool<T>(
+// dot limits are powers of two, so no request can round up beyond its cap.
+// Catch markers are bounded by the aggregate token ceiling instead.
+fn grow_parse_pool<T>(
     lexer: &mut super::Lexer<'_>,
     pool: &mut Vec<T>,
     needed: usize,
@@ -515,17 +721,53 @@ impl ParsedFunction {
     }
 }
 
-fn patch_local(
+#[derive(Clone, Copy)]
+enum DirectSlot {
+    Local(u8),
+    Catch(CatchSlot),
+}
+
+impl DirectSlot {
+    fn load(self) -> Instruction {
+        match self {
+            Self::Local(slot) => Instruction::LoadLocal(slot),
+            Self::Catch(slot) => Instruction::LoadCatch(slot),
+        }
+    }
+
+    fn store(self, keep: bool) -> Instruction {
+        match self {
+            Self::Local(slot) => Instruction::StoreLocal { slot, keep },
+            Self::Catch(slot) => Instruction::StoreCatch { slot, keep },
+        }
+    }
+
+    fn update(self, op: super::Update, result: super::UpdateResult) -> Instruction {
+        match self {
+            Self::Local(slot) => Instruction::UpdateLocal { slot, op, result },
+            Self::Catch(slot) => Instruction::UpdateCatch { slot, op, result },
+        }
+    }
+
+    fn role(self) -> Role {
+        match self {
+            Self::Local(_) => Role::Local,
+            Self::Catch(_) => Role::Catch,
+        }
+    }
+}
+
+fn patch_direct(
     ops: &mut [Instruction],
     access: super::Access,
-    slot: u8,
+    slot: DirectSlot,
 ) -> Result<(), CompileError> {
     let op = ops
         .get_mut(access.instruction)
         .ok_or(CompileError::InvalidScript)?;
     *op = match (access.kind, *op) {
         (AccessKind::Read | AccessKind::TypeofRead, Instruction::LoadBinding(UNPATCHED)) => {
-            Instruction::LoadLocal(slot)
+            slot.load()
         }
         (
             AccessKind::Write(WriteAccess { load: None, .. }),
@@ -534,13 +776,9 @@ fn patch_local(
                 op,
                 result,
             },
-        ) => Instruction::UpdateLocal { slot, op, result },
-        (AccessKind::Write(_), Instruction::StoreBinding(UNPATCHED)) => {
-            Instruction::StoreLocal { slot, keep: false }
-        }
-        (AccessKind::Write(_), Instruction::StoreBindingKeep(UNPATCHED)) => {
-            Instruction::StoreLocal { slot, keep: true }
-        }
+        ) => slot.update(op, result),
+        (AccessKind::Write(_), Instruction::StoreBinding(UNPATCHED)) => slot.store(false),
+        (AccessKind::Write(_), Instruction::StoreBindingKeep(UNPATCHED)) => slot.store(true),
         _ => return Err(CompileError::InvalidScript),
     };
     if let AccessKind::Write(write) = access.kind
@@ -549,7 +787,7 @@ fn patch_local(
         let Some(op @ Instruction::LoadBinding(UNPATCHED)) = ops.get_mut(load) else {
             return Err(CompileError::InvalidScript);
         };
-        *op = Instruction::LoadLocal(slot);
+        *op = slot.load();
     }
     Ok(())
 }
@@ -560,7 +798,10 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         let limit = match error.realm_limit {
             Some(RealmParseLimit::Arguments) => CompileLimit::Arguments,
             Some(RealmParseLimit::Parameters) => CompileLimit::Parameters,
-            Some(RealmParseLimit::FormalNameBytes) => CompileLimit::NameBytes,
+            Some(RealmParseLimit::FormalNameBytes | RealmParseLimit::CatchNameBytes) => {
+                CompileLimit::NameBytes
+            }
+            Some(RealmParseLimit::RegionTarget) => CompileLimit::Instructions,
             Some(RealmParseLimit::DotSites) => CompileLimit::DotSites,
             Some(RealmParseLimit::DotKeyUnits) => CompileLimit::DotKeyUnits,
             Some(RealmParseLimit::PooledDotKeyUnits) => CompileLimit::PooledDotKeyUnits,
@@ -570,21 +811,47 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
     })?;
     // Validate the entire body, including earlier directives and dead code,
     // after parsing (including streaming limits) but before final lowering.
-    let strict_witness = |mode, witness: &QuotedDecimalEscape| match (mode, witness) {
-        (CodeMode::Strict, QuotedDecimalEscape::Found(span)) => Some(*span),
-        _ => None,
+    let witnesses = |mode, witness: &QuotedDecimalEscape, restricted| {
+        let quoted = match witness {
+            QuotedDecimalEscape::Found(span) => Some(*span),
+            _ => None,
+        };
+        match mode {
+            CodeMode::Strict => (
+                quoted
+                    .into_iter()
+                    .chain(restricted)
+                    .min_by_key(|span| span.start),
+                None,
+            ),
+            CodeMode::Sloppy => (None, restricted),
+        }
     };
-    if let Some(span) = strict_witness(mode, &parser.lexer.quoted_decimal_escape)
-        .into_iter()
-        .chain(
-            parser
-                .functions
-                .iter()
-                .filter_map(|f| strict_witness(f.body.mode, &f.witness)),
-        )
-        .min_by_key(|span| span.start)
-    {
+    let (mut strict, mut sloppy) = witnesses(
+        mode,
+        &parser.lexer.quoted_decimal_escape,
+        parser.script_restricted_catch,
+    );
+    for f in &parser.functions {
+        let (body_strict, body_sloppy) = witnesses(f.body.mode, &f.witness, f.restricted_catch);
+        strict = strict
+            .into_iter()
+            .chain(body_strict)
+            .min_by_key(|span| span.start);
+        sloppy = sloppy
+            .into_iter()
+            .chain(body_sloppy)
+            .min_by_key(|span| span.start);
+    }
+    if let Some(span) = strict {
         return Err(CompileError::SyntaxError { span });
+    }
+    if let Some(span) = sloppy {
+        return Err(Error::unsupported(
+            span,
+            "eval and arguments catch bindings are outside the subset",
+        )
+        .into());
     }
     let end = Span::at(parser.lexer.offset);
     let declarations = parser.realm_declarations.len();
@@ -653,43 +920,62 @@ pub(crate) fn compile_realm(source: &str) -> Result<CompiledScript, CompileError
         let body = parsed
             .peek_mut()
             .filter(|f| f.body.accesses.contains(&index));
-        if let Some(function) = body
-            && let Some(slot) = parser.find_local(&function.locals, access.name)?
+        let direct = if let Some(slot) =
+            parser.find_catch(parser.scopes[access.scope].nearest_catch, access.name)?
         {
-            // Keep access numbering dense and bounded. Local sites have
-            // source provenance but are never linked or looked up globally.
-            parser.lexer.charge(1, access.name)?;
-            if matches!(access.kind, AccessKind::Write(write) if write.load.is_some()) {
-                parser.lexer.charge(1, access.name)?;
+            Some(DirectSlot::Catch(slot))
+        } else if let Some(function) = body.as_deref() {
+            if let Some(slot) = parser.find_local(&function.locals, access.name)? {
+                Some(DirectSlot::Local(slot))
+            } else if parser
+                .find_catch(
+                    parser.scopes[function.definition_scope].nearest_catch,
+                    access.name,
+                )?
+                .is_some()
+            {
+                return Err(Error::unsupported(
+                    access.name,
+                    "capturing a catch binding across a function body is outside the subset",
+                )
+                .into());
+            } else {
+                None
             }
-            patch_local(&mut function.body.instructions, access, slot)?;
-            sites.push(Site {
-                span: access.name,
-                start: 0,
-                end: 0,
-                role: Role::Local,
-            });
-            continue;
-        }
+        } else {
+            None
+        };
         let role = match access.kind {
             AccessKind::Read => Role::Read,
             AccessKind::TypeofRead => Role::Typeof,
             AccessKind::Write(_) => Role::Write,
         };
         let slot = sites.len();
-        sites.push(copy_name(&mut parser, &mut names, access.name, role)?);
+        sites.push(if let Some(direct) = direct {
+            // Keep local and catch access numbers dense, but never link the
+            // sentinel or retain name bytes for it (including in root IR).
+            Site {
+                span: access.name,
+                start: 0,
+                end: 0,
+                role: direct.role(),
+            }
+        } else {
+            copy_name(&mut parser, &mut names, access.name, role)?
+        });
         parser.lexer.charge(1, access.name)?;
         if let AccessKind::Write(write) = access.kind
             && write.load.is_some()
         {
             parser.lexer.charge(1, access.name)?;
         }
-        let instructions = parsed
-            .peek_mut()
-            .filter(|f| f.body.accesses.contains(&index))
-            .map_or(&mut parser.instructions, |f| &mut f.body.instructions);
-        Parser::patch_access_in(instructions, access, Some(slot))
-            .map_err(|_| CompileError::InvalidScript)?;
+        let instructions = body.map_or(&mut parser.instructions, |f| &mut f.body.instructions);
+        if let Some(direct) = direct {
+            patch_direct(instructions, access, direct)?;
+        } else {
+            Parser::patch_access_in(instructions, access, Some(slot))
+                .map_err(|_| CompileError::InvalidScript)?;
+        }
     }
     for function in parsed {
         let mut body = function.body;
@@ -1339,5 +1625,766 @@ mod dot_lowering_tests {
             assert_eq!(err.kind(), ErrorKind::Unsupported);
             assert_eq!(err.span(), one_byte(start));
         }
+    }
+}
+
+#[cfg(test)]
+mod abrupt_lowering_tests {
+    use super::*;
+    use crate::{
+        ErrorKind, ParseErrorType,
+        parser::{ExitStack, THROW_SEMICOLON, Update, UpdateResult},
+    };
+    use Instruction::*;
+
+    fn span(source: &str, text: &str) -> Span {
+        let start = source.find(text).unwrap();
+        Span {
+            start,
+            end: start + text.len(),
+        }
+    }
+
+    fn error(source: &str) -> Error {
+        match compile_realm(source) {
+            Err(CompileError::Parse(error)) => error,
+            Err(other) => panic!("{source}: {other:?}"),
+            Ok(_) => panic!("unexpectedly compiled: {source}"),
+        }
+    }
+
+    #[test]
+    fn throw_restriction_precedes_operand_and_eof_and_does_not_apply_later() {
+        for lt in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+            for (prefix, suffix) in [("", ""), (" //comment", ""), (" /*comment", "end*/")] {
+                for operand in ["", "new F;", "[1];", "/regexp/;", "1;"] {
+                    let trivia = format!("throw{prefix}{lt}{suffix} ");
+                    assert_eq!(
+                        error(&format!("{trivia}{operand}")),
+                        Error::syntax(
+                            Span::at(trivia.len()),
+                            "line terminator before a restricted operand"
+                        )
+                    );
+                }
+            }
+        }
+        let text = "throw /*no break*/ (1\r\n + 2), f(`a${3}`)\n;";
+        let code = compile_realm(text).unwrap();
+        assert_eq!(
+            code.instructions.last(),
+            Some(&ThrowValue { start: 0, end: 5 })
+        );
+        assert_eq!(code.exit, ExitStack::Empty);
+        for source in [
+            "throw 1",
+            "{ throw 1 }",
+            "throw 1\n2;",
+            "throw x\n++x;",
+            "throw 1\n!x;",
+            "if (true) throw 1\nelse ;",
+            "throw 1\ntry {} catch (e) {}",
+        ] {
+            let err = error(source);
+            assert_eq!(err.kind(), ErrorKind::Unsupported);
+            assert_eq!(err.parse_error_type(), None);
+            assert_eq!(err.message(), THROW_SEMICOLON);
+        }
+        for (source, bad) in [
+            ("throw;", ";"),
+            ("throw )", ")"),
+            ("throw *1;", "*"),
+            ("throw =1;", "="),
+            ("throw 1 + );", ")"),
+            ("{throw }", "}"),
+            ("{throw (1 }", "}"),
+            ("{throw 1 + }", "}"),
+            ("throw 1 }", "}"),
+            ("throw 1 2;", "2"),
+            ("throw 1 const x = 0;", "const"),
+            ("throw 1 else ;", "else"),
+            ("throw 1);", ")"),
+            ("throw 1 !x;", "!"),
+        ] {
+            let err = error(source);
+            assert_eq!(
+                (err.parse_error_type(), err.span()),
+                (Some(ParseErrorType::SyntaxError), span(source, bad)),
+                "{source}"
+            );
+        }
+        for source in ["throw", "throw //no newline", "throw 1 +"] {
+            let err = error(source);
+            assert_eq!(err.parse_error_type(), Some(ParseErrorType::SyntaxError));
+            assert_eq!(err.span(), Span::at(source.len()));
+        }
+    }
+
+    #[test]
+    fn cached_operand_preserves_original_trivia_without_replay() {
+        for (text, newline) in [("throw /* x */1;", false), ("throw /*\u{2029} */1;", true)] {
+            let mut parser = new_parser(text, Limits::default(), BindingPolicy::Realm).unwrap();
+            let keyword = parser.next_token(TokenPosition::Operand).unwrap().unwrap();
+            parser.lookahead = Some(parser.next_token(TokenPosition::Operand).unwrap());
+            let work = parser.lexer.work_left;
+            let tokens = parser.lexer.tokens_left;
+            let offset = parser.lexer.offset;
+            if newline {
+                assert_eq!(
+                    parser.parse_throw(keyword.span).err(),
+                    Some(Error::syntax(
+                        Span::at(span(text, "1").start),
+                        "line terminator before a restricted operand"
+                    ))
+                );
+                assert!(parser.lookahead.is_some());
+            } else {
+                assert!(parser.parse_throw(keyword.span).is_ok());
+                assert!(parser.lookahead.is_none());
+            }
+            assert_eq!(
+                (
+                    parser.lexer.work_left,
+                    parser.lexer.tokens_left,
+                    parser.lexer.offset
+                ),
+                (work, tokens, offset)
+            );
+        }
+    }
+
+    #[test]
+    fn dot_identifier_names_and_legacy_exclusions_keep_their_own_frontiers() {
+        for key in ["throw", "try", "catch", "finally"] {
+            let text = format!("throw obj.{key};");
+            let code = compile_realm(&text).unwrap();
+            assert!(matches!(
+                code.instructions.as_slice(),
+                [LoadBinding(_), GetDot(0), ThrowValue { start: 0, end: 5 }]
+            ));
+            let site = code.dot.sites[0];
+            let dot = span(&text, ".");
+            assert_eq!(
+                (site.dot_start as usize, site.dot_end as usize),
+                (dot.start, dot.end)
+            );
+            let text = format!("a; /*comment*/ {key};");
+            let mut legacy = new_parser(&text, Limits::default(), BindingPolicy::Legacy).unwrap();
+            assert_eq!(
+                legacy.parse(false).err(),
+                Some(Error::unsupported(
+                    span(&text, key),
+                    "reserved or excluded name is outside the subset"
+                ))
+            );
+            for tail in ["é", "\\u0030"] {
+                let text = format!("{key}{tail}");
+                let mut legacy =
+                    new_parser(&text, Limits::default(), BindingPolicy::Legacy).unwrap();
+                let err = legacy.parse(false).err().unwrap();
+                assert_eq!(err.kind(), ErrorKind::Unsupported);
+                assert_eq!(err.span().start, key.len());
+            }
+        }
+    }
+
+    #[test]
+    fn braces_clauses_and_parameter_fences_have_exact_diagnostics() {
+        for (source, bad) in [
+            ("try ;", ";"),
+            ("try {} 1;", "1"),
+            ("catch(e) {}", "catch"),
+            ("finally {}", "finally"),
+            ("try {} catch 1", "1"),
+            ("try {} catch() {}", ")"),
+            ("try {} catch('e') {}", "'e'"),
+            ("try {} catch(e,e) {}", ","),
+            ("try {} catch(e=0) {}", "="),
+            ("try {} catch(e) ;", ";"),
+            ("try {} catch(new) {}", "new"),
+            ("throw 0; try {} catch(null) {}", "null"),
+        ] {
+            let err = error(source);
+            assert_eq!(
+                (err.parse_error_type(), err.span()),
+                (Some(ParseErrorType::SyntaxError), span(source, bad)),
+                "{source}"
+            );
+        }
+        for source in [
+            "try {",
+            "try {}",
+            "try {} catch",
+            "try {} catch (e)",
+            "try {} catch (e) {",
+        ] {
+            let err = error(source);
+            assert_eq!(
+                err.parse_error_type(),
+                Some(ParseErrorType::SyntaxError),
+                "{source}"
+            );
+            assert_eq!(err.span(), Span::at(source.len()));
+        }
+        for (source, bad) in [
+            ("try {} finally {}", "finally"),
+            ("try {} catch(e) {} finally {}", "finally"),
+            ("try { } catch {}", "{}"),
+            ("try {} catch({e}) {}", "{e}"),
+            ("try {} catch([e]) {}", "["),
+            ("try {} catch(let) {}", "let"),
+            ("try {} catch(await) {}", "await"),
+            ("try {} catch(yield) {}", "yield"),
+            ("try {} catch(e\\u0030) {}", "\\"),
+            ("label: try {} catch(e) {}", "try"),
+        ] {
+            let err = error(source);
+            let mut bad_span = span(source, bad);
+            if bad.starts_with('{') {
+                bad_span.end = bad_span.start + 1;
+            }
+            assert_eq!(
+                (err.kind(), err.parse_error_type(), err.span()),
+                (ErrorKind::Unsupported, None, bad_span),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_markers_keep_empty_arms_and_dangling_else_distinct() {
+        assert_eq!(
+            compile_realm("try {} catch(e) {}").unwrap().instructions,
+            [
+                EnterTry { catch: 2, after: 4 },
+                LeaveTry { enter: 0 },
+                EnterCatch { enter: 0 },
+                LeaveCatch { enter: 0 },
+            ]
+        );
+        let text = "if (true) try { throw 7; } catch(e) { throw e; } else throw 0;";
+        let code = compile_realm(text).unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                Boolean(true),
+                JumpIfFalseStatement(11),
+                EnterTry {
+                    catch: 6,
+                    after: 10
+                },
+                Number(7.),
+                ThrowValue { start: 16, end: 21 },
+                LeaveTry { enter: 2 },
+                EnterCatch { enter: 2 },
+                LoadCatch(CatchSlot { enter: 2, depth: 1 }),
+                ThrowValue { start: 38, end: 43 },
+                LeaveCatch { enter: 2 },
+                JumpStatement(13),
+                Number(0.),
+                ThrowValue { start: 54, end: 59 },
+            ]
+        );
+        assert!(code.names.is_empty());
+        assert_eq!(code.sites.len(), 1);
+        assert_eq!((code.sites[0].start, code.sites[0].end), (0, 0));
+        assert!(matches!(code.sites[0].role, Role::Catch));
+        assert!(compile_realm("if (true) if (false) try {} catch(e) {} else ; else ;").is_ok());
+        assert!(compile_realm("try {} catch(e) {} `a${1}`;").is_ok());
+    }
+
+    #[test]
+    fn cells_shadow_locals_and_builtins_and_all_patch_shapes_stay_direct() {
+        let text = "var e; function f(e) {var x; try { e; } catch(e) {\
+                    typeof e; e += 1; e = 2; (e = 3); (++e); (e++); \
+                    try { e; } catch(undefined) { undefined; e; } } return e; } e;";
+        let code = compile_realm(text).unwrap();
+        let body = &code.functions[0];
+        let ops = &body.instructions;
+        let outer = CatchSlot { enter: 0, depth: 1 };
+        assert_eq!(ops[1], LoadLocal(0));
+        assert_eq!(
+            ops[5..22],
+            [
+                LoadCatch(outer),
+                Typeof,
+                Discard,
+                LoadCatch(outer),
+                Number(1.),
+                Add,
+                StoreCatch {
+                    slot: outer,
+                    keep: false
+                },
+                Number(2.),
+                StoreCatch {
+                    slot: outer,
+                    keep: false
+                },
+                Number(3.),
+                StoreCatch {
+                    slot: outer,
+                    keep: true
+                },
+                Discard,
+                UpdateCatch {
+                    slot: outer,
+                    op: Update::Increment,
+                    result: UpdateResult::New
+                },
+                Discard,
+                UpdateCatch {
+                    slot: outer,
+                    op: Update::Increment,
+                    result: UpdateResult::Old
+                },
+                Discard,
+                EnterTry {
+                    catch: 25,
+                    after: 31
+                },
+            ]
+        );
+        assert_eq!(ops[22], LoadCatch(outer));
+        assert_eq!(
+            ops[26],
+            LoadCatch(CatchSlot {
+                enter: 21,
+                depth: 2
+            })
+        );
+        assert_eq!(ops[28], LoadCatch(outer));
+        assert_eq!(ops[32..], [LoadLocal(0), Return { value: true }]);
+        let sites = &code.sites[body.accesses.clone()];
+        assert_eq!(sites.len(), 11);
+        for (i, site) in sites.iter().enumerate() {
+            assert!(if i == 0 || i == sites.len() - 1 {
+                matches!(site.role, Role::Local)
+            } else {
+                matches!(site.role, Role::Catch)
+            });
+            assert_eq!((site.start, site.end), (0, 0));
+        }
+        let code = compile_realm("try {} catch(e) {try {} catch(e) {e;} e;} e;").unwrap();
+        assert!(matches!(
+            code.instructions[6],
+            LoadCatch(CatchSlot { enter: 3, depth: 2 })
+        ));
+        assert!(matches!(
+            code.instructions[9],
+            LoadCatch(CatchSlot { enter: 0, depth: 1 })
+        ));
+        assert!(matches!(code.sites[2].role, Role::Read));
+    }
+
+    #[test]
+    fn catch_hoists_and_capture_resolution_obey_body_ownership() {
+        for source in [
+            "try {} catch(e) {throw 1; var e;}",
+            "try {} catch(e) {for(var e;false;) {}}",
+            "try {} catch(e) {try {} catch(x) {var a,e;}}",
+            "function f(){ try{}catch(x){var x;} }",
+        ] {
+            let err = error(source);
+            assert_eq!(
+                err.message(),
+                "var with the same name as an enclosing catch binding is outside the subset"
+            );
+            assert_eq!(err.span().end - err.span().start, 1);
+        }
+        for rhs in ["e;", "typeof e;", "e = 0;", "e += 1;", "e++;", "undefined;"] {
+            let name = if rhs == "undefined;" {
+                "undefined"
+            } else {
+                "e"
+            };
+            let text =
+                format!("try {{ throw 1; }} catch({name}) {{ (function() {{ return; {rhs} }}); }}");
+            let err = error(&text);
+            assert_eq!(
+                err.message(),
+                "capturing a catch binding across a function body is outside the subset"
+            );
+            assert_eq!(&text[err.span().start..err.span().end], name);
+        }
+        let text = "var e; try { var e; } catch(e) { var x; \
+                     (function() {e; var e;}); (function(e) {e;}); \
+                     (function() { try {} catch(e) {e;} g; }); \
+                     e; } try {e;} catch(x) {e;}";
+        let code = compile_realm(text).unwrap();
+        let [var_body, formal_body, guarded_body] = &code.functions[..] else {
+            panic!()
+        };
+        assert_eq!(var_body.instructions[0], LoadLocal(0));
+        assert_eq!(formal_body.instructions[0], LoadLocal(0));
+        assert_eq!(
+            guarded_body.instructions[3],
+            LoadCatch(CatchSlot { enter: 0, depth: 1 })
+        );
+        assert!(matches!(
+            code.sites[guarded_body.accesses.end - 1].role,
+            Role::Read
+        ));
+        assert!(matches!(
+            code.sites[guarded_body.accesses.end].role,
+            Role::Catch
+        ));
+        let code = compile_realm("function f(){var x; try{}catch(x){x;} return x;}").unwrap();
+        assert_eq!(
+            code.functions[0].instructions[3],
+            LoadCatch(CatchSlot { enter: 0, depth: 1 })
+        );
+        assert_eq!(code.functions[0].instructions[6], LoadLocal(0));
+    }
+
+    #[test]
+    fn restriction_witnesses_survive_parking_order_and_owner_modes() {
+        for (text, bad) in [
+            ("'use strict'; try{}catch(eval){} '\\8';", "eval"),
+            ("'\\8'; 'use strict'; try{}catch(eval){}", "\\8"),
+            (
+                "'use strict'; try{}catch(e){ (function(){try{}catch(arguments){}}); }",
+                "arguments",
+            ),
+            (
+                "(function(){'use strict'; try{}catch(eval){} }); try{}catch(arguments){}",
+                "eval",
+            ),
+            (
+                "try{}catch(eval){ (function(){'use strict'; '\\8';}); }",
+                "\\8",
+            ),
+        ] {
+            let Some(CompileError::SyntaxError { span: actual }) = compile_realm(text).err() else {
+                panic!("{text}");
+            };
+            assert_eq!(actual, span(text, bad), "{text}");
+        }
+        for (text, bad) in [
+            ("try{}catch(eval){'use strict';}", "eval"),
+            ("try{}catch(eval){ (function(){'use strict';}); }", "eval"),
+            (
+                "(function(){'use strict';}); (function(){try{}catch(arguments){}});",
+                "arguments",
+            ),
+            ("try{}catch(e){ (function(){try{}catch(eval){}}); }", "eval"),
+        ] {
+            let err = error(text);
+            assert_eq!(
+                (err.kind(), err.parse_error_type(), err.span()),
+                (ErrorKind::Unsupported, None, span(text, bad))
+            );
+        }
+        let text = "'use strict'; try{}catch(eval){} throw;";
+        assert_eq!(
+            error(text).span(),
+            Span {
+                start: text.len() - 1,
+                end: text.len()
+            }
+        );
+    }
+}
+
+// Parser-only tests: deliberately never submit the split ABI to Realm execution.
+#[cfg(test)]
+mod abrupt_control_tests {
+    use super::*;
+    use crate::parser::MAX_STATEMENT_FRAMES;
+    use Instruction::*;
+
+    #[test]
+    fn loop_in_try_keeps_region_but_nested_continue_leaves_one_region() {
+        let code =
+            compile_realm("try {while(true) {if(false) break; continue;}} catch(e) {}").unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                EnterTry {
+                    catch: 9,
+                    after: 11
+                },
+                Boolean(true),
+                JumpIfFalseStatement(8),
+                Boolean(false),
+                JumpIfFalseStatement(6),
+                JumpStatement(8),
+                LoopBack(1),
+                LoopBack(1),
+                LeaveTry { enter: 0 },
+                EnterCatch { enter: 0 },
+                LeaveCatch { enter: 0 },
+            ]
+        );
+        let code =
+            compile_realm("label: while(true) { try {continue label;} catch(e) {break label;} }")
+                .unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                Boolean(true),
+                JumpIfFalseStatement(9),
+                EnterTry { catch: 5, after: 8 },
+                ExitRegions {
+                    target: 0,
+                    pop: 1,
+                    backward: true
+                },
+                LeaveTry { enter: 2 },
+                EnterCatch { enter: 2 },
+                ExitRegions {
+                    target: 9,
+                    pop: 1,
+                    backward: false
+                },
+                LeaveCatch { enter: 2 },
+                LoopBack(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_forward_lists_with_do_and_labeled_block_and_disconnected_for_update() {
+        let code = compile_realm(
+            "label: do {if(true) continue; try {\
+            try { continue label; } catch(e) {continue label;} \
+            } catch(e) {break label;} continue; } while(false);",
+        )
+        .unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                Boolean(true),
+                JumpIfFalseStatement(3),
+                JumpStatement(15),
+                EnterTry {
+                    catch: 11,
+                    after: 14
+                },
+                EnterTry {
+                    catch: 7,
+                    after: 10
+                },
+                ExitRegions {
+                    target: 15,
+                    pop: 2,
+                    backward: false
+                },
+                LeaveTry { enter: 4 },
+                EnterCatch { enter: 4 },
+                ExitRegions {
+                    target: 15,
+                    pop: 2,
+                    backward: false
+                },
+                LeaveCatch { enter: 4 },
+                LeaveTry { enter: 3 },
+                EnterCatch { enter: 3 },
+                ExitRegions {
+                    target: 18,
+                    pop: 1,
+                    backward: false
+                },
+                LeaveCatch { enter: 3 },
+                JumpStatement(15),
+                Boolean(false),
+                JumpIfFalseStatement(18),
+                LoopBack(0),
+            ]
+        );
+        let code =
+            compile_realm("label: {try {break label;} catch(e){ break label;} break label;}")
+                .unwrap();
+        assert_eq!(
+            code.instructions,
+            [
+                EnterTry { catch: 3, after: 6 },
+                ExitRegions {
+                    target: 7,
+                    pop: 1,
+                    backward: false
+                },
+                LeaveTry { enter: 0 },
+                EnterCatch { enter: 0 },
+                ExitRegions {
+                    target: 7,
+                    pop: 1,
+                    backward: false
+                },
+                LeaveCatch { enter: 0 },
+                JumpStatement(7),
+            ]
+        );
+        let code = compile_realm(
+            "try { for (;true; i++) {try {continue;} catch(e) {continue;}} } catch(e) {}",
+        )
+        .unwrap();
+        let ops = &code.instructions;
+        assert_eq!(ops[3], JumpStatement(9));
+        assert_eq!(ops[8], LoopBack(1));
+        assert_eq!(
+            ops[10],
+            ExitRegions {
+                target: 4,
+                pop: 1,
+                backward: true
+            }
+        );
+        assert_eq!(
+            ops[13],
+            ExitRegions {
+                target: 4,
+                pop: 1,
+                backward: true
+            }
+        );
+        assert_eq!(ops[15], LoopBack(4));
+    }
+
+    #[test]
+    fn return_and_dead_expression_islands_preserve_scope_and_operand_owners() {
+        let code = compile_realm("function f() {try {return h(); throw `a${false ? 0 : true && 2}`;} catch(e) {return e;} return;}").unwrap();
+        let ops = &code.functions[0].instructions;
+        let EnterTry { catch, after } = ops[0] else {
+            panic!()
+        };
+        let catch = usize::from(catch);
+        let after = usize::from(after);
+        assert_eq!(ops[3], Return { value: true });
+        assert!(matches!(ops[catch - 2], ThrowValue { .. }));
+        assert_eq!(
+            ops[catch - 1..after],
+            [
+                LeaveTry { enter: 0 },
+                EnterCatch { enter: 0 },
+                LoadCatch(CatchSlot { enter: 0, depth: 1 }),
+                Return { value: true },
+                LeaveCatch { enter: 0 }
+            ]
+        );
+        assert_eq!(ops[after..], [Return { value: false }]);
+        assert!(!ops.iter().any(|op| matches!(op, ExitRegions { .. })));
+        let text =
+            "try {} catch(e) {throw `x${(function(){try {} catch (x) {return x;}})() ? e : e}`;}";
+        let code = compile_realm(text).unwrap();
+        assert_eq!(code.functions.len(), 1);
+        assert_eq!(
+            code.instructions
+                .iter()
+                .filter(|op| matches!(op, LoadCatch(CatchSlot { enter: 0, depth: 1 })))
+                .count(),
+            2
+        );
+        assert_eq!(
+            code.functions[0].instructions[3],
+            LoadCatch(CatchSlot { enter: 0, depth: 1 })
+        );
+        assert_eq!(code.functions[0].accesses.len(), 1);
+    }
+
+    #[test]
+    fn catch_name_search_spends_only_actual_catch_chain_work() {
+        let text = "try {} catch(outer) { try {} catch(e) { {{{ outer; }}} } } outer;";
+        let mut parser = parse_with(text, Limits::default()).unwrap_or_else(|e| panic!("{e:?}"));
+        let access = parser.accesses[0];
+        let arm = parser.scopes[access.scope].nearest_catch;
+        parser.lexer.work_left = 7; // two markers, five matched name bytes
+        assert_eq!(
+            parser.find_catch(arm, access.name).unwrap(),
+            Some(CatchSlot { enter: 0, depth: 1 })
+        );
+        assert_eq!(parser.lexer.work_left, 0);
+        let sibling = parser.accesses[1];
+        assert!(
+            parser
+                .find_catch(parser.scopes[sibling.scope].nearest_catch, sibling.name)
+                .unwrap()
+                .is_none()
+        );
+        parser.lexer.work_left = 6;
+        assert_eq!(
+            parser.find_catch(arm, access.name).err(),
+            Some(Error::limit(access.name, Limit::Work))
+        );
+    }
+
+    fn parse_with(text: &str, limits: Limits) -> Result<Parser<'_>, Error> {
+        let mut parser = new_parser(text, limits, BindingPolicy::Realm)?;
+        parser.parse(true)?;
+        Ok(parser)
+    }
+
+    #[test]
+    fn token_work_and_parked_statement_frame_bounds_have_exact_frontiers() {
+        let text = "try{}catch(e){ (function(){try{}catch(x){throw x;}}); throw e; }";
+        let ok = parse_with(text, Limits::default()).unwrap_or_else(|e| panic!("{e:?}"));
+        let defaults = Limits::default();
+        let tokens = defaults.max_tokens - ok.lexer.tokens_left;
+        let work = defaults.max_work - ok.lexer.work_left;
+        assert_eq!((tokens, work), (32, 89));
+        assert!(
+            parse_with(
+                text,
+                Limits {
+                    max_tokens: tokens,
+                    max_work: work,
+                    ..defaults
+                }
+            )
+            .is_ok()
+        );
+        let err = parse_with(
+            text,
+            Limits {
+                max_tokens: tokens - 1,
+                ..defaults
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err,
+            Error::limit(
+                Span {
+                    start: text.len() - 1,
+                    end: text.len()
+                },
+                Limit::Tokens
+            )
+        );
+        let err = parse_with(
+            text,
+            Limits {
+                max_work: work - 1,
+                ..defaults
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err,
+            Error::limit(
+                Span {
+                    start: text.len() - 1,
+                    end: text.len()
+                },
+                Limit::Work
+            )
+        );
+        // One root catch remains parked while the independent callee opens blocks.
+        let make = |count| {
+            format!(
+                "try {{}} catch(e) {{ (function() {{ {}{} }}); }}",
+                "{".repeat(count),
+                "}".repeat(count)
+            )
+        };
+        assert!(compile_realm(&make(MAX_STATEMENT_FRAMES - 1)).is_ok());
+        let bad = make(MAX_STATEMENT_FRAMES);
+        let start = bad.find("{{").unwrap() + MAX_STATEMENT_FRAMES - 1;
+        assert!(
+            matches!(compile_realm(&bad), Err(CompileError::Parse(error))
+            if error == Error { message: "statement nesting ceiling exceeded", ..Error::limit(Span{start,end:start+1},Limit::NestingDepth) })
+        );
     }
 }

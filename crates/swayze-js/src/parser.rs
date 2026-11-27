@@ -94,6 +94,8 @@ enum RealmParseLimit {
     Arguments,
     Parameters,
     FormalNameBytes,
+    CatchNameBytes,
+    RegionTarget,
     DotSites,
     DotKeyUnits,
     PooledDotKeyUnits,
@@ -138,6 +140,13 @@ impl Error {
         }
     }
 
+    fn syntax(span: Span, message: &'static str) -> Self {
+        Self {
+            parse_error_type: Some(ParseErrorType::SyntaxError),
+            ..Self::malformed(span, message)
+        }
+    }
+
     fn unsupported(span: Span, message: &'static str) -> Self {
         Self {
             kind: ErrorKind::Unsupported,
@@ -177,6 +186,8 @@ impl Error {
             RealmParseLimit::Arguments => "call argument ceiling exceeded",
             RealmParseLimit::Parameters => "function parameter ceiling exceeded",
             RealmParseLimit::FormalNameBytes => "formal name byte ceiling exceeded",
+            RealmParseLimit::CatchNameBytes => "catch binding name byte ceiling exceeded",
+            RealmParseLimit::RegionTarget => "region target instruction ceiling exceeded",
             RealmParseLimit::DotSites => "dot occurrence ceiling exceeded",
             RealmParseLimit::DotKeyUnits => "dot key unit ceiling exceeded",
             RealmParseLimit::PooledDotKeyUnits => "pooled dot key unit ceiling exceeded",
@@ -348,43 +359,34 @@ pub(crate) enum Instruction {
     Return {
         value: bool,
     },
-    // Private Realm ABI; no source producer in this checkpoint.
-    #[allow(dead_code)]
+    // Private Realm region and catch-cell ABI.
     EnterTry {
         catch: u16,
         after: u16,
     },
-    #[allow(dead_code)]
     LeaveTry {
         enter: u16,
     },
-    #[allow(dead_code)]
     EnterCatch {
         enter: u16,
     },
-    #[allow(dead_code)]
     LeaveCatch {
         enter: u16,
     },
-    #[allow(dead_code)]
     ThrowValue {
         start: u32,
         end: u32,
     },
-    #[allow(dead_code)]
     LoadCatch(CatchSlot),
-    #[allow(dead_code)]
     StoreCatch {
         slot: CatchSlot,
         keep: bool,
     },
-    #[allow(dead_code)]
     UpdateCatch {
         slot: CatchSlot,
         op: Update,
         result: UpdateResult,
     },
-    #[allow(dead_code)]
     ExitRegions {
         target: u16,
         pop: u8,
@@ -545,6 +547,8 @@ fn new_parser(source: &str, limits: Limits, policy: BindingPolicy) -> Result<Par
         for_header_scope: None,
         instructions: Vec::new(),
         scopes: Vec::new(),
+        catches: Vec::new(),
+        script_restricted_catch: None,
         bindings: Vec::new(),
         realm_declarations: Vec::new(),
         functions: Vec::new(),
@@ -706,6 +710,11 @@ enum TokenKind {
     Var,
     Function,
     Return,
+    Throw,
+    Try,
+    Catch,
+    Finally,
+    RestrictedCatchName,
     If,
     Else,
     While,
@@ -736,6 +745,8 @@ enum TokenPosition {
     Operand,
     // May lex a property continuation (Legacy only `.length`), never a tagged template.
     AfterPrimary,
+    // Sole context exposing the exact ASCII eval/arguments witness.
+    CatchParameter,
 }
 
 struct Token {
@@ -905,19 +916,21 @@ impl Lexer<'_> {
         self.next_after_trivia(position, at_script_start, after_line_break)
     }
 
-    #[cfg(test)]
     fn next_restricted_operand(&mut self) -> Result<Option<Token>, Error> {
-        debug_assert!(self.offset != 0); // Called only after a simulated keyword.
+        debug_assert!(self.offset != 0); // Called only after the keyword.
         let after_line_break = self.skip_trivia()?;
-        if after_line_break {
-            let mut error = Error::malformed(
-                Span::at(self.offset),
-                "line terminator before a restricted operand",
-            );
-            error.parse_error_type = Some(ParseErrorType::SyntaxError);
-            return Err(error);
-        }
+        Self::check_restricted_trivia(self.offset, after_line_break)?;
         self.next_after_trivia(TokenPosition::Operand, false, after_line_break)
+    }
+
+    fn check_restricted_trivia(start: usize, after_line_break: bool) -> Result<(), Error> {
+        if after_line_break {
+            return Err(Error::syntax(
+                Span::at(start),
+                "line terminator before a restricted operand",
+            ));
+        }
+        Ok(())
     }
 
     // `at_script_start` describes the offset before the caller scans trivia.
@@ -969,7 +982,13 @@ impl Lexer<'_> {
                     CookedSegment::Substitution(range) => TokenKind::TemplateHead(range),
                 }
             }
-            _ if is_identifier_start(c) => self.identifier(start)?,
+            '[' if position == TokenPosition::CatchParameter => {
+                return Err(Error::unsupported(
+                    first,
+                    "catch binding patterns are outside the subset",
+                ));
+            }
+            _ if is_identifier_start(c) => self.identifier(start, position)?,
             '=' | '!' => self.equals_or_bang(c, start)?,
             '&' | '|' | '^' => self.bitwise_or_logical(c)?,
             '~' => TokenKind::Operator(Operator::BitwiseNot),
@@ -1083,7 +1102,7 @@ impl Lexer<'_> {
         self.reject_non_ascii_identifier()
     }
 
-    fn identifier(&mut self, start: usize) -> Result<TokenKind, Error> {
+    fn identifier(&mut self, start: usize, position: TokenPosition) -> Result<TokenKind, Error> {
         self.consume_identifier_tail()?;
         let name = &self.source[start..self.offset];
         match name {
@@ -1092,6 +1111,13 @@ impl Lexer<'_> {
             "var" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Var),
             "function" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Function),
             "return" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Return),
+            "throw" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Throw),
+            "try" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Try),
+            "catch" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Catch),
+            "finally" if self.policy == BindingPolicy::Realm => Ok(TokenKind::Finally),
+            "eval" | "arguments" if position == TokenPosition::CatchParameter => {
+                Ok(TokenKind::RestrictedCatchName)
+            }
             "if" => Ok(TokenKind::If),
             "else" => Ok(TokenKind::Else),
             "while" => Ok(TokenKind::While),
@@ -1104,6 +1130,19 @@ impl Lexer<'_> {
             "null" => Ok(TokenKind::Null),
             "void" => Ok(TokenKind::Operator(Operator::Void)),
             "typeof" => Ok(TokenKind::Operator(Operator::Typeof)),
+            "case" | "class" | "debugger" | "default" | "delete" | "enum" | "export"
+            | "extends" | "import" | "in" | "instanceof" | "new" | "super" | "switch" | "this"
+            | "with"
+                if position == TokenPosition::CatchParameter =>
+            {
+                Err(Error::syntax(
+                    Span {
+                        start,
+                        end: self.offset,
+                    },
+                    "expected a catch binding name",
+                ))
+            }
             _ if is_excluded_name(name) => Err(Error::unsupported(
                 Span {
                     start,
@@ -1458,6 +1497,14 @@ const UNPATCHED: usize = usize::MAX;
 struct Scope {
     parent: Option<usize>,
     last_binding: Option<usize>,
+    // Immutable across later arm switches and while a new body is parsed.
+    nearest_catch: Option<usize>,
+}
+
+struct CatchBinding {
+    name: Span,
+    slot: CatchSlot,
+    parent: Option<usize>,
 }
 
 struct Binding {
@@ -1519,6 +1566,7 @@ enum ExpressionEnd {
     Script,
     ExpressionStatement,
     Return,
+    Throw,
     // A bare assignment RHS ends at the first outer comma or semicolon.
     StatementStore,
     // Subsequent comma operands use expression rules but still require ';'.
@@ -1545,6 +1593,7 @@ enum DeclaratorEnd {
 
 const FOR_SEMICOLON: &str = "expected ';' between for clauses";
 const FOR_UPDATE_CLOSE: &str = "expected ')' after the for update";
+const THROW_SEMICOLON: &str = "throw requires an explicit semicolon";
 const EXPRESSION_STATEMENT_SEMICOLON: &str = "expression statements require explicit semicolons";
 const ASSIGNMENT_STATEMENT_SEMICOLON: &str = "assignments require explicit semicolons";
 const UPDATE_STATEMENT_SEMICOLON: &str = "increments and decrements require explicit semicolons";
@@ -1562,6 +1611,12 @@ struct StatementFrame {
 #[derive(Clone, Copy)]
 enum StatementKind {
     Block,
+    Try {
+        enter: u16,
+    },
+    Catch {
+        enter: u16,
+    },
     IfThen {
         branch: usize,
         arm: StatementBody,
@@ -1625,6 +1680,9 @@ struct ActiveStatement {
     statement: StatementFrame,
     // A braced body owns this scope; a single arm inherits it.
     scope: usize,
+    // Ordinary frames inherit this body's active region depth. A try or
+    // catch arm increments it. A jump to a target retains its own depth.
+    regions: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1640,6 +1698,7 @@ struct ParseOwner {
     saw_statement: bool,
     in_directive_prologue: bool,
     single_arm: Option<usize>,
+    restricted_catch: Option<Span>,
 }
 
 impl Default for ParseOwner {
@@ -1649,6 +1708,7 @@ impl Default for ParseOwner {
             saw_statement: false,
             in_directive_prologue: true,
             single_arm: None,
+            restricted_catch: None,
         }
     }
 }
@@ -1754,6 +1814,7 @@ enum AfterExpression {
     StoreSuffix(Follow),
     Follow(Follow),
     Return(Span),
+    Throw(Span),
     Declaration(Declarator),
     Store {
         access: usize,
@@ -1787,6 +1848,8 @@ struct Parser<'s> {
     instructions: Vec<Instruction>,
     // Parse-only scope, declaration (in slot order), and access tables.
     scopes: Vec<Scope>,
+    catches: Vec<CatchBinding>,
+    script_restricted_catch: Option<Span>,
     bindings: Vec<Binding>,
     realm_declarations: Vec<(Span, crate::realm::Role)>,
     accesses: Vec<Access>,
@@ -1839,12 +1902,15 @@ impl Parser<'_> {
                         ParseAction::Item
                     }
                 },
-                ParseAction::Unwind(end) => self.finish_body(end)?,
-                ParseAction::Follow(after, end) => self.follow(&state, after, end)?,
+                ParseAction::Unwind(end) => self.finish_body(&mut state, end)?,
+                ParseAction::Follow(after, end) => self.follow(&mut state, after, end)?,
                 ParseAction::Declarator(kind, mode, after) => {
                     self.parse_declarator(kind, mode, after)?
                 }
-                ParseAction::Exit(exit) => return Ok((exit, state.mode)),
+                ParseAction::Exit(exit) => {
+                    self.script_restricted_catch = state.restricted_catch;
+                    return Ok((exit, state.mode));
+                }
             };
         }
     }
@@ -2005,6 +2071,23 @@ impl Parser<'_> {
                     Span::at(self.lexer.offset),
                 ))
             }
+            AfterExpression::Throw(keyword) => {
+                debug_assert!(matches!(delimiter, Some(TokenKind::Semicolon)));
+                let pack = |offset| {
+                    u32::try_from(offset).map_err(|_| Error::limit(keyword, Limit::SourceBytes))
+                };
+                self.emit(
+                    Instruction::ThrowValue {
+                        start: pack(keyword.start)?,
+                        end: pack(keyword.end)?,
+                    },
+                    keyword,
+                )?;
+                Ok(ParseAction::Follow(
+                    Follow::Item,
+                    Span::at(self.lexer.offset),
+                ))
+            }
             AfterExpression::Declaration(decl) => {
                 self.infer_function_name(reference, decl.name)?;
                 self.finish_declarator(decl, end, delimiter)
@@ -2039,14 +2122,14 @@ impl Parser<'_> {
 
     fn follow(
         &mut self,
-        state: &ParseOwner,
+        state: &mut ParseOwner,
         after: Follow,
         end: Span,
     ) -> Result<ParseAction, Error> {
         match after {
             Follow::Item => {
                 if state.single_arm == Some(self.statement_frames.len()) {
-                    self.finish_body(end)
+                    self.finish_body(state, end)
                 } else {
                     Ok(ParseAction::Item)
                 }
@@ -2124,6 +2207,19 @@ impl Parser<'_> {
         }
     }
 
+    fn next_throw_operand(&mut self) -> Result<Option<Token>, Error> {
+        match self.lookahead.as_ref() {
+            Some(Some(token)) => {
+                // Use the cached bit and start, not the cursor past the token.
+                Lexer::check_restricted_trivia(token.span.start, token.after_line_break)?;
+                self.next_token(TokenPosition::Operand)
+            }
+            // All real lookahead stops at the throw keyword, not beyond it.
+            Some(None) => unreachable!("EOF cannot be cached past throw"),
+            None => self.lexer.next_restricted_operand(),
+        }
+    }
+
     fn require_token(
         &mut self,
         position: TokenPosition,
@@ -2150,12 +2246,23 @@ impl Parser<'_> {
     }
 
     fn add_scope(&mut self, parent: Option<usize>, span: Span) -> Result<usize, Error> {
+        let nearest_catch = parent.and_then(|scope| self.scopes[scope].nearest_catch);
+        self.push_scope(parent, nearest_catch, span)
+    }
+
+    fn push_scope(
+        &mut self,
+        parent: Option<usize>,
+        nearest_catch: Option<usize>,
+        span: Span,
+    ) -> Result<usize, Error> {
         let id = self.scopes.len();
         try_push(
             &mut self.scopes,
             Scope {
                 parent,
                 last_binding: None,
+                nearest_catch,
             },
             span,
         )?;
@@ -2196,6 +2303,7 @@ impl Parser<'_> {
                 );
             }
             TokenKind::For => return self.open_for(label_start),
+            TokenKind::Try => self.open_try(first.span)?,
             TokenKind::Do => {
                 let frame = self.loop_frame(
                     LoopLayout::PostTest {
@@ -2238,11 +2346,14 @@ impl Parser<'_> {
         self.lexer.charge(1, start)?;
         let index = self.statement_frames.len();
         let scope = self.body_scope(body, self.current_scope(), start)?;
+        let regions =
+            self.region_depth() + u8::from(matches!(frame.kind, StatementKind::Try { .. }));
         try_push(
             &mut self.statement_frames,
             ActiveStatement {
                 statement: frame,
                 scope,
+                regions,
             },
             start,
         )?;
@@ -2255,7 +2366,13 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn finish_body(&mut self, end: Span) -> Result<ParseAction, Error> {
+    fn region_depth(&self) -> u8 {
+        self.statement_frames
+            .last()
+            .map_or(0, |frame| frame.regions)
+    }
+
+    fn finish_body(&mut self, state: &mut ParseOwner, end: Span) -> Result<ParseAction, Error> {
         let index = self.statement_frames.len() - 1;
         let kind = self.statement_frames[index].statement.kind;
         match kind {
@@ -2266,6 +2383,8 @@ impl Parser<'_> {
                 self.patch_if_jump(branch, end)?;
             }
             StatementKind::IfElse { join, .. } => self.patch_if_jump(join, end)?,
+            StatementKind::Try { enter } => return self.open_catch(state, index, enter, end),
+            StatementKind::Catch { enter } => self.close_catch(enter, end)?,
             StatementKind::Block | StatementKind::Loop { .. } => {}
         }
         let break_head = self.pop_frame();
@@ -2624,13 +2743,18 @@ impl Parser<'_> {
             .kind
             .has_single_arm();
         state.single_arm = single_arm.then_some(depth);
-        let first = self.require_token(
-            TokenPosition::Operand,
-            "expected a statement or '}' in the block",
-        )?;
+        let first = self.next_token(TokenPosition::Operand)?.ok_or_else(|| {
+            let eof = Span::at(self.lexer.offset);
+            match self.statement_frames[depth - 1].statement.kind {
+                StatementKind::Try { .. } | StatementKind::Catch { .. } => {
+                    Error::syntax(eof, "expected '}' to close the try or catch block")
+                }
+                _ => Error::malformed(eof, "expected a statement or '}' in the block"),
+            }
+        })?;
         self.check_statement_boundary(first.span)?;
         if !single_arm && matches!(first.kind, TokenKind::CloseBrace) {
-            return self.finish_body(first.span);
+            return self.finish_body(state, first.span);
         }
         if single_arm && matches!(first.kind, TokenKind::Declaration(_)) {
             return Err(Error::unsupported(
@@ -2659,6 +2783,13 @@ impl Parser<'_> {
                 ));
             }
             TokenKind::Return => self.parse_return(first.span)?,
+            TokenKind::Throw => self.parse_throw(first.span)?,
+            TokenKind::Catch | TokenKind::Finally => {
+                return Err(Error::syntax(
+                    first.span,
+                    "catch and finally require a preceding try",
+                ));
+            }
             TokenKind::Declaration(kind) => {
                 self.parse_declaration(DeclarationKind::Lexical(kind))?
             }
@@ -2667,7 +2798,8 @@ impl Parser<'_> {
             | TokenKind::If
             | TokenKind::While
             | TokenKind::For
-            | TokenKind::Do => self.open_statement(first, self.labels.len())?,
+            | TokenKind::Do
+            | TokenKind::Try => self.open_statement(first, self.labels.len())?,
             TokenKind::Break | TokenKind::Continue => {
                 self.parse_statement_jump(&first)?;
                 ParseAction::Follow(Follow::Item, Span::at(self.lexer.offset))
@@ -2873,6 +3005,7 @@ impl Parser<'_> {
                 },
             );
         }
+        let pop = self.region_depth() - self.statement_frames[index].regions;
         let statement = &mut self.statement_frames[index].statement;
         let head = if is_continue {
             let StatementKind::Loop { layout, .. } = &mut statement.kind else {
@@ -2883,7 +3016,16 @@ impl Parser<'_> {
                     continue_target, ..
                 } => {
                     let target = *continue_target;
-                    return self.emit(Instruction::LoopBack(target), next.span);
+                    let jump = if pop == 0 {
+                        Instruction::LoopBack(target)
+                    } else {
+                        Instruction::ExitRegions {
+                            target: Self::pack_region_target(target, next.span)?,
+                            pop,
+                            backward: true,
+                        }
+                    };
+                    return self.emit(jump, next.span);
                 }
                 LoopLayout::PostTest { continue_head, .. } => continue_head,
             }
@@ -2894,7 +3036,22 @@ impl Parser<'_> {
             &mut target.break_head
         };
         let previous = std::mem::replace(head, self.instructions.len());
-        self.emit(Instruction::JumpStatement(previous), next.span)
+        let jump = if pop == 0 {
+            Instruction::JumpStatement(previous)
+        } else {
+            // The target field temporarily threads the same list as ordinary
+            // forward jumps. The reserved sentinel is never retained in IR.
+            Instruction::ExitRegions {
+                target: if previous == UNPATCHED {
+                    u16::MAX
+                } else {
+                    Self::pack_region_target(previous, next.span)?
+                },
+                pop,
+                backward: false,
+            }
+        };
+        self.emit(jump, next.span)
     }
 
     fn patch_pending_jumps(&mut self, mut head: usize, close: Span) -> Result<(), Error> {
@@ -2902,17 +3059,25 @@ impl Parser<'_> {
         while head != UNPATCHED {
             // Link each pending jump at emission and visit it once at the target's close.
             self.lexer.charge(1, close)?;
-            let Some(Instruction::JumpStatement(previous)) = self.instructions.get_mut(head) else {
-                return Err(Error::malformed(close, "invalid pending statement jump"));
+            let previous = match self.instructions.get_mut(head) {
+                Some(Instruction::JumpStatement(link)) => std::mem::replace(link, target),
+                Some(Instruction::ExitRegions {
+                    target: link,
+                    backward: false,
+                    ..
+                }) => match std::mem::replace(link, Self::pack_region_target(target, close)?) {
+                    u16::MAX => UNPATCHED,
+                    index => usize::from(index),
+                },
+                _ => return Err(Error::malformed(close, "invalid pending statement jump")),
             };
-            if *previous != UNPATCHED && *previous >= head {
+            if previous != UNPATCHED && previous >= head {
                 return Err(Error::malformed(
                     close,
                     "invalid pending statement jump link",
                 ));
             }
-            head = *previous;
-            *previous = target;
+            head = previous;
         }
         Ok(())
     }
@@ -2992,7 +3157,12 @@ impl Parser<'_> {
                     "void cannot be used as a binding name",
                 ));
             }
-            TokenKind::Operator(Operator::Typeof) | TokenKind::Var => {
+            TokenKind::Operator(Operator::Typeof)
+            | TokenKind::Var
+            | TokenKind::Throw
+            | TokenKind::Try
+            | TokenKind::Catch
+            | TokenKind::Finally => {
                 return Err(Error::unsupported(
                     name.span,
                     "reserved or excluded name is outside the subset",
@@ -3031,6 +3201,16 @@ impl Parser<'_> {
             if self.find_in_scope(scope, name.span)?.is_some() {
                 return Err(Error::malformed(name.span, "duplicate binding declaration"));
             }
+        }
+        if kind == DeclarationKind::Var
+            && self
+                .find_catch(self.scopes[scope].nearest_catch, name.span)?
+                .is_some()
+        {
+            return Err(Error::unsupported(
+                name.span,
+                "var with the same name as an enclosing catch binding is outside the subset",
+            ));
         }
         let expected_delimiter = match kind {
             DeclarationKind::Lexical(BindingKind::Const) => "expected '=' after the binding name",
@@ -3602,6 +3782,14 @@ impl Parser<'_> {
         end_kind: ExpressionEnd,
     ) -> Result<ExpressionStep, Error> {
         let statement_test = matches!(end_kind, ExpressionEnd::StatementTest);
+        let throw = matches!(end_kind, ExpressionEnd::Throw);
+        // Use the typed diagnostic only at unambiguous throw grammar fences,
+        // not for excluded lexical/expression forms or reducer errors.
+        let throw_syntax = if throw {
+            Error::syntax
+        } else {
+            Error::malformed
+        };
         let for_update = matches!(
             end_kind,
             ExpressionEnd::ForClause(ForClauseEnd::Update)
@@ -3618,6 +3806,7 @@ impl Parser<'_> {
         let missing_semicolon = match end_kind {
             ExpressionEnd::ExpressionStatement => Some(EXPRESSION_STATEMENT_SEMICOLON),
             ExpressionEnd::Return => Some("return requires an explicit semicolon"),
+            ExpressionEnd::Throw => Some(THROW_SEMICOLON),
             ExpressionEnd::StatementStore => Some(ASSIGNMENT_STATEMENT_SEMICOLON),
             ExpressionEnd::StatementStoreSuffix(message)
             | ExpressionEnd::Declarator(DeclaratorEnd::Statement(message)) => Some(message),
@@ -3669,6 +3858,7 @@ impl Parser<'_> {
                     end_kind,
                     ExpressionEnd::ForTest
                         | ExpressionEnd::Return
+                        | ExpressionEnd::Throw
                         | ExpressionEnd::Declarator(_)
                         | ExpressionEnd::StatementStore
                         | ExpressionEnd::StatementStoreSuffix(_)
@@ -3681,7 +3871,7 @@ impl Parser<'_> {
             let Some(token) = next else {
                 let eof = Span::at(self.lexer.offset);
                 if needs_operand {
-                    return Err(Error::malformed(
+                    return Err(throw_syntax(
                         eof,
                         "expected an operand before end of source",
                     ));
@@ -3693,6 +3883,92 @@ impl Parser<'_> {
                 span,
                 after_line_break,
             } = token;
+            if throw {
+                match (needs_operand, kind) {
+                    (
+                        true,
+                        TokenKind::Semicolon
+                        | TokenKind::Comma
+                        | TokenKind::Colon
+                        | TokenKind::Question
+                        | TokenKind::Declaration(_)
+                        | TokenKind::Var
+                        | TokenKind::If
+                        | TokenKind::Else
+                        | TokenKind::While
+                        | TokenKind::For
+                        | TokenKind::Do
+                        | TokenKind::Break
+                        | TokenKind::Continue
+                        | TokenKind::Return,
+                    ) => {
+                        return Err(Error::syntax(span, "expected a throw operand"));
+                    }
+                    (true, TokenKind::CloseBrace) if template_depth == 0 => {
+                        return Err(Error::syntax(span, "expected a throw operand"));
+                    }
+                    (false, TokenKind::CloseBrace) if template_depth == 0 => {
+                        self.reduce_expression(span, &mut reference)?;
+                        return Err(
+                            if self.pending.is_empty()
+                                && (self.current_scope() != 0 || self.function.is_some())
+                            {
+                                Error::unsupported(span, THROW_SEMICOLON)
+                            } else {
+                                Error::syntax(span, "unexpected '}' in throw statement")
+                            },
+                        );
+                    }
+                    (
+                        false,
+                        TokenKind::OpenBrace
+                        | TokenKind::If
+                        | TokenKind::While
+                        | TokenKind::For
+                        | TokenKind::Do
+                        | TokenKind::Break
+                        | TokenKind::Continue
+                        | TokenKind::Var
+                        | TokenKind::Declaration(_)
+                        | TokenKind::Return
+                        | TokenKind::Throw
+                        | TokenKind::Try
+                        | TokenKind::Function
+                        | TokenKind::Operator(Operator::Not | Operator::BitwiseNot),
+                    ) => {
+                        self.reduce_expression(span, &mut reference)?;
+                        return Err(if after_line_break && self.pending.is_empty() {
+                            Error::unsupported(span, THROW_SEMICOLON)
+                        } else {
+                            Error::syntax(span, "expected ';' after throw expression")
+                        });
+                    }
+                    (false, TokenKind::Update(_)) if after_line_break => {
+                        self.reduce_expression(span, &mut reference)?;
+                        if self.pending.is_empty() {
+                            return Err(Error::unsupported(span, THROW_SEMICOLON));
+                        }
+                    }
+                    (false, TokenKind::Else) => {
+                        self.reduce_expression(span, &mut reference)?;
+                        let then_arm = self.statement_frames.last().is_some_and(|frame| {
+                            matches!(
+                                frame.statement.kind,
+                                StatementKind::IfThen {
+                                    arm: StatementBody::Single,
+                                    ..
+                                }
+                            )
+                        });
+                        return Err(if after_line_break && self.pending.is_empty() && then_arm {
+                            Error::unsupported(span, THROW_SEMICOLON)
+                        } else {
+                            Error::syntax(span, "unexpected 'else' in throw statement")
+                        });
+                    }
+                    _ => {}
+                }
+            }
             let group_start =
                 after_open && matches!(self.pending.last(), Some((Pending::Group { .. }, _)));
             if needs_operand {
@@ -3742,6 +4018,11 @@ impl Parser<'_> {
                     )?;
                     reference = None;
                     needs_operand = true;
+                }
+                (true, TokenKind::Assignment(op))
+                    if throw && !matches!(op, Some(Operator::Divide)) =>
+                {
+                    return Err(Error::syntax(span, "expected a throw operand"));
                 }
                 (_, TokenKind::Assignment(_)) => {
                     return Err(Error::unsupported(
@@ -3870,7 +4151,7 @@ impl Parser<'_> {
                             kind: TokenKind::Update(op),
                             span: operator,
                             after_line_break,
-                        }) => {
+                        }) if !throw || !after_line_break => {
                             check_postfix_line_break(operator, after_line_break)?;
                             self.emit_expression_update(span, operator, op, UpdateResult::Old)?;
                         }
@@ -3908,7 +4189,7 @@ impl Parser<'_> {
                                 "regular expression literals are outside the arithmetic subset",
                             ));
                         }
-                        _ => return Err(Error::malformed(span, "expected an operand")),
+                        _ => return Err(throw_syntax(span, "expected an operand")),
                     };
                     // Don't pop pending operators: another prefix applies before this one.
                     self.push_pending(Pending::Op(prefix), span)?;
@@ -3944,7 +4225,7 @@ impl Parser<'_> {
                             "arrow syntax or HTML comments are outside the arithmetic subset",
                         ));
                     }
-                    return Err(Error::malformed(span, "empty parenthesized expression"));
+                    return Err(throw_syntax(span, "empty parenthesized expression"));
                 }
                 (false, TokenKind::Comma) => {
                     // Comma is looser than ?: and =. Finish pending subexpressions
@@ -3994,6 +4275,7 @@ impl Parser<'_> {
                             end_kind,
                             ExpressionEnd::Script
                                 | ExpressionEnd::Return
+                                | ExpressionEnd::Throw
                                 | ExpressionEnd::ExpressionStatement
                                 | ExpressionEnd::StatementStoreSuffix(_)
                                 | ExpressionEnd::ForTest
@@ -4043,13 +4325,27 @@ impl Parser<'_> {
                         "function expressions are outside the subset",
                     ));
                 }
+                (
+                    _,
+                    TokenKind::Throw
+                    | TokenKind::Try
+                    | TokenKind::Catch
+                    | TokenKind::Finally
+                    | TokenKind::RestrictedCatchName,
+                ) => {
+                    return Err(if throw {
+                        Error::syntax(span, "unexpected statement keyword in throw expression")
+                    } else {
+                        Error::unsupported(span, "reserved or excluded name is outside the subset")
+                    });
+                }
                 (_, TokenKind::Return) => {
                     return Err(Error::malformed(
                         span,
                         "unexpected return keyword in expression",
                     ));
                 }
-                (true, _) => return Err(Error::malformed(span, "expected an operand")),
+                (true, _) => return Err(throw_syntax(span, "expected an operand")),
                 (false, TokenKind::Operator(Operator::Not)) => {
                     return Err(Error::unsupported(
                         span,
@@ -4122,7 +4418,9 @@ impl Parser<'_> {
                         None if let Some(message) = for_delimiter => {
                             return Err(Error::malformed(span, message));
                         }
-                        _ => return Err(Error::malformed(span, "unmatched closing parenthesis")),
+                        _ => {
+                            return Err(throw_syntax(span, "unmatched closing parenthesis"));
+                        }
                     }
                 }
                 (false, TokenKind::Template(_) | TokenKind::TemplateHead(_)) => {
@@ -4186,7 +4484,7 @@ impl Parser<'_> {
                             ));
                         }
                     }
-                    return Err(Error::malformed(span, "expected a binary operator"));
+                    return Err(throw_syntax(span, "expected a binary operator"));
                 }
                 (false, TokenKind::Operator(op)) => {
                     self.push_infix(op, span, &mut reference)?;
@@ -4244,7 +4542,7 @@ impl Parser<'_> {
                 Pending::Template { .. } => "semicolon inside a template substitution",
                 _ => "expected ':' to complete conditional expression",
             };
-            return Err(Error::malformed(end, message));
+            return Err(throw_syntax(end, message));
         }
         if at_eof && let Some(message) = missing_semicolon {
             return Err(Error::unsupported(end, message));
@@ -4741,17 +5039,30 @@ mod restricted_operand_tests {
         for policy in [BindingPolicy::Legacy, BindingPolicy::Realm] {
             for word in ["throw", "try", "catch", "finally"] {
                 let mut lexer = lexer(word, policy, 1, word.len());
-                let error = lexer.next(TokenPosition::Plain).err().unwrap();
-                assert_eq!(
-                    error,
-                    Error::unsupported(
-                        Span {
-                            start: 0,
-                            end: word.len()
-                        },
-                        "reserved or excluded name is outside the subset"
-                    )
-                );
+                let span = Span {
+                    start: 0,
+                    end: word.len(),
+                };
+                let next = lexer.next(TokenPosition::Plain);
+                if policy == BindingPolicy::Legacy {
+                    assert_eq!(
+                        next.err(),
+                        Some(Error::unsupported(
+                            span,
+                            "reserved or excluded name is outside the subset"
+                        ))
+                    );
+                } else {
+                    let token = next.unwrap().unwrap();
+                    assert_eq!(token.span, span);
+                    assert!(matches!(
+                        (word, token.kind),
+                        ("throw", TokenKind::Throw)
+                            | ("try", TokenKind::Try)
+                            | ("catch", TokenKind::Catch)
+                            | ("finally", TokenKind::Finally)
+                    ));
+                }
                 assert_frontier(&lexer, word.len(), 0, 0);
             }
             let mut absolute = lexer("#!é\r\nx", policy, 1, 7);

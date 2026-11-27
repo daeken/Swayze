@@ -810,6 +810,19 @@ mod tests {
         )
     }
 
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn requested_heap_layout_on_arm64() {
+        assert_eq!(
+            (
+                size_of::<Object>(),
+                size_of::<Row>(),
+                size_of::<FunctionRecord>()
+            ),
+            (14, 40, 6)
+        );
+    }
+
     fn own(heap: &Heap, object: ObjectId, key: &str) -> Option<Descriptor> {
         let mut row = heap.objects[usize::from(object.0)].head;
         while let Some(id) = row {

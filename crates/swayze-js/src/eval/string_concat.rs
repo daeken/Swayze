@@ -31,9 +31,23 @@ pub(super) enum StaticText {
     Function,
     ObjectName,
     FunctionName,
+    ErrorName,
+    ReferenceErrorName,
+    TypeErrorName,
 }
 
 impl StaticText {
+    pub(super) fn is_realm_only(self) -> bool {
+        matches!(
+            self,
+            Self::ObjectName
+                | Self::FunctionName
+                | Self::ErrorName
+                | Self::ReferenceErrorName
+                | Self::TypeErrorName
+        )
+    }
+
     pub(super) fn units(self) -> &'static [u16] {
         static NUMBER: [u16; 6] = ascii_units(b"number");
         static BOOLEAN: [u16; 7] = ascii_units(b"boolean");
@@ -43,9 +57,15 @@ impl StaticText {
         static FUNCTION: [u16; 8] = ascii_units(b"function");
         static OBJECT_NAME: [u16; 6] = ascii_units(b"Object");
         static FUNCTION_NAME: [u16; 8] = ascii_units(b"Function");
+        static ERROR_NAME: [u16; 5] = ascii_units(b"Error");
+        static REFERENCE_ERROR_NAME: [u16; 14] = ascii_units(b"ReferenceError");
+        static TYPE_ERROR_NAME: [u16; 9] = ascii_units(b"TypeError");
         match self {
             Self::ObjectName => &OBJECT_NAME,
             Self::FunctionName => &FUNCTION_NAME,
+            Self::ErrorName => &ERROR_NAME,
+            Self::ReferenceErrorName => &REFERENCE_ERROR_NAME,
+            Self::TypeErrorName => &TYPE_ERROR_NAME,
             Self::Function => &FUNCTION,
             Self::Number => &NUMBER,
             Self::Boolean => &BOOLEAN,
@@ -57,7 +77,7 @@ impl StaticText {
 }
 
 const fn ascii_units<const N: usize>(bytes: &[u8; N]) -> [u16; N] {
-    assert!(N > 0 && N <= 9 && N <= MAX_CONCAT_UNITS && bytes.is_ascii());
+    assert!(N > 0 && N <= 14 && N <= MAX_CONCAT_UNITS && bytes.is_ascii());
     let mut units = [0; N];
     let mut i = 0;
     while i < N {

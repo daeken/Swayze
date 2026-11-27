@@ -13,12 +13,15 @@ const ROOT_OBJECTS: usize = 4;
 const ROOT_ROWS: usize = 27;
 const FUNCTION_OBJECTS: usize = 2;
 const FUNCTION_ROWS: usize = 4;
+const ERROR_OBJECTS: usize = 6;
+const ERROR_ROWS: usize = 19;
+const ERROR_FRONTIER_WORK: usize = ERROR_OBJECTS + 1;
 pub(super) const PROPERTY_WORK: usize = 128 * 1024;
 pub(super) const HEAP_REQUEST_BYTES: usize = 512 * 1024;
 
 const _: () = {
-    assert!(ROOT_OBJECTS + MAX_FUNCTIONS * FUNCTION_OBJECTS <= OBJECT_LIMIT);
-    assert!(ROOT_ROWS + MAX_FUNCTIONS * FUNCTION_ROWS <= ROW_LIMIT);
+    assert!(ROOT_OBJECTS + MAX_FUNCTIONS * FUNCTION_OBJECTS + ERROR_OBJECTS < OBJECT_LIMIT);
+    assert!(ROOT_ROWS + MAX_FUNCTIONS * FUNCTION_ROWS + ERROR_ROWS <= ROW_LIMIT);
     assert!(OBJECT_LIMIT <= u16::MAX as usize);
     assert!(ROW_LIMIT <= u16::MAX as usize);
     assert!(size_of::<Row>() <= 48 && size_of::<Object>() <= 16);
@@ -26,9 +29,12 @@ const _: () = {
     assert!(
         (2047 + OBJECT_LIMIT) * size_of::<Object>() + 8191 * size_of::<Row>() <= HEAP_REQUEST_BYTES
     );
-    // Each initial node/row has two writes charged. The sum of old lengths
-    // moved is bounded by its preceding geometric tiers.
-    assert!(2 * (OBJECT_LIMIT + ROW_LIMIT) + 2047 + 4095 <= PROPERTY_WORK);
+    // Two writes per initial node/row, preceding geometric tier moves, and
+    // at most one pack authentication per successful node append.
+    assert!(
+        2 * (OBJECT_LIMIT + ROW_LIMIT) + 2047 + 4095 + OBJECT_LIMIT * ERROR_FRONTIER_WORK
+            <= PROPERTY_WORK
+    );
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +53,71 @@ pub(in crate::eval) enum Intrinsic {
     FunctionPrototype,
     ObjectConstructor,
     FunctionConstructor,
+    NativeErrorConstructor(ErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::eval) enum ErrorKind {
+    Error,
+    ReferenceError,
+    TypeError,
+}
+
+impl ErrorKind {
+    const ALL: [Self; 3] = [Self::Error, Self::ReferenceError, Self::TypeError];
+
+    const fn name(self) -> StoredValue {
+        StoredValue::StaticText(match self {
+            Self::Error => StaticText::ErrorName,
+            Self::ReferenceError => StaticText::ReferenceErrorName,
+            Self::TypeError => StaticText::TypeErrorName,
+        })
+    }
+
+    const fn callable(self) -> Callable {
+        Callable::Intrinsic(Intrinsic::NativeErrorConstructor(self))
+    }
+}
+
+/// The checked start of the contiguous pack, wherever it was appended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ErrorRoots(ObjectId);
+
+impl ErrorRoots {
+    fn at(start: usize) -> Option<Self> {
+        (start >= ROOT_OBJECTS && start.checked_add(ERROR_OBJECTS)? <= OBJECT_LIMIT)
+            .then_some(Self(ObjectId(start as u16)))
+    }
+
+    const fn prototype(self, kind: ErrorKind) -> ObjectId {
+        let ObjectId(start) = self.0;
+        ObjectId(
+            start
+                + match kind {
+                    ErrorKind::Error => 0,
+                    ErrorKind::ReferenceError => 2,
+                    ErrorKind::TypeError => 4,
+                },
+        )
+    }
+
+    const fn constructor(self, kind: ErrorKind) -> ObjectId {
+        ObjectId(self.prototype(kind).0 + 1)
+    }
+
+    const fn ctor_parent(self, kind: ErrorKind) -> ObjectId {
+        match kind {
+            ErrorKind::Error => FUNCTION_PROTO,
+            _ => self.constructor(ErrorKind::Error),
+        }
+    }
+
+    const fn proto_parent(self, kind: ErrorKind) -> ObjectId {
+        match kind {
+            ErrorKind::Error => OBJECT_PROTO,
+            _ => self.prototype(ErrorKind::Error),
+        }
+    }
 }
 
 type Callable = FunctionId;
@@ -151,6 +222,7 @@ enum Atom {
     Arguments,
     Caller,
     Prototype,
+    Message,
 }
 impl Atom {
     fn bytes(self) -> &'static [u8] {
@@ -175,6 +247,7 @@ impl Atom {
             Self::Arguments => b"arguments",
             Self::Caller => b"caller",
             Self::Prototype => b"prototype",
+            Self::Message => b"message",
         }
     }
 }
@@ -194,10 +267,17 @@ struct Row {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Complete,
+    Incomplete,
+    ErrorData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Object {
     callable: Option<Callable>,
     prototype: Option<ObjectId>,
-    complete: bool,
+    shape: Shape,
     head: Option<RowId>,
     own: u8,
 }
@@ -207,9 +287,20 @@ impl Object {
         Self {
             callable,
             prototype,
-            complete,
+            shape: if complete {
+                Shape::Complete
+            } else {
+                Shape::Incomplete
+            },
             head: None,
             own: 0,
+        }
+    }
+
+    const fn error(prototype: ObjectId) -> Self {
+        Self {
+            shape: Shape::ErrorData,
+            ..Self::new(None, Some(prototype), true)
         }
     }
 }
@@ -224,6 +315,7 @@ pub(super) struct FunctionRecord {
 pub(super) struct Heap {
     objects: Vec<Object>,
     rows: Vec<Row>,
+    error_roots: Option<ErrorRoots>,
 }
 
 impl Heap {
@@ -260,6 +352,9 @@ impl Heap {
             FunctionId::Intrinsic(Intrinsic::FunctionPrototype) => FUNCTION_PROTO,
             FunctionId::Intrinsic(Intrinsic::ObjectConstructor) => OBJECT_CTOR,
             FunctionId::Intrinsic(Intrinsic::FunctionConstructor) => FUNCTION_CTOR,
+            FunctionId::Intrinsic(Intrinsic::NativeErrorConstructor(kind)) => {
+                self.error_roots?.constructor(kind)
+            }
         };
         (self.objects.get(usize::from(object.0))?.callable == Some(id)).then_some(object)
     }
@@ -318,7 +413,7 @@ impl Heap {
             if next.is_some() {
                 return Err(InvalidScript);
             }
-            if !object.complete {
+            if object.shape == Shape::Incomplete {
                 return Ok(Lookup::Incomplete);
             }
             let Some(proto) = object.prototype else {
@@ -362,6 +457,63 @@ impl Heap {
             replace,
             attrs,
             tier,
+        })
+    }
+
+    /// Root presence is determined by the heap, including when an Error was
+    /// created before the first user function. Row counts are only a floor:
+    /// ordinary property Set appends rows to this same frontier.
+    fn creation_frontier(&self, functions: usize) -> Result<Frontier, InstantiateError> {
+        use InstantiateError::InvalidScript;
+        if functions > MAX_FUNCTIONS {
+            return Err(InvalidScript);
+        }
+        let nodes = self.objects.len();
+        let rows = self.rows.len();
+        let roots = nodes == 0;
+        let base_nodes = usize::from(!roots) * ROOT_OBJECTS + functions * FUNCTION_OBJECTS;
+        let base_rows = usize::from(!roots) * ROOT_ROWS + functions * FUNCTION_ROWS;
+        let mut check_work = 0;
+        if let Some(pack) = self.error_roots {
+            let start = usize::from(pack.0.0);
+            let Some(first) = self.objects.get(start + ERROR_OBJECTS) else {
+                return Err(InvalidScript);
+            };
+            // The first Error transaction published a pack and its first
+            // instance together. Later user/function appends may interleave.
+            if ErrorRoots::at(start) != Some(pack)
+                || !(start - ROOT_OBJECTS).is_multiple_of(FUNCTION_OBJECTS)
+                || start > base_nodes
+                || nodes <= base_nodes + ERROR_OBJECTS
+                || rows < base_rows + ERROR_ROWS
+                || first.shape != Shape::ErrorData
+                || first.callable.is_some()
+                || !ErrorKind::ALL
+                    .into_iter()
+                    .any(|kind| first.prototype == Some(pack.prototype(kind)))
+            {
+                return Err(InvalidScript);
+            }
+            for kind in ErrorKind::ALL {
+                let proto = self.objects[usize::from(pack.prototype(kind).0)];
+                let ctor = self.objects[usize::from(pack.constructor(kind).0)];
+                if proto.callable.is_some()
+                    || proto.prototype != Some(pack.proto_parent(kind))
+                    || proto.shape != Shape::Complete
+                    || ctor.callable != Some(kind.callable())
+                    || ctor.prototype != Some(pack.ctor_parent(kind))
+                    || ctor.shape != Shape::Complete
+                {
+                    return Err(InvalidScript);
+                }
+            }
+            check_work = ERROR_FRONTIER_WORK;
+        } else if nodes != base_nodes || rows < base_rows || (roots && rows != 0) {
+            return Err(InvalidScript);
+        }
+        Ok(Frontier {
+            add_base: roots,
+            check_work,
         })
     }
 
@@ -469,6 +621,45 @@ impl Heap {
         ];
         for (owner, key, descriptor) in rows {
             self.append_row(owner, Key::Atom(key), descriptor);
+        }
+    }
+
+    fn append_error_roots(&mut self, pack: ErrorRoots) {
+        use Initial::{Constructor, Length, Prototype};
+        for kind in ErrorKind::ALL {
+            let prototype = pack.prototype(kind);
+            let ctor = pack.constructor(kind);
+            self.append_object(Object::new(None, Some(pack.proto_parent(kind)), true));
+            self.append_object(Object::new(
+                Some(kind.callable()),
+                Some(pack.ctor_parent(kind)),
+                true,
+            ));
+            for (owner, key, descriptor) in [
+                (
+                    prototype,
+                    Atom::Constructor,
+                    data(Constructor(kind.callable()), METHOD),
+                ),
+                (prototype, Atom::Name, Descriptor::Data(kind.name(), METHOD)),
+                (
+                    prototype,
+                    Atom::Message,
+                    Descriptor::Data(StoredValue::Empty, METHOD),
+                ),
+                (ctor, Atom::Name, Descriptor::Data(kind.name(), META)),
+                (ctor, Atom::Length, data(Length(1), META)),
+                (
+                    ctor,
+                    Atom::Prototype,
+                    data(Prototype(PrototypeValue::Object(prototype)), FROZEN),
+                ),
+            ] {
+                self.append_row(owner, Key::Atom(key), descriptor);
+            }
+            if kind == ErrorKind::Error {
+                self.append_row(prototype, Key::Atom(Atom::ToString), BUILTIN);
+            }
         }
     }
 
@@ -636,6 +827,167 @@ impl Tier {
     }
 }
 
+struct Frontier {
+    add_base: bool,
+    check_work: usize,
+}
+
+/// Shared append budget and detached reserves for both namespace/origin
+/// creation and Error materialization; an append cannot borrow guest data.
+struct HeapAppend {
+    add_base: bool,
+    objects: Tier,
+    rows: Tier,
+    recipe_work: usize,
+}
+
+impl HeapAppend {
+    fn plan(
+        heap: &Heap,
+        frontier: Frontier,
+        nodes: usize,
+        rows: usize,
+    ) -> Result<Self, InstantiateError> {
+        use InstantiateError::PropertyLimitExceeded;
+        let nodes = nodes + if frontier.add_base { ROOT_OBJECTS } else { 0 };
+        let rows = rows + if frontier.add_base { ROOT_ROWS } else { 0 };
+        let old_nodes = heap.objects.len();
+        let old_rows = heap.rows.len();
+        let node_end = old_nodes
+            .checked_add(nodes)
+            .filter(|&end| end <= OBJECT_LIMIT)
+            .ok_or(PropertyLimitExceeded)?;
+        let row_end = old_rows
+            .checked_add(rows)
+            .filter(|&end| end <= ROW_LIMIT)
+            .ok_or(PropertyLimitExceeded)?;
+        Ok(Self {
+            add_base: frontier.add_base,
+            objects: Tier::plan(old_nodes, node_end, OBJECT_LIMIT),
+            rows: Tier::plan(old_rows, row_end, ROW_LIMIT),
+            recipe_work: frontier.check_work + 2 * (nodes + rows), // stage/link + publish
+        })
+    }
+
+    fn work(&self) -> usize {
+        self.recipe_work + self.objects.moves + self.rows.moves
+    }
+
+    fn bytes(&self) -> usize {
+        self.objects.request * size_of::<Object>() + self.rows.request * size_of::<Row>()
+    }
+
+    fn reserve(
+        &self,
+        before_reserve: &mut impl FnMut(usize) -> Result<(), InstantiateError>,
+    ) -> Result<ReservedHeap, InstantiateError> {
+        // Requested old+new overlap <= 2304 Object + 6144 Row slots. No
+        // copying during preparation; a second reserve failure drops the first.
+        before_reserve(0)?;
+        let objects = self.objects.reserve()?;
+        before_reserve(1)?;
+        let rows = self.rows.reserve()?;
+        Ok(ReservedHeap {
+            add_base: self.add_base,
+            objects,
+            rows,
+        })
+    }
+}
+
+struct ReservedHeap {
+    add_base: bool,
+    objects: Option<Vec<Object>>,
+    rows: Option<Vec<Row>>,
+}
+
+impl ReservedHeap {
+    fn publish(self, heap: &mut Heap) {
+        commit_rows(&mut heap.objects, std::iter::empty(), self.objects);
+        commit_rows(&mut heap.rows, std::iter::empty(), self.rows);
+        if self.add_base {
+            heap.append_roots();
+        }
+    }
+}
+
+/// One instance and (on first use) the entire intrinsic pack. No function
+/// origins, dynamic properties or Strings are staged by this recipe.
+pub(super) struct ErrorCreation<'a> {
+    heap: &'a mut Heap,
+    append: HeapAppend,
+    new_pack: Option<ErrorRoots>,
+    prototype: ObjectId,
+    id: ObjectId,
+}
+
+impl<'a> ErrorCreation<'a> {
+    pub(super) fn plan(
+        heap: &'a mut Heap,
+        functions: usize,
+        kind: ErrorKind,
+    ) -> Result<Self, InstantiateError> {
+        let frontier = heap.creation_frontier(functions)?;
+        let needs_pack = heap.error_roots.is_none();
+        let nodes = 1 + usize::from(needs_pack) * ERROR_OBJECTS;
+        let rows = usize::from(needs_pack) * ERROR_ROWS;
+        let start = heap.objects.len() + usize::from(frontier.add_base) * ROOT_OBJECTS;
+        let append = HeapAppend::plan(heap, frontier, nodes, rows)?;
+        let pack = match heap.error_roots {
+            Some(pack) => pack,
+            None => ErrorRoots::at(start).ok_or(InstantiateError::InvalidScript)?,
+        };
+        Ok(Self {
+            heap,
+            append,
+            new_pack: needs_pack.then_some(pack),
+            prototype: pack.prototype(kind),
+            id: ObjectId((start + nodes - 1) as u16),
+        })
+    }
+
+    pub(super) fn heap_work(&self) -> usize {
+        self.append.work()
+    }
+    pub(super) fn request_bytes(&self) -> usize {
+        self.append.bytes()
+    }
+
+    pub(super) fn reserve_with(
+        self,
+        mut before_reserve: impl FnMut(usize) -> Result<(), InstantiateError>,
+    ) -> Result<ReservedError<'a>, InstantiateError> {
+        let growth = self.append.reserve(&mut before_reserve)?;
+        Ok(ReservedError { plan: self, growth })
+    }
+}
+
+pub(super) struct ReservedError<'a> {
+    plan: ErrorCreation<'a>,
+    growth: ReservedHeap,
+}
+
+impl ReservedError<'_> {
+    pub(super) fn publish(self) -> ObjectId {
+        let ErrorCreation {
+            heap,
+            new_pack,
+            prototype,
+            id,
+            ..
+        } = self.plan;
+        self.growth.publish(heap);
+        if let Some(pack) = new_pack {
+            heap.append_error_roots(pack);
+        }
+        heap.append_object(Object::error(prototype));
+        if new_pack.is_some() {
+            heap.error_roots = new_pack;
+        }
+        id
+    }
+}
+
 /// Same bounded recipe for GDI (selected origins only) and a reached creator
 /// (one origin). Exclusive borrows keep all checked frontiers stable; the one
 /// caller-owned origin slice and immutable artifact supply the whole batch.
@@ -644,11 +996,8 @@ pub(super) struct Creation<'a> {
     functions: &'a mut Vec<FunctionRecord>,
     artifact: &'a Artifact,
     origins: &'a [FunctionOrigin],
-    roots: bool,
-    objects: Tier,
-    rows: Tier,
+    append: HeapAppend,
     records: Tier,
-    recipe_work: usize,
 }
 
 impl<'a> Creation<'a> {
@@ -674,43 +1023,20 @@ impl<'a> Creation<'a> {
             .checked_add(count)
             .filter(|&end| end <= MAX_FUNCTIONS)
             .ok_or(FunctionLimitExceeded)?;
-        // Only the two callable creators append nodes. Dynamic property rows
-        // share their row frontier, so the initial recipe is only a floor.
-        let roots = functions.is_empty();
-        let old_objects = heap.objects.len();
-        let old_rows = heap.rows.len();
-        let expected = |roots, per_function| {
-            if functions.is_empty() {
-                0
-            } else {
-                roots + per_function * functions.len()
-            }
-        };
-        if old_objects != expected(ROOT_OBJECTS, FUNCTION_OBJECTS)
-            || old_rows < expected(ROOT_ROWS, FUNCTION_ROWS)
-            || (roots && old_rows != 0)
-        {
-            return Err(InvalidScript);
-        }
-        let object_add = FUNCTION_OBJECTS * count + if roots { ROOT_OBJECTS } else { 0 };
-        let row_add = FUNCTION_ROWS * count + if roots { ROOT_ROWS } else { 0 };
-        if old_rows + row_add > ROW_LIMIT {
-            return Err(InstantiateError::PropertyLimitExceeded);
-        }
-
-        // Ends fit by the checked user frontier and the compile-time formula.
-        // Fixed recipes have unique keys per node, bounded own rows, backwards
-        // [[Prototype]] edges, and descriptor links only to allocated slots.
+        let frontier = heap.creation_frontier(functions.len())?;
+        let append = HeapAppend::plan(
+            heap,
+            frontier,
+            FUNCTION_OBJECTS * count,
+            FUNCTION_ROWS * count,
+        )?;
         Ok(Self {
-            objects: Tier::plan(old_objects, old_objects + object_add, OBJECT_LIMIT),
-            rows: Tier::plan(old_rows, old_rows + row_add, ROW_LIMIT),
+            append,
             records: Tier::plan(functions.len(), function_end, MAX_FUNCTIONS),
-            recipe_work: 2 * (object_add + row_add), // stage/link + publish per entry
             heap,
             functions,
             artifact,
             origins,
-            roots,
         })
     }
 
@@ -719,11 +1045,11 @@ impl<'a> Creation<'a> {
     }
 
     pub(super) fn heap_work(&self) -> usize {
-        self.recipe_work + self.objects.moves + self.rows.moves
+        self.append.work()
     }
 
     pub(super) fn request_bytes(&self) -> usize {
-        self.objects.request * size_of::<Object>() + self.rows.request * size_of::<Row>()
+        self.append.bytes()
     }
 
     pub(super) fn reserve(self) -> Result<Reserved<'a>, InstantiateError> {
@@ -734,18 +1060,12 @@ impl<'a> Creation<'a> {
         self,
         mut before_reserve: impl FnMut(usize) -> Result<(), InstantiateError>,
     ) -> Result<Reserved<'a>, InstantiateError> {
-        // Requested old+new overlap <= 2304 Object + 6144 Row + 768
-        // FunctionRecord slots. No old table is copied during preparation;
-        // each destination is detached, including on a later failure.
-        before_reserve(0)?;
-        let objects = self.objects.reserve()?;
-        before_reserve(1)?;
-        let rows = self.rows.reserve()?;
+        let growth = self.append.reserve(&mut before_reserve)?;
+        // At most 768 FunctionRecord slots old+new, also detached.
         before_reserve(2)?;
         let records = self.records.reserve()?;
         Ok(Reserved {
-            objects,
-            rows,
+            growth,
             records,
             plan: self,
         })
@@ -754,8 +1074,7 @@ impl<'a> Creation<'a> {
 
 pub(super) struct Reserved<'a> {
     plan: Creation<'a>,
-    objects: Option<Vec<Object>>,
-    rows: Option<Vec<Row>>,
+    growth: ReservedHeap,
     records: Option<Vec<FunctionRecord>>,
 }
 
@@ -766,19 +1085,14 @@ impl Reserved<'_> {
             functions,
             artifact,
             origins,
-            roots,
             ..
         } = self.plan;
         let first = FunctionId::User(functions.len() as u16);
-        commit_rows(&mut heap.objects, std::iter::empty(), self.objects);
-        commit_rows(&mut heap.rows, std::iter::empty(), self.rows);
+        self.growth.publish(heap);
         commit_rows(functions, std::iter::empty(), self.records);
         // All three tables now have room for their checked ends (regardless
         // of allocator surplus). Only infallible copies/pushes remain. Artifact
         // metadata and origin indices cannot change under the shared borrow.
-        if roots {
-            heap.append_roots();
-        }
         for &origin in origins {
             let id = FunctionId::User(functions.len() as u16);
             let formals = artifact.bodies[usize::from(origin.body)].layout.formals;
@@ -793,6 +1107,9 @@ impl Reserved<'_> {
         first
     }
 }
+
+#[cfg(test)]
+mod error_tests;
 
 #[cfg(test)]
 mod tests {
@@ -860,7 +1177,8 @@ mod tests {
         assert_eq!(heap.objects[1].prototype, Some(OBJECT_PROTO));
         assert_eq!(heap.objects[2].prototype, Some(FUNCTION_PROTO));
         assert_eq!(heap.objects[3].prototype, Some(FUNCTION_PROTO));
-        assert!(!heap.objects[2].complete && heap.objects[3].complete);
+        assert_eq!(heap.objects[2].shape, Shape::Incomplete);
+        assert_eq!(heap.objects[3].shape, Shape::Complete);
         for (prototype, intrinsic) in [
             (OBJECT_PROTO, Intrinsic::ObjectConstructor),
             (FUNCTION_PROTO, Intrinsic::FunctionConstructor),

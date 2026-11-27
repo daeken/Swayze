@@ -326,7 +326,7 @@ fn grammar_reports_exclusions_and_preserves_legacy_refusal() {
         "function f(x=1){}",
         "function f(...x){}",
         "function f(){function g(){}}",
-        "var expr = function(){};",
+        "var expr = function named(){};",
         "if (false) function f(){}",
         "{function f(){}}",
         "function *f(){}",
@@ -569,5 +569,205 @@ fn frame_moves_do_not_promote_strings_and_shared_operation_caps_do_not_reset() {
     assert_eq!(
         run(&mut realm, &format!("{warmup} payload() - num;")),
         fault(EvalError::StringNumericConversionLimitExceeded)
+    );
+}
+
+#[test]
+fn anonymous_primary_resumes_script_state_across_expression_and_statement_owners() {
+    let mut realm = Realm::new();
+    normal(
+        &mut realm,
+        r#"
+        (function () { return 1; })();
+        let f = ((function (x) { var y = x + 1; return y; })), g = function () {};
+        function apply(a,b,c) { return a(b()) + c; }
+        var x = 0, out = 0;
+        if (apply(function (z) { return z + 2; }, function () { return 3; }, 4) !== 9) bad;
+        if (`a${1 + (function () { return 2; })()}${`b${(function () { return 'c'; })()}`}d` !== 'a3bcd') bad;
+        if (f(9) !== 10 || g() !== undefined) bad;
+        outer: for (var f2 = function () { return 2; }, i = 0;
+                    i < (function () { return 3; })();
+                    i += (function () { return 1; })()) {
+            if (i === 0) do {
+                out += (function () { return 20; })(); continue;
+            } while ((function () { return false; })());
+            else if (i === 1) continue outer;
+            else stop: { f2 = function () { return 4; }, out += 2; break stop; bad; }
+        }
+        x_loop: while ((function () { return x < 2; })()) { x++; }
+        if (x !== 2 || out !== 22 || i !== 3 || f2() !== 4) bad;
+        if (false ? function () {} : (0, function () { return true; })()) ; else bad;
+    "#,
+    );
+}
+
+#[test]
+fn anonymous_identity_is_reached_fresh_and_escapes_its_producer_without_self_binding() {
+    let mut realm = Realm::new();
+    normal(
+        &mut realm,
+        r#"
+        let switcher = function () { return switcher; };
+        var alias = switcher, late = function () { return typeof fresh; }, f, old, i = 0;
+        while (i < 2) { old = f; f = function () { return `body${i}`; }; i++; }
+        if (f === old || f() !== old() || late() !== 'undefined') bad;
+    "#,
+    );
+    normal(
+        &mut realm,
+        r#"
+        let fresh = 5;
+        switcher = function () { return 7; };
+        if (alias() !== switcher || alias()() !== 7 || old() !== 'body2' || late() !== 'number') bad;
+    "#,
+    );
+    let probe = "if (late() !== 'number') bad; let never;";
+    normal(&mut realm, probe);
+    normal(
+        &mut realm,
+        "var tdz = function () { return typeof notYet; };",
+    );
+    let source = "tdz(); let notYet;";
+    assert!(matches!(
+        run(&mut realm, source),
+        Ok(Completion::Throw(Throw::ReferenceError { .. }))
+    ));
+}
+
+#[test]
+fn anonymous_calls_keep_getvalue_arguments_and_putvalue_order() {
+    let mut realm = Realm::new();
+    normal(&mut realm, "var hits = 0; const fixed = 5;");
+    assert!(matches!(
+        run(&mut realm, "fixed = function () {};"),
+        Ok(Completion::Throw(Throw::TypeError { .. }))
+    ));
+    assert!(matches!(
+        run(&mut realm, "fixed((function () { return (hits = 1); })());"),
+        Ok(Completion::Throw(Throw::TypeError { .. }))
+    ));
+    normal(
+        &mut realm,
+        r#"
+        if (hits !== 1 || fixed !== 5) bad;
+        hits ||= function () { bad; };
+        var f;
+        f ??= (function (a,b) { return a + b; });
+        if ((f ||= function () { bad; })(2,3) !== 5) bad;
+        var f2 = (f &&= (function () { return hits; }));
+        if (f2 !== f || f2() !== 1) bad;
+    "#,
+    );
+}
+
+#[test]
+fn anonymous_body_eligibility_and_decimal_witnesses_are_lexically_owned() {
+    for source in [
+        "function () {};",
+        "var f = function named() {};",
+        "{ function f(){} }",
+        "label: function f(){}",
+        "if (false) function f(){}",
+        "for (let x=1;;) { (function () {return x;}); }",
+        "var f = function () { if (false) { (function () {}); } };",
+        "function f(){ return; (function () {}); }",
+        "(function(t,t){});",
+        "(function () { return this; })();",
+        "(function () {}).name;",
+        "new (function () {});",
+    ] {
+        assert!(
+            matches!(CompiledScript::compile(source), Err(CompileError::Parse(_))),
+            "{source}"
+        );
+    }
+    let legacy = "(function () {});";
+    let err = parse_script_for_completion(legacy).unwrap_err();
+    assert_eq!(err.span(), span(legacy, "function"));
+    let mut realm = Realm::new();
+    normal(
+        &mut realm,
+        r#"var a = function(){ return '\8'; }, b = function(){ 'use strict'; return 7; }; if (a() !== '8' || b() !== 7 || '\9' !== '9') bad;"#,
+    );
+    for (source, escape) in [
+        (r#"'\8'; var f = function(){ '\9'; 'use strict'; };"#, "\\9"),
+        (
+            r#"'use strict'; false && (function () { if (false) '\8'; });"#,
+            "\\8",
+        ),
+        (
+            r#"var x = `${(function () {'use strict'; return '\9';})()}${'\8'}`;"#,
+            "\\9",
+        ),
+        (
+            r#"'use strict'; var x = `${(function () {return 1;})()}${'\8'}`;"#,
+            "\\8",
+        ),
+    ] {
+        assert_eq!(
+            CompiledScript::compile(source).unwrap_err(),
+            CompileError::SyntaxError {
+                span: span(source, escape)
+            }
+        );
+    }
+    normal(
+        &mut realm,
+        "'use strict'; var w = function () { var undefined = 2; return ++undefined; }, s = function () { undefined = (effect = 3); }; var effect = 0;",
+    );
+    assert!(matches!(
+        run(&mut realm, "if (w() !== 3) bad; s();"),
+        Ok(Completion::Throw(Throw::TypeError { .. }))
+    ));
+    normal(
+        &mut realm,
+        "if (effect !== 3) bad; var sloppy = function () { undefined = (effect = 4); };",
+    );
+    normal(&mut realm, "'use strict'; sloppy(); if (effect !== 4) bad;");
+}
+
+#[test]
+fn expression_literals_and_names_are_owned_by_each_realm() {
+    let mut one = Realm::new();
+    let mut two = Realm::new();
+    {
+        let code = CompiledScript::compile("var f = function (x) { var result = x; return `left:${result}:${dynamic}:right`; }; var alias = f;").unwrap();
+        for realm in [&mut one, &mut two] {
+            assert_eq!(
+                realm.instantiate(&code).unwrap().execute(),
+                Ok(Completion::Normal)
+            );
+        }
+    }
+    normal(&mut one, "let dynamic = 'one';");
+    normal(&mut two, "var dynamic = 'two';");
+    let root = CompiledScript::compile(
+        "var text = 'caller:' + alias('arg'); false && function () { return 'not the source'; };",
+    )
+    .unwrap();
+    for (realm, expected) in [(&mut one, "one"), (&mut two, "two")] {
+        assert_eq!(
+            realm.instantiate(&root).unwrap().execute(),
+            Ok(Completion::Normal)
+        );
+        normal(
+            realm,
+            &format!("if (text !== 'caller:left:arg:{expected}:right' || alias !== f) bad;"),
+        );
+    }
+}
+
+#[test]
+fn anonymous_primary_and_body_delimiters_share_the_parked_nesting_limit() {
+    let source = |count| {
+        format!(
+            "{}function () {{ return (1); }}{};",
+            "(".repeat(count),
+            ")".repeat(count)
+        )
+    };
+    normal(&mut Realm::new(), &source(126));
+    assert!(
+        matches!(CompiledScript::compile(&source(127)), Err(CompileError::Parse(err)) if err.kind() == ErrorKind::LimitExceeded(Limit::NestingDepth))
     );
 }

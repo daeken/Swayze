@@ -1,7 +1,7 @@
 use super::{
     BindingKind, EvalError, EvalScratch, ExternalStrings, Operand, Stack, StringPools,
     TransientStrings, Update, UpdateResult, Value, push_operand,
-    realm::{Artifact, FunctionOrigin},
+    realm::{Artifact, FunctionId, FunctionOrigin},
     update_number,
 };
 
@@ -29,6 +29,14 @@ pub(super) trait Bindings {
     }
 
     fn select_body(&mut self, _: Option<FunctionOrigin>) {}
+
+    fn function_origin(&self, _: FunctionId) -> Result<FunctionOrigin, Self::Error> {
+        Err(EvalError::InvalidScript.into())
+    }
+
+    fn create_function(&mut self, _: u16) -> Result<FunctionId, Self::Error> {
+        Err(EvalError::InvalidScript.into())
+    }
 
     fn non_callable(&self, _: crate::Span) -> Self::Error {
         EvalError::InvalidScript.into()

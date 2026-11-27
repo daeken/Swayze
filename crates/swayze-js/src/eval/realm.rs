@@ -41,6 +41,9 @@ use super::{
     validate_layout,
 };
 
+mod object_heap;
+use object_heap::{CREATION_REQUEST_BYTES, CREATION_WORK, Creation, FunctionRecord, Heap};
+
 pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CODE_NAME_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_DECLARATIONS: usize = 256;
@@ -125,7 +128,7 @@ impl FrameLayout {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NameRange {
     pub(crate) start: u16,
     pub(crate) end: u16,
@@ -499,7 +502,7 @@ struct ObjectBindings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FunctionId(u16);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FunctionOrigin {
     pub(super) artifact: u8,
     body: u16,
@@ -510,6 +513,9 @@ pub(super) struct Artifact {
     pub(super) string_units: Vec<u16>,
     names: Vec<u8>,
     sites: Vec<Site>,
+    // Body-indexed provenance into the existing name pool. No second spelling
+    // or changes to the literal pool before there is a property consumer.
+    body_names: Vec<Option<NameRange>>,
 }
 
 impl Artifact {
@@ -524,10 +530,37 @@ impl Artifact {
         validate_body(&code.instructions, code.max_stack_depth, code.exit)
             .map_err(|_| InstantiateError::InvalidScript)?;
         let mut bodies = reserve_code(code.functions.len(), &mut bytes, work)?;
-        for body in &code.functions {
-            if let BodyKind::Expression(Some(name)) = body.kind {
-                work.charge(1)?;
-                let name = name
+        let mut body_names = reserve_code(code.functions.len(), &mut bytes, work)?;
+        let declarations = code
+            .sites
+            .get(..code.declarations)
+            .ok_or(InstantiateError::InvalidScript)?;
+        work.charge(declarations.len())?;
+        let mut declaration_names = declarations.iter().filter_map(|site| match site.role {
+            Role::Function { body } => Some((
+                body,
+                NameRange {
+                    start: site.start,
+                    end: site.end,
+                },
+            )),
+            _ => None,
+        });
+        for (index, body) in code.functions.iter().enumerate() {
+            let name = match body.kind {
+                BodyKind::Declaration => {
+                    let (site_body, name) = declaration_names
+                        .next()
+                        .ok_or(InstantiateError::InvalidScript)?;
+                    if usize::from(site_body) != index {
+                        return Err(InstantiateError::InvalidScript);
+                    }
+                    Some(name)
+                }
+                BodyKind::Expression(name) => name,
+            };
+            if let Some(range) = name {
+                let name = range
                     .get(&code.names)
                     .ok_or(InstantiateError::InvalidScript)?;
                 work.charge(name.len())?;
@@ -536,6 +569,7 @@ impl Artifact {
                     return Err(InstantiateError::InvalidScript);
                 }
             }
+            body_names.push(name);
             validate_body(&body.instructions, body.max_stack_depth, ExitStack::Empty)
                 .map_err(|_| InstantiateError::InvalidScript)?;
             work.charge(body.instructions.len())?;
@@ -555,6 +589,9 @@ impl Artifact {
                 layout: body.layout,
                 accesses: body.accesses.clone(),
             });
+        }
+        if declaration_names.next().is_some() {
+            return Err(InstantiateError::InvalidScript);
         }
         // A merge scan authenticates each root creator against a distinct
         // expression template in emission order. Charge both sides, including
@@ -583,9 +620,23 @@ impl Artifact {
                 string_units,
                 names,
                 sites,
+                body_names,
             },
             bytes,
         ))
+    }
+
+    fn initial_name(&self, body: u16) -> Option<&[u8]> {
+        let index = usize::from(body);
+        let template = self.bodies.get(index)?;
+        template.layout.counts()?;
+        let name = *self.body_names.get(index)?;
+        match (template.kind, name) {
+            (BodyKind::Declaration, None) => None,
+            (BodyKind::Expression(expected), name) if expected != name => None,
+            (_, Some(name)) => name.get(&self.names),
+            (_, None) => Some(&[]),
+        }
     }
 }
 
@@ -641,7 +692,8 @@ pub struct Realm {
     state: RealmState,
     artifacts: Vec<Artifact>,
     artifact_bytes: usize,
-    functions: Vec<FunctionOrigin>,
+    functions: Vec<FunctionRecord>,
+    heap: Heap,
 }
 
 #[derive(Default)]
@@ -965,12 +1017,33 @@ impl Realm {
             Some(Artifact::stage(code, self.artifact_bytes, &mut work)?)
         };
         let root_artifact = artifact.as_ref().map(|_| artifact_id as u8);
-        // Geometrically grown descriptor tables are separately bounded by
-        // 16 artifacts and 512 identities (old + new request <= 24 and 768
-        // entries). Failed staging publishes neither contents nor capacities.
+        // The artifact table requests at most 24 simultaneous old/new slots.
         let artifact_growth =
             prepare_growth(&self.artifacts, usize::from(artifact.is_some()), &mut work)?;
-        let function_growth = prepare_growth(&self.functions, identities.len(), &mut work)?;
+        let creation = if identities.is_empty() {
+            None
+        } else {
+            let (staged, _) = artifact.as_ref().ok_or(InvalidScript)?;
+            let plan = Creation::plan(
+                &mut self.heap,
+                &mut self.functions,
+                artifact_id as u8,
+                staged,
+                &identities,
+            )?;
+            work.charge(plan.function_moves())?;
+            work.charge(plan.heap_work())?;
+            if plan.request_bytes() > CREATION_REQUEST_BYTES {
+                return Err(AllocationFailed);
+            }
+            Some(plan.reserve()?)
+        };
+        // Publication starts only after all checks and detached reservations.
+        // This plan borrows staged code, so publish the already-proven heap
+        // and identities first; only this commit can observe future origins.
+        if let Some(creation) = creation {
+            creation.publish();
+        }
         commit_rows(
             &mut self.state.globals,
             lexicals.into_iter(),
@@ -988,7 +1061,6 @@ impl Realm {
             );
             self.artifact_bytes = bytes;
         }
-        commit_rows(&mut self.functions, identities.into_iter(), function_growth);
         for (slot, function) in installs {
             self.state.object.vars[slot].value = StoredValue::Function(function);
         }
@@ -1085,6 +1157,7 @@ impl fmt::Debug for Realm {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Work(usize);
 
 impl Work {
@@ -1207,6 +1280,9 @@ impl ReadyScript<'_, '_> {
                 artifacts: &self.realm.artifacts,
             },
             functions: &mut self.realm.functions,
+            heap: &mut self.realm.heap,
+            creation_work: Work(CREATION_WORK),
+            creation_requests: CREATION_REQUEST_BYTES,
             root_artifact: self.root_artifact,
             active: None,
             lookup: Work(LOOKUP_WORK),
@@ -1221,7 +1297,10 @@ impl ReadyScript<'_, '_> {
 struct Execution<'realm, 'code> {
     realm: &'realm mut RealmState,
     callable: CallableCode<'realm>,
-    functions: &'realm mut Vec<FunctionOrigin>,
+    functions: &'realm mut Vec<FunctionRecord>,
+    heap: &'realm mut Heap,
+    creation_work: Work,
+    creation_requests: usize,
     root_artifact: Option<u8>,
     active: Option<FunctionOrigin>,
     lookup: Work,
@@ -1431,6 +1510,14 @@ impl From<EvalError> for Stop {
     }
 }
 
+fn creation_eval_error(error: InstantiateError) -> EvalError {
+    match error {
+        InstantiateError::FunctionLimitExceeded => EvalError::FunctionLimitExceeded,
+        InstantiateError::AllocationFailed => EvalError::AllocationFailed,
+        _ => EvalError::InvalidScript,
+    }
+}
+
 impl Bindings for Execution<'_, '_> {
     type Error = Stop;
     const CALLS: bool = true;
@@ -1464,9 +1551,8 @@ impl Bindings for Execution<'_, '_> {
     }
 
     fn function_origin(&self, id: FunctionId) -> Result<FunctionOrigin, Stop> {
-        self.functions
-            .get(usize::from(id.0))
-            .copied()
+        self.heap
+            .origin(id, self.functions)
             .ok_or(EvalError::InvalidScript.into())
     }
 
@@ -1477,28 +1563,37 @@ impl Bindings for Execution<'_, '_> {
         let artifact = self.root_artifact.ok_or(EvalError::InvalidScript)?;
         let origin = FunctionOrigin { artifact, body };
         let (artifact, template) = self.callable.body(origin).ok_or(EvalError::InvalidScript)?;
-        let BodyKind::Expression(name) = template.kind else {
+        if !matches!(template.kind, BodyKind::Expression(_)) {
             return Err(EvalError::InvalidScript.into());
-        };
-        if let Some(name) = name {
-            name.get(&artifact.names).ok_or(EvalError::InvalidScript)?;
         }
-        let len = self.functions.len();
-        if len >= MAX_FUNCTIONS {
-            return Err(EvalError::FunctionLimitExceeded.into());
-        }
-        let growth = len == self.functions.capacity();
-        // Dispatch already paid for the opcode. Charge the row and all
-        // potentially moved rows before reserve/publish. Both entry points
-        // use power-of-two tiers; total requested overlap is at most 768 rows.
-        self.charge_call(1 + if growth { len } else { 0 })?;
-        if growth {
-            self.functions
-                .try_reserve_exact((len + 1).next_power_of_two() - len)
-                .map_err(|_| EvalError::AllocationFailed)?;
-        }
-        self.functions.push(origin);
-        Ok(FunctionId(len as u16))
+        let plan = Creation::plan(
+            self.heap,
+            self.functions,
+            origin.artifact,
+            artifact,
+            std::slice::from_ref(&origin),
+        )
+        .map_err(creation_eval_error)?;
+        let mut lookup = self.lookup;
+        let mut creation_work = self.creation_work;
+        // Preserve the origin write/move debit in the existing call setup
+        // budget. Initial shape has a separate execute-wide debit; this
+        // constructor-only protocol cannot exhaust it at the user frontier.
+        lookup
+            .charge(1 + plan.function_moves())
+            .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
+        creation_work
+            .charge(plan.heap_work())
+            .map_err(|_| EvalError::GlobalLookupLimitExceeded)?;
+        let requests = self
+            .creation_requests
+            .checked_sub(plan.request_bytes())
+            .ok_or(EvalError::AllocationFailed)?;
+        let id = plan.reserve().map_err(creation_eval_error)?.publish();
+        self.lookup = lookup;
+        self.creation_work = creation_work;
+        self.creation_requests = requests;
+        Ok(id)
     }
 
     fn load(&mut self, index: usize) -> Result<Operand, Stop> {
@@ -1657,7 +1752,9 @@ mod tests {
         assert_eq!(code.instructions.len(), 3599);
         assert_eq!(code.functions.len(), 1);
         assert!(code.functions[0].instructions.is_empty());
-        let stage_cost = code.instructions.len() + 4; // scan root; reserve and visit one body; one site and name byte
+        // Scan root; reserve and visit one body; copy one site and name byte.
+        // Initial name provenance adds a table entry, site walk and name check.
+        let stage_cost = code.instructions.len() + 7;
         assert!(matches!(
             Artifact::stage(&code, 0, &mut Work(stage_cost - 1)),
             Err(InstantiateError::WorkLimitExceeded)

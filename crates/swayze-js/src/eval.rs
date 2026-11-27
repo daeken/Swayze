@@ -13,6 +13,7 @@ pub(crate) const MAX_INSTRUCTIONS: usize = 4096;
 const MAX_DISPATCHES: usize = 16_384;
 const MAX_STRING_COMPARISON_PAIRS: usize = 65_536;
 
+mod abrupt;
 mod bindings;
 pub mod realm;
 use bindings::{
@@ -731,6 +732,13 @@ fn ends_packet_scope(op: Instruction) -> bool {
             | Instruction::InitBinding { .. }
             | Instruction::StoreBinding(_)
             | Instruction::StoreLocal { keep: false, .. }
+            | Instruction::StoreCatch { keep: false, .. }
+            | Instruction::ThrowValue { .. }
+            | Instruction::EnterTry { .. }
+            | Instruction::LeaveTry { .. }
+            | Instruction::EnterCatch { .. }
+            | Instruction::LeaveCatch { .. }
+            | Instruction::ExitRegions { .. }
     )
 }
 
@@ -748,7 +756,11 @@ struct Frame<'code> {
     temps: u16,
     fence: u16,
     receiver: Option<Operand>, // bare undefined is implicit
+    region_fence: u8,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Frame<'_>>() == 56);
 
 impl<'code> Frame<'code> {
     fn root(ops: &'code [Instruction], max_operands: usize, exit: ExitStack) -> Self {
@@ -763,6 +775,7 @@ impl<'code> Frame<'code> {
             temps: 0,
             fence: 0,
             receiver: None,
+            region_fence: 0,
         }
     }
 }
@@ -781,6 +794,40 @@ fn validate_body(
         return Err(EvalError::InvalidScript);
     }
     Ok(())
+}
+
+// Shared lexical authentication for both packet-only and guarded streams.
+fn packet_shape<E: From<EvalError>>(
+    ops: &[Instruction],
+    at: usize,
+    signature: u16,
+    parent: impl FnOnce(usize) -> u16,
+    check_site: &mut impl FnMut(u16) -> Result<(), E>,
+) -> Result<u16, E> {
+    let op = ops[at];
+    let index = match op {
+        Instruction::GetDot(site)
+        | Instruction::FormDot(site)
+        | Instruction::PutDot(site)
+        | Instruction::PrepareDotCall(site) => site,
+        Instruction::Call { member, .. } if member != BARE_CALL => member,
+        _ => return Ok(signature),
+    };
+    check_dot_index(index)?;
+    check_site(index)?;
+    let expected = match op {
+        Instruction::FormDot(_) | Instruction::PrepareDotCall(_) => return Ok((at + 1) as u16),
+        Instruction::PutDot(_) => Instruction::FormDot(index),
+        Instruction::Call { .. } => Instruction::PrepareDotCall(index),
+        _ => return Ok(signature),
+    };
+    let opener = usize::from(signature)
+        .checked_sub(1)
+        .ok_or(EvalError::InvalidScript)?;
+    if ops.get(opener) != Some(&expected) {
+        return Err(EvalError::InvalidScript.into());
+    }
+    Ok(parent(opener))
 }
 
 // Realm calls this for both root forms and every property-bearing body.
@@ -809,32 +856,7 @@ fn validate_property_shape<E: From<EvalError>>(
         if signature != 0 && ends_packet_scope(op) {
             return Err(EvalError::InvalidScript.into());
         }
-        let index = match op {
-            Instruction::GetDot(site)
-            | Instruction::FormDot(site)
-            | Instruction::PutDot(site)
-            | Instruction::PrepareDotCall(site) => site,
-            Instruction::Call { member, .. } if member != BARE_CALL => member,
-            _ => continue,
-        };
-        check_dot_index(index)?;
-        check_site(index)?;
-        let expected = match op {
-            Instruction::FormDot(_) | Instruction::PrepareDotCall(_) => {
-                signature = (at + 1) as u16; // validated <= MAX_INSTRUCTIONS
-                continue;
-            }
-            Instruction::PutDot(_) => Instruction::FormDot(index),
-            Instruction::Call { .. } => Instruction::PrepareDotCall(index),
-            _ => continue,
-        };
-        let opener = usize::from(signature)
-            .checked_sub(1)
-            .ok_or(EvalError::InvalidScript)?;
-        if ops[opener] != expected {
-            return Err(EvalError::InvalidScript.into());
-        }
-        signature = before[opener];
+        signature = packet_shape(ops, at, signature, |opener| before[opener], &mut check_site)?;
     }
     if signature != 0 {
         return Err(EvalError::InvalidScript.into());
@@ -949,6 +971,8 @@ fn dispatch<'code, B: Bindings>(
     let mut callers = Vec::<Frame<'_>>::new();
     let mut packets = Packets::default();
     let mut receivers = 0;
+    let mut regions = abrupt::Regions::default();
+    let mut exceptional_entry = false;
     loop {
         let Frame {
             ops,
@@ -959,6 +983,7 @@ fn dispatch<'code, B: Bindings>(
             exit,
             fence,
             receiver,
+            region_fence,
             ref mut ip,
         } = frame;
         let (max_operands, base, temps, fence) = (
@@ -975,7 +1000,7 @@ fn dispatch<'code, B: Bindings>(
             floor,
         };
         if *ip == ops.len() {
-            if packets.rows.len() != fence {
+            if packets.rows.len() != fence || regions.len() != usize::from(region_fence) {
                 return Err(EvalError::InvalidScript.into());
             }
             // Frame frontier is not dispatched; ordinary body fallthrough
@@ -1006,505 +1031,644 @@ fn dispatch<'code, B: Bindings>(
             .ok_or(EvalError::DispatchLimitExceeded)?;
         let op = *ops.get(*ip).ok_or(EvalError::InvalidScript)?;
         *ip += 1;
-        let source = bindings.transient(scratch, string_units, callable.artifacts);
         if packets.rows.len() != fence && ends_packet_scope(op) {
             return Err(EvalError::InvalidScript.into());
         }
-        match op {
-            Instruction::CreateFunction(template) if B::CALLS => {
-                // Do not allocate an identity unless the root can hold the
-                // result; the active frame's operand reservation already exists.
-                if body.is_some()
-                    || stack.len() >= max_operands
-                    || stack.slots.len() == stack.slots.capacity()
-                {
-                    return Err(EvalError::InvalidScript.into());
-                }
-                let id = bindings.create_function(template)?;
-                push_operand(&mut stack, max_operands, Operand::Function(id))?;
-            }
-            Instruction::GetDot(site)
-            | Instruction::FormDot(site)
-            | Instruction::PrepareDotCall(site)
-                if B::CALLS =>
-            {
-                let captured = *stack.last().ok_or(EvalError::InvalidScript)?;
-                let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
-                let checked = authenticate_dot(properties, body, site)?;
-                if matches!(op, Instruction::GetDot(_)) {
-                    *stack.last_mut().ok_or(EvalError::InvalidScript)? =
-                        properties.get_dot(checked, captured, source)?;
-                } else {
-                    let anchor = u16::try_from(stack.slots.len() - 1)
-                        .map_err(|_| EvalError::InvalidScript)?;
-                    packets.reserve_push(temps, max_operands, receivers, properties)?;
-                    let kind = if matches!(op, Instruction::FormDot(_)) {
-                        stack.pop(); // Formation does not inspect the receiver.
-                        PacketKind::Form
-                    } else {
-                        let callee = properties.get_dot(checked, captured, source)?;
-                        stack.slots[usize::from(anchor)] = callee;
-                        PacketKind::PreparedCall
-                    };
-                    packets.rows.push(Packet {
-                        captured,
-                        site,
-                        anchor,
-                        kind,
-                    });
-                }
-            }
-            Instruction::PutDot(site) if B::CALLS => {
-                let rhs = *stack.last().ok_or(EvalError::InvalidScript)?;
-                let anchor = stack.slots.len() - 1;
-                let packet = packets.matching(fence, PacketKind::Form, site, anchor)?;
-                let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
-                let checked = authenticate_dot(properties, body, site)?;
-                properties.put_dot(checked, packet.captured, rhs, source)?;
-                packets.rows.pop();
-            }
-            Instruction::Call {
-                start,
-                end,
-                argc,
-                member,
-            } if B::CALLS => {
-                let argc = usize::from(argc);
-                if argc > usize::from(realm::MAX_PARAMETERS) || start >= end {
-                    return Err(EvalError::InvalidScript.into());
-                }
-                let pos = stack
-                    .slots
-                    .len()
-                    .checked_sub(argc + 1)
-                    .ok_or(EvalError::InvalidScript)?;
-                let raw_receiver = if member == BARE_CALL {
-                    if pos < floor {
+        let entering_catch = std::mem::take(&mut exceptional_entry);
+        let mut next_frame = None;
+        let step = (|| -> Result<(), B::Error> {
+            let source = bindings.transient(scratch, string_units, callable.artifacts);
+            match op {
+                Instruction::CreateFunction(template) if B::CALLS => {
+                    // Do not allocate an identity unless the root can hold the
+                    // result; the active frame's operand reservation already exists.
+                    if body.is_some()
+                        || stack.len() >= max_operands
+                        || stack.slots.len() == stack.slots.capacity()
+                    {
                         return Err(EvalError::InvalidScript.into());
                     }
-                    None
-                } else {
-                    let packet = packets.matching(fence, PacketKind::PreparedCall, member, pos)?;
+                    let id = bindings.create_function(template)?;
+                    push_operand(&mut stack, max_operands, Operand::Function(id))?;
+                }
+                Instruction::GetDot(site)
+                | Instruction::FormDot(site)
+                | Instruction::PrepareDotCall(site)
+                    if B::CALLS =>
+                {
+                    let captured = *stack.last().ok_or(EvalError::InvalidScript)?;
                     let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
-                    authenticate_dot(properties, body, member)?;
-                    Some(packet.captured)
-                };
-                let transfer = usize::from(raw_receiver.is_some());
-                if !packets.rows.is_empty() || receivers != 0 {
-                    // Include extra arguments before the slot-moving ABI removes them.
-                    check_live_slots(stack.slots.len(), 0, packets.rows.len(), receivers)?;
-                }
-                let span = crate::Span {
-                    start: start as usize,
-                    end: end as usize,
-                };
-                let Operand::Function(id) = slots[pos] else {
-                    return Err(bindings.non_callable(span));
-                };
-                // Only after GetValue and all argument expressions succeed.
-                let origin = match bindings.classify_callable(id, span)? {
-                    CallTarget::User(origin) => origin,
-                    CallTarget::FunctionPrototype => {
-                        // Exact [[Call]]: discard evaluated args, replace the callee.
-                        // No user-frame check, receiver slot, reserve or setup charge.
-                        if transfer != 0 {
-                            packets.rows.pop();
-                        }
-                        slots.truncate(pos + 1);
-                        slots[pos] = UNDEFINED;
-                        continue;
+                    let checked = authenticate_dot(properties, body, site)?;
+                    if matches!(op, Instruction::GetDot(_)) {
+                        *stack.last_mut().ok_or(EvalError::InvalidScript)? =
+                            properties.get_dot(checked, captured, source)?;
+                    } else {
+                        let anchor = u16::try_from(stack.slots.len() - 1)
+                            .map_err(|_| EvalError::InvalidScript)?;
+                        packets.reserve_push(
+                            temps,
+                            max_operands,
+                            receivers + regions.len(),
+                            properties,
+                        )?;
+                        let kind = if matches!(op, Instruction::FormDot(_)) {
+                            stack.pop(); // Formation does not inspect the receiver.
+                            PacketKind::Form
+                        } else {
+                            let callee = properties.get_dot(checked, captured, source)?;
+                            stack.slots[usize::from(anchor)] = callee;
+                            PacketKind::PreparedCall
+                        };
+                        packets.rows.push(Packet {
+                            captured,
+                            site,
+                            anchor,
+                            kind,
+                        });
                     }
-                };
-                let (_, target) = callable.body(origin).ok_or(EvalError::InvalidScript)?;
-                if callers.len() == MAX_GUEST_FRAMES {
-                    return Err(EvalError::CallDepthLimitExceeded.into());
                 }
-                let (formals, locals) = target.layout.counts().ok_or(EvalError::InvalidScript)?;
-                let local_end = pos + locals;
-                let next_receivers = receivers + transfer;
-                let needed = check_live_slots(
-                    local_end,
-                    target.max_stack_depth,
-                    packets.rows.len() - transfer,
-                    next_receivers,
-                )?;
-                bindings.charge_call(1 + locals)?;
-                if callers.capacity() == 0 {
-                    callers
-                        .try_reserve_exact(MAX_GUEST_FRAMES)
-                        .map_err(|_| EvalError::AllocationFailed)?;
-                }
-                if needed > slots.capacity() {
-                    // Geometric startup; at most 4096 requested slots, and
-                    // <8192 old initialized slots moved over the execution.
-                    let capacity = needed.next_power_of_two();
-                    slots
-                        .try_reserve_exact(capacity - slots.len())
-                        .map_err(|_| EvalError::AllocationFailed)?;
-                }
-                if transfer != 0 {
+                Instruction::PutDot(site) if B::CALLS => {
+                    let rhs = *stack.last().ok_or(EvalError::InvalidScript)?;
+                    let anchor = stack.slots.len() - 1;
+                    let packet = packets.matching(fence, PacketKind::Form, site, anchor)?;
+                    let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
+                    let checked = authenticate_dot(properties, body, site)?;
+                    properties.put_dot(checked, packet.captured, rhs, source)?;
                     packets.rows.pop();
                 }
-                receivers = next_receivers;
-                let supplied = argc.min(formals);
-                slots.copy_within(pos + 1..pos + 1 + supplied, pos);
-                slots.truncate(pos + supplied);
-                // Extra arguments are never local initializers. Fill the
-                // missing formal prefix and var-only tail on every entry.
-                slots.resize(local_end, UNDEFINED);
-                let callee = Frame {
-                    ops: &target.instructions,
-                    // All four offsets are bounded by the successful slot check.
-                    max_operands: target.max_stack_depth as u16,
-                    exit: ExitStack::Empty,
-                    body: Some(origin),
-                    ip: 0,
-                    base: pos as u16,
-                    temps: local_end as u16,
-                    fence: packets.rows.len() as u16,
-                    receiver: raw_receiver,
-                };
-                callers.push(std::mem::replace(&mut frame, callee));
-                bindings.select_body(Some(origin));
-            }
-            Instruction::Return { value } if B::CALLS => {
-                if body.is_none() || stack.len() != usize::from(value) {
-                    return Err(EvalError::InvalidScript.into());
+                Instruction::Call {
+                    start,
+                    end,
+                    argc,
+                    member,
+                } if B::CALLS => {
+                    let argc = usize::from(argc);
+                    if argc > usize::from(realm::MAX_PARAMETERS) || start >= end {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    let pos = stack
+                        .slots
+                        .len()
+                        .checked_sub(argc + 1)
+                        .ok_or(EvalError::InvalidScript)?;
+                    let raw_receiver = if member == BARE_CALL {
+                        if pos < floor {
+                            return Err(EvalError::InvalidScript.into());
+                        }
+                        None
+                    } else {
+                        let packet =
+                            packets.matching(fence, PacketKind::PreparedCall, member, pos)?;
+                        let properties = bindings.properties().ok_or(EvalError::InvalidScript)?;
+                        authenticate_dot(properties, body, member)?;
+                        Some(packet.captured)
+                    };
+                    let transfer = usize::from(raw_receiver.is_some());
+                    if !packets.rows.is_empty() || receivers != 0 || regions.len() != 0 {
+                        // Include extra arguments before the slot-moving ABI removes them.
+                        check_live_slots(
+                            stack.slots.len(),
+                            0,
+                            packets.rows.len(),
+                            receivers + regions.len(),
+                        )?;
+                    }
+                    let span = crate::Span {
+                        start: start as usize,
+                        end: end as usize,
+                    };
+                    let Operand::Function(id) = stack.slots[pos] else {
+                        return Err(bindings.non_callable(span));
+                    };
+                    // Only after GetValue and all argument expressions succeed.
+                    let origin = match bindings.classify_callable(id, span)? {
+                        CallTarget::User(origin) => origin,
+                        CallTarget::FunctionPrototype => {
+                            // Exact [[Call]]: discard evaluated args, replace the callee.
+                            // No user-frame check, receiver slot, reserve or setup charge.
+                            if transfer != 0 {
+                                packets.rows.pop();
+                            }
+                            stack.slots.truncate(pos + 1);
+                            stack.slots[pos] = UNDEFINED;
+                            return Ok(());
+                        }
+                    };
+                    let (_, target) = callable.body(origin).ok_or(EvalError::InvalidScript)?;
+                    if callers.len() == MAX_GUEST_FRAMES {
+                        return Err(EvalError::CallDepthLimitExceeded.into());
+                    }
+                    let (formals, locals) =
+                        target.layout.counts().ok_or(EvalError::InvalidScript)?;
+                    let local_end = pos + locals;
+                    let next_receivers = receivers + transfer;
+                    let needed = check_live_slots(
+                        local_end,
+                        target.max_stack_depth,
+                        packets.rows.len() - transfer,
+                        next_receivers + regions.len(),
+                    )?;
+                    bindings.charge_call(1 + locals)?;
+                    if callers.capacity() == 0 {
+                        callers
+                            .try_reserve_exact(MAX_GUEST_FRAMES)
+                            .map_err(|_| EvalError::AllocationFailed)?;
+                    }
+                    if needed > stack.slots.capacity() {
+                        // Geometric startup; at most 4096 requested slots, and
+                        // <8192 old initialized slots moved over the execution.
+                        let capacity = needed.next_power_of_two();
+                        stack
+                            .slots
+                            .try_reserve_exact(capacity - stack.slots.len())
+                            .map_err(|_| EvalError::AllocationFailed)?;
+                    }
+                    if transfer != 0 {
+                        packets.rows.pop();
+                    }
+                    receivers = next_receivers;
+                    let supplied = argc.min(formals);
+                    stack.slots.copy_within(pos + 1..pos + 1 + supplied, pos);
+                    stack.slots.truncate(pos + supplied);
+                    // Extra arguments are never local initializers. Fill the
+                    // missing formal prefix and var-only tail on every entry.
+                    stack.slots.resize(local_end, UNDEFINED);
+                    let callee = Frame {
+                        ops: &target.instructions,
+                        // All four offsets are bounded by the successful slot check.
+                        max_operands: target.max_stack_depth as u16,
+                        exit: ExitStack::Empty,
+                        body: Some(origin),
+                        ip: 0,
+                        base: pos as u16,
+                        temps: local_end as u16,
+                        fence: packets.rows.len() as u16,
+                        receiver: raw_receiver,
+                        region_fence: regions.len() as u8,
+                    };
+                    next_frame = Some((callee, true));
+                    bindings.select_body(Some(origin));
                 }
-                let value = stack.pop().unwrap_or(UNDEFINED);
-                receivers -= usize::from(receiver.is_some());
-                frame = resume(&mut callers, &mut slots, &packets, base, value, bindings)?;
-            }
-            Instruction::LoadLocal(slot) if B::CALLS => {
-                let value = *stack.local(slot)?;
-                push_operand(&mut stack, max_operands, value)?;
-            }
-            Instruction::StoreLocal { slot, keep } if B::CALLS => {
-                let value = store_operand(&mut stack, keep)?;
-                *stack.local(slot)? = value;
-            }
-            Instruction::UpdateLocal { slot, op, result } if B::CALLS => {
-                let old = stack.local(slot)?.to_number(
-                    source.with_retained(bindings.retained_units()),
-                    &mut string_conversion_credits_left,
-                )?;
-                let new = update_number(op, old);
-                update_result(&mut stack, max_operands, result, old, new)?;
-                *stack.local(slot)? = Operand::Scalar(Value::Number(new));
-            }
-            Instruction::CreateFunction(_)
-            | Instruction::Call { .. }
-            | Instruction::GetDot(_)
-            | Instruction::FormDot(_)
-            | Instruction::PutDot(_)
-            | Instruction::PrepareDotCall(_)
-            | Instruction::Return { .. }
-            | Instruction::LoadLocal(_)
-            | Instruction::StoreLocal { .. }
-            | Instruction::UpdateLocal { .. }
-            | Instruction::EnterTry { .. }
-            | Instruction::LeaveTry { .. }
-            | Instruction::EnterCatch { .. }
-            | Instruction::LeaveCatch { .. }
-            | Instruction::ThrowValue { .. }
-            | Instruction::LoadCatch(_)
-            | Instruction::StoreCatch { .. }
-            | Instruction::UpdateCatch { .. }
-            | Instruction::ExitRegions { .. } => return Err(EvalError::InvalidScript.into()),
-            Instruction::Number(value) => {
-                push_operand(
-                    &mut stack,
-                    max_operands,
-                    Operand::Scalar(Value::Number(value)),
-                )?;
-            }
-            Instruction::String(range) => {
-                let artifact = bindings.active_artifact();
-                bindings
-                    .external_strings(string_units)
-                    .literal(artifact, range)
-                    .ok_or(EvalError::InvalidScript)?;
-                push_operand(
-                    &mut stack,
-                    max_operands,
-                    Operand::String(StringOperand::literal(artifact, range)),
-                )?;
-            }
-            Instruction::Boolean(value) => {
-                push_operand(
-                    &mut stack,
-                    max_operands,
-                    Operand::Scalar(Value::Boolean(value)),
-                )?;
-            }
-            Instruction::Null => {
-                push_operand(&mut stack, max_operands, Operand::Scalar(Value::Null))?
-            }
-            Instruction::Undefined => {
-                push_operand(&mut stack, max_operands, Operand::Scalar(Value::Undefined))?
-            }
-            Instruction::LoadBinding(slot) => {
-                push_operand(&mut stack, max_operands, bindings.load(slot)?)?;
-            }
-            Instruction::InitBinding { slot, kind } => {
-                bindings.init(slot, kind, *ip - 1, &mut stack, source)?;
-            }
-            Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
-                bindings.store(
-                    slot,
-                    matches!(op, Instruction::StoreBindingKeep(_)),
-                    &mut stack,
-                    source,
-                )?;
-            }
-            Instruction::UpdateBinding { slot, op, result } => {
-                bindings.update(
-                    slot,
-                    op,
-                    result,
-                    &mut stack,
-                    max_operands,
-                    UpdateNumeric {
+                Instruction::Return { value } if B::CALLS => {
+                    if body.is_none() || stack.len() != usize::from(value) {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    if regions.len() != usize::from(region_fence) {
+                        let count = regions
+                            .len()
+                            .checked_sub(usize::from(region_fence))
+                            .ok_or(EvalError::InvalidScript)?;
+                        regions.drop_local(region_fence, count, &mut remaining)?;
+                    }
+                    let value = stack.pop().unwrap_or(UNDEFINED);
+                    receivers -= usize::from(receiver.is_some());
+                    next_frame = Some((
+                        resume(&mut callers, stack.slots, &packets, base, value, bindings)?,
+                        false,
+                    ));
+                }
+                Instruction::LoadLocal(slot) if B::CALLS => {
+                    let value = *stack.local(slot)?;
+                    push_operand(&mut stack, max_operands, value)?;
+                }
+                Instruction::StoreLocal { slot, keep } if B::CALLS => {
+                    let value = store_operand(&mut stack, keep)?;
+                    *stack.local(slot)? = value;
+                }
+                Instruction::UpdateLocal { slot, op, result } if B::CALLS => {
+                    let old = stack.local(slot)?.to_number(
+                        source.with_retained(bindings.retained_units()),
+                        &mut string_conversion_credits_left,
+                    )?;
+                    let new = update_number(op, old);
+                    update_result(&mut stack, max_operands, result, old, new)?;
+                    *stack.local(slot)? = Operand::Scalar(Value::Number(new));
+                }
+                op if abrupt::guarded(op) && B::CALLS && bindings.abrupt_enabled() => {
+                    let at = *ip - 1;
+                    let depth = callers.len();
+                    let current = Frame {
+                        ops,
+                        max_operands: max_operands as u16,
+                        exit,
+                        body,
+                        ip: *ip,
+                        base: base as u16,
+                        temps: temps as u16,
+                        fence: fence as u16,
+                        receiver,
+                        region_fence,
+                    };
+                    match op {
+                        Instruction::EnterTry { .. } => {
+                            if !stack.is_empty() {
+                                return Err(EvalError::InvalidScript.into());
+                            }
+                            regions.enter(at, &current, depth, receivers, &mut remaining)?;
+                        }
+                        Instruction::LeaveTry { enter }
+                        | Instruction::EnterCatch { enter }
+                        | Instruction::LeaveCatch { enter } => {
+                            if !stack.is_empty()
+                                || entering_catch != matches!(op, Instruction::EnterCatch { .. })
+                            {
+                                return Err(EvalError::InvalidScript.into());
+                            }
+                            let after = regions.boundary(&current, depth, enter, at, op)?;
+                            if !entering_catch {
+                                regions.drop_local(region_fence, 1, &mut remaining)?;
+                            }
+                            if matches!(op, Instruction::LeaveTry { .. }) {
+                                *ip = after;
+                            }
+                        }
+                        Instruction::ExitRegions { target, .. } => {
+                            if !stack.is_empty() {
+                                return Err(EvalError::InvalidScript.into());
+                            }
+                            regions.exit(&current, depth, op, &mut remaining)?;
+                            *ip = usize::from(target);
+                        }
+                        Instruction::ThrowValue { start, end } => {
+                            let span = crate::Span {
+                                start: start as usize,
+                                end: end as usize,
+                            };
+                            let value = init_operand(&mut stack)?;
+                            return Err(bindings.explicit_throw(abrupt::Thrown {
+                                value,
+                                owner: body,
+                                span,
+                            }));
+                        }
+                        Instruction::LoadCatch(slot) => {
+                            let value = *regions.cell(&current, depth, at, slot)?;
+                            push_operand(&mut stack, max_operands, value)?;
+                        }
+                        Instruction::StoreCatch { slot, keep } => {
+                            let cell = regions.cell(&current, depth, at, slot)?;
+                            *cell = store_operand(&mut stack, keep)?;
+                        }
+                        Instruction::UpdateCatch { slot, op, result } => {
+                            let cell = regions.cell(&current, depth, at, slot)?;
+                            let old = cell.to_number(
+                                source.with_retained(bindings.retained_units()),
+                                &mut string_conversion_credits_left,
+                            )?;
+                            let new = update_number(op, old);
+                            update_result(&mut stack, max_operands, result, old, new)?;
+                            *cell = Operand::Scalar(Value::Number(new));
+                        }
+                        _ => return Err(EvalError::InvalidScript.into()),
+                    }
+                }
+                Instruction::CreateFunction(_)
+                | Instruction::Call { .. }
+                | Instruction::GetDot(_)
+                | Instruction::FormDot(_)
+                | Instruction::PutDot(_)
+                | Instruction::PrepareDotCall(_)
+                | Instruction::Return { .. }
+                | Instruction::LoadLocal(_)
+                | Instruction::StoreLocal { .. }
+                | Instruction::UpdateLocal { .. }
+                | Instruction::EnterTry { .. }
+                | Instruction::LeaveTry { .. }
+                | Instruction::EnterCatch { .. }
+                | Instruction::LeaveCatch { .. }
+                | Instruction::ThrowValue { .. }
+                | Instruction::LoadCatch(_)
+                | Instruction::StoreCatch { .. }
+                | Instruction::UpdateCatch { .. }
+                | Instruction::ExitRegions { .. } => return Err(EvalError::InvalidScript.into()),
+                Instruction::Number(value) => {
+                    push_operand(
+                        &mut stack,
+                        max_operands,
+                        Operand::Scalar(Value::Number(value)),
+                    )?;
+                }
+                Instruction::String(range) => {
+                    let artifact = bindings.active_artifact();
+                    bindings
+                        .external_strings(string_units)
+                        .literal(artifact, range)
+                        .ok_or(EvalError::InvalidScript)?;
+                    push_operand(
+                        &mut stack,
+                        max_operands,
+                        Operand::String(StringOperand::literal(artifact, range)),
+                    )?;
+                }
+                Instruction::Boolean(value) => {
+                    push_operand(
+                        &mut stack,
+                        max_operands,
+                        Operand::Scalar(Value::Boolean(value)),
+                    )?;
+                }
+                Instruction::Null => {
+                    push_operand(&mut stack, max_operands, Operand::Scalar(Value::Null))?
+                }
+                Instruction::Undefined => {
+                    push_operand(&mut stack, max_operands, Operand::Scalar(Value::Undefined))?
+                }
+                Instruction::LoadBinding(slot) => {
+                    push_operand(&mut stack, max_operands, bindings.load(slot)?)?;
+                }
+                Instruction::InitBinding { slot, kind } => {
+                    bindings.init(slot, kind, *ip - 1, &mut stack, source)?;
+                }
+                Instruction::StoreBinding(slot) | Instruction::StoreBindingKeep(slot) => {
+                    bindings.store(
+                        slot,
+                        matches!(op, Instruction::StoreBindingKeep(_)),
+                        &mut stack,
                         source,
-                        credits: &mut string_conversion_credits_left,
-                    },
-                )?;
-            }
-            Instruction::Discard => {
-                stack.pop().ok_or(EvalError::InvalidScript)?;
-            }
-            Instruction::UpdateNumber(op) => apply_binary(&mut stack, |lhs, rhs| {
-                if !matches!(rhs, Operand::Scalar(Value::Number(1.0))) {
-                    return Err(EvalError::InvalidScript.into());
+                    )?;
                 }
-                let old = lhs.to_number(
+                Instruction::UpdateBinding { slot, op, result } => {
+                    bindings.update(
+                        slot,
+                        op,
+                        result,
+                        &mut stack,
+                        max_operands,
+                        UpdateNumeric {
+                            source,
+                            credits: &mut string_conversion_credits_left,
+                        },
+                    )?;
+                }
+                Instruction::Discard => {
+                    stack.pop().ok_or(EvalError::InvalidScript)?;
+                }
+                Instruction::UpdateNumber(op) => apply_binary(&mut stack, |lhs, rhs| {
+                    if !matches!(rhs, Operand::Scalar(Value::Number(1.0))) {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    let old = lhs.to_number(
+                        bindings.string_pools(scratch, string_units),
+                        &mut string_conversion_credits_left,
+                    )?;
+                    Ok::<_, Conversion>(Value::Number(update_number(op, old)))
+                })?,
+                Instruction::Add => apply_binary_operand(&mut stack, |lhs, rhs| {
+                    add(lhs, rhs, bindings.external_strings(string_units), scratch)
+                })?,
+                Instruction::TemplateAppend(following) => {
+                    append_template(
+                        &mut stack,
+                        bindings.external_strings(string_units),
+                        scratch,
+                        following,
+                    )?;
+                }
+                Instruction::Subtract => apply_numeric_binary(
+                    &mut stack,
                     bindings.string_pools(scratch, string_units),
                     &mut string_conversion_credits_left,
-                )?;
-                Ok::<_, Conversion>(Value::Number(update_number(op, old)))
-            })?,
-            Instruction::Add => apply_binary_operand(&mut stack, |lhs, rhs| {
-                add(lhs, rhs, bindings.external_strings(string_units), scratch)
-            })?,
-            Instruction::TemplateAppend(following) => {
-                append_template(
+                    |lhs, rhs| lhs - rhs,
+                )?,
+                Instruction::Multiply => apply_numeric_binary(
                     &mut stack,
-                    bindings.external_strings(string_units),
-                    scratch,
-                    following,
-                )?;
-            }
-            Instruction::Subtract => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| lhs - rhs,
-            )?,
-            Instruction::Multiply => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| lhs * rhs,
-            )?,
-            Instruction::Divide => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| lhs / rhs,
-            )?,
-            // Floating-point `%` uses a quotient truncated toward zero, as in JS.
-            Instruction::Remainder => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| lhs % rhs,
-            )?,
-            Instruction::Exponentiate => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                exponentiate,
-            )?,
-            Instruction::BitwiseAnd => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                signed_bitwise(|lhs, rhs| lhs & rhs),
-            )?,
-            Instruction::BitwiseXor => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                signed_bitwise(|lhs, rhs| lhs ^ rhs),
-            )?,
-            Instruction::BitwiseOr => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                signed_bitwise(|lhs, rhs| lhs | rhs),
-            )?,
-            // Rust's wrapping shifts use only the low five count bits for i32/u32.
-            Instruction::ShiftLeft => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shl(number_to_uint32(rhs))),
-            )?,
-            Instruction::ShiftRight => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shr(number_to_uint32(rhs))),
-            )?,
-            Instruction::ShiftRightUnsigned => apply_numeric_binary(
-                &mut stack,
-                bindings.string_pools(scratch, string_units),
-                &mut string_conversion_credits_left,
-                |lhs, rhs| f64::from(number_to_uint32(lhs).wrapping_shr(number_to_uint32(rhs))),
-            )?,
-            Instruction::LooseEqual
-            | Instruction::LooseNotEqual
-            | Instruction::StrictEqual
-            | Instruction::StrictNotEqual => {
-                let strict = matches!(op, Instruction::StrictEqual | Instruction::StrictNotEqual);
-                let negate = matches!(op, Instruction::LooseNotEqual | Instruction::StrictNotEqual);
-                apply_binary(&mut stack, |lhs, rhs| {
-                    let equal = operands_equal(
-                        lhs,
-                        rhs,
-                        strict,
-                        bindings.string_pools(scratch, string_units),
-                        &mut string_pairs_left,
-                        &mut string_conversion_credits_left,
-                    )?;
-                    Ok::<_, Conversion>(Value::Boolean(equal ^ negate))
-                })?;
-            }
-            Instruction::LessThan
-            | Instruction::LessThanOrEqual
-            | Instruction::GreaterThan
-            | Instruction::GreaterThanOrEqual => {
-                apply_binary(&mut stack, |lhs, rhs| {
-                    let order = operands_order(
-                        lhs,
-                        rhs,
-                        bindings.string_pools(scratch, string_units),
-                        &mut string_pairs_left,
-                        &mut string_conversion_credits_left,
-                    )?;
-                    let result = match order {
-                        Some(Ordering::Less) => {
-                            matches!(op, Instruction::LessThan | Instruction::LessThanOrEqual)
-                        }
-                        Some(Ordering::Equal) => matches!(
-                            op,
-                            Instruction::LessThanOrEqual | Instruction::GreaterThanOrEqual
-                        ),
-                        Some(Ordering::Greater) => matches!(
-                            op,
-                            Instruction::GreaterThan | Instruction::GreaterThanOrEqual
-                        ),
-                        None => false, // All four relations are false for NaN operands.
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| lhs * rhs,
+                )?,
+                Instruction::Divide => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| lhs / rhs,
+                )?,
+                // Floating-point `%` uses a quotient truncated toward zero, as in JS.
+                Instruction::Remainder => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| lhs % rhs,
+                )?,
+                Instruction::Exponentiate => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    exponentiate,
+                )?,
+                Instruction::BitwiseAnd => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    signed_bitwise(|lhs, rhs| lhs & rhs),
+                )?,
+                Instruction::BitwiseXor => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    signed_bitwise(|lhs, rhs| lhs ^ rhs),
+                )?,
+                Instruction::BitwiseOr => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    signed_bitwise(|lhs, rhs| lhs | rhs),
+                )?,
+                // Rust's wrapping shifts use only the low five count bits for i32/u32.
+                Instruction::ShiftLeft => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shl(number_to_uint32(rhs))),
+                )?,
+                Instruction::ShiftRight => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| f64::from(number_to_int32(lhs).wrapping_shr(number_to_uint32(rhs))),
+                )?,
+                Instruction::ShiftRightUnsigned => apply_numeric_binary(
+                    &mut stack,
+                    bindings.string_pools(scratch, string_units),
+                    &mut string_conversion_credits_left,
+                    |lhs, rhs| f64::from(number_to_uint32(lhs).wrapping_shr(number_to_uint32(rhs))),
+                )?,
+                Instruction::LooseEqual
+                | Instruction::LooseNotEqual
+                | Instruction::StrictEqual
+                | Instruction::StrictNotEqual => {
+                    let strict =
+                        matches!(op, Instruction::StrictEqual | Instruction::StrictNotEqual);
+                    let negate =
+                        matches!(op, Instruction::LooseNotEqual | Instruction::StrictNotEqual);
+                    apply_binary(&mut stack, |lhs, rhs| {
+                        let equal = operands_equal(
+                            lhs,
+                            rhs,
+                            strict,
+                            bindings.string_pools(scratch, string_units),
+                            &mut string_pairs_left,
+                            &mut string_conversion_credits_left,
+                        )?;
+                        Ok::<_, Conversion>(Value::Boolean(equal ^ negate))
+                    })?;
+                }
+                Instruction::LessThan
+                | Instruction::LessThanOrEqual
+                | Instruction::GreaterThan
+                | Instruction::GreaterThanOrEqual => {
+                    apply_binary(&mut stack, |lhs, rhs| {
+                        let order = operands_order(
+                            lhs,
+                            rhs,
+                            bindings.string_pools(scratch, string_units),
+                            &mut string_pairs_left,
+                            &mut string_conversion_credits_left,
+                        )?;
+                        let result = match order {
+                            Some(Ordering::Less) => {
+                                matches!(op, Instruction::LessThan | Instruction::LessThanOrEqual)
+                            }
+                            Some(Ordering::Equal) => matches!(
+                                op,
+                                Instruction::LessThanOrEqual | Instruction::GreaterThanOrEqual
+                            ),
+                            Some(Ordering::Greater) => matches!(
+                                op,
+                                Instruction::GreaterThan | Instruction::GreaterThanOrEqual
+                            ),
+                            None => false, // All four relations are false for NaN operands.
+                        };
+                        Ok::<_, Conversion>(Value::Boolean(result))
+                    })?;
+                }
+                Instruction::Positive => {
+                    apply_unary(stack.as_mut_slice(), |value| {
+                        let number = value.to_number(
+                            bindings.string_pools(scratch, string_units),
+                            &mut string_conversion_credits_left,
+                        )?;
+                        Ok::<_, Conversion>(Value::Number(number))
+                    })?;
+                }
+                Instruction::Negate => {
+                    apply_unary(stack.as_mut_slice(), |value| {
+                        let number = value.to_number(
+                            bindings.string_pools(scratch, string_units),
+                            &mut string_conversion_credits_left,
+                        )?;
+                        Ok::<_, Conversion>(Value::Number(-number))
+                    })?;
+                }
+                Instruction::Not => {
+                    apply_unary(stack.as_mut_slice(), |value| {
+                        Ok::<_, EvalError>(Value::Boolean(!value.to_boolean()))
+                    })?;
+                }
+                Instruction::BitwiseNot => {
+                    apply_unary(stack.as_mut_slice(), |value| {
+                        let number = value.to_number(
+                            bindings.string_pools(scratch, string_units),
+                            &mut string_conversion_credits_left,
+                        )?;
+                        Ok::<_, Conversion>(Value::Number(f64::from(!number_to_int32(number))))
+                    })?;
+                }
+                Instruction::Void => apply_unary(stack.as_mut_slice(), |_| {
+                    Ok::<_, EvalError>(Value::Undefined)
+                })?,
+                Instruction::Typeof => {
+                    let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
+                    let name = match *value {
+                        Operand::Scalar(Value::Number(_)) => StaticText::Number,
+                        Operand::Scalar(Value::Boolean(_)) => StaticText::Boolean,
+                        Operand::Scalar(Value::Null) => StaticText::Object,
+                        Operand::Scalar(Value::Undefined) => StaticText::Undefined,
+                        Operand::String(_) => StaticText::String,
+                        Operand::Function(_) => StaticText::Function,
+                        Operand::Object(_) => StaticText::Object,
                     };
-                    Ok::<_, Conversion>(Value::Boolean(result))
-                })?;
-            }
-            Instruction::Positive => {
-                apply_unary(stack.as_mut_slice(), |value| {
-                    let number = value.to_number(
-                        bindings.string_pools(scratch, string_units),
-                        &mut string_conversion_credits_left,
-                    )?;
-                    Ok::<_, Conversion>(Value::Number(number))
-                })?;
-            }
-            Instruction::Negate => {
-                apply_unary(stack.as_mut_slice(), |value| {
-                    let number = value.to_number(
-                        bindings.string_pools(scratch, string_units),
-                        &mut string_conversion_credits_left,
-                    )?;
-                    Ok::<_, Conversion>(Value::Number(-number))
-                })?;
-            }
-            Instruction::Not => {
-                apply_unary(stack.as_mut_slice(), |value| {
-                    Ok::<_, EvalError>(Value::Boolean(!value.to_boolean()))
-                })?;
-            }
-            Instruction::BitwiseNot => {
-                apply_unary(stack.as_mut_slice(), |value| {
-                    let number = value.to_number(
-                        bindings.string_pools(scratch, string_units),
-                        &mut string_conversion_credits_left,
-                    )?;
-                    Ok::<_, Conversion>(Value::Number(f64::from(!number_to_int32(number))))
-                })?;
-            }
-            Instruction::Void => apply_unary(stack.as_mut_slice(), |_| {
-                Ok::<_, EvalError>(Value::Undefined)
-            })?,
-            Instruction::Typeof => {
-                let value = stack.last_mut().ok_or(EvalError::InvalidScript)?;
-                let name = match *value {
-                    Operand::Scalar(Value::Number(_)) => StaticText::Number,
-                    Operand::Scalar(Value::Boolean(_)) => StaticText::Boolean,
-                    Operand::Scalar(Value::Null) => StaticText::Object,
-                    Operand::Scalar(Value::Undefined) => StaticText::Undefined,
-                    Operand::String(_) => StaticText::String,
-                    Operand::Function(_) => StaticText::Function,
-                    Operand::Object(_) => StaticText::Object,
-                };
-                *value = Operand::String(StringOperand::StaticText(name));
-            }
-            Instruction::StringLength => {
-                apply_unary(stack.as_mut_slice(), |value| {
-                    string_length(value, bindings.string_pools(scratch, string_units))
-                })?;
-            }
-            Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
-                let target = check_forward_target(*ip, target, ops.len())?;
-                if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
-                    return Err(EvalError::InvalidScript.into());
+                    *value = Operand::String(StringOperand::StaticText(name));
                 }
-                let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
-                if !condition.to_boolean() {
+                Instruction::StringLength => {
+                    apply_unary(stack.as_mut_slice(), |value| {
+                        string_length(value, bindings.string_pools(scratch, string_units))
+                    })?;
+                }
+                Instruction::JumpIfFalse(target) | Instruction::JumpIfFalseStatement(target) => {
+                    let target = check_forward_target(*ip, target, ops.len())?;
+                    if matches!(op, Instruction::JumpIfFalseStatement(_)) && stack.len() != 1 {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    let condition = stack.pop().ok_or(EvalError::InvalidScript)?;
+                    if !condition.to_boolean() {
+                        *ip = target;
+                    }
+                }
+                Instruction::ShortCircuit { target, condition } => {
+                    let target = check_forward_target(*ip, target, ops.len())?;
+                    let lhs = *stack.last().ok_or(EvalError::InvalidScript)?;
+                    if condition.skips_rhs(lhs) {
+                        *ip = target;
+                    } else {
+                        stack.pop();
+                    }
+                }
+                Instruction::ShortCircuitStatement { target, condition } => {
+                    let target = check_forward_target(*ip, target, ops.len())?;
+                    if stack.len() != 1 {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    let lhs = stack.pop().ok_or(EvalError::InvalidScript)?;
+                    if condition.skips_rhs(lhs) {
+                        *ip = target;
+                    }
+                }
+                Instruction::Jump(target) => *ip = check_forward_target(*ip, target, ops.len())?,
+                Instruction::JumpStatement(target) => {
+                    if !stack.is_empty() {
+                        return Err(EvalError::InvalidScript.into());
+                    }
+                    *ip = check_forward_target(*ip, target, ops.len())?;
+                }
+                Instruction::LoopBack(target) => {
+                    // `ip` already points past this instruction. Reject self and
+                    // forward edges, and require statement depth on entry.
+                    if target >= *ip - 1 || !stack.is_empty() {
+                        return Err(EvalError::InvalidScript.into());
+                    }
                     *ip = target;
                 }
             }
-            Instruction::ShortCircuit { target, condition } => {
-                let target = check_forward_target(*ip, target, ops.len())?;
-                let lhs = *stack.last().ok_or(EvalError::InvalidScript)?;
-                if condition.skips_rhs(lhs) {
-                    *ip = target;
-                } else {
-                    stack.pop();
-                }
+            Ok(())
+        })();
+        if let Err(error) = step {
+            if !bindings.abrupt_enabled() {
+                return Err(error);
             }
-            Instruction::ShortCircuitStatement { target, condition } => {
-                let target = check_forward_target(*ip, target, ops.len())?;
-                if stack.len() != 1 {
-                    return Err(EvalError::InvalidScript.into());
-                }
-                let lhs = stack.pop().ok_or(EvalError::InvalidScript)?;
-                if condition.skips_rhs(lhs) {
-                    *ip = target;
-                }
+            let thrown = B::thrown(error)?;
+            if thrown.owner != frame.body {
+                return Err(EvalError::InvalidScript.into());
             }
-            Instruction::Jump(target) => *ip = check_forward_target(*ip, target, ops.len())?,
-            Instruction::JumpStatement(target) => {
-                if !stack.is_empty() {
-                    return Err(EvalError::InvalidScript.into());
-                }
-                *ip = check_forward_target(*ip, target, ops.len())?;
+            bindings.check_throw_span(thrown.span)?;
+            if !regions.transfer(
+                thrown,
+                abrupt::Unwind {
+                    frame: &mut frame,
+                    callers: &mut callers,
+                    slots: &mut slots,
+                    packets: &mut packets,
+                    receivers: &mut receivers,
+                    fuel: &mut remaining,
+                },
+                bindings,
+            )? {
+                return Err(bindings.uncaught(thrown));
             }
-            Instruction::LoopBack(target) => {
-                // `ip` already points past this instruction. Reject self and
-                // forward edges, and require statement depth on entry.
-                if target >= *ip - 1 || !stack.is_empty() {
-                    return Err(EvalError::InvalidScript.into());
-                }
-                *ip = target;
+            exceptional_entry = true;
+        } else if let Some((next, suspend)) = next_frame {
+            let old = std::mem::replace(&mut frame, next);
+            if suspend {
+                callers.push(old);
             }
         }
     }

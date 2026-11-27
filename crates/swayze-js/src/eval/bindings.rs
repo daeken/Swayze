@@ -55,6 +55,26 @@ pub(super) trait Bindings {
     type Error: From<EvalError> + From<Conversion>;
     const CALLS: bool = false;
 
+    fn abrupt_enabled(&self) -> bool {
+        false
+    }
+
+    fn check_throw_span(&self, _: crate::Span) -> Result<(), Self::Error> {
+        Err(EvalError::InvalidScript.into())
+    }
+
+    fn explicit_throw(&self, _: super::abrupt::Thrown) -> Self::Error {
+        EvalError::InvalidScript.into()
+    }
+
+    fn thrown(error: Self::Error) -> Result<super::abrupt::Thrown, Self::Error> {
+        Err(error)
+    }
+
+    fn uncaught(&self, _: super::abrupt::Thrown) -> Self::Error {
+        EvalError::InvalidScript.into()
+    }
+
     fn retained_units(&self) -> &[u16] {
         &[]
     }

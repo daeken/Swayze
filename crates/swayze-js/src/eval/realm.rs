@@ -37,10 +37,14 @@ use crate::{
 use super::{
     BindingKind, Bindings, CallTarget, Conversion, DotSite, EvalError, EvalScratch, ExitStack,
     Frame, Instruction, Operand, Properties, Stack, StaticText, StringOperand, TransientStrings,
-    Update, UpdateNumeric, UpdateResult, Value, dispatch, init_operand, new_stack, store_operand,
-    update_number, update_result, validate_body, validate_layout, validate_property_shape,
+    Update, UpdateNumeric, UpdateResult, Value, abrupt, dispatch, init_operand, new_stack,
+    store_operand, update_number, update_result, validate_body, validate_layout,
+    validate_property_shape,
 };
 
+#[cfg(test)]
+#[path = "realm/abrupt_tests.rs"]
+mod abrupt_tests;
 mod object_heap;
 #[cfg(test)]
 #[path = "realm/property_tests.rs"]
@@ -129,6 +133,32 @@ impl DotCode {
         Ok(())
     }
 
+    fn validate_guarded(
+        &self,
+        owner: u16,
+        ops: &[Instruction],
+        peak: usize,
+        exit: ExitStack,
+        locals: Option<usize>,
+        work: &mut Work,
+    ) -> Result<(), InstantiateError> {
+        let remaining = std::cell::Cell::new(*work);
+        let charge = |n| {
+            let mut ledger = remaining.get();
+            ledger.charge(n)?;
+            remaining.set(ledger);
+            Ok(())
+        };
+        abrupt::validate(ops, peak, exit, self.source_len, locals, charge, |index| {
+            charge(1)?;
+            self.occurrence(owner, index)
+                .ok_or(InstantiateError::InvalidScript)?;
+            Ok::<(), InstantiateError>(())
+        })?;
+        *work = remaining.get();
+        Ok(())
+    }
+
     fn validate_ops(
         &self,
         owner: u16,
@@ -161,6 +191,27 @@ fn identifier_name(key: &[u16]) -> bool {
     key.split_first().is_some_and(|(&head, tail)| {
         start(head) && tail.iter().all(|&u| start(u) || (48..=57).contains(&u))
     })
+}
+
+// Script-wide, not filtered by opcode owner: a foreign/sibling sentinel
+// is just as invalid as one in the issuing body. Called on every instruction
+// only if the charged dense-site scan authenticated at least one sentinel.
+fn reject_catch_alias(op: Instruction, sites: &[Site]) -> Result<(), InstantiateError> {
+    let index = match op {
+        Instruction::LoadBinding(slot)
+        | Instruction::StoreBinding(slot)
+        | Instruction::StoreBindingKeep(slot)
+        | Instruction::UpdateBinding { slot, .. }
+        | Instruction::InitBinding { slot, .. } => slot,
+        _ => return Ok(()),
+    };
+    if sites
+        .get(index)
+        .is_some_and(|site| matches!(site.role, Role::Catch))
+    {
+        return Err(InstantiateError::InvalidScript);
+    }
+    Ok(())
 }
 
 fn property_op(op: Instruction) -> bool {
@@ -708,10 +759,24 @@ pub(super) struct Artifact {
 }
 
 impl Artifact {
+    #[cfg(test)]
     fn stage(
         code: &CompiledScript,
         retained: usize,
         work: &mut Work,
+    ) -> Result<(Self, usize), InstantiateError> {
+        let has_catch = code
+            .sites
+            .iter()
+            .any(|site| matches!(site.role, Role::Catch));
+        Self::stage_with_catch(code, retained, work, has_catch)
+    }
+
+    fn stage_with_catch(
+        code: &CompiledScript,
+        retained: usize,
+        work: &mut Work,
+        has_catch: bool,
     ) -> Result<(Self, usize), InstantiateError> {
         // Exact fresh reservations: no realloc overlap within the immutable
         // backing. The budget includes measured capacities, including metadata.
@@ -771,13 +836,27 @@ impl Artifact {
                 return Err(InstantiateError::InvalidScript);
             }
             let mut has_dot = false;
+            let mut guarded = false;
             for &op in &body.instructions {
+                guarded |= abrupt::guarded(op);
+                if has_catch {
+                    reject_catch_alias(op, &code.sites)?;
+                }
                 if matches!(op, Instruction::CreateFunction(_)) {
                     return Err(InstantiateError::InvalidScript);
                 }
                 has_dot |= property_op(op);
             }
-            if has_dot {
+            if guarded {
+                code.dot.validate_guarded(
+                    index as u16,
+                    &body.instructions,
+                    body.max_stack_depth,
+                    ExitStack::Empty,
+                    body.layout.counts().map(|(_, locals)| locals),
+                    work,
+                )?;
+            } else if has_dot {
                 code.dot.validate_ops(
                     index as u16,
                     &body.instructions,
@@ -807,7 +886,12 @@ impl Artifact {
             matches!(body.kind, BodyKind::Expression(_)).then_some(index)
         });
         let mut root_has_dot = false;
+        let mut root_guarded = false;
         for &op in &code.instructions {
+            root_guarded |= abrupt::guarded(op);
+            if has_catch {
+                reject_catch_alias(op, &code.sites)?;
+            }
             root_has_dot |= property_op(op);
             if let Instruction::CreateFunction(body) = op
                 && expected.next() != Some(usize::from(body))
@@ -815,7 +899,16 @@ impl Artifact {
                 return Err(InstantiateError::InvalidScript);
             }
         }
-        if root_has_dot {
+        if root_guarded {
+            code.dot.validate_guarded(
+                DOT_ROOT,
+                &code.instructions,
+                code.max_stack_depth,
+                code.exit,
+                None,
+                work,
+            )?;
+        } else if root_has_dot {
             code.dot.validate_ops(
                 DOT_ROOT,
                 &code.instructions,
@@ -1210,12 +1303,21 @@ impl Realm {
             return Err(InvalidScript);
         }
         let mut bodies = code.functions.iter().peekable();
+        let mut has_catch = false;
         for (offset, site) in accesses.iter().enumerate() {
             work.charge(1)?;
             let index = code.declarations + offset;
             while bodies.peek().is_some_and(|body| body.accesses.end <= index) {
                 work.charge(1)?;
                 bodies.next();
+            }
+            if matches!(site.role, Role::Catch) {
+                if (site.start, site.end) != (0, 0) {
+                    return Err(InvalidScript);
+                }
+                has_catch = true;
+                links.push(Target::Unlinked);
+                continue;
             }
             if bodies
                 .peek()
@@ -1274,14 +1376,36 @@ impl Realm {
             if code.instructions.len() > super::MAX_INSTRUCTIONS {
                 return Err(InvalidScript);
             }
+            if has_catch {
+                work.charge(code.instructions.len())?;
+            }
             let mut has_call = false;
             let mut has_dot = false;
+            let mut guarded = false;
             for &op in &code.instructions {
+                guarded |= abrupt::guarded(op);
+                if has_catch {
+                    reject_catch_alias(op, &code.sites)?;
+                }
                 has_call |= matches!(op, Instruction::Call { .. });
                 has_dot |= property_op(op);
             }
-            if has_dot {
-                work.charge(code.instructions.len())?;
+            if guarded {
+                if !has_catch {
+                    work.charge(code.instructions.len())?;
+                }
+                code.dot.validate_guarded(
+                    DOT_ROOT,
+                    &code.instructions,
+                    code.max_stack_depth,
+                    code.exit,
+                    None,
+                    &mut work,
+                )?;
+            } else if has_dot {
+                if !has_catch {
+                    work.charge(code.instructions.len())?;
+                }
                 code.dot.validate_ops(
                     DOT_ROOT,
                     &code.instructions,
@@ -1303,7 +1427,12 @@ impl Realm {
             if artifact_id >= MAX_ARTIFACTS {
                 return Err(InstantiateError::ArtifactLimitExceeded);
             }
-            Some(Artifact::stage(code, self.artifact_bytes, &mut work)?)
+            Some(Artifact::stage_with_catch(
+                code,
+                self.artifact_bytes,
+                &mut work,
+                has_catch,
+            )?)
         };
         let root_artifact = artifact.as_ref().map(|_| artifact_id as u8);
         // The artifact table requests at most 24 simultaneous old/new slots.
@@ -1562,6 +1691,7 @@ impl ReadyScript<'_, '_> {
             Ok(_) => Ok(Completion::Normal),
             Err(Stop::Throw(error)) => Ok(Completion::Throw(error)),
             Err(Stop::Engine(error)) => Err(error),
+            Err(Stop::ValueThrow(_)) => Err(EngineFault::Evaluation(EvalError::InvalidScript)),
         }
     }
 
@@ -1583,6 +1713,8 @@ impl ReadyScript<'_, '_> {
             links: &self.links,
             mode: self.code.mode,
             copied: 0,
+            #[cfg(test)]
+            private_abrupt: false,
         }
     }
 }
@@ -1602,6 +1734,8 @@ struct Execution<'realm, 'code> {
     links: &'code [Target],
     mode: CodeMode,
     copied: usize,
+    #[cfg(test)]
+    private_abrupt: bool,
 }
 
 impl Execution<'_, '_> {
@@ -1882,6 +2016,7 @@ fn escape(
 
 pub(super) enum Stop {
     Throw(Throw),
+    ValueThrow(super::abrupt::Thrown),
     Engine(EngineFault),
 }
 
@@ -2208,6 +2343,44 @@ impl Execution<'_, '_> {
 }
 
 impl Bindings for Execution<'_, '_> {
+    #[cfg(test)]
+    fn abrupt_enabled(&self) -> bool {
+        self.private_abrupt
+    }
+
+    fn check_throw_span(&self, span: Span) -> Result<(), Stop> {
+        let limit = match self.active {
+            Some(origin) => {
+                self.callable
+                    .body(origin)
+                    .ok_or(EvalError::InvalidScript)?
+                    .0
+                    .dot
+                    .source_len
+            }
+            None => self.root_dot.source_len,
+        };
+        if span.start >= span.end || span.end > limit as usize {
+            return Err(EvalError::InvalidScript.into());
+        }
+        Ok(())
+    }
+
+    fn explicit_throw(&self, packet: super::abrupt::Thrown) -> Stop {
+        Stop::ValueThrow(packet)
+    }
+
+    fn thrown(error: Stop) -> Result<super::abrupt::Thrown, Stop> {
+        match error {
+            Stop::ValueThrow(packet) => Ok(packet),
+            other => Err(other),
+        }
+    }
+
+    fn uncaught(&self, packet: super::abrupt::Thrown) -> Stop {
+        Stop::ValueThrow(packet)
+    }
+
     type Error = Stop;
     const CALLS: bool = true;
 

@@ -598,6 +598,13 @@ fn evaluate(
 
 const MAX_GUEST_FRAMES: usize = 32;
 const MAX_LIVE_SLOTS: usize = 4096;
+// Frame/region offsets store the inclusive frontier; receiver counts cannot
+// exceed suspended frames plus the active frame.
+const _: () = assert!(MAX_LIVE_SLOTS <= u16::MAX as usize);
+const _: () = assert!(MAX_INSTRUCTIONS <= u16::MAX as usize);
+const _: () = assert!(MAX_GUEST_FRAMES < u8::MAX as usize);
+const _: () = assert!(abrupt::MAX_REGIONS <= u8::MAX as usize);
+
 use realm::MAX_DOT_SITES;
 const UNDEFINED: Operand = Operand::Scalar(Value::Undefined);
 
@@ -1244,7 +1251,7 @@ fn dispatch<'code, B: Bindings>(
                     update_result(&mut stack, max_operands, result, old, new)?;
                     *stack.local(slot)? = Operand::Scalar(Value::Number(new));
                 }
-                op if abrupt::guarded(op) && B::CALLS && bindings.abrupt_enabled() => {
+                op if B::CALLS && B::ABRUPT && abrupt::guarded(op) => {
                     let at = *ip - 1;
                     let depth = callers.len();
                     let current = Frame {
@@ -1642,28 +1649,38 @@ fn dispatch<'code, B: Bindings>(
             Ok(())
         })();
         if let Err(error) = step {
-            if !bindings.abrupt_enabled() {
+            if !B::ABRUPT {
                 return Err(error);
             }
-            let thrown = B::thrown(error)?;
-            if thrown.owner != frame.body {
+            // Engine faults stop here, before any handler work. Capture the
+            // producer's owner before changing bodies or materializing a value.
+            let pending = bindings.thrown(error)?;
+            if pending.owner != frame.body {
                 return Err(EvalError::InvalidScript.into());
             }
-            bindings.check_throw_span(thrown.span)?;
-            if !regions.transfer(
-                thrown,
-                abrupt::Unwind {
-                    frame: &mut frame,
-                    callers: &mut callers,
-                    slots: &mut slots,
-                    packets: &mut packets,
-                    receivers: &mut receivers,
-                    fuel: &mut remaining,
-                },
-                bindings,
-            )? {
-                return Err(bindings.uncaught(thrown));
+            let explicit = matches!(pending.reason, abrupt::Reason::Explicit(_));
+            if explicit {
+                bindings.check_throw_span(pending.span)?;
             }
+            let Some(plan) = regions.plan(abrupt::Unwind {
+                frame: &mut frame,
+                callers: &mut callers,
+                slots: &mut slots,
+                packets: &mut packets,
+                receivers: &mut receivers,
+                fuel: &mut remaining,
+            })?
+            else {
+                // In particular, unguarded automatic producers use no new
+                // heap or fuel and retain their original public diagnostic.
+                return Err(bindings.uncaught(pending));
+            };
+            if !explicit {
+                bindings.check_throw_span(pending.span)?;
+            }
+            let value = bindings.catch_value(pending)?;
+            plan.commit(value);
+            bindings.select_body(frame.body);
             exceptional_entry = true;
         } else if let Some((next, suspend)) = next_frame {
             let old = std::mem::replace(&mut frame, next);

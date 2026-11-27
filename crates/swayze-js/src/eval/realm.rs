@@ -461,8 +461,16 @@ pub enum Completion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Throw {
-    ReferenceError { span: Span },
-    TypeError { span: Span },
+    /// An uncaught `throw` statement. The guest value stays private.
+    Explicit {
+        span: Span,
+    },
+    ReferenceError {
+        span: Span,
+    },
+    TypeError {
+        span: Span,
+    },
 }
 
 /// A VM stop, distinct from a language throw.
@@ -516,6 +524,9 @@ pub enum PropertyFault {
 pub enum IntrinsicCall {
     Object,
     Function,
+    Error,
+    ReferenceError,
+    TypeError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1698,9 +1709,13 @@ impl ReadyScript<'_, '_> {
             &mut execution,
         ) {
             Ok(_) => Ok(Completion::Normal),
-            Err(Stop::Throw(error)) => Ok(Completion::Throw(error)),
+            Err(Stop::Automatic(kind, span)) => {
+                Ok(Completion::Throw(automatic_diagnostic(kind, span)))
+            }
             Err(Stop::Engine(error)) => Err(error),
-            Err(Stop::ValueThrow(_)) => Err(EngineFault::Evaluation(EvalError::InvalidScript)),
+            Err(Stop::ValueThrow(packet)) => {
+                Ok(Completion::Throw(Throw::Explicit { span: packet.span }))
+            }
         }
     }
 
@@ -1722,8 +1737,6 @@ impl ReadyScript<'_, '_> {
             links: &self.links,
             mode: self.code.mode,
             copied: 0,
-            #[cfg(test)]
-            private_abrupt: false,
         }
     }
 }
@@ -1743,8 +1756,6 @@ struct Execution<'realm, 'code> {
     links: &'code [Target],
     mode: CodeMode,
     copied: usize,
-    #[cfg(test)]
-    private_abrupt: bool,
 }
 
 impl Execution<'_, '_> {
@@ -1819,7 +1830,9 @@ impl Execution<'_, '_> {
         let value = match target {
             Target::Undefined => StoredValue::Scalar(Value::Undefined),
             Target::Missing if direct_typeof => StoredValue::Scalar(Value::Undefined),
-            Target::Missing => return Err(Stop::Throw(Throw::ReferenceError { span })),
+            Target::Missing => {
+                return Err(Stop::Automatic(abrupt::Automatic::ReferenceError, span));
+            }
             Target::Unlinked => return Err(EvalError::InvalidScript.into()),
             Target::Lexical(slot) => self
                 .realm
@@ -1827,7 +1840,7 @@ impl Execution<'_, '_> {
                 .get(slot)
                 .ok_or(EvalError::InvalidScript)?
                 .value
-                .ok_or(Stop::Throw(Throw::ReferenceError { span }))?,
+                .ok_or(Stop::Automatic(abrupt::Automatic::ReferenceError, span))?,
             Target::Var(slot) => {
                 self.realm
                     .object
@@ -1905,11 +1918,11 @@ impl Execution<'_, '_> {
         let destination = match target {
             // Only reached writes get here, after RHS evaluation/coercion.
             Target::Undefined if mode == CodeMode::Strict => {
-                return Err(Stop::Throw(Throw::TypeError { span }));
+                return Err(Stop::Automatic(abrupt::Automatic::TypeError, span));
             }
             Target::Undefined => return Ok(()), // Sloppy readonly write, even with a String RHS.
             Target::Missing if mode == CodeMode::Strict => {
-                return Err(Stop::Throw(Throw::ReferenceError { span }));
+                return Err(Stop::Automatic(abrupt::Automatic::ReferenceError, span));
             }
             Target::Missing => return Err(Stop::Engine(EngineFault::ImplicitGlobal { span })),
             Target::Unlinked => return Err(EvalError::InvalidScript.into()),
@@ -1922,9 +1935,9 @@ impl Execution<'_, '_> {
                 let destination = cell
                     .value
                     .as_mut()
-                    .ok_or(Stop::Throw(Throw::ReferenceError { span }))?;
+                    .ok_or(Stop::Automatic(abrupt::Automatic::ReferenceError, span))?;
                 if cell.kind == BindingKind::Const {
-                    return Err(Stop::Throw(Throw::TypeError { span }));
+                    return Err(Stop::Automatic(abrupt::Automatic::TypeError, span));
                 }
                 destination
             }
@@ -2024,9 +2037,16 @@ fn escape(
 }
 
 pub(super) enum Stop {
-    Throw(Throw),
+    Automatic(abrupt::Automatic, Span),
     ValueThrow(super::abrupt::Thrown),
     Engine(EngineFault),
+}
+
+fn automatic_diagnostic(kind: abrupt::Automatic, span: Span) -> Throw {
+    match kind {
+        abrupt::Automatic::ReferenceError => Throw::ReferenceError { span },
+        abrupt::Automatic::TypeError => Throw::TypeError { span },
+    }
 }
 
 impl From<EvalError> for Stop {
@@ -2089,7 +2109,7 @@ fn unsupported_property(span: Span, cause: PropertyFault) -> Stop {
 
 fn false_set(site: DotSite) -> Result<(), Stop> {
     if site.mode == CodeMode::Strict {
-        Err(Stop::Throw(Throw::TypeError { span: site.span }))
+        Err(Stop::Automatic(abrupt::Automatic::TypeError, site.span))
     } else {
         Ok(())
     }
@@ -2098,7 +2118,7 @@ fn false_set(site: DotSite) -> Result<(), Stop> {
 fn primitive_dot(receiver: Operand, key: &[u16], span: Span) -> Result<StringOperand, Stop> {
     match receiver {
         Operand::Scalar(Value::Null | Value::Undefined) => {
-            Err(Stop::Throw(Throw::TypeError { span }))
+            Err(Stop::Automatic(abrupt::Automatic::TypeError, span))
         }
         Operand::String(string)
             if key
@@ -2240,12 +2260,7 @@ impl Properties for Execution<'_, '_> {
 }
 
 impl Execution<'_, '_> {
-    // Do not invoke from existing diagnostic producers: nothing becomes a
-    // retained Error until an observable value consumer is integrated.
-    #[allow(
-        dead_code,
-        reason = "private Error heap checkpoint; not yet guest-reachable"
-    )]
+    // Reached only once unwind planning has authenticated a value consumer.
     fn materialize_error(
         &mut self,
         kind: ErrorKind,
@@ -2351,11 +2366,13 @@ impl Execution<'_, '_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_CAUGHT_ERROR_RESERVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Bindings for Execution<'_, '_> {
-    #[cfg(test)]
-    fn abrupt_enabled(&self) -> bool {
-        self.private_abrupt
-    }
+    const ABRUPT: bool = true;
 
     fn check_throw_span(&self, span: Span) -> Result<(), Stop> {
         let limit = match self.active {
@@ -2379,15 +2396,48 @@ impl Bindings for Execution<'_, '_> {
         Stop::ValueThrow(packet)
     }
 
-    fn thrown(error: Stop) -> Result<super::abrupt::Thrown, Stop> {
-        match error {
-            Stop::ValueThrow(packet) => Ok(packet),
-            other => Err(other),
-        }
+    fn thrown(&self, error: Stop) -> Result<abrupt::Pending, Stop> {
+        Ok(match error {
+            Stop::ValueThrow(abrupt::Thrown { value, owner, span }) => abrupt::Pending {
+                reason: abrupt::Reason::Explicit(value),
+                owner,
+                span,
+            },
+            Stop::Automatic(kind, span) => abrupt::Pending {
+                reason: abrupt::Reason::Automatic(kind),
+                owner: self.active,
+                span,
+            },
+            Stop::Engine(_) => return Err(error),
+        })
     }
 
-    fn uncaught(&self, packet: super::abrupt::Thrown) -> Stop {
-        Stop::ValueThrow(packet)
+    fn catch_value(&mut self, pending: abrupt::Pending) -> Result<Operand, Stop> {
+        let kind = match pending.reason {
+            abrupt::Reason::Explicit(value) => return Ok(value),
+            abrupt::Reason::Automatic(abrupt::Automatic::ReferenceError) => {
+                ErrorKind::ReferenceError
+            }
+            abrupt::Reason::Automatic(abrupt::Automatic::TypeError) => ErrorKind::TypeError,
+        };
+        self.materialize_error(kind, pending.span, |_| {
+            #[cfg(test)]
+            if FAIL_CAUGHT_ERROR_RESERVE.with(|flag| flag.replace(false)) {
+                return Err(InstantiateError::AllocationFailed);
+            }
+            Ok(())
+        })
+    }
+
+    fn uncaught(&self, pending: abrupt::Pending) -> Stop {
+        match pending.reason {
+            abrupt::Reason::Explicit(value) => Stop::ValueThrow(abrupt::Thrown {
+                value,
+                owner: pending.owner,
+                span: pending.span,
+            }),
+            abrupt::Reason::Automatic(kind) => Stop::Automatic(kind, pending.span),
+        }
     }
 
     type Error = Stop;
@@ -2412,7 +2462,7 @@ impl Bindings for Execution<'_, '_> {
     }
 
     fn non_callable(&self, span: Span) -> Stop {
-        Stop::Throw(Throw::TypeError { span })
+        Stop::Automatic(abrupt::Automatic::TypeError, span)
     }
 
     fn charge_call(&mut self, work: usize) -> Result<(), Stop> {
@@ -2438,11 +2488,15 @@ impl Bindings for Execution<'_, '_> {
             FunctionId::Intrinsic(Intrinsic::FunctionPrototype) => {
                 Ok(CallTarget::FunctionPrototype)
             }
-            FunctionId::Intrinsic(Intrinsic::NativeErrorConstructor(_)) => {
-                // Real callable identity, unsupported [[Call]] and [[Construct]].
-                // The private checkpoint has no way to pass this ID to guest
-                // dispatch; crossing that boundary is invalid, not a JS throw.
-                Err(EvalError::InvalidScript.into())
+            FunctionId::Intrinsic(Intrinsic::NativeErrorConstructor(kind)) => {
+                Err(Stop::Engine(EngineFault::UnsupportedIntrinsicCall {
+                    span,
+                    intrinsic: match kind {
+                        ErrorKind::Error => IntrinsicCall::Error,
+                        ErrorKind::ReferenceError => IntrinsicCall::ReferenceError,
+                        ErrorKind::TypeError => IntrinsicCall::TypeError,
+                    },
+                }))
             }
             FunctionId::Intrinsic(
                 tag @ (Intrinsic::ObjectConstructor | Intrinsic::FunctionConstructor),
@@ -4414,7 +4468,7 @@ mod tests {
         }
         assert!(matches!(
             update(1, 2),
-            Err(Stop::Throw(Throw::TypeError { .. }))
+            Err(Stop::Automatic(abrupt::Automatic::TypeError, _))
         ));
         assert!(matches!(stack.as_slice(), [Operand::Scalar(Value::Null)]));
         assert_eq!(

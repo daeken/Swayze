@@ -1,4 +1,4 @@
-//! Private guarded dispatch. Gating and diagnostics belong to the binding policy.
+//! Private value transport and the bounded guarded-stream verifier.
 use super::*;
 use crate::{Span, parser::CatchSlot};
 
@@ -7,6 +7,25 @@ pub(super) const MAX_REGIONS: usize = 128;
 #[derive(Clone, Copy)]
 pub(super) struct Thrown {
     pub(super) value: Operand,
+    pub(super) owner: Option<realm::FunctionOrigin>,
+    pub(super) span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Automatic {
+    ReferenceError,
+    TypeError,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Reason {
+    Explicit(Operand),
+    Automatic(Automatic),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Pending {
+    pub(super) reason: Reason,
     pub(super) owner: Option<realm::FunctionOrigin>,
     pub(super) span: Span,
 }
@@ -38,6 +57,44 @@ pub(super) struct Unwind<'a, 'code> {
     pub(super) packets: &'a mut Packets,
     pub(super) receivers: &'a mut usize,
     pub(super) fuel: &'a mut usize,
+}
+
+// Exclusive borrow of the dispatcher state bridges planning and allocation.
+// Only the binding policy can change while this plan exists.
+pub(super) struct PreparedUnwind<'a, 'code> {
+    state: Unwind<'a, 'code>,
+    regions: &'a mut Regions,
+    index: usize,
+    depth: usize,
+    catch: usize,
+    slots: usize,
+    packets: usize,
+    receivers: usize,
+}
+
+impl PreparedUnwind<'_, '_> {
+    pub(super) fn commit(self, value: Operand) {
+        let Unwind {
+            frame,
+            callers,
+            slots,
+            packets,
+            receivers,
+            ..
+        } = self.state;
+        if self.depth != callers.len() {
+            callers.truncate(self.depth + 1);
+            *frame = callers.pop().expect("validated suspended catcher");
+        }
+        slots.truncate(self.slots);
+        packets.rows.truncate(self.packets);
+        *receivers = self.receivers;
+        self.regions.0.truncate(self.index + 1);
+        let row = &mut self.regions.0[self.index];
+        row.phase = Phase::Active;
+        row.value = value;
+        frame.ip = self.catch;
+    }
 }
 
 pub(super) fn debit(fuel: &mut usize, work: usize) -> Result<(), EvalError> {
@@ -244,12 +301,10 @@ impl Regions {
         self.drop_local(frame.region_fence, pop, fuel)
     }
 
-    pub(super) fn transfer<'code, B: Bindings>(
-        &mut self,
-        thrown: Thrown,
-        state: Unwind<'_, 'code>,
-        bindings: &mut B,
-    ) -> Result<bool, EvalError> {
+    pub(super) fn plan<'a, 'code>(
+        &'a mut self,
+        mut state: Unwind<'a, 'code>,
+    ) -> Result<Option<PreparedUnwind<'a, 'code>>, EvalError> {
         let Unwind {
             frame,
             callers,
@@ -257,23 +312,30 @@ impl Regions {
             packets,
             receivers,
             fuel,
-        } = state;
-        let mut visited = 0;
-        let selected = self.0.iter().rposition(|r| {
-            visited += 1;
-            r.phase == Phase::Protected
-        });
+        } = &mut state;
+        // Charge each visit before reading the phase, including skipped active
+        // catches. An empty region stack visits nothing and needs no fuel.
+        let mut selected = None;
+        for (index, row) in self.0.iter().enumerate().rev() {
+            debit(fuel, 1)?;
+            if row.phase == Phase::Protected {
+                selected = Some(index);
+                break;
+            }
+        }
         let Some(index) = selected else {
-            debit(fuel, visited)?;
-            return Ok(false);
+            return Ok(None);
         };
         let r = &self.0[index];
         let depth = usize::from(r.depth);
         let old_depth = callers.len();
-        let catcher = if depth == old_depth {
-            &*frame
+        let (catcher, first_exited) = if depth == old_depth {
+            (&**frame, None)
         } else {
-            callers.get(depth).ok_or(EvalError::InvalidScript)?
+            (
+                callers.get(depth).ok_or(EvalError::InvalidScript)?,
+                Some(callers.get(depth + 1).unwrap_or(frame)),
+            )
         };
         let enter = usize::from(r.enter);
         let (catch, _) = bounds(catcher.ops, enter)?;
@@ -287,20 +349,26 @@ impl Regions {
             usize::from(r.receivers),
         );
         if index < usize::from(catcher.region_fence)
+            || first_exited.is_some_and(|exited| {
+                index >= usize::from(exited.region_fence)
+                    || s > usize::from(exited.base)
+                    || p > usize::from(exited.fence)
+            })
+            || usize::from(catcher.base) > s
             || s != usize::from(catcher.temps)
             || p != usize::from(catcher.fence)
             || s > slots.len()
             || p > packets.rows.len()
-            || rs > *receivers
-            || (depth == old_depth && rs != *receivers)
+            || rs > **receivers
+            || (depth == old_depth && rs != **receivers)
         {
             return Err(EvalError::InvalidScript);
         }
+
         let dropped_frames = old_depth - depth;
-        debit(
-            fuel,
-            visited + self.len() - index - 1 + 2 * dropped_frames + 1,
-        )?;
+        // Meter before any removed-frame walk or heap allocation. Packet and
+        // operand truncations are constant time (their records are Copy).
+        debit(fuel, self.len() - index - 1 + 2 * dropped_frames + 1)?;
         if dropped_frames != 0 {
             let discarded_receivers = usize::from(frame.receiver.is_some())
                 + callers[depth + 1..]
@@ -310,18 +378,17 @@ impl Regions {
             if receivers.checked_sub(discarded_receivers) != Some(rs) {
                 return Err(EvalError::InvalidScript);
             }
-            callers.truncate(depth + 1);
-            *frame = callers.pop().ok_or(EvalError::InvalidScript)?;
         }
-        slots.truncate(s);
-        packets.rows.truncate(p);
-        *receivers = rs;
-        self.0.truncate(index + 1);
-        self.0[index].phase = Phase::Active;
-        self.0[index].value = thrown.value;
-        frame.ip = catch;
-        bindings.select_body(frame.body);
-        Ok(true)
+        Ok(Some(PreparedUnwind {
+            state,
+            regions: self,
+            index,
+            depth,
+            catch,
+            slots: s,
+            packets: p,
+            receivers: rs,
+        }))
     }
 }
 
@@ -769,36 +836,31 @@ mod limits {
             tier: 2,
         };
         let mut receivers = 2;
-        let mut bindings = LegacyBindings::new(0).unwrap();
-        let thrown = Thrown {
-            value: Operand::Scalar(Value::Number(42.0)),
-            owner: None,
-            span: Span { start: 1, end: 2 },
-        };
-        macro_rules! transfer {
+        current.base = 2;
+        current.fence = 1;
+        macro_rules! plan {
             () => {
-                rows.transfer(
-                    thrown,
-                    Unwind {
-                        frame: &mut current,
-                        callers: &mut callers,
-                        slots: &mut slots,
-                        packets: &mut packets,
-                        receivers: &mut receivers,
-                        fuel: &mut fuel,
-                    },
-                    &mut bindings,
-                )
+                rows.plan(Unwind {
+                    frame: &mut current,
+                    callers: &mut callers,
+                    slots: &mut slots,
+                    packets: &mut packets,
+                    receivers: &mut receivers,
+                    fuel: &mut fuel,
+                })
             };
         }
         fuel = 3; // visit + frame traversal and removal + active install = 4
-        assert_eq!(transfer!(), Err(EvalError::DispatchLimitExceeded));
+        assert!(matches!(plan!(), Err(EvalError::DispatchLimitExceeded)));
         assert_eq!(
             (callers.len(), slots.len(), packets.rows.len(), receivers),
             (2, 3, 2, 2)
         );
         fuel = 4;
-        assert_eq!(transfer!(), Ok(true));
+        plan!()
+            .unwrap()
+            .unwrap()
+            .commit(Operand::Scalar(Value::Number(42.0)));
         assert_eq!(
             (
                 callers.len(),
@@ -819,5 +881,12 @@ mod limits {
             Operand::Scalar(Value::Number(42.0))
         ));
         assert_eq!(fuel, 0);
+        assert!(matches!(plan!(), Err(EvalError::DispatchLimitExceeded)));
+        fuel = 1;
+        assert!(matches!(plan!(), Ok(None))); // active row still costs one visit
+        assert_eq!(fuel, 0);
+        assert_eq!(rows.len(), 1);
+        rows.0.clear();
+        assert!(matches!(plan!(), Ok(None))); // no rows means no extra debit
     }
 }

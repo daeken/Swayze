@@ -3,7 +3,8 @@ use crate::Span;
 use crate::eval::{
     DotSite, EvalScratch, Operand, Properties, StringOperand,
     realm::{
-        Bindings, CompiledScript, Completion, EngineFault, EvalError, Execution, Realm, Stop, Throw,
+        Bindings, CompiledScript, Completion, EngineFault, EvalError, Execution, IntrinsicCall,
+        Realm, Stop, Throw,
     },
 };
 
@@ -115,11 +116,15 @@ fn native_roots_are_real_descriptors_and_fresh_errors_use_the_existing_value_dom
         assert_eq!(exec.callable_object(kind.callable()).ok(), Some(ctor));
         assert!(!exec.heap.is_noncallable(ctor));
         assert_eq!(exec.heap.origin(kind.callable(), &[]), None);
+        let expected_intrinsic = match kind {
+            ErrorKind::Error => IntrinsicCall::Error,
+            ErrorKind::ReferenceError => IntrinsicCall::ReferenceError,
+            ErrorKind::TypeError => IntrinsicCall::TypeError,
+        };
         assert!(matches!(
             exec.classify_callable(kind.callable(), SITE),
-            Err(Stop::Engine(EngineFault::Evaluation(
-                EvalError::InvalidScript
-            )))
+            Err(Stop::Engine(EngineFault::UnsupportedIntrinsicCall { span: SITE, intrinsic }))
+                if intrinsic == expected_intrinsic
         ));
 
         let receiver = exec.load_value(StoredValue::Object(id)).ok().unwrap();

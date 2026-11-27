@@ -18,17 +18,22 @@ fn wrap(body: &[Instruction], handler: &[Instruction]) -> Vec<Instruction> {
 
 fn run(ready: &mut ReadyScript<'_, '_>) -> (Result<Option<Operand>, Stop>, EvalScratch) {
     let code = ready.code;
+    run_execution(code, &mut ready.execution())
+}
+
+fn run_execution(
+    code: &CompiledScript,
+    execution: &mut Execution<'_, '_>,
+) -> (Result<Option<Operand>, Stop>, EvalScratch) {
     let stack = new_stack(code.max_stack_depth).unwrap();
     let mut scratch = EvalScratch::new();
-    let mut execution = ready.execution();
-    execution.private_abrupt = true;
     let result = dispatch(
         Frame::root(&code.instructions, code.max_stack_depth, code.exit),
         stack,
         &code.string_units,
         execution.callable,
         &mut scratch,
-        &mut execution,
+        execution,
     );
     (result, scratch)
 }
@@ -68,7 +73,7 @@ fn reject_atomic(code: &CompiledScript) {
 }
 
 #[test]
-fn private_gate_and_explicit_rethrow_provenance() {
+fn explicit_rethrow_projects_new_span_without_a_public_value() {
     let code = root(
         wrap(
             &[Number(9.0), THROW],
@@ -79,7 +84,9 @@ fn private_gate_and_explicit_rethrow_provenance() {
     let mut lives = Realm::new();
     assert_eq!(
         lives.instantiate(&code).unwrap().execute(),
-        Err(EngineFault::Evaluation(EvalError::InvalidScript))
+        Ok(Completion::Throw(Throw::Explicit {
+            span: Span { start: 2, end: 4 }
+        }))
     );
     assert!(matches!(
         run(&mut lives.instantiate(&code).unwrap()).0,
@@ -216,28 +223,27 @@ fn retained_throw_moves_scratch_utf16_and_uncaught_owner_into_packet() {
 }
 
 #[test]
-fn call_and_binding_diagnostics_and_engine_faults_still_bypass_the_private_gate() {
-    for (source, expected) in [
-        (
-            "missing;",
-            Throw::ReferenceError {
-                span: Span { start: 0, end: 7 },
-            },
-        ),
-        (
-            "(1)();",
-            Throw::TypeError {
-                span: Span { start: 3, end: 5 },
-            },
-        ),
-    ] {
+fn caught_automatic_errors_pass_values_but_engine_faults_bypass_catch() {
+    for source in ["missing;", "(1)();"] {
         let mut code = CompiledScript::compile(source).unwrap();
         code.instructions.push(Discard);
-        code.instructions = wrap(&code.instructions, &[Number(99.0), THROW]);
+        code.instructions = wrap(&code.instructions, &[LoadCatch(FIRST), THROW]);
         code.exit = ExitStack::Empty;
         let mut realm = Realm::new();
+        assert_eq!(
+            realm.instantiate(&code).unwrap().execute(),
+            Ok(Completion::Throw(Throw::Explicit {
+                span: Span { start: 0, end: 1 }
+            })),
+        );
         let actual = run(&mut realm.instantiate(&code).unwrap()).0;
-        assert!(matches!(actual, Err(Stop::Throw(error)) if error == expected));
+        assert!(matches!(
+            actual,
+            Err(Stop::ValueThrow(abrupt::Thrown {
+                value: Operand::Object(_),
+                ..
+            }))
+        ));
     }
     let mut code = CompiledScript::compile("var state=1; bad=2;").unwrap();
     code.instructions = wrap(&code.instructions, &[Number(99.0), THROW]);
@@ -251,6 +257,378 @@ fn call_and_binding_diagnostics_and_engine_faults_still_bypass_the_private_gate(
         run(&mut realm.instantiate(&read).unwrap()).0,
         Ok(Some(Operand::Scalar(Value::Number(1.0))))
     ));
+}
+
+fn evaluate(realm: &mut Realm, source: &str) -> Result<Completion, EngineFault> {
+    let code = CompiledScript::compile(source).unwrap();
+    realm.instantiate(&code).unwrap().execute()
+}
+
+// The parser producer lives on a different lane. Build the control edges by
+// hand, keeping every lookup/property site from the real compiler.
+fn capture_guard(code: &mut CompiledScript) {
+    assert_eq!(code.exit, ExitStack::Empty);
+    let handler = code.instructions.split_off(code.instructions.len() - 2);
+    let [LoadBinding(_), store @ StoreBinding(_)] = handler[..] else {
+        panic!("expected a trailing capture = placeholder statement: {handler:?}")
+    };
+    code.instructions = wrap(&code.instructions, &[LoadCatch(FIRST), store]);
+}
+
+#[test]
+fn automatic_producers_keep_exact_diagnostics_and_order_and_deliver_real_errors() {
+    use abrupt::Automatic::{ReferenceError as Reference, TypeError as Type};
+    for (body, token, kind, effect) in [
+        ("missing;", "missing", Reference, 0),
+        (
+            "typeof pending; const pending = 1;",
+            "pending",
+            Reference,
+            0,
+        ),
+        (
+            "'use strict'; undefined = (side = 1);",
+            "undefined",
+            Type,
+            1,
+        ),
+        (
+            "'use strict'; missing = (side = 2);",
+            "missing",
+            Reference,
+            2,
+        ),
+        (
+            "pending = (side = 3); const pending = 1;",
+            "pending",
+            Reference,
+            3,
+        ),
+        ("fixed = (side = 4);", "fixed", Type, 4),
+        ("'use strict'; 'x'.length = (side = 5);", ".", Type, 5),
+        (
+            "'use strict'; f.constructor.prototype = (side = 6);",
+            ".prototype",
+            Type,
+            6,
+        ),
+        ("null.x;", ".", Type, 0),
+        ("null.x(side = 7);", ".", Type, 0),
+        ("null.x = (side = 8);", ".", Type, 8),
+        ("f.prototype(side = 9);", "(side = 9)", Type, 9),
+        // RHS lookup precedes both the readonly and nullish Put failures.
+        ("null.x = missing;", "missing", Reference, 0),
+        (
+            "'use strict'; undefined = missing;",
+            "missing",
+            Reference,
+            0,
+        ),
+    ] {
+        let source = format!("{body} capture = placeholder;");
+        let mut code = CompiledScript::compile(&source).unwrap();
+        let start = source.find(token).unwrap();
+        let len = if token.starts_with('.') {
+            1
+        } else {
+            token.len()
+        };
+        let span = Span {
+            start,
+            end: start + len,
+        };
+        let name = match kind {
+            Reference => "ReferenceError",
+            Type => "TypeError",
+        };
+        for caught in [false, true] {
+            let mut realm = Realm::new();
+            let diagnostic = match kind {
+                Reference => Throw::ReferenceError { span },
+                Type => Throw::TypeError { span },
+            };
+            assert_eq!(
+                evaluate(
+                    &mut realm,
+                    "var side = 0, capture; const fixed = 1; function f(){}"
+                ),
+                Ok(Completion::Normal),
+            );
+            if caught {
+                capture_guard(&mut code);
+            }
+            assert_eq!(
+                realm.instantiate(&code).unwrap().execute(),
+                Ok(if caught {
+                    Completion::Normal
+                } else {
+                    Completion::Throw(diagnostic)
+                }),
+                "{body}",
+            );
+            let observed = if caught {
+                format!(
+                    "if (typeof capture !== 'object' || capture.name !== '{name}' || capture.message !== '' || capture.constructor.name !== '{name}' || capture.constructor.prototype.constructor !== capture.constructor || side !== {effect} || f.name !== 'f' || fixed !== 1) bad;"
+                )
+            } else {
+                format!(
+                    "if (capture !== undefined || side !== {effect} || f.name !== 'f' || fixed !== 1) bad;"
+                )
+            };
+            assert_eq!(
+                evaluate(&mut realm, &observed),
+                Ok(Completion::Normal),
+                "{body}"
+            );
+        }
+    }
+
+    let mut realm = Realm::new();
+    assert_eq!(
+        evaluate(&mut realm, "var capture, state;"),
+        Ok(Completion::Normal)
+    );
+    let mut code =
+        CompiledScript::compile("state = typeof missing; capture = placeholder;").unwrap();
+    capture_guard(&mut code);
+    assert_eq!(
+        realm.instantiate(&code).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        evaluate(
+            &mut realm,
+            "if (state !== 'undefined' || capture !== undefined) bad;"
+        ),
+        Ok(Completion::Normal)
+    );
+}
+
+#[test]
+fn automatic_catches_are_fresh_and_reached_error_constructors_are_engine_faults() {
+    let mut realm = Realm::new();
+    assert_eq!(
+        evaluate(&mut realm, "var capture, earlier, type, base, side = 0;"),
+        Ok(Completion::Normal)
+    );
+    let mut missing = CompiledScript::compile("missing; capture = placeholder;").unwrap();
+    capture_guard(&mut missing);
+    assert_eq!(
+        realm.instantiate(&missing).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        evaluate(&mut realm, "earlier = capture;"),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        realm.instantiate(&missing).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    let mut bad_call = CompiledScript::compile("(1)(); type = placeholder;").unwrap();
+    capture_guard(&mut bad_call);
+    assert_eq!(
+        realm.instantiate(&bad_call).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        evaluate(
+            &mut realm,
+            "if (capture === earlier || capture.constructor !== earlier.constructor || capture.constructor.prototype !== earlier.constructor.prototype || capture.constructor === type.constructor || capture.constructor.prototype === type.constructor.prototype) bad;"
+        ),
+        Ok(Completion::Normal)
+    );
+
+    // There is deliberately no guest Error binding. Seed a real base Error
+    // through the same private materializer solely to exercise its call tag.
+    {
+        let seed = CompiledScript::compile("base = placeholder;").unwrap();
+        let mut ready = realm.instantiate(&seed).unwrap();
+        let mut exec = ready.execution();
+        let Ok(value) =
+            exec.materialize_error(ErrorKind::Error, Span { start: 0, end: 1 }, |_| Ok(()))
+        else {
+            panic!("expected Error object")
+        };
+        let StoreBinding(site) = seed.instructions[1] else {
+            panic!("expected base assignment")
+        };
+        let (target, span, _) = exec.site(site).ok().unwrap();
+        assert!(
+            exec.put(target, span, value, EvalScratch::new().transient(&[]))
+                .is_ok()
+        );
+    }
+
+    for (receiver, intrinsic, effect) in [
+        ("capture", IntrinsicCall::ReferenceError, 1),
+        ("type", IntrinsicCall::TypeError, 2),
+        ("base", IntrinsicCall::Error, 3),
+    ] {
+        let source = format!("{receiver}.constructor(side = {effect}); capture = placeholder;");
+        let mut code = CompiledScript::compile(&source).unwrap();
+        capture_guard(&mut code);
+        let start = source.find('(').unwrap();
+        let end = source.find(')').unwrap() + 1;
+        assert_eq!(
+            realm.instantiate(&code).unwrap().execute(),
+            Err(EngineFault::UnsupportedIntrinsicCall {
+                span: Span { start, end },
+                intrinsic
+            })
+        );
+        assert_eq!(
+            evaluate(
+                &mut realm,
+                &format!("if (side !== {effect} || capture.name !== 'ReferenceError') bad;")
+            ),
+            Ok(Completion::Normal)
+        );
+    }
+}
+
+#[test]
+fn retained_automatic_throw_uses_issuing_span_then_restores_catcher_mode_and_packets() {
+    let mut realm = Realm::new();
+    let producer = format!(
+        "function boom(){{'use strict'; {} absent;}}",
+        " ".repeat(512)
+    );
+    assert_eq!(evaluate(&mut realm, &producer), Ok(Completion::Normal));
+    let start = producer.find("absent").unwrap();
+    assert_eq!(
+        evaluate(&mut realm, "boom();"),
+        Ok(Completion::Throw(Throw::ReferenceError {
+            span: Span {
+                start,
+                end: start + 6
+            }
+        }))
+    );
+
+    let mut caller = CompiledScript::compile(concat!(
+        "function mid(a){mid.open=mid.go(boom()); mid.name = 1; capture = placeholder;}",
+        "function holder(){} var capture; var host=holder; host.go=mid; mid.go=holder; mid.open=3; ",
+        "host.result=host.go(42);",
+    )).unwrap();
+    let body = &mut caller.functions[0];
+    let mut handler = body.instructions.split_off(body.instructions.len() - 7);
+    let [
+        LoadBinding(_),
+        FormDot(_),
+        Number(1.0),
+        PutDot(_),
+        Discard,
+        LoadBinding(_),
+        StoreBinding(_),
+    ] = handler[..]
+    else {
+        panic!("expected sloppy readonly store and capture: {handler:?}")
+    };
+    handler[5] = LoadCatch(FIRST);
+    handler.extend([LoadLocal(0), Return { value: true }]);
+    body.instructions = wrap(&body.instructions, &handler);
+    assert_eq!(
+        realm.instantiate(&caller).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        evaluate(
+            &mut realm,
+            "if (host.result !== 42 || mid.open !== 3 || mid.name !== 'mid' || capture.name !== 'ReferenceError') bad;"
+        ),
+        Ok(Completion::Normal)
+    );
+}
+
+#[test]
+fn automatic_error_creation_is_only_for_a_real_target_and_failure_skips_the_handler() {
+    let mut realm = Realm::new();
+    assert_eq!(
+        evaluate(&mut realm, "var side, capture;"),
+        Ok(Completion::Normal)
+    );
+    let source = "side = 7; missing; capture = placeholder;";
+    let plain = CompiledScript::compile(source).unwrap();
+    let start = source.find("missing").unwrap();
+    let span = Span {
+        start,
+        end: start + 7,
+    };
+    let mut guarded = CompiledScript::compile(source).unwrap();
+    capture_guard(&mut guarded);
+    let mut active = CompiledScript::compile(source).unwrap();
+    active.instructions.truncate(active.instructions.len() - 2);
+    active.instructions = wrap(&[Undefined, THROW], &active.instructions);
+
+    for (code, limits, expected) in [
+        (&plain, (true, true, true), None),
+        (&active, (true, true, true), None),
+        (
+            &guarded,
+            (true, false, false),
+            Some(EngineFault::PropertyWorkLimitExceeded),
+        ),
+        (
+            &guarded,
+            (false, true, false),
+            Some(EngineFault::Evaluation(EvalError::AllocationFailed)),
+        ),
+        (
+            &guarded,
+            (false, false, true),
+            Some(EngineFault::Evaluation(EvalError::AllocationFailed)),
+        ),
+    ] {
+        assert_eq!(evaluate(&mut realm, "side = 0;"), Ok(Completion::Normal));
+        {
+            let mut ready = realm.instantiate(code).unwrap();
+            let mut exec = ready.execution();
+            if limits.0 {
+                exec.property_work = Work(0);
+            }
+            if limits.1 {
+                exec.heap_requests = 0;
+            }
+            let before = (
+                exec.heap.test_snapshot(),
+                exec.property_work.0,
+                exec.heap_requests,
+            );
+            FAIL_CAUGHT_ERROR_RESERVE.with(|fail| fail.set(limits.2));
+            let (stop, _) = run_execution(code, &mut exec);
+            let did_not_reach_reserve = FAIL_CAUGHT_ERROR_RESERVE.with(|fail| fail.replace(false));
+            assert_eq!(did_not_reach_reserve, limits.2 && expected.is_none());
+            match expected {
+                Some(expected) => {
+                    assert!(matches!(stop, Err(Stop::Engine(actual)) if actual == expected))
+                }
+                None => assert!(
+                    matches!(stop, Err(Stop::Automatic(abrupt::Automatic::ReferenceError, actual)) if actual == span)
+                ),
+            }
+            assert_eq!(
+                (
+                    exec.heap.test_snapshot(),
+                    exec.property_work.0,
+                    exec.heap_requests
+                ),
+                before
+            );
+        }
+        assert_eq!(
+            evaluate(&mut realm, "if (side !== 7 || capture !== undefined) bad;"),
+            Ok(Completion::Normal)
+        );
+    }
+    assert_eq!(
+        realm.instantiate(&guarded).unwrap().execute(),
+        Ok(Completion::Normal)
+    );
+    assert_eq!(
+        evaluate(&mut realm, "if (capture.name !== 'ReferenceError') bad;"),
+        Ok(Completion::Normal)
+    );
 }
 
 #[test]
@@ -447,7 +825,6 @@ fn guarded_reserve_is_lazy_fallible_and_fuel_only() {
     ));
     let mut ready = realm.instantiate(&code).unwrap();
     let mut execution = ready.execution();
-    execution.private_abrupt = true;
     execution.property_work = Work(0);
     assert!(matches!(
         dispatch(

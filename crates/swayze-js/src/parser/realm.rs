@@ -1721,6 +1721,147 @@ mod abrupt_lowering_tests {
     }
 
     #[test]
+    fn throw_diagnostics_distinguish_excluded_operands_and_call_commas() {
+        for (text, at, message) in [
+            (
+                "throw let;",
+                "let",
+                "declarations are not expression tokens",
+            ),
+            (
+                "throw f(1,);",
+                ");",
+                "trailing call commas are outside the subset",
+            ),
+            (
+                "throw obj.f(1, /* comment */);",
+                ");",
+                "trailing call commas are outside the subset",
+            ),
+            (
+                "throw f(g(1,), 2);",
+                "),",
+                "trailing call commas are outside the subset",
+            ),
+        ] {
+            let start = text.find(at).unwrap();
+            let end = start + if at == "let" { 3 } else { 1 };
+            assert_eq!(
+                error(text),
+                Error::unsupported(Span { start, end }, message),
+                "{text}"
+            );
+        }
+        for (text, at) in [
+            ("throw const;", "const"),
+            ("throw (1,);", ");"),
+            ("throw f((1,), 2);", "),"),
+            ("throw f(1,, 2);", ",,"),
+        ] {
+            let err = error(text);
+            assert_eq!(
+                err.parse_error_type(),
+                Some(ParseErrorType::SyntaxError),
+                "{text}"
+            );
+            assert_eq!(
+                err.span().start,
+                text.find(at).unwrap() + usize::from(at == ",,"),
+                "{text}"
+            );
+        }
+        assert_eq!(error("f(1,);").parse_error_type(), None);
+        for text in ["throw f();", "throw f(1, 2);"] {
+            assert!(compile_realm(text).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn throw_asi_before_else_only_walks_completing_single_arms_in_its_owner() {
+        for text in [
+            "if (a) if (b) ; else throw 0\nelse ;",
+            "if (a) if (b) ; else if (c) ; else throw 0\nelse ;",
+            "function g() { if (a) if (b) ; else throw 0\nelse ; }",
+        ] {
+            let start = text.rfind("else").unwrap();
+            assert_eq!(
+                error(text),
+                Error::unsupported(
+                    Span {
+                        start,
+                        end: start + 4
+                    },
+                    THROW_SEMICOLON
+                )
+            );
+            assert_eq!(
+                error(&text.replace("0\n", "0 ")),
+                Error::syntax(
+                    Span {
+                        start,
+                        end: start + 4
+                    },
+                    "unexpected 'else' in throw statement"
+                )
+            );
+            assert!(compile_realm(&text.replace("0\n", "0;\n")).is_ok());
+        }
+        for text in [
+            "throw 0\nelse ;",
+            "if (a) { if (b) ; else throw 0\nelse ; }",
+            "if (a) (function() { if (b) ; else throw 0\nelse ; });",
+            "if (a) if (b) ; else throw (0\nelse ;",
+        ] {
+            let start = text.rfind("else").unwrap();
+            assert_eq!(
+                error(text),
+                Error::syntax(
+                    Span {
+                        start,
+                        end: start + 4
+                    },
+                    "unexpected 'else' in throw statement"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn throw_else_ancestry_charges_at_the_cached_delimiter_per_frame() {
+        let text = "if (a) if (b) ; else if (c) ; else throw x\nelse ;";
+        let start = text.rfind("else").unwrap();
+        let delimiter = Span {
+            start,
+            end: start + 4,
+        };
+        let parse = |source: &str, max_work| {
+            let mut parser = new_parser(
+                source,
+                Limits {
+                    max_work,
+                    ..Limits::default()
+                },
+                BindingPolicy::Realm,
+            )
+            .unwrap();
+            let error = parser.parse(false).err().unwrap();
+            assert_eq!(parser.lexer.offset, delimiter.end);
+            (error, parser.lexer.work_left, parser.lexer.tokens_left)
+        };
+        let ceiling = Limits::default().max_work;
+        let (_, same_line, same_tokens) = parse(&text.replace('\n', " "), ceiling);
+        let (err, new_line, new_tokens) = parse(text, ceiling);
+        assert_eq!(err, Error::unsupported(delimiter, THROW_SEMICOLON));
+        assert_eq!(same_line - new_line, 3); // two completing else arms, then its then arm
+        assert_eq!(same_tokens, new_tokens);
+        assert_eq!(parse(text, ceiling - new_line).0, err);
+        assert_eq!(
+            parse(text, ceiling - new_line - 1).0,
+            Error::limit(delimiter, Limit::Work)
+        );
+    }
+
+    #[test]
     fn cached_operand_preserves_original_trivia_without_replay() {
         for (text, newline) in [("throw /* x */1;", false), ("throw /*\u{2029} */1;", true)] {
             let mut parser = new_parser(text, Limits::default(), BindingPolicy::Realm).unwrap();

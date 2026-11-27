@@ -2432,6 +2432,27 @@ impl Parser<'_> {
         )
     }
 
+    // A complete throw would finish its immediate single arm. If that was
+    // an else arm, the finished if can in turn complete an enclosing arm.
+    // Stop at the first then arm (dangling else) or any braced boundary.
+    fn else_after_completed_throw(&mut self, span: Span) -> Result<bool, Error> {
+        for frame in self.statement_frames.iter().rev() {
+            self.lexer.charge(1, span)?;
+            match frame.statement.kind {
+                StatementKind::IfElse {
+                    arm: StatementBody::Single,
+                    ..
+                } => {}
+                StatementKind::IfThen {
+                    arm: StatementBody::Single,
+                    ..
+                } => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
     fn open_else_arm(&mut self, index: usize, branch: usize) -> Result<bool, Error> {
         // Check the nearest unfinished then-arm first. Leave any other
         // lookahead (including EOF) cached for an outer arm or the next item.
@@ -3891,7 +3912,9 @@ impl Parser<'_> {
                         | TokenKind::Comma
                         | TokenKind::Colon
                         | TokenKind::Question
-                        | TokenKind::Declaration(_)
+                        // Sloppy `let` can be an IdentifierReference; leave
+                        // it to the ordinary untyped exclusion below.
+                        | TokenKind::Declaration(BindingKind::Const)
                         | TokenKind::Var
                         | TokenKind::If
                         | TokenKind::Else
@@ -3951,16 +3974,10 @@ impl Parser<'_> {
                     }
                     (false, TokenKind::Else) => {
                         self.reduce_expression(span, &mut reference)?;
-                        let then_arm = self.statement_frames.last().is_some_and(|frame| {
-                            matches!(
-                                frame.statement.kind,
-                                StatementKind::IfThen {
-                                    arm: StatementBody::Single,
-                                    ..
-                                }
-                            )
-                        });
-                        return Err(if after_line_break && self.pending.is_empty() && then_arm {
+                        return Err(if after_line_break
+                            && self.pending.is_empty()
+                            && self.else_after_completed_throw(span)?
+                        {
                             Error::unsupported(span, THROW_SEMICOLON)
                         } else {
                             Error::syntax(span, "unexpected 'else' in throw statement")
@@ -4250,6 +4267,20 @@ impl Parser<'_> {
                         allow_assignment = true;
                         after_open = false;
                         next = self.next_token(TokenPosition::Operand)?;
+                        if throw
+                            && let Some(Token {
+                                kind: TokenKind::Close,
+                                span,
+                                ..
+                            }) = next
+                        {
+                            // A comma immediately before this call's close is
+                            // valid JS, but not admitted by the call subset.
+                            return Err(Error::unsupported(
+                                span,
+                                "trailing call commas are outside the subset",
+                            ));
+                        }
                         continue;
                     }
                     match self.pending.last() {
